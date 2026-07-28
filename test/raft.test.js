@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { ready } from '../wasm/nisaba-wasm.js';
 import { NotLeaderError } from '../src/raft.js';
 import {
-  Sim, MemoryNetwork, makeCluster, bootNode, stopNode,
+  Sim, MemoryNetwork, makeCluster, bootNode, stopNode, takeSnapshot,
   leaders, until, settle, kvSet
 } from './raft-harness.js';
 
@@ -104,6 +104,115 @@ describe('raft: replication', () => {
     const settled = await Promise.all(proposals);
     for (const s of settled) expect(s).not.toBeInstanceOf(Error);
     expect(maps(cluster)[0]).toEqual(maps(cluster)[1]);
+  });
+});
+
+describe('raft: snapshot install (5b)', () => {
+  it('a follower behind the leader\'s compacted log catches up via a multi-chunk install', async () => {
+    const sim = new Sim(31);
+    const net = new MemoryNetwork(sim);
+    // Tiny chunks force a real multi-chunk transfer.
+    const cluster = await makeCluster(3, sim, net, { snapshotChunkBytes: 16 });
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    const leader = () => leaders(cluster)[0];
+
+    for (let i = 1; i <= 6; i++) await settle(sim, cluster, leader().node.propose(kvSet(`k${i}`, i)));
+
+    const victimId = [...cluster.values()].find((m) => m.node.role !== 'leader').node.id;
+    const victim = cluster.get(victimId);
+    await stopNode(net, victim);
+
+    for (let i = 7; i <= 12; i++) await settle(sim, cluster, leader().node.propose(kvSet(`k${i}`, i)));
+    const boundary = await takeSnapshot(leader());
+    expect(leader().log.baseIndex).toBe(boundary);
+    // Drain in-flight messages to the dead node: heartbeats computed from
+    // the pre-compaction log still sit in the virtual network, and a
+    // delayed AppendEntries would catch the reboot up WITHOUT an install
+    // (a legitimate heal, but not the path under test).
+    await sim.advance(200, [...cluster.values()].filter((m) => m.node.isRunning).map((m) => m.node));
+
+    // The rebooted follower's log ends far below the leader's base: only
+    // an install can catch it up.
+    const reborn = await bootNode(victimId, [...cluster.keys()], sim, net, victim.handle, { snapshotChunkBytes: 16 });
+    cluster.set(victimId, reborn);
+    await until(sim, cluster, () => reborn.machine.map.get('k12') === 12);
+    expect(reborn.machine.snapshot()).toEqual(leader().machine.snapshot());
+    expect(reborn.log.baseIndex).toBe(boundary);
+    expect(reborn.node.lastApplied).toBeGreaterThanOrEqual(boundary);
+    expect(leader().node.peersNeedingSnapshot).toEqual([]);
+  });
+
+  it('a replacement node with an empty disk is bootstrapped by install, then follows normally', async () => {
+    const sim = new Sim(32);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeCluster(3, sim, net);
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    const leader = () => leaders(cluster)[0];
+
+    for (let i = 1; i <= 5; i++) await settle(sim, cluster, leader().node.propose(kvSet(`k${i}`, i)));
+    const boundary = await takeSnapshot(leader());
+
+    // A follower's disk is lost entirely; a blank replacement takes its
+    // id (drain first — see the multi-chunk test's comment).
+    const deadId = [...cluster.values()].find((m) => m.node.role !== 'leader').node.id;
+    await stopNode(net, cluster.get(deadId));
+    await sim.advance(200, [...cluster.values()].filter((m) => m.node.isRunning).map((m) => m.node));
+    const { MemoryHandle } = await import('../wasm/nisaba-wasm.js');
+    const replacement = await bootNode(deadId, [...cluster.keys()], sim, net, new MemoryHandle());
+    cluster.set(deadId, replacement);
+
+    await until(sim, cluster, () => replacement.machine.map.get('k5') === 5);
+    expect(replacement.log.baseIndex).toBe(boundary);
+
+    // Post-install traffic arrives by ordinary AppendEntries, not repeat
+    // installs: the follower's log now extends past the boundary.
+    await settle(sim, cluster, leader().node.propose(kvSet('post', 1)));
+    await until(sim, cluster, () => replacement.machine.map.get('post') === 1);
+    expect(replacement.log.lastIndex).toBeGreaterThan(boundary);
+  });
+
+  it('an install from a stale term is refused', async () => {
+    const sim = new Sim(33);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeCluster(3, sim, net);
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    const follower = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    const reply = await follower.node.handleMessage({
+      kind: 'installSnapshot', term: 0, leaderId: 99,
+      lastIncludedIndex: 100, lastIncludedTerm: 1,
+      manifest: { config: null, files: [] }, role: null, offset: 0,
+      data: new Uint8Array(0), done: true
+    });
+    expect(reply.success).toBe(false);
+    expect(reply.term).toBe(follower.node.term);
+    expect(follower.node.lastApplied).toBeLessThan(100);
+  });
+
+  it('without a leader-side snapshotter the peer parks; restoring it recovers', async () => {
+    const sim = new Sim(34);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeCluster(3, sim, net);
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    const leader = () => leaders(cluster)[0];
+
+    for (let i = 1; i <= 4; i++) await settle(sim, cluster, leader().node.propose(kvSet(`k${i}`, i)));
+    await takeSnapshot(leader());
+    const disabled = leader().node.snapshotter;
+    leader().node.snapshotter = null;
+
+    const deadId = [...cluster.values()].find((m) => m.node.role !== 'leader').node.id;
+    await stopNode(net, cluster.get(deadId));
+    await sim.advance(200, [...cluster.values()].filter((m) => m.node.isRunning).map((m) => m.node));
+    const { MemoryHandle } = await import('../wasm/nisaba-wasm.js');
+    const replacement = await bootNode(deadId, [...cluster.keys()], sim, net, new MemoryHandle());
+    cluster.set(deadId, replacement);
+
+    await until(sim, cluster, () => leader().node.peersNeedingSnapshot.includes(deadId));
+    expect(replacement.machine.map.size).toBe(0); // stuck, as designed
+
+    leader().node.snapshotter = disabled; // host intervenes
+    await until(sim, cluster, () => replacement.machine.map.get('k4') === 4);
+    expect(leader().node.peersNeedingSnapshot).toEqual([]);
   });
 });
 

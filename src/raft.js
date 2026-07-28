@@ -37,11 +37,24 @@
  * appends a NOOP entry to commit its term's boundary (Raft §5.4.2: only
  * current-term entries commit by counting).
  *
- * Still to come (see roadmap): InstallSnapshot streaming (a follower
- * whose nextIndex falls below the leader's log base currently stalls —
- * the leader marks it `needsSnapshot` and the host must intervene), CONFIG
- * entries for membership changes, and the WalDb integration that turns
- * proposals into database commands (5c).
+ * Snapshot install (5b): when a follower's nextIndex falls below the
+ * leader's log base, AppendEntries can never catch it up — the entries
+ * are compacted away. With a `snapshotter` configured, the leader streams
+ * its latest snapshot instead: the manifest travels with the first chunk,
+ * then every file chunk-by-chunk over the same request/response
+ * transport, each chunk awaited (a stale term in any reply aborts). The
+ * follower stages chunks through snapshotter.beginInstall's transaction;
+ * commit() validates and adopts the whole state (its appliedIndex
+ * becomes the boundary), then the node swaps its log for a fresh one
+ * based at the boundary via the `rebaseLog` hook — EntryLog cannot
+ * rebase in place — and re-persists its hard state onto it. The commit
+ * and swap are serialized through the apply chain so an in-flight apply
+ * loop can never observe the swap. Without a snapshotter, such peers
+ * park in `peersNeedingSnapshot` for the host to notice.
+ *
+ * Still to come (see roadmap): CONFIG entries for membership changes,
+ * and the WalDb integration that turns proposals into database commands
+ * (5c).
  */
 import { ENTRYLOG_TYPE } from '../wasm/nisaba-wasm.js';
 
@@ -72,15 +85,30 @@ export class RaftNode {
    *   once per index per process (crash replay is the state machine's
    *   appliedIndex contract, roadmap step 1)
    * @param {object} options.transport - { call(peerId, msg) -> Promise<reply> }
+   * @param {object} [options.snapshotter] - snapshot serving + install:
+   *   { latest() -> { lastIncludedIndex, lastIncludedTerm, config,
+   *       files: [{ role, size, crc, ... }] } | null,      // leader side
+   *     openFile(role) -> { read(buf, {at}), close() },     // leader side
+   *     beginInstall(manifest) -> {                         // follower side
+   *       writeChunk(role, offset, data), commit(), abort() } }
+   *   commit() must validate the staged bytes and adopt the whole state
+   *   into the state machine (appliedIndex becomes the boundary).
+   * @param {(lastIncludedIndex, lastIncludedTerm) => Promise<EntryLog>}
+   *   [options.rebaseLog] - after an install commits, return a fresh OPEN
+   *   EntryLog based at the boundary (the node closes the old log first
+   *   and re-persists its hard state onto the new one). Required for a
+   *   follower to accept installs.
    * @param {[number, number]} [options.electionTimeoutMs=[150,300]]
    * @param {number} [options.heartbeatMs=50]
    * @param {number} [options.maxBatchBytes=65536] - AppendEntries batch cap
+   * @param {number} [options.snapshotChunkBytes=65536]
    * @param {() => number} [options.random=Math.random]
    */
   constructor({
     id, peers, log, stateMachine, transport,
+    snapshotter = null, rebaseLog = null,
     electionTimeoutMs = [150, 300], heartbeatMs = 50,
-    maxBatchBytes = 65536, random = Math.random
+    maxBatchBytes = 65536, snapshotChunkBytes = 65536, random = Math.random
   }) {
     if (!Number.isInteger(id) || id <= 0) throw new Error('RaftNode id must be a positive integer');
     this.id = id;
@@ -88,9 +116,12 @@ export class RaftNode {
     this.log = log;
     this.stateMachine = stateMachine;
     this.transport = transport;
+    this.snapshotter = snapshotter;
+    this.rebaseLog = rebaseLog;
     this.electionTimeoutMs = electionTimeoutMs;
     this.heartbeatMs = heartbeatMs;
     this.maxBatchBytes = maxBatchBytes;
+    this.snapshotChunkBytes = snapshotChunkBytes;
     this.random = random;
 
     this.role = ROLE.FOLLOWER;
@@ -111,6 +142,7 @@ export class RaftNode {
     this._inflight = new Set();   // peers with an AppendEntries in flight
     this._waiters = [];           // propose() promises: {index, term, resolve, reject}
     this._applyChain = Promise.resolve();
+    this._install = null;         // follower: in-progress install transaction
   }
 
   get term() { return this.log.currentTerm; }
@@ -173,12 +205,14 @@ export class RaftNode {
   // ---- RPC handlers -------------------------------------------------------
 
   /** The transport hands every incoming message here; the return value is
-   * the reply. Synchronous internally (all log operations are). */
+   * the reply (a promise for installSnapshot; synchronous otherwise —
+   * all log operations are). */
   handleMessage(msg) {
     if (!this.isRunning) throw new Error('node is stopped');
     switch (msg.kind) {
       case 'requestVote': return this._onRequestVote(msg);
       case 'appendEntries': return this._onAppendEntries(msg);
+      case 'installSnapshot': return this._onInstallSnapshot(msg);
       default: throw new Error(`raft: unknown message kind "${msg.kind}"`);
     }
   }
@@ -261,6 +295,82 @@ export class RaftNode {
     return { term: currentTerm, success: true, matchIndex };
   }
 
+  async _onInstallSnapshot(msg) {
+    const currentTerm = this.log.currentTerm;
+    if (msg.term < currentTerm) return { term: currentTerm, success: false };
+    if (msg.term > currentTerm || this.role !== ROLE.FOLLOWER) {
+      this._becomeFollower(msg.term, msg.leaderId);
+    }
+    this.leaderId = msg.leaderId;
+    this._lastLeaderContact = this._now;
+    this._resetElectionTimer();
+
+    if (!this.snapshotter || !this.rebaseLog) {
+      return { term: this.log.currentTerm, success: false };
+    }
+
+    if (msg.manifest) {
+      // First chunk of a (re)started install: supersede anything staged.
+      await this._abortInstall();
+      this._install = {
+        lastIncludedIndex: msg.lastIncludedIndex,
+        lastIncludedTerm: msg.lastIncludedTerm,
+        tx: await this.snapshotter.beginInstall({
+          lastIncludedIndex: msg.lastIncludedIndex,
+          lastIncludedTerm: msg.lastIncludedTerm,
+          config: msg.manifest.config,
+          files: msg.manifest.files
+        })
+      };
+    }
+    const install = this._install;
+    if (!install ||
+        install.lastIncludedIndex !== msg.lastIncludedIndex ||
+        install.lastIncludedTerm !== msg.lastIncludedTerm) {
+      // A chunk for an install we never started (leader restarted, or we
+      // aborted): ask for the manifest again.
+      return { term: this.log.currentTerm, success: false, restart: true };
+    }
+    if (msg.role != null && msg.data && msg.data.length) {
+      await install.tx.writeChunk(msg.role, msg.offset, msg.data);
+    }
+
+    if (msg.done) {
+      // Commit + log swap serialize through the apply chain so an
+      // in-flight apply loop can never observe the swap mid-batch.
+      const finish = async () => {
+        await install.tx.commit(); // validate + adopt into the state machine
+        const term = this.log.currentTerm;
+        const votedFor = this.log.votedFor;
+        await this.log.close();
+        this.log = await this.rebaseLog(msg.lastIncludedIndex, msg.lastIncludedTerm);
+        if (term > 0) this.log.setHardState(term, votedFor); // fresh logs start at 0/0
+        this.lastApplied = msg.lastIncludedIndex;
+        this.commitIndex = Math.max(this.commitIndex, msg.lastIncludedIndex);
+        this._install = null;
+      };
+      const run = this._applyChain.then(finish);
+      this._applyChain = run.catch(() => {});
+      try {
+        await run;
+      } catch {
+        // A failed commit (e.g. checksum mismatch on a corrupted
+        // transfer) adopts nothing; have the leader start over.
+        this._install = null;
+        return { term: this.log.currentTerm, success: false, restart: true };
+      }
+    }
+    return { term: this.log.currentTerm, success: true };
+  }
+
+  async _abortInstall() {
+    const install = this._install;
+    this._install = null;
+    if (install) {
+      try { await install.tx.abort(); } catch { /* best-effort */ }
+    }
+  }
+
   // ---- elections ----------------------------------------------------------
 
   _resetElectionTimer() {
@@ -284,6 +394,7 @@ export class RaftNode {
       this.log.setHardState(term, this.id); // persist term + self-vote first
       this.role = ROLE.CANDIDATE;
       this.leaderId = 0;
+      this._abortInstall(); // a half-staged install belongs to the old world
     }
     this._resetElectionTimer();
     const quorum = this._quorum();
@@ -342,7 +453,11 @@ export class RaftNode {
     if (this.role !== ROLE.LEADER || this._inflight.has(peer)) return;
     const next = this._next.get(peer);
     if (next <= this.log.baseIndex) {
-      this._needsSnapshot.add(peer); // 5b: InstallSnapshot goes here
+      // AppendEntries can never catch this peer up — the entries are
+      // compacted away. Stream the snapshot instead, or park the peer
+      // for the host if we can't serve one.
+      if (this.snapshotter && this.snapshotter.latest()) return this._sendSnapshot(peer);
+      this._needsSnapshot.add(peer);
       return;
     }
     this._needsSnapshot.delete(peer);
@@ -368,10 +483,16 @@ export class RaftNode {
         }
         again = this._next.get(peer) <= this.log.lastIndex;
       } else {
-        // Back up along the follower's hint (never past what's already
-        // matched, never forward of a plain decrement).
+        // Back up along the follower's hint (never forward of a plain
+        // decrement). The hint may fall below matchIndex: a follower can
+        // regress like that only by losing its disk (a blank replacement
+        // reusing the id) — believe it, and drop matchIndex with it so a
+        // replica that no longer holds the entries stops counting toward
+        // quorums, and nextIndex can fall back to the install path.
         const hint = reply.hintIndex !== undefined ? reply.hintIndex : next - 1;
-        this._next.set(peer, Math.max(this._match.get(peer) + 1, Math.min(hint, next - 1), 1));
+        const backedTo = Math.max(1, Math.min(hint, next - 1));
+        if (backedTo <= this._match.get(peer)) this._match.set(peer, backedTo - 1);
+        this._next.set(peer, backedTo);
         again = true;
       }
     } catch {
@@ -380,6 +501,78 @@ export class RaftNode {
       this._inflight.delete(peer);
     }
     if (again) this._replicate(peer);
+  }
+
+  /** Stream the latest snapshot to a peer, chunk by chunk, each chunk
+   * awaited: the manifest rides the first chunk, `done` marks the last
+   * chunk of the last file. On success the peer stands at the snapshot
+   * boundary and ordinary AppendEntries resumes from there. */
+  async _sendSnapshot(peer) {
+    if (this._inflight.has(peer)) return;
+    this._inflight.add(peer);
+    const term = this.log.currentTerm;
+    let installed = false;
+    let boundary = 0;
+    try {
+      const snap = this.snapshotter.latest();
+      const { lastIncludedIndex, lastIncludedTerm } = snap;
+      boundary = lastIncludedIndex;
+      const files = snap.files;
+      const base = {
+        kind: 'installSnapshot', term, leaderId: this.id,
+        lastIncludedIndex, lastIncludedTerm
+      };
+      const manifest = {
+        config: snap.config ?? null,
+        files: files.map(({ role, size, crc }) => ({ role, size, crc }))
+      };
+      const send = async (msg) => {
+        const reply = await this.transport.call(peer, msg);
+        if (!this.isRunning || this.role !== ROLE.LEADER || this.log.currentTerm !== term) return false;
+        if (reply.term > term) { this._becomeFollower(reply.term, 0); return false; }
+        return reply.success === true; // restart/false: give up, retry from the top later
+      };
+
+      if (files.length === 0) {
+        installed = await send({ ...base, manifest, role: null, offset: 0, data: EMPTY, done: true });
+      } else {
+        let first = true;
+        outer:
+        for (let f = 0; f < files.length; f++) {
+          const file = files[f];
+          const handle = await this.snapshotter.openFile(file.role);
+          try {
+            let offset = 0;
+            do {
+              const n = Math.min(this.snapshotChunkBytes, file.size - offset);
+              const data = new Uint8Array(n);
+              if (n) handle.read(data, { at: offset });
+              const done = f === files.length - 1 && offset + n >= file.size;
+              const msg = { ...base, role: file.role, offset, data, done };
+              if (first) { msg.manifest = manifest; first = false; }
+              if (!await send(msg)) break outer;
+              offset += n;
+              if (done) installed = true;
+            } while (offset < file.size);
+          } finally {
+            if (handle.close) await handle.close();
+          }
+        }
+      }
+      if (installed) {
+        if (boundary > this._match.get(peer)) this._match.set(peer, boundary);
+        this._next.set(peer, this._match.get(peer) + 1);
+        this._needsSnapshot.delete(peer);
+        this._advanceCommit();
+      }
+    } catch {
+      // Peer unreachable mid-transfer; the next heartbeat starts over.
+    } finally {
+      this._inflight.delete(peer);
+    }
+    if (installed && this.role === ROLE.LEADER && this._next.get(peer) <= this.log.lastIndex) {
+      this._replicate(peer);
+    }
   }
 
   _quorum() { return Math.floor((this.peers.length + 1) / 2) + 1; }

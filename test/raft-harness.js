@@ -7,7 +7,7 @@
  * delivers only when the simulation advances, and every random draw
  * comes from the seed — a failing schedule replays exactly.
  */
-import { EntryLog, MemoryHandle, encode, decode } from '../wasm/nisaba-wasm.js';
+import { EntryLog, MemoryHandle, encode, decode, crc32 } from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 
 /** Small, well-known seedable PRNG. */
@@ -136,6 +136,101 @@ export const kvSet = (k, v) => encode({ op: 'set', k, v });
 export const kvDel = (k) => encode({ op: 'del', k });
 
 /**
+ * In-memory implementation of the RaftNode snapshotter contract over a
+ * KvMachine: take() freezes the current map into a single 'kv' role file
+ * (binjson bytes + manifest CRC); beginInstall stages chunks, and
+ * commit() validates size + CRC against the manifest and adopts the
+ * whole state into the machine.
+ */
+export class KvSnapshotter {
+  constructor(machine) {
+    this.machine = machine;
+    this._latest = null; // { lastIncludedIndex, lastIncludedTerm, config, files, bytes }
+  }
+
+  /** Leader-side: freeze the machine's state at the given boundary. */
+  take(lastIncludedIndex, lastIncludedTerm) {
+    const bytes = encode({ entries: [...this.machine.map.entries()] });
+    this._latest = {
+      lastIncludedIndex, lastIncludedTerm, config: null,
+      files: [{ role: 'kv', size: bytes.length, crc: crc32(bytes) }],
+      bytes
+    };
+    return this._latest;
+  }
+
+  latest() { return this._latest; }
+
+  openFile(role) {
+    if (!this._latest || role !== 'kv') throw new Error(`no snapshot file for role ${role}`);
+    const bytes = this._latest.bytes;
+    return {
+      read(buf, { at = 0 } = {}) {
+        const n = Math.min(buf.length, bytes.length - at);
+        if (n > 0) buf.set(bytes.subarray(at, at + n), 0);
+        return Math.max(0, n);
+      },
+      close() {}
+    };
+  }
+
+  beginInstall(manifest) {
+    const staged = new Map(); // role -> growing Uint8Array
+    const snapshotter = this;
+    return {
+      writeChunk(role, offset, data) {
+        let buf = staged.get(role) || new Uint8Array(0);
+        if (offset + data.length > buf.length) {
+          const grown = new Uint8Array(offset + data.length);
+          grown.set(buf, 0);
+          buf = grown;
+        }
+        buf.set(data, offset);
+        staged.set(role, buf);
+      },
+      commit() {
+        for (const f of manifest.files) {
+          const buf = staged.get(f.role) || new Uint8Array(0);
+          if (buf.length !== f.size || crc32(buf) !== f.crc) {
+            throw new Error(`snapshot file ${f.role} failed validation`);
+          }
+        }
+        const { entries } = decode(staged.get('kv') || encode({ entries: [] }));
+        snapshotter.machine.map = new Map(entries);
+        snapshotter.machine.applied = manifest.lastIncludedIndex;
+        // The installed state is also this node's own latest snapshot —
+        // it can serve it onward if it ever leads.
+        snapshotter.take(manifest.lastIncludedIndex, manifest.lastIncludedTerm);
+      },
+      abort() { staged.clear(); }
+    };
+  }
+}
+
+/**
+ * Quiesced leader-side snapshot: freeze the state machine at the node's
+ * lastApplied and compact the EntryLog through that boundary into a
+ * fresh MemoryHandle (raising baseIndex — what forces InstallSnapshot
+ * for lagging peers). Mirrors what WalDb.snapshot() does with the
+ * SnapshotStore (roadmap step 3), scaled down to the harness.
+ */
+export async function takeSnapshot(member) {
+  const { node, log } = member;
+  const boundary = node.lastApplied;
+  const boundaryTerm = log.termAt(boundary);
+  member.snapshotter.take(boundary, boundaryTerm);
+  const dest = new MemoryHandle();
+  await log.compact(dest, boundary, boundaryTerm);
+  const fresh = new EntryLog(dest);
+  await fresh.open();
+  await log.close();
+  member.log = fresh;
+  member.handle = dest;
+  node.log = fresh;
+  return boundary;
+}
+
+/**
  * Build an n-node cluster on the network. Returns Map(id -> { node, log,
  * handle, machine }); `handle` outlives restarts (restartNode reopens it).
  */
@@ -152,15 +247,29 @@ export async function bootNode(id, ids, sim, net, handle, nodeOptions = {}) {
   const log = new EntryLog(handle);
   await log.open();
   const machine = new KvMachine();
+  const snapshotter = new KvSnapshotter(machine);
+  const member = { log, handle, machine, snapshotter };
   const node = new RaftNode({
     id, peers: ids, log, stateMachine: machine,
     transport: { call: (to, msg) => net.call(id, to, msg) },
+    snapshotter,
+    // After an install commits, the follower's log restarts at the
+    // boundary on a fresh handle (the old file's history is superseded).
+    rebaseLog: async (lastIncludedIndex, lastIncludedTerm) => {
+      member.handle = new MemoryHandle();
+      member.log = new EntryLog(member.handle, {
+        baseIndex: lastIncludedIndex, baseTerm: lastIncludedTerm
+      });
+      await member.log.open();
+      return member.log;
+    },
     random: sim.rng,
     ...nodeOptions
   });
+  member.node = node;
   net.register(id, (msg) => node.handleMessage(msg));
   await node.start(sim.time);
-  return { node, log, handle, machine };
+  return member;
 }
 
 /** Fully stop a member (network + node + log); its handle survives for a

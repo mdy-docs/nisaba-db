@@ -335,6 +335,50 @@ int dc_collection_recover(dc_collection *c, const bj_io *journal) {
     return e;
 }
 
+uint64_t dc_applied_index(const dc_collection *c) {
+    return bpt_applied_index(c->primary);
+}
+
+/* One structure's staging check/stage, switched on what the dc_index
+ * actually holds. `stage == 0` only validates (see dc_set_applied_index's
+ * no-partial-staging contract); `stage == 1` performs the staging, which
+ * cannot fail after a passing validation pass. */
+static int stage_applied_bpt(bpt *t, uint64_t index, int stage) {
+    if (stage) return bpt_set_applied_index(t, index);
+    if (bpt_is_snapshot(t) || index < bpt_applied_index(t)) return BJ_ERR_STATE;
+    return BJ_OK;
+}
+
+static int stage_applied_all(dc_collection *c, uint64_t index, int stage) {
+    int e = stage_applied_bpt(c->primary, index, stage);
+    if (e) return e;
+    for (uint32_t i = 0; i < c->index_count; i++) {
+        dc_index *ix = &c->indexes[i];
+        switch (ix->kind) {
+        case DC_IDX_EQUALITY:
+            e = stage_applied_bpt(ix->tree, index, stage);
+            break;
+        case DC_IDX_TEXT:
+            e = stage_applied_bpt(ix->tix_index, index, stage);
+            if (!e) e = stage_applied_bpt(ix->tix_doc_terms, index, stage);
+            if (!e) e = stage_applied_bpt(ix->tix_doc_lengths, index, stage);
+            break;
+        case DC_IDX_GEO:
+            if (stage) e = rtree_set_applied_index(ix->rt, index);
+            else e = (index < rtree_applied_index(ix->rt)) ? BJ_ERR_STATE : BJ_OK;
+            break;
+        }
+        if (e) return e;
+    }
+    return BJ_OK;
+}
+
+int dc_set_applied_index(dc_collection *c, uint64_t index) {
+    int e = stage_applied_all(c, index, 0);
+    if (e) return e;
+    return stage_applied_all(c, index, 1);
+}
+
 /* Defined in the index-maintenance section below; forward-declared here so
  * backfill_index (used by the dc_collection_add_*_index family, defined
  * earlier in the file for readability alongside their attach_* siblings)

@@ -2263,6 +2263,31 @@ class Collection {
     return this.countDocuments({});
   }
 
+  /**
+   * Replicated-log integration (dc_applied_index in wasm/include/db.h):
+   * the last log index applied to this collection -- read from the
+   * primary tree, which every document mutation commits. 0 = the
+   * collection is not log-driven. The apply loop resumes replay from
+   * appliedIndex() + 1 after a crash; the cross-file commit journal
+   * guarantees that resume point is exact (see the db.h contract).
+   */
+  async appliedIndex() {
+    return requireModule()._dcw_applied_index(this._collCtx);
+  }
+
+  /**
+   * Stage a log entry's index onto the primary tree and every attached
+   * index structure, so each file's next commit persists it atomically
+   * with the entry's own mutation. Call once per log entry, immediately
+   * before applying its mutation. Never decreases; refused while the
+   * collection has a snapshot open (both BJ_ERR_STATE, checked against
+   * every structure before anything is staged).
+   */
+  async setAppliedIndex(index) {
+    const rc = requireModule()._dcw_set_applied_index(this._collCtx, index);
+    if (rc !== 0) throw codeError(rc, 'setAppliedIndex');
+  }
+
   /** Unique values of `field` (dot-separated path) across every document
    * matching `filter`. */
   async distinct(field, filter = {}) {
@@ -2543,7 +2568,8 @@ for (const name of [
   'deleteOne', 'deleteMany', 'findOneAndDelete',
   'replaceOne', 'findOneAndReplace',
   'updateOne', 'findOneAndUpdate', 'updateMany',
-  'countDocuments', 'distinct', 'bulkWrite', 'pruneExpired'
+  'countDocuments', 'distinct', 'bulkWrite', 'pruneExpired',
+  'appliedIndex', 'setAppliedIndex'
 ]) {
   const orig = Collection.prototype[name];
   Collection.prototype[name] = async function (...args) {

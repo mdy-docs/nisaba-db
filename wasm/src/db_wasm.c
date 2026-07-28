@@ -56,6 +56,15 @@ EMSCRIPTEN_KEEPALIVE int dcw_collection_recover(dc_collection *c, int jfd) {
     return dc_collection_recover(c, &jio);
 }
 
+/* Replicated-log integration -- see dc_applied_index/dc_set_applied_index
+ * in db.h. Indexes cross the bridge as doubles, same as elw/bptw. */
+EMSCRIPTEN_KEEPALIVE double dcw_applied_index(dc_collection *c) {
+    return (double)dc_applied_index(c);
+}
+EMSCRIPTEN_KEEPALIVE int dcw_set_applied_index(dc_collection *c, double index) {
+    return dc_set_applied_index(c, (uint64_t)index);
+}
+
 /* `partial_filter_len == 0` means "no partial filter" (partial_filter may
  * then be any pointer, including NULL/0 -- dc_collection_attach_index only
  * consults it when the length is positive). */

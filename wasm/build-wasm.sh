@@ -60,6 +60,7 @@ EXPORTS='_malloc,_free,'\
 '_bjw_decode,_bjw_events_ptr,_bjw_events_len,_bjw_consumed,_bjw_value_size,'\
 "$STRUCT_EXPORTS,"\
 '_dcw_collection_open,_dcw_collection_free,_dcw_collection_recover,'\
+'_dcw_applied_index,_dcw_set_applied_index,'\
 '_dcw_collection_attach_index,_dcw_collection_add_index,_dcw_collection_remove_index,'\
 '_dcw_collection_attach_text_index,_dcw_collection_add_text_index,'\
 '_dcw_collection_attach_geo_index,_dcw_collection_add_geo_index,'\

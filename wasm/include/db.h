@@ -174,6 +174,32 @@ int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
 int dc_collection_recover(dc_collection *c, const bj_io *journal);
 
 /*
+ * Replicated-log integration (mirrors the per-structure contract in
+ * bplustree.h/rtree.h): the last log index applied to this collection.
+ *
+ * dc_set_applied_index stages `index` onto the primary tree and every
+ * attached index structure, so each file's next commit persists it in
+ * that file's own metadata record, atomically with the mutation it
+ * belongs to. The apply loop calls it once per log entry, immediately
+ * before the entry's mutation. The value never decreases (BJ_ERR_STATE),
+ * and staging is refused while any structure is a snapshot; refusal is
+ * checked against every structure before anything is staged, so an error
+ * never leaves the collection partially staged.
+ *
+ * dc_applied_index reads the PRIMARY tree's persisted/staged value --
+ * the primary is the authority because every document mutation commits
+ * it, while an index file a mutation didn't touch lags until its own
+ * next commit (staged values are sticky, so it catches up then). That
+ * lag is safe: the cross-file commit journal (dc_collection_recover)
+ * rewinds every file to one consistent commit on crash recovery, so the
+ * collection either fully has an entry's mutation or fully lacks it --
+ * replay from dc_applied_index + 1 is exact, never double-applying.
+ * 0 = the collection is not log-driven.
+ */
+uint64_t dc_applied_index(const dc_collection *c);
+int      dc_set_applied_index(dc_collection *c, uint64_t index);
+
+/*
  * Like dc_collection_attach_index, but also backfills `index_tree` (expected
  * empty) against every document already in `c`'s primary tree before
  * attaching it for ongoing maintenance — for creating a brand-new index.

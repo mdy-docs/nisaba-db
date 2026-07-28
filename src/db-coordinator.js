@@ -450,6 +450,8 @@ class SharedCollection {
   async updateMany(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateMany', [filter, update, options]); }
   async countDocuments(filter = {}) { return this._coord.dispatch(this.name, 'countDocuments', [filter]); }
   async estimatedDocumentCount() { return this._coord.dispatch(this.name, 'estimatedDocumentCount', []); }
+  async appliedIndex() { return this._coord.dispatch(this.name, 'appliedIndex', []); }
+  async setAppliedIndex(index) { return this._coord.dispatch(this.name, 'setAppliedIndex', [index]); }
   async distinct(field, filter = {}) { return this._coord.dispatch(this.name, 'distinct', [field, filter]); }
   async explain(filter = {}) { return this._coord.dispatch(this.name, 'explain', [filter]); }
   /** Same cursor-like shape as the real aggregate(); one RPC on first pull. */

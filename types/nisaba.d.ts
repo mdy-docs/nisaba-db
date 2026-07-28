@@ -219,6 +219,12 @@ export class Collection<T extends Document = Document> {
   countDocuments(filter?: Filter): Promise<number>;
   estimatedDocumentCount(): Promise<number>;
   distinct(field: string, filter?: Filter): Promise<any[]>;
+  /** Replicated-log integration: the last log index applied to this
+   * collection (0 = not log-driven). Resume replay from appliedIndex()+1. */
+  appliedIndex(): Promise<number>;
+  /** Stage a log entry's index onto every structure this collection owns;
+   * the entry's own mutation then persists it atomically. Monotonic. */
+  setAppliedIndex(index: number): Promise<void>;
   /** Which source serves `filter` (index or scan) -- see ExplainResult. */
   explain(filter?: Filter): Promise<ExplainResult>;
   /** Small aggregation subset: $match (leading stage runs in the engine

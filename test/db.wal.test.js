@@ -130,13 +130,35 @@ describe('WAL: driver-shaped behavior', () => {
     await db.close();
   });
 
-  it('dropCollection is refused without listFiles() (no snapshot barrier possible)', async () => {
+  it('DDL is logged: createIndex/dropIndex/dropCollection replay like any write', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider);
+    const users = await db.collection('users');
+    await users.insertOne({ _id: oid(1), team: 'red' });
+    const before = db.log.lastIndex;
+    await users.createIndex({ team: 1 });
+    expect(db.log.lastIndex).toBe(before + 1); // DDL is an entry
+    expect((await users.find({ team: 'red' }).toArray()).length).toBe(1);
+    await users.dropIndex('team_1');
+    expect(db.log.lastIndex).toBe(before + 2);
+    expect(await db.dropCollection('users')).toBe(true);
+    expect(db.log.lastIndex).toBe(before + 3);
+    await db.close();
+
+    // Replay reconstructs the same end state: recreated then re-dropped.
+    const db2 = await connectWal(provider);
+    expect(await db2.listCollections()).toEqual([]);
+    await db2.close();
+  });
+
+  it('snapshot() is refused without listFiles(), but dropCollection works (it is just a logged command)', async () => {
     const provider = new MemoryStorageProvider();
     const bare = { openFile: provider.openFile.bind(provider), deleteFile: provider.deleteFile.bind(provider) };
     const db = await connectWal(bare);
     await (await db.collection('users')).insertOne({ n: 1 });
-    await expect(db.dropCollection('users')).rejects.toThrow(/listFiles/);
     await expect(db.snapshot()).rejects.toThrow(/listFiles/);
+    expect(await db.dropCollection('users')).toBe(true);
+    expect(await db.listCollections()).toEqual([]);
     await db.close();
   });
 });

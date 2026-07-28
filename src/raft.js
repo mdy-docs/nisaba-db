@@ -143,6 +143,27 @@ export class RaftNode {
     this._waiters = [];           // propose() promises: {index, term, resolve, reject}
     this._applyChain = Promise.resolve();
     this._install = null;         // follower: in-progress install transaction
+    this._exclusive = null;       // runExclusive gate promise, or null
+  }
+
+  /**
+   * Run `fn` with the node quiesced: incoming messages queue behind the
+   * gate, ticks skip, proposals wait, and in-flight applies drain first.
+   * The host uses this for operations that swap the log out from under
+   * the node (local snapshot + log compaction): inside `fn`, nothing else
+   * can touch `this.log`. Reassign `node.log` inside `fn` if it swaps.
+   */
+  async runExclusive(fn) {
+    while (this._exclusive) await this._exclusive;
+    let release;
+    this._exclusive = new Promise((resolve) => { release = resolve; });
+    try {
+      await this._applyChain.catch(() => {});
+      return await fn();
+    } finally {
+      this._exclusive = null;
+      release();
+    }
   }
 
   get term() { return this.log.currentTerm; }
@@ -165,7 +186,7 @@ export class RaftNode {
   /** Drive timers. Call periodically (the simulator's virtual clock, or
    * setInterval on a real host); `now` must be monotonic. */
   tick(now) {
-    if (!this.isRunning) return;
+    if (!this.isRunning || this._exclusive) return;
     this._now = Math.max(this._now, now);
     if (this.role === ROLE.LEADER) {
       if (this._now >= this._heartbeatDue) {
@@ -184,6 +205,9 @@ export class RaftNode {
    * if this node is not the leader or loses leadership before commit.
    */
   propose(payload, type = ENTRYLOG_TYPE.NORMAL) {
+    if (this._exclusive) {
+      return this._exclusive.then(() => this.propose(payload, type));
+    }
     if (!this.isRunning || this.role !== ROLE.LEADER) {
       return Promise.reject(new NotLeaderError(this.leaderId));
     }
@@ -208,6 +232,9 @@ export class RaftNode {
    * the reply (a promise for installSnapshot; synchronous otherwise —
    * all log operations are). */
   handleMessage(msg) {
+    if (this._exclusive) {
+      return this._exclusive.then(() => this.handleMessage(msg));
+    }
     if (!this.isRunning) throw new Error('node is stopped');
     switch (msg.kind) {
       case 'requestVote': return this._onRequestVote(msg);

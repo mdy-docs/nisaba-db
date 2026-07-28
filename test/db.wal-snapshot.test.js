@@ -72,7 +72,8 @@ describe('WAL snapshots: log compaction', () => {
     await users.insertOne({ _id: oid(3), team: 'a' });
     const snap2 = await db.snapshot();
     expect(snap2.gen).toBe(2);
-    expect(snap2.lastIncludedIndex).toBe(3);
+    // createIndex(1) + insertMany(2) + insertOne(1) = 4 logged entries
+    expect(snap2.lastIncludedIndex).toBe(4);
 
     // Generation 1's data files and paired log are gone; only gen 2 remains.
     const files = await provider.listFiles();
@@ -168,8 +169,8 @@ describe('WAL snapshots: dropCollection barrier', () => {
 
     expect(await db.dropCollection('users')).toBe(true);
     expect(await db.listCollections()).toEqual(['logs']);
-    // The barrier snapshot emptied the log: nothing left to resurrect from.
-    expect(db.log.baseIndex).toBe(db.log.lastIndex);
+    // The drop itself is a logged command: replay re-drops after any
+    // transient resurrection, so no barrier snapshot is needed.
     await db.close();
 
     const db2 = await connectWal(provider);

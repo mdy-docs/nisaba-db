@@ -107,6 +107,11 @@ function providerDirectory(provider) {
  *   { c, op: 'r',  id, doc }              replace the document `id`
  *   { c, op: 'ru', filter, doc, did }     upsert-replace
  *   { c, op: 'd',  id }                   delete the document `id`
+ *   { c, op: 'createIndex', keys, options }   DDL — logged so replicas
+ *   { c, op: 'dropIndex', name }              and crash replay perform
+ *   { c, op: 'dropCollection' }               it too (step-4 decision);
+ *                                             apply is idempotent, not
+ *                                             appliedIndex-guarded
  */
 class WalDb {
   constructor(db, log, { provider, store }) {
@@ -117,6 +122,10 @@ class WalDb {
     this._collections = new Map(); // name -> WalCollection
     this._chain = Promise.resolve();
     this._broken = null; // Error that poisoned the log (failed sync), or null
+    /** Non-null while the inner Db is being swapped out under a snapshot
+     * install (ReplicatedDb): async reads await it so they can't touch a
+     * closed collection's freed WASM context mid-swap. */
+    this._readGate = null;
     this.isOpen = true;
   }
 
@@ -141,18 +150,16 @@ class WalDb {
 
   async listCollections() { return this._db.listCollections(); }
 
-  /** Drop a collection. The drop itself is not logged; instead the drop
-   * is immediately followed by a snapshot, whose log compaction discards
-   * every entry at or below the boundary — so no pre-drop entry survives
-   * to resurrect the collection on replay. */
+  /** Drop a collection — a logged command like any other write, so crash
+   * replay (and, replicated, every follower) performs the drop too:
+   * pre-drop entries may transiently resurrect the collection during a
+   * replay, but the drop entry then re-drops it, and the next snapshot's
+   * log compaction removes the churn entirely. */
   async dropCollection(name) {
-    this._requireStore('dropCollection');
     return this._serialize(async () => {
-      const dropped = await this._db.dropCollection(name);
-      if (!dropped) return false;
-      this._collections.delete(name);
-      await this._snapshotLocked();
-      return true;
+      const { results, firstError } = await this._commit([{ c: name, op: 'dropCollection' }]);
+      if (firstError) throw firstError.error;
+      return results[0];
     });
   }
 
@@ -177,10 +184,13 @@ class WalDb {
     }
   }
 
-  async _snapshotLocked() {
+  /** `boundaryIndex` defaults to the log tail (single-node: quiesced
+   * means everything is applied). ReplicatedDb passes its lastApplied —
+   * an uncommitted suffix must never be baked into a snapshot. */
+  async _snapshotLocked(boundaryIndex = null) {
     const log = this._log;
-    const lastIncludedIndex = log.lastIndex;
-    const lastIncludedTerm = log.lastTerm;
+    const lastIncludedIndex = boundaryIndex ?? log.lastIndex;
+    const lastIncludedTerm = log.termAt(lastIncludedIndex);
 
     // Build the generation: every structure streams its live entries into
     // a fresh role file (compact() reads from the live tree and closes the
@@ -283,12 +293,55 @@ class WalDb {
     try { this._log.truncateFrom(index); } catch { /* see doc comment */ }
   }
 
+  /**
+   * The commit engine: make every command durable in the log, then apply
+   * each in order, returning per-command results. This local (single-node)
+   * implementation appends all commands under one sync() (group commit)
+   * and truncates a failed command — with its never-applied suffix, when
+   * `ordered` — back out of the log. ReplicatedDb overrides this with the
+   * Raft propose path (roadmap 5c): same commands, same results, but
+   * durability means a quorum and nothing is ever retracted.
+   */
+  async _commit(cmds, { ordered = true } = {}) {
+    const first = this._propose(cmds);
+    const results = new Array(cmds.length);
+    let firstError = null;
+    for (let i = 0; i < cmds.length; i++) {
+      const index = first + i;
+      try {
+        results[i] = await this._applyCommand(index, cmds[i]);
+      } catch (err) {
+        if (firstError === null) firstError = { index: i, error: err };
+        if (ordered) {
+          this._retractFrom(index);
+          break;
+        }
+      }
+    }
+    return { results, firstError };
+  }
+
   /** Apply one logged command to the state machine — the ONLY code that
    * mutates collections, shared verbatim by the live write path and
-   * recovery replay. Stages the entry's index first (step 1's contract),
-   * so the mutation's own commit persists it. */
+   * recovery replay (and, in ReplicatedDb, by every replica's apply
+   * loop). Document mutations stage the entry's index first (step 1's
+   * contract), so the mutation's own commit persists it. DDL commands
+   * don't stage (createIndex commits catalog + index files but not the
+   * primary tree, so a staged value wouldn't persist anyway); their
+   * replay is idempotent instead — a re-run createIndex resolves to the
+   * existing index, a re-run drop of a missing target reports "nothing
+   * to do" — bounded by the next snapshot's log compaction. */
   async _applyCommand(index, cmd) {
+    if (cmd.op === 'dropCollection') {
+      const dropped = await this._db.dropCollection(cmd.c);
+      this._collections.delete(cmd.c);
+      return dropped;
+    }
     const col = await this._db.collection(cmd.c);
+    switch (cmd.op) {
+      case 'createIndex': return col.createIndex(cmd.keys, cmd.options);
+      case 'dropIndex': return col.dropIndex(cmd.name);
+    }
     await col.setAppliedIndex(index);
     switch (cmd.op) {
       case 'i': return col.insertOne(cmd.doc);
@@ -333,48 +386,49 @@ class WalCollection {
   }
 
   // ---- reads and un-logged operations: straight through -------------------
+  // Async reads await the install read-gate (see WalDb._readGate); the
+  // synchronously-shaped ones (find/aggregate cursors, watch) cannot —
+  // a cursor obtained across an install adoption window is a documented
+  // 5d hazard, not a supported operation.
+
+  async _read(fn) {
+    if (this._wal._readGate) await this._wal._readGate;
+    return fn();
+  }
 
   find(filter, options) { return this._inner.find(filter, options); }
-  findOne(filter, options) { return this._inner.findOne(filter, options); }
-  findByIndex(indexName, values) { return this._inner.findByIndex(indexName, values); }
-  countDocuments(filter) { return this._inner.countDocuments(filter); }
-  estimatedDocumentCount() { return this._inner.estimatedDocumentCount(); }
-  distinct(field, filter) { return this._inner.distinct(field, filter); }
+  findOne(filter, options) { return this._read(() => this._inner.findOne(filter, options)); }
+  findByIndex(indexName, values) { return this._read(() => this._inner.findByIndex(indexName, values)); }
+  countDocuments(filter) { return this._read(() => this._inner.countDocuments(filter)); }
+  estimatedDocumentCount() { return this._read(() => this._inner.estimatedDocumentCount()); }
+  distinct(field, filter) { return this._read(() => this._inner.distinct(field, filter)); }
   aggregate(pipeline) { return this._inner.aggregate(pipeline); }
-  explain(filter) { return this._inner.explain(filter); }
+  explain(filter) { return this._read(() => this._inner.explain(filter)); }
   watch(options) { return this._inner.watch(options); }
-  listIndexes() { return this._inner.listIndexes(); }
-  /** Index DDL and compact are serialized like WalDb.compact -- they
-   * change the collection's file set, which must not happen mid-snapshot. */
-  createIndex(keys, options) { return this._wal._serialize(() => this._inner.createIndex(keys, options)); }
-  dropIndex(name) { return this._wal._serialize(() => this._inner.dropIndex(name)); }
+  listIndexes() { return this._read(() => this._inner.listIndexes()); }
+  /** Compact stays un-logged but serialized like WalDb.compact -- it
+   * changes the collection's file set, which must not happen mid-snapshot. */
   compact() { return this._wal._serialize(() => this._inner.compact()); }
   appliedIndex() { return this._inner.appliedIndex(); }
 
   // ---- logged writes ------------------------------------------------------
 
-  /** Propose-then-apply for a batch of already-deterministic commands.
-   * `apply(i, index)` applies commands[i] (logged at `index`) and returns
-   * its result; `ordered` stops at the first failure and retracts the
-   * never-applied suffix. Returns { results, firstError } — per-command
-   * results (undefined where skipped/failed). */
-  async _run(cmds, { ordered = true, apply } = {}) {
-    const first = this._wal._propose(cmds);
-    const results = new Array(cmds.length);
-    let firstError = null;
-    for (let i = 0; i < cmds.length; i++) {
-      const index = first + i;
-      try {
-        results[i] = await (apply ? apply(i, index) : this._wal._applyCommand(index, cmds[i]));
-      } catch (err) {
-        if (firstError === null) firstError = { index: i, error: err };
-        if (ordered) {
-          this._wal._retractFrom(index);
-          break;
-        }
-      }
-    }
-    return { results, firstError };
+  /** One logged command through the commit engine; throws its error or
+   * returns its result. */
+  async _one(cmd) {
+    const { results, firstError } = await this._wal._commit([cmd]);
+    if (firstError) throw firstError.error;
+    return results[0];
+  }
+
+  /** Index DDL is logged (step-4 decision: replicas and crash replay must
+   * perform it too); see _applyCommand for the idempotent-replay story. */
+  async createIndex(keys, options = {}) {
+    return this._wal._serialize(() => this._one({ c: this.name, op: 'createIndex', keys, options }));
+  }
+
+  async dropIndex(name) {
+    return this._wal._serialize(() => this._one({ c: this.name, op: 'dropIndex', name }));
   }
 
   async insertOne(doc) {
@@ -382,11 +436,7 @@ class WalCollection {
       throw new Error('insertOne requires a document object');
     }
     const _id = doc._id !== undefined ? doc._id : new ObjectId();
-    return this._wal._serialize(async () => {
-      const { results, firstError } = await this._run([{ c: this.name, op: 'i', doc: { ...doc, _id } }]);
-      if (firstError) throw firstError.error;
-      return results[0];
-    });
+    return this._wal._serialize(() => this._one({ c: this.name, op: 'i', doc: { ...doc, _id } }));
   }
 
   async insertMany(docs, { ordered = true } = {}) {
@@ -396,7 +446,7 @@ class WalCollection {
     const withIds = docs.map((doc) => ({ ...doc, _id: doc._id !== undefined ? doc._id : new ObjectId() }));
     return this._wal._serialize(async () => {
       const cmds = withIds.map((doc) => ({ c: this.name, op: 'i', doc }));
-      const { results } = await this._run(cmds, { ordered });
+      const { results } = await this._wal._commit(cmds, { ordered });
       // Mirror the inner insertMany's result/throw contract: scan in doc
       // order, throw at the first failed document with the partial result.
       const insertedIds = {};
@@ -419,9 +469,7 @@ class WalCollection {
     return this._wal._serialize(async () => {
       const target = await this._inner.findOne(filter, { projection: { _id: 1 } });
       if (!target) return { acknowledged: true, deletedCount: 0 };
-      const { results, firstError } = await this._run([{ c: this.name, op: 'd', id: target._id }]);
-      if (firstError) throw firstError.error;
-      return results[0];
+      return this._one({ c: this.name, op: 'd', id: target._id });
     });
   }
 
@@ -430,7 +478,7 @@ class WalCollection {
       const ids = (await this._inner.find(filter, { projection: { _id: 1 } }).toArray()).map((d) => d._id);
       if (ids.length === 0) return { acknowledged: true, deletedCount: 0 };
       const cmds = ids.map((id) => ({ c: this.name, op: 'd', id }));
-      const { results, firstError } = await this._run(cmds);
+      const { results, firstError } = await this._wal._commit(cmds);
       if (firstError) throw firstError.error;
       return { acknowledged: true, deletedCount: results.reduce((n, r) => n + r.deletedCount, 0) };
     });
@@ -440,31 +488,28 @@ class WalCollection {
     return this._wal._serialize(async () => {
       const doc = await this._inner.findOne(filter);
       if (!doc) return null;
-      const { firstError } = await this._run([{ c: this.name, op: 'd', id: doc._id }]);
-      if (firstError) throw firstError.error;
+      await this._one({ c: this.name, op: 'd', id: doc._id });
       return doc;
     });
   }
 
-  /** Shared proposal shape for updateOne/replaceOne/findOneAndUpdate/
-   * findOneAndReplace: resolve the target to its _id (matched) or pin the
-   * upsert id, log the one command, apply via `applyMatched`/`applyUpsert`
-   * (which run the inner method so return semantics are exact). */
-  async _updateLike(filter, matchedCmd, upsertCmd, { upsert, noMatch, applyMatched, applyUpsert }) {
+  /**
+   * Shared shape for updateOne/replaceOne/findOneAndUpdate/
+   * findOneAndReplace: resolve the target document (matched) or pin the
+   * upsert id at proposal time, log the one command, and let the commit
+   * engine apply it generically — identical on the local path, on crash
+   * replay, and on every replica. `finish(result, target, did)` shapes
+   * the caller-facing return from the generic result plus the pre-image
+   * resolved here (writes are serialized, so nothing intervenes between
+   * the resolve, the apply, and any post-apply read in finish).
+   */
+  async _updateLike(filter, matchedCmd, upsertCmd, { upsert, noMatch, finish }) {
     return this._wal._serialize(async () => {
-      const target = await this._inner.findOne(filter, { projection: { _id: 1 } });
+      const target = await this._inner.findOne(filter);
       if (!target && !upsert) return noMatch;
       const did = target ? null : new ObjectId();
-      const cmd = target ? matchedCmd(target._id) : upsertCmd(did);
-      const { results, firstError } = await this._run([cmd], {
-        apply: async (_, index) => {
-          const col = await this._wal._db.collection(this.name);
-          await col.setAppliedIndex(index);
-          return target ? applyMatched(col, target._id) : applyUpsert(col, did);
-        }
-      });
-      if (firstError) throw firstError.error;
-      return results[0];
+      const result = await this._one(target ? matchedCmd(target._id) : upsertCmd(did));
+      return finish(result, target, did);
     });
   }
 
@@ -477,8 +522,7 @@ class WalCollection {
       {
         upsert,
         noMatch: { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null },
-        applyMatched: (col, id) => col.updateOne({ _id: id }, update),
-        applyUpsert: (col, did) => col.updateOne(filter, update, { upsert: true, _defaultId: did })
+        finish: (result) => result
       }
     );
   }
@@ -491,8 +535,7 @@ class WalCollection {
       {
         upsert,
         noMatch: { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null },
-        applyMatched: (col, id) => col.replaceOne({ _id: id }, replacement),
-        applyUpsert: (col, did) => col.replaceOne(filter, replacement, { upsert: true, _defaultId: did })
+        finish: (result) => result
       }
     );
   }
@@ -506,8 +549,12 @@ class WalCollection {
       {
         upsert,
         noMatch: null,
-        applyMatched: (col, id) => col.findOneAndUpdate({ _id: id }, update, { returnDocument }),
-        applyUpsert: (col, did) => col.findOneAndUpdate(filter, update, { upsert: true, returnDocument, _defaultId: did })
+        // 'before': the pre-image resolved at proposal (null for an
+        // upsert-insert, matching the driver); 'after': read back the
+        // known target id post-apply.
+        finish: (result, target, did) => returnDocument === 'after'
+          ? this._inner.findOne({ _id: target ? target._id : did })
+          : (target || null)
       }
     );
   }
@@ -520,8 +567,9 @@ class WalCollection {
       {
         upsert,
         noMatch: null,
-        applyMatched: (col, id) => col.findOneAndReplace({ _id: id }, replacement, { returnDocument }),
-        applyUpsert: (col, did) => col.findOneAndReplace(filter, replacement, { upsert: true, returnDocument, _defaultId: did })
+        finish: (result, target, did) => returnDocument === 'after'
+          ? this._inner.findOne({ _id: target ? target._id : did })
+          : (target || null)
       }
     );
   }
@@ -533,12 +581,11 @@ class WalCollection {
       if (ids.length === 0) {
         if (!upsert) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
         const did = new ObjectId();
-        const { results, firstError } = await this._run([{ c: this.name, op: 'uu', filter, update, did }]);
-        if (firstError) throw firstError.error;
-        return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: results[0].upsertedId };
+        const result = await this._one({ c: this.name, op: 'uu', filter, update, did });
+        return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: result.upsertedId };
       }
       const cmds = ids.map((id) => ({ c: this.name, op: 'u', id, update }));
-      const { firstError } = await this._run(cmds); // ordered: mirror the engine's stop-at-first-error
+      const { firstError } = await this._wal._commit(cmds); // ordered: mirror the engine's stop-at-first-error
       if (firstError) throw firstError.error;
       return { acknowledged: true, matchedCount: ids.length, modifiedCount: ids.length, upsertedId: null };
     });
@@ -635,55 +682,66 @@ class WalCollection {
  * applied. Options pass through to connect() (order, autoCompact), plus
  * `snapshotPrefix` (default '__snap').
  */
+/**
+ * Open the snapshot store (when the provider can list files) and adopt
+ * the newest entry log that opens — generation-paired logs newest first,
+ * the legacy fixed-name file last. Shared by connectWal and
+ * connectReplicated (src/db-replicated.js). `setHardState` is left to
+ * the caller: single-node WAL pins term 1; a Raft node owns its terms.
+ */
+export async function openWalStorage(provider, { snapshotPrefix = SNAP_PREFIX } = {}) {
+  let store = null;
+  if (typeof provider.listFiles === 'function') {
+    store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
+    await store.open();
+  }
+
+  let log = null;
+  let logName = null;
+  const candidates = store ? await store.logCandidates() : [];
+  candidates.push(WAL_FILE);
+  for (const name of candidates) {
+    try {
+      const l = new EntryLog(await provider.openFile(name, { create: false }));
+      await l.open();
+      log = l;
+      logName = name;
+      break;
+    } catch { /* missing or torn: try the predecessor */ }
+  }
+  if (!log) {
+    if (store && store.latest) {
+      // A snapshot with no openable log: start a fresh one at the
+      // snapshot boundary so recovery/replication resume from there.
+      const { name, handle } = await store.createLogFile();
+      handle.truncate(0); // the name may be a torn leftover
+      log = new EntryLog(handle, {
+        baseIndex: store.latest.lastIncludedIndex,
+        baseTerm: store.latest.lastIncludedTerm
+      });
+      logName = name;
+    } else {
+      log = new EntryLog(await provider.openFile(WAL_FILE, { create: true }));
+      logName = WAL_FILE;
+    }
+    await log.open();
+  }
+
+  if (store) {
+    await store.pruneLogs(logName);
+    if (logName !== WAL_FILE) {
+      try { await provider.deleteFile(WAL_FILE); } catch { /* best-effort */ }
+    }
+  }
+  return { store, log, logName };
+}
+
 export async function connectWal(provider, options = {}) {
   const { snapshotPrefix = SNAP_PREFIX, ...dbOptions } = options;
   const db = await connect(provider, dbOptions);
   try {
-    let store = null;
-    if (typeof provider.listFiles === 'function') {
-      store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
-      await store.open();
-    }
-
-    let log = null;
-    let logName = null;
-    const candidates = store ? await store.logCandidates() : [];
-    candidates.push(WAL_FILE);
-    for (const name of candidates) {
-      try {
-        const l = new EntryLog(await provider.openFile(name, { create: false }));
-        await l.open();
-        log = l;
-        logName = name;
-        break;
-      } catch { /* missing or torn: try the predecessor */ }
-    }
-    if (!log) {
-      if (store && store.latest) {
-        // A snapshot with no openable log: start a fresh one at the
-        // snapshot boundary so recovery/replication resume from there.
-        const { name, handle } = await store.createLogFile();
-        handle.truncate(0); // the name may be a torn leftover
-        log = new EntryLog(handle, {
-          baseIndex: store.latest.lastIncludedIndex,
-          baseTerm: store.latest.lastIncludedTerm
-        });
-        logName = name;
-      } else {
-        log = new EntryLog(await provider.openFile(WAL_FILE, { create: true }));
-        logName = WAL_FILE;
-      }
-      await log.open();
-    }
+    const { store, log } = await openWalStorage(provider, { snapshotPrefix });
     if (log.currentTerm === 0) log.setHardState(1);
-
-    if (store) {
-      await store.pruneLogs(logName);
-      if (logName !== WAL_FILE) {
-        try { await provider.deleteFile(WAL_FILE); } catch { /* best-effort */ }
-      }
-    }
-
     const walDb = new WalDb(db, log, { provider, store });
     await walDb._recover();
     return walDb;
@@ -710,6 +768,12 @@ export async function restoreLatestSnapshot(provider, { snapshotPrefix = SNAP_PR
   }
   const store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
   await store.open();
+  return restoreFromStore(provider, store);
+}
+
+/** The store-half of restoreLatestSnapshot, for callers that already
+ * hold an open store (the replicated install path). */
+export async function restoreFromStore(provider, store) {
   if (!store.latest) throw new Error('No snapshot to restore');
   for (const name of await provider.listFiles()) {
     if (name === CATALOG_FILE || DB_FILE_PATTERN.test(name)) await provider.deleteFile(name);
@@ -720,4 +784,4 @@ export async function restoreLatestSnapshot(provider, { snapshotPrefix = SNAP_PR
   return store.latest;
 }
 
-export { WalDb, WalCollection, WAL_FILE };
+export { WalDb, WalCollection, WAL_FILE, SNAP_PREFIX, providerDirectory };

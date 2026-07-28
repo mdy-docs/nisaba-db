@@ -203,4 +203,39 @@ export class TcpRaftTransport {
     }
     conn.pending.clear();
   }
+
+  /**
+   * One-shot request to a bare ADDRESS — no peer id, no pooled
+   * connection. This is how a joiner reaches a cluster it is not part
+   * of yet (joinGroup in src/raft-host.js): seeds are addresses, ids
+   * come later from the member records. Dial, send, await one reply,
+   * hang up. Not for steady-state traffic — that is call()'s pooled job.
+   */
+  callAddress(addr, envelope) {
+    return new Promise((resolve, reject) => {
+      const socket = net.connect(addr.port, addr.host);
+      socket.setNoDelay(true);
+      const timer = setTimeout(() => {
+        socket.destroy();
+        reject(new Error(`${addr.host}:${addr.port} timed out`));
+      }, this.requestTimeoutMs);
+      if (timer.unref) timer.unref();
+      const done = (fn, value) => {
+        clearTimeout(timer);
+        socket.destroy();
+        fn(value);
+      };
+      const parser = new Parser(
+        (obj) => {
+          if (obj.t !== 'res') return;
+          if (obj.ok) done(resolve, obj.value);
+          else done(reject, new Error(obj.error));
+        },
+        (err) => done(reject, err)
+      );
+      socket.on('data', (chunk) => parser.push(chunk));
+      socket.on('error', (err) => done(reject, err));
+      socket.write(frame({ t: 'req', id: 0, env: envelope }));
+    });
+  }
 }

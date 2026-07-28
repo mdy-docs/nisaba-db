@@ -23,5 +23,7 @@ export declare class HttpRaftTransport {
   /** The bound address (useful with listenPort 0). */
   address(): { address: string; port: number } | null;
   call(peerId: number, envelope: object): Promise<object>;
+  /** One-shot request to a bare address (join flow — docs/clustering.md). */
+  callAddress(addr: { host: string; port: number }, envelope: object): Promise<object>;
   stop(): Promise<void>;
 }

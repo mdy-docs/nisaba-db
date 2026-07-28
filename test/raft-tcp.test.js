@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest';
 import { ready, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
-import { RaftGroupHost } from '../src/raft-host.js';
+import { RaftGroupHost, joinGroup, leaveGroup } from '../src/raft-host.js';
 import { TcpRaftTransport } from '../src/raft-transport-tcp.js';
 import { KvMachine, kvSet } from './raft-harness.js';
 
@@ -78,6 +78,90 @@ describe('tcp transport', () => {
     await a2.stop();
     await b.stop();
   });
+
+  it('grow-by-joining: nodes spin up knowing only a seed address and find the club through the log', async () => {
+    const HOST = '127.0.0.1';
+    const booted = new Map(); // id -> { host, transport, node, machine, log }
+
+    /** One process seat: transport + group host; the node comes later. */
+    async function seat(id) {
+      const host = new RaftGroupHost({ transport: null, tickMs: 20, quiesceAfterMs: 0 });
+      const transport = new TcpRaftTransport({
+        listenPort: 0, peers: {},
+        onMessage: (env) => host.handleEnvelope(env),
+        requestTimeoutMs: 1000
+      });
+      await transport.start();
+      host._transport = transport;
+      return { id, host, transport, addr: { host: HOST, port: transport.address().port } };
+    }
+
+    async function bootNodeOn(seat, memberRecords) {
+      const log = new EntryLog(new MemoryHandle());
+      await log.open();
+      const machine = new KvMachine();
+      const node = new RaftNode({
+        id: seat.id, peers: memberRecords, log, stateMachine: machine,
+        transport: seat.host.groupTransport('kv')
+      });
+      await node.start(Date.now());
+      seat.host.addGroup('kv', node); // syncs the peer table from the records
+      seat.host.start();
+      booted.set(seat.id, { ...seat, node, machine, log });
+    }
+
+    const waitFor = async (pred, ms = 8000) => {
+      for (let waited = 0; waited < ms; waited += 50) {
+        if (pred()) return;
+        await sleep(50);
+      }
+      if (!pred()) throw new Error('condition not reached');
+    };
+
+    try {
+      // Bootstrap: node 1 alone, listing ITSELF with its address so
+      // later joiners learn it from the log.
+      const s1 = await seat(1);
+      await bootNodeOn(s1, [{ id: 1, host: HOST, port: s1.addr.port }]);
+      await waitFor(() => booted.get(1).node.role === 'leader');
+      await booted.get(1).node.propose(kvSet('genesis', 1));
+
+      // Node 2 joins knowing ONLY node 1's address.
+      const s2 = await seat(2);
+      const members2 = await joinGroup(s2.transport, 'kv',
+        { id: 2, host: HOST, port: s2.addr.port }, { seeds: [s1.addr] });
+      expect(members2.map((m) => m.id)).toEqual([1, 2]);
+      await bootNodeOn(s2, members2);
+      await waitFor(() => booted.get(2).machine.map.get('genesis') === 1);
+
+      // Node 3 joins via node 2 — which is a FOLLOWER, so the join takes
+      // the leader-redirect path (address learned from the records).
+      const s3 = await seat(3);
+      const members3 = await joinGroup(s3.transport, 'kv',
+        { id: 3, host: HOST, port: s3.addr.port }, { seeds: [s2.addr] });
+      expect(members3.map((m) => m.id)).toEqual([1, 2, 3]);
+      await bootNodeOn(s3, members3);
+      await waitFor(() => booted.get(3).machine.map.get('genesis') === 1);
+
+      // The 3-node cluster commits (quorum 2 of 3).
+      await booted.get(1).node.propose(kvSet('trio', 3));
+      await waitFor(() => [...booted.values()].every((n) => n.machine.map.get('trio') === 3));
+
+      // Node 3 leaves gracefully via a seed; the pair keeps committing.
+      const membersAfter = await leaveGroup(s3.transport, 'kv', 3, { seeds: [s2.addr] });
+      expect(membersAfter.map((m) => m.id)).toEqual([1, 2]);
+      await waitFor(() => booted.get(1).node.members.length === 2);
+      await booted.get(1).node.propose(kvSet('duo', 2));
+      await waitFor(() => booted.get(2).machine.map.get('duo') === 2);
+    } finally {
+      for (const n of booted.values()) {
+        n.host.stop();
+        await n.node.stop();
+        await n.transport.stop();
+        await n.log.close();
+      }
+    }
+  }, 30_000);
 
   it('a real 3-node KV cluster over TCP elects and commits with real timers', async () => {
     const ids = [1, 2, 3];

@@ -155,6 +155,146 @@ describe('raft host: multi-group', () => {
   });
 });
 
+describe('raft: member records, address sync, join/leave (sim)', () => {
+  /** 3 hosts whose envelope transports record setPeer calls; one group
+   * of nodes bootstrapped with FULL records (id + address). */
+  async function makeAddressedCluster(sim, net) {
+    const ids = [1, 2, 3];
+    const records = ids.map((id) => ({ id, host: `node${id}`, port: 7000 + id }));
+    const hosts = new Map();
+    const members = new Map();
+    for (const id of ids) {
+      const peerTable = new Map();
+      const transport = {
+        call: (peer, env) => net.call(id, peer, env),
+        setPeer: (peerId, addr) => peerTable.set(peerId, addr)
+      };
+      const host = new RaftGroupHost({ transport, quiesceAfterMs: 0, now: () => sim.time });
+      net.register(id, (env) => host.handleEnvelope(env));
+      hosts.set(id, { host, peerTable, transport });
+    }
+    for (const id of ids) {
+      const { host } = hosts.get(id);
+      const log = new EntryLog(new MemoryHandle());
+      await log.open();
+      const machine = new KvMachine();
+      const node = new RaftNode({
+        id, peers: records, log, stateMachine: machine,
+        snapshotter: new KvSnapshotter(machine),
+        transport: host.groupTransport('g'),
+        random: sim.rng
+      });
+      await node.start(sim.time);
+      host.addGroup('g', node);
+      members.set(id, { node, machine, log, handle: log.syncAccessHandle });
+    }
+    return { hosts, members, records };
+  }
+
+  const tick = (hosts) => [...hosts.values()].map((h) => ({ tick: (t) => h.host.tick(t), isRunning: true }));
+
+  async function advanceUntil(sim, hosts, pred, maxMs = 10_000) {
+    for (let waited = 0; waited < maxMs; waited += 50) {
+      if (pred()) return;
+      await sim.advance(50, tick(hosts));
+    }
+    if (!pred()) throw new Error('condition not reached');
+  }
+
+  it('bootstrap records flow into every peer table via onConfig at addGroup', async () => {
+    const sim = new Sim(81);
+    const net = new MemoryNetwork(sim);
+    const { hosts } = await makeAddressedCluster(sim, net);
+    for (const [id, h] of hosts) {
+      // Everyone knows everyone's address straight from the records.
+      for (const other of [1, 2, 3]) {
+        expect(h.peerTable.get(other)).toEqual({ host: `node${other}`, port: 7000 + other });
+      }
+      expect(id).toBeGreaterThan(0);
+    }
+  });
+
+  it('join lands on a follower, redirects with the leader ADDRESS, commits on the leader, and syncs everywhere', async () => {
+    const sim = new Sim(82);
+    const net = new MemoryNetwork(sim);
+    const { hosts, members } = await makeAddressedCluster(sim, net);
+    await advanceUntil(sim, hosts, () => [...members.values()].some((m) => m.node.role === 'leader'));
+    const leader = [...members.values()].find((m) => m.node.role === 'leader');
+    const follower = [...members.values()].find((m) => m.node.role === 'follower' && m.node.leaderId === leader.node.id);
+
+    const joinMsg = { kind: 'join', member: { id: 4, host: 'node4', port: 7004 } };
+    // Follower: refusal carries the leader's id AND address (it knows
+    // both from the records) — a joiner needs no id->address table.
+    const redirect = await follower.node.handleMessage(joinMsg);
+    expect(redirect.ok).toBe(false);
+    expect(redirect.leaderId).toBe(leader.node.id);
+    expect(redirect.leaderAddress).toEqual({ host: `node${leader.node.id}`, port: 7000 + leader.node.id });
+
+    // Leader: commits the CONFIG entry and replies with the new set.
+    const joined = leader.node.handleMessage(joinMsg);
+    await advanceUntil(sim, hosts, () => leader.node.members.includes(4));
+    const reply = await joined;
+    expect(reply.ok).toBe(true);
+    expect(reply.members.map((m) => m.id)).toEqual([1, 2, 3, 4]);
+
+    // Idempotent retry: same record, no new log entry.
+    const before = leader.node.log.lastIndex;
+    expect((await leader.node.handleMessage(joinMsg)).ok).toBe(true);
+    expect(leader.node.log.lastIndex).toBe(before);
+
+    // The newcomer's address reached every host's peer table via the log.
+    await advanceUntil(sim, hosts, () =>
+      [...hosts.values()].every((h) => h.peerTable.get(4)?.port === 7004));
+  });
+
+  it('leave shrinks the set once and is idempotent after', async () => {
+    const sim = new Sim(83);
+    const net = new MemoryNetwork(sim);
+    const { hosts, members } = await makeAddressedCluster(sim, net);
+    await advanceUntil(sim, hosts, () => [...members.values()].some((m) => m.node.role === 'leader'));
+    const leader = [...members.values()].find((m) => m.node.role === 'leader');
+    const goner = [...members.values()].find((m) => m.node.role !== 'leader');
+
+    const left = leader.node.handleMessage({ kind: 'leave', id: goner.node.id });
+    await advanceUntil(sim, hosts, () => !leader.node.members.includes(goner.node.id));
+    expect((await left).ok).toBe(true);
+
+    const before = leader.node.log.lastIndex;
+    expect((await leader.node.handleMessage({ kind: 'leave', id: goner.node.id })).ok).toBe(true);
+    expect(leader.node.log.lastIndex).toBe(before); // idempotent
+  });
+
+  it('a restart rebuilds addresses from the log alone (empty bootstrap peers)', async () => {
+    const sim = new Sim(84);
+    const net = new MemoryNetwork(sim);
+    const { hosts, members } = await makeAddressedCluster(sim, net);
+    await advanceUntil(sim, hosts, () => [...members.values()].some((m) => m.node.role === 'leader'));
+    const leader = [...members.values()].find((m) => m.node.role === 'leader');
+    // Commit a CONFIG entry so the log carries the records.
+    const joined = leader.node.handleMessage({ kind: 'join', member: { id: 4, host: 'node4', port: 7004 } });
+    await advanceUntil(sim, hosts, () => leader.node.members.includes(4));
+    await joined;
+
+    // "Restart" a follower: same log bytes, NO bootstrap records at all.
+    const victim = [...members.values()].find((m) => m.node.role === 'follower');
+    await victim.node.stop();
+    await victim.log.close();
+    const log2 = new EntryLog(victim.handle);
+    await log2.open();
+    const reborn = new RaftNode({
+      id: victim.node.id, peers: [victim.node.id], log: log2,
+      stateMachine: new KvMachine(),
+      transport: { call: async () => { throw new Error('offline'); } },
+      random: sim.rng
+    });
+    await reborn.start(sim.time);
+    // The log's CONFIG entry restored ids AND addresses.
+    expect(reborn.members).toEqual([1, 2, 3, 4]);
+    expect(reborn.memberInfo.find((m) => m.id === 4)).toEqual({ id: 4, host: 'node4', port: 7004 });
+    await reborn.stop();
+  });
+});
+
 describe('raft: membership changes (CONFIG entries)', () => {
   it('growing a cluster from 3 to 4: the new member is caught up and votes', async () => {
     const sim = new Sim(74);

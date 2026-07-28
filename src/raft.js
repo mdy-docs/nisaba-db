@@ -53,16 +53,39 @@
  * park in `peersNeedingSnapshot` for the host to notice.
  *
  * Membership (5d): the cluster's member set travels through the log as
- * CONFIG entries (payload: encode({ members })), proposed one at a time
- * via changeMembership() and adopted when APPLIED — the etcd convention
- * rather than the paper's adopt-on-append, trading the paper's edge-case
- * arguments for truncation-proof simplicity; single-server changes stay
- * safe because a change commits under the OLD quorum and the next one
- * can't start until it has. On restart the committed prefix is scanned
- * for the last CONFIG entry (static `peers` is only the bootstrap
- * default); a snapshot install adopts the leader's members from the
- * manifest. A node that applies its own removal steps down and stops
- * campaigning — the host closes it.
+ * CONFIG entries, proposed one at a time via changeMembership() and
+ * adopted when APPLIED — the etcd convention rather than the paper's
+ * adopt-on-append, trading the paper's edge-case arguments for
+ * truncation-proof simplicity; single-server changes stay safe because
+ * a change commits under the OLD quorum and the next one can't start
+ * until it has. On restart the log is scanned for the last CONFIG entry
+ * (static `peers` is only the bootstrap default); a snapshot install
+ * adopts the leader's members from the manifest. A node that applies
+ * its own removal steps down and stops campaigning — the host closes
+ * it.
+ *
+ * Members are RECORDS, not bare ids: { id, host?, port?, ... } — the
+ * CONFIG entry carries each member's address, making the log the single
+ * source of truth for the cluster's shape. Every adoption path
+ * (constructor, apply, restart scan, snapshot install) funnels through
+ * one place and fires the `onConfig` hook with the full record list, so
+ * a host keeps its transport's peer table in sync BY CONSTRUCTION —
+ * there is no separate address book to drift (RaftGroupHost wires this
+ * automatically; see src/raft-host.js). changeMembership() merges
+ * id-only inputs with the known records so a plain [1,2,3,4] can never
+ * silently erase addresses. Extra record fields ride along untouched —
+ * `voting: false` (learners) is the planned next occupant.
+ *
+ * Join/leave: a node gets INTO the club by asking any member —
+ * 'join'/'leave' messages ride the ordinary transport. A follower
+ * answers with the leader's id AND address (it knows both from the
+ * records); the leader upserts/removes the record via changeMembership
+ * and replies with the adopted member list once committed. Retries are
+ * idempotent: re-joining with an identical record, or leaving an
+ * already-absent id, succeeds without a new CONFIG entry. The
+ * joinGroup/leaveGroup helpers (src/raft-host.js) drive the
+ * seed-address loop; the bootstrap (first) node should list itself
+ * WITH its address in `peers` so later joiners learn it from the log.
  *
  * Quiescence (5d): quiesce() parks the timers (a leader stops
  * heartbeating, a follower stops counting down), wake() restores them;
@@ -91,8 +114,16 @@ export class RaftNode {
    * @param {object} options
    * @param {number} options.id - this node's id (nonzero small integer;
    *   0 is EntryLog's "voted for nobody")
-   * @param {number[]} options.peers - every node id in the cluster
-   *   (including or excluding this one — self is filtered out)
+   * @param {Array<number|{id: number, host?: string, port?: number}>}
+   *   options.peers - the BOOTSTRAP member set (ids or full records,
+   *   self included or not; a CONFIG entry recovered from the log or a
+   *   snapshot overrides it). The first node of a fresh cluster should
+   *   list itself WITH its address ([{ id, host, port }]) so joiners
+   *   learn it from the log.
+   * @param {(members: Array<object>) => void} [options.onConfig] - fired
+   *   with the full member-record list on EVERY adoption (bootstrap,
+   *   apply, restart, install) — the hook that keeps a transport's peer
+   *   table in sync with the log; RaftGroupHost wires it automatically.
    * @param {object} options.log - an OPEN EntryLog
    * @param {object} options.stateMachine - { apply(entry) -> any|Promise,
    *   appliedIndex() -> number|Promise } — apply receives {index, term,
@@ -121,13 +152,20 @@ export class RaftNode {
    */
   constructor({
     id, peers, log, stateMachine, transport,
-    snapshotter = null, rebaseLog = null,
+    snapshotter = null, rebaseLog = null, onConfig = null,
     electionTimeoutMs = [150, 300], heartbeatMs = 50,
     maxBatchBytes = 65536, snapshotChunkBytes = 65536, random = Math.random
   }) {
     if (!Number.isInteger(id) || id <= 0) throw new Error('RaftNode id must be a positive integer');
     this.id = id;
-    this._setMembers([...new Set([...peers, id])]);
+    this.onConfig = onConfig;
+    const boot = new Map();
+    for (const m of peers) {
+      const record = typeof m === 'number' ? { id: m } : { ...m };
+      boot.set(record.id, record);
+    }
+    if (!boot.has(id)) boot.set(id, { id });
+    this._setMembers([...boot.values()]);
     this.log = log;
     this.stateMachine = stateMachine;
     this.transport = transport;
@@ -163,10 +201,20 @@ export class RaftNode {
     this._configInFlight = false; // one membership change at a time
   }
 
-  /** Adopt a member set: `members` includes every node id (self too, if
-   * still a member). Leader bookkeeping follows the set. */
-  _setMembers(members) {
-    this.members = [...members].sort((a, b) => a - b);
+  /**
+   * Adopt a member set — the ONE funnel every membership source goes
+   * through (constructor bootstrap, CONFIG apply, restart scan, snapshot
+   * install), which is what keeps address books in sync by design.
+   * `input` is member records ({ id, host?, port?, ... }) or bare ids
+   * (normalized to records); includes self, if still a member. Leader
+   * bookkeeping follows the set, and `onConfig` fires with the records.
+   */
+  _setMembers(input) {
+    const records = input
+      .map((m) => (typeof m === 'number' ? { id: m } : { ...m }))
+      .sort((a, b) => a.id - b.id);
+    this.memberInfo = records;
+    this.members = records.map((m) => m.id);
     this.peers = this.members.filter((p) => p !== this.id);
     if (this._next) {
       for (const p of this.peers) {
@@ -182,6 +230,9 @@ export class RaftNode {
           this._needsSnapshot.delete(p);
         }
       }
+    }
+    if (this.onConfig) {
+      try { this.onConfig(this.memberInfo); } catch { /* host hook; never ours to crash on */ }
     }
   }
 
@@ -306,8 +357,11 @@ export class RaftNode {
   get peersNeedingSnapshot() { return [...this._needsSnapshot]; }
 
   /**
-   * Propose a new member set (every node id, including or excluding this
-   * one). Leader-only; one change may be in flight at a time — commit it
+   * Propose a new member set — full replacement, as member records
+   * ({ id, host?, port?, ... }) or bare ids. An id-only entry inherits
+   * the currently-known record for that id, so `changeMembership([1, 2,
+   * 3, 4])` can never silently erase addresses the log already carries.
+   * Leader-only; one change may be in flight at a time — commit it
    * before proposing the next (the single-server-change safety argument
    * rests on changes serializing). The change takes effect on every node
    * when its CONFIG entry APPLIES; resolves like propose(). A brand-new
@@ -315,19 +369,86 @@ export class RaftNode {
    * replication path handles that once it is a member.
    */
   async changeMembership(members) {
-    const set = [...new Set(members)];
-    if (set.length === 0 || set.some((m) => !Number.isInteger(m) || m <= 0)) {
-      throw new Error('changeMembership requires a non-empty array of positive integer node ids');
+    const next = new Map();
+    for (const m of members) {
+      const record = typeof m === 'number' ? { id: m } : { ...m };
+      if (!Number.isInteger(record.id) || record.id <= 0) {
+        throw new Error('changeMembership requires member records with positive integer ids');
+      }
+      if (record.host === undefined) {
+        const known = this.memberInfo.find((k) => k.id === record.id);
+        if (known) Object.assign(record, { ...known, ...record });
+      }
+      next.set(record.id, record);
+    }
+    if (next.size === 0) {
+      throw new Error('changeMembership requires a non-empty member set');
     }
     if (this._configInFlight) {
       throw new Error('a membership change is already in flight; wait for it to commit');
     }
     this._configInFlight = true;
     try {
-      return await this.propose(encode({ members: set }), ENTRYLOG_TYPE.CONFIG);
+      return await this.propose(encode({ members: [...next.values()] }), ENTRYLOG_TYPE.CONFIG);
     } finally {
       this._configInFlight = false;
     }
+  }
+
+  /**
+   * Handle a join request ({ kind: 'join', member: { id, host, port,
+   * ... } }) — sent to ANY member; a non-leader answers with the
+   * leader's id and address so the joiner can retry there. The leader
+   * upserts the record and replies { ok: true, members } once the
+   * CONFIG entry commits. Idempotent: re-joining with an identical
+   * record succeeds without a new entry (safe to retry).
+   */
+  _onJoin(msg) {
+    const member = msg.member;
+    if (!member || !Number.isInteger(member.id) || member.id <= 0) {
+      return { ok: false, error: 'join requires member { id, host, port }' };
+    }
+    if (this.role !== ROLE.LEADER) return this._redirectToLeader();
+    const existing = this.memberInfo.find((m) => m.id === member.id);
+    if (existing && existing.host === member.host && existing.port === member.port) {
+      return { ok: true, members: this.memberInfo };
+    }
+    if (this._configInFlight) return { ok: false, retry: true };
+    const next = [...this.memberInfo.filter((m) => m.id !== member.id), { ...member }];
+    return this.changeMembership(next).then(
+      () => ({ ok: true, members: this.memberInfo }),
+      (err) => ({ ok: false, error: String(err?.message ?? err) })
+    );
+  }
+
+  /** Handle a leave request ({ kind: 'leave', id }) — graceful
+   * decommission from the departing node itself, or an admin removing a
+   * dead one. Same redirect/idempotence rules as join. */
+  _onLeave(msg) {
+    if (!Number.isInteger(msg.id) || msg.id <= 0) {
+      return { ok: false, error: 'leave requires a member id' };
+    }
+    if (this.role !== ROLE.LEADER) return this._redirectToLeader();
+    if (!this.members.includes(msg.id)) {
+      return { ok: true, members: this.memberInfo };
+    }
+    if (this._configInFlight) return { ok: false, retry: true };
+    const next = this.memberInfo.filter((m) => m.id !== msg.id);
+    return this.changeMembership(next).then(
+      () => ({ ok: true, members: this.memberInfo }),
+      (err) => ({ ok: false, error: String(err?.message ?? err) })
+    );
+  }
+
+  _redirectToLeader() {
+    const leader = this.memberInfo.find((m) => m.id === this.leaderId);
+    return {
+      ok: false,
+      leaderId: this.leaderId,
+      leaderAddress: leader && leader.host !== undefined
+        ? { host: leader.host, port: leader.port }
+        : null
+    };
   }
 
   // ---- RPC handlers -------------------------------------------------------
@@ -345,6 +466,8 @@ export class RaftNode {
       case 'requestVote': return this._onRequestVote(msg);
       case 'appendEntries': return this._onAppendEntries(msg);
       case 'installSnapshot': return this._onInstallSnapshot(msg);
+      case 'join': return this._onJoin(msg);
+      case 'leave': return this._onLeave(msg);
       default: throw new Error(`raft: unknown message kind "${msg.kind}"`);
     }
   }
@@ -669,12 +792,13 @@ export class RaftNode {
       const manifest = {
         config: snap.config ?? null,
         files: files.map(({ role, size, crc }) => ({ role, size, crc })),
-        // The member set travels with the install so a bootstrapped node
-        // (whose log won't contain the CONFIG history) adopts it. This is
-        // the CURRENT set, an approximation of "the set at the boundary"
-        // that is exact whenever changes are committed and settled — the
-        // only time snapshots should be taken anyway.
-        members: this.members
+        // The member records (ids AND addresses) travel with the install
+        // so a bootstrapped node — whose log won't contain the CONFIG
+        // history — adopts the whole cluster shape. This is the CURRENT
+        // set, an approximation of "the set at the boundary" that is
+        // exact whenever changes are committed and settled — the only
+        // time snapshots should be taken anyway.
+        members: this.memberInfo
       };
       const send = async (msg) => {
         const reply = await this.transport.call(peer, msg);

@@ -31,3 +31,22 @@ export declare class RaftGroupHost {
   start(): void;
   stop(): void;
 }
+
+/** Join a group knowing only seed ADDRESSES; resolves with the adopted
+ * member records once the leader commits (docs/clustering.md). Call
+ * before creating the group's node and pass the result as its peers. */
+export declare function joinGroup(
+  transport: { callAddress(addr: object, envelope: object): Promise<object>; setPeer?(id: number, addr: object): void },
+  groupId: string,
+  member: { id: number; host: string; port: number },
+  options: { seeds: Array<{ host: string; port: number }>; attempts?: number; delayMs?: number }
+): Promise<Array<{ id: number; host?: string; port?: number }>>;
+
+/** Remove a member via any seed address; resolves with the adopted
+ * member records once committed. */
+export declare function leaveGroup(
+  transport: { callAddress(addr: object, envelope: object): Promise<object> },
+  groupId: string,
+  id: number,
+  options: { seeds: Array<{ host: string; port: number }>; attempts?: number; delayMs?: number }
+): Promise<Array<{ id: number; host?: string; port?: number }>>;

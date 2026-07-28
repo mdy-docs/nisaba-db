@@ -66,13 +66,39 @@ export class RaftGroupHost {
    * Register a group. `value` is whatever owns the RaftNode — a
    * ReplicatedDb (uses .raft) or a bare RaftNode — created by the caller
    * with this host's groupTransport(groupId). Returns `value`.
+   *
+   * Address sync BY CONSTRUCTION: the node's onConfig hook is chained so
+   * every membership adoption (bootstrap, apply, restart, install)
+   * pushes each member record's address into the transport's peer table
+   * (transport.setPeer, when it exists) — the log IS the address book,
+   * and it is applied immediately for whatever the node already knows.
+   * Addresses are only ever ADDED or UPDATED, never auto-removed: the
+   * transport is shared by every group on this host, and another group
+   * may still talk to a node this group just dropped — pruning dead
+   * addresses is host policy (transport.removePeer), not ours.
    */
   addGroup(groupId, value) {
     if (this._groups.has(groupId)) throw new Error(`group already hosted: ${groupId}`);
     const node = value.raft ?? value;
     if (typeof node.tick !== 'function') throw new Error('addGroup value must be a RaftNode or expose .raft');
+    if (typeof this._transport?.setPeer === 'function') {
+      const previous = node.onConfig;
+      node.onConfig = (members) => {
+        this._applyAddresses(members);
+        if (previous) previous(members);
+      };
+      node.onConfig(node.memberInfo); // sync what it already knows
+    }
     this._groups.set(groupId, { node, value, lastActivity: this._now() });
     return value;
+  }
+
+  _applyAddresses(members) {
+    for (const m of members) {
+      if (m.id !== undefined && m.host !== undefined && m.port !== undefined) {
+        this._transport.setPeer(m.id, { host: m.host, port: m.port });
+      }
+    }
   }
 
   /** Deregister (the caller closes the node/db itself). */
@@ -146,4 +172,83 @@ export class RaftGroupHost {
     if (this._interval) clearInterval(this._interval);
     this._interval = null;
   }
+}
+
+/**
+ * The seed loop shared by joinGroup/leaveGroup: send `msg` for `groupId`
+ * to any address that answers, follow leader redirects, retry through
+ * elections. `targets` starts as the seeds; a redirect that names the
+ * leader's address jumps the queue. Resolves with the reply's adopted
+ * member records.
+ */
+async function seedRequest(transport, groupId, msg, { seeds, attempts = 20, delayMs = 250 }) {
+  if (typeof transport.callAddress !== 'function') {
+    throw new Error('joining needs a transport with callAddress(addr, envelope)');
+  }
+  if (!seeds || seeds.length === 0) throw new Error('at least one seed address is required');
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  let preferred = null; // last leader hint
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const targets = preferred ? [preferred, ...seeds] : [...seeds];
+    for (const addr of targets) {
+      let reply;
+      try {
+        reply = await transport.callAddress(addr, { group: groupId, msg });
+      } catch (err) {
+        lastError = err;
+        continue; // seed down; try the next
+      }
+      if (reply.ok) return reply.members;
+      if (reply.error) throw new Error(reply.error); // a validation refusal never heals by retrying
+      if (reply.leaderAddress) preferred = reply.leaderAddress;
+      lastError = new Error(reply.retry
+        ? 'membership change in flight'
+        : `no leader yet (last hint: node ${reply.leaderId ?? 0})`);
+    }
+    await sleep(delayMs); // mid-election or change in flight; let it settle
+  }
+  throw new Error(`could not ${msg.kind} group "${groupId}" after ${attempts} attempts: ${lastError?.message ?? 'no seed reachable'}`);
+}
+
+/**
+ * Join a Raft group knowing only seed ADDRESSES — the "spin up a node
+ * and it finds the club" flow. `member` is this node's record ({ id,
+ * host, port }); the request lands on any seed, follows the leader
+ * redirect, and resolves once the leader's CONFIG entry commits, with
+ * the adopted member records. Call BEFORE creating the group's RaftNode
+ * and pass the result as its `peers` — the whole flow:
+ *
+ *   const transport = new TcpRaftTransport({ listenPort, onMessage: (e) => host.handleEnvelope(e) });
+ *   await transport.start();
+ *   const me = { id: 4, host: myHost, port: transport.address().port };
+ *   const members = await joinGroup(transport, 'tenant-1', me, { seeds: [{ host, port }] });
+ *   const rdb = await connectReplicated(provider, { id: 4, peers: members, transport: host.groupTransport('tenant-1') });
+ *   host.addGroup('tenant-1', rdb);   // addGroup syncs the peer table from the records
+ *
+ * Idempotent (a retry after a lost reply re-joins harmlessly), and a
+ * RESTART needs no join at all: the node's own log carries the last
+ * CONFIG entry, and onConfig rebuilds the peer table from it.
+ */
+export async function joinGroup(transport, groupId, member, options) {
+  const members = await seedRequest(transport, groupId, { kind: 'join', member }, options);
+  // Prime the local peer table so the node can talk to everyone the
+  // moment it boots (addGroup re-syncs from the records again anyway).
+  if (typeof transport.setPeer === 'function') {
+    for (const m of members) {
+      if (m.host !== undefined && m.id !== member.id) transport.setPeer(m.id, { host: m.host, port: m.port });
+    }
+  }
+  return members;
+}
+
+/**
+ * Remove a member (graceful decommission from the departing node, or an
+ * admin removing a dead one) via any seed address. Resolves with the
+ * adopted member records once committed. The departed node's process is
+ * the caller's to shut down; its address stays in surviving transports
+ * until host policy prunes it (see addGroup's doc).
+ */
+export async function leaveGroup(transport, groupId, id, options) {
+  return seedRequest(transport, groupId, { kind: 'leave', id }, options);
 }

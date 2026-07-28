@@ -157,10 +157,22 @@ export class HttpRaftTransport {
     }
   }
 
+  /** One-shot request to a bare ADDRESS — how a joiner reaches a
+   * cluster it is not part of yet (joinGroup in src/raft-host.js):
+   * seeds are addresses, ids come later from the member records. Same
+   * pooled agent as call(); HTTP needs no separate dial path. */
+  callAddress(addr, envelope) {
+    return this._request(addr, envelope, 'address');
+  }
+
   call(peerId, envelope) {
     if (!this.isRunning) return Promise.reject(new Error('transport not started'));
     const addr = this._peers.get(peerId);
     if (!addr) return Promise.reject(new Error(`no address for peer ${peerId}`));
+    return this._request(addr, envelope, `peer ${peerId}`);
+  }
+
+  _request(addr, envelope, who) {
     const body = encode(envelope);
     return new Promise((resolve, reject) => {
       const req = http.request({
@@ -181,11 +193,11 @@ export class HttpRaftTransport {
             try { resolve(decode(new Uint8Array(buf))); }
             catch (err) { reject(err); }
           } else {
-            reject(new Error(buf.toString('utf8') || `peer ${peerId} replied ${res.statusCode}`));
+            reject(new Error(buf.toString('utf8') || `${who} replied ${res.statusCode}`));
           }
         }, reject);
       });
-      req.on('timeout', () => req.destroy(new Error(`peer ${peerId} timed out`)));
+      req.on('timeout', () => req.destroy(new Error(`${who} timed out`)));
       req.on('error', reject);
       req.end(Buffer.from(body.buffer, body.byteOffset, body.length));
     });

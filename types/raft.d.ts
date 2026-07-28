@@ -49,10 +49,25 @@ export interface RaftSnapshotter {
   } | Promise<any>;
 }
 
+/** A cluster member: id plus (optionally) its transport address. Extra
+ * fields ride through CONFIG entries untouched. */
+export interface MemberRecord {
+  id: number;
+  host?: string;
+  port?: number;
+  [k: string]: unknown;
+}
+
 export declare class RaftNode {
   constructor(options: {
     id: number;
-    peers: number[];
+    /** Bootstrap member set (ids or records; a CONFIG entry recovered
+     * from the log or a snapshot overrides it). The first node of a
+     * fresh cluster should list itself WITH its address. */
+    peers: Array<number | MemberRecord>;
+    /** Fired with the full member-record list on every membership
+     * adoption — the peer-table sync hook (docs/clustering.md). */
+    onConfig?: (members: MemberRecord[]) => void;
     log: any; // an open EntryLog (`nisaba/wasm`)
     stateMachine: RaftStateMachine;
     transport: RaftTransport;
@@ -69,6 +84,11 @@ export declare class RaftNode {
   readonly id: number;
   readonly role: 'follower' | 'candidate' | 'leader';
   readonly term: number;
+  /** Current member ids (derived from memberInfo). */
+  readonly members: number[];
+  /** Current member records — ids and addresses, from the log. */
+  readonly memberInfo: MemberRecord[];
+  onConfig: ((members: MemberRecord[]) => void) | null;
   leaderId: number;
   commitIndex: number;
   lastApplied: number;
@@ -79,5 +99,8 @@ export declare class RaftNode {
   stop(): Promise<void>;
   tick(now: number): void;
   propose(payload: Uint8Array | string, type?: number): Promise<{ index: number; term: number }>;
-  handleMessage(message: object): object;
+  /** Propose a full-replacement member set (ids inherit known records,
+   * so addresses can't be erased). One change in flight at a time. */
+  changeMembership(members: Array<number | MemberRecord>): Promise<{ index: number; term: number }>;
+  handleMessage(message: object): object | Promise<object>;
 }

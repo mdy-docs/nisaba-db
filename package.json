@@ -11,7 +11,8 @@
     "./node": { "types": "./types/node.d.ts", "default": "./src/db-node.js" },
     "./wasm": { "types": "./types/wasm.d.ts", "default": "./wasm/nisaba-wasm.js" },
     "./coordinator": { "types": "./types/coordinator.d.ts", "default": "./src/db-coordinator.js" },
-    "./wal": { "types": "./types/wal.d.ts", "default": "./src/db-wal.js" }
+    "./wal": { "types": "./types/wal.d.ts", "default": "./src/db-wal.js" },
+    "./raft": { "types": "./types/raft.d.ts", "default": "./src/raft.js" }
   },
   "files": [
     "wasm",

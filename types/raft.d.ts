@@ -49,12 +49,16 @@ export interface RaftSnapshotter {
   } | Promise<any>;
 }
 
-/** A cluster member: id plus (optionally) its transport address. Extra
- * fields ride through CONFIG entries untouched. */
+/** A cluster member: id plus (optionally) its transport address.
+ * voting: false marks a learner — replicated to, but no quorum weight,
+ * no campaigning, no votes; auto-promoted when caught up
+ * (docs/clustering.md). Extra fields ride through CONFIG entries
+ * untouched. */
 export interface MemberRecord {
   id: number;
   host?: string;
   port?: number;
+  voting?: boolean;
   [k: string]: unknown;
 }
 
@@ -86,6 +90,8 @@ export declare class RaftNode {
   readonly term: number;
   /** Current member ids (derived from memberInfo). */
   readonly members: number[];
+  /** The electorate: member ids without voting: false. */
+  readonly voters: number[];
   /** Current member records — ids and addresses, from the log. */
   readonly memberInfo: MemberRecord[];
   onConfig: ((members: MemberRecord[]) => void) | null;

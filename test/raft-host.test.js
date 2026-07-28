@@ -288,10 +288,106 @@ describe('raft: member records, address sync, join/leave (sim)', () => {
       random: sim.rng
     });
     await reborn.start(sim.time);
-    // The log's CONFIG entry restored ids AND addresses.
+    // The log's CONFIG entry restored ids AND addresses (member 4 joined
+    // and never caught up, so it is still a learner).
     expect(reborn.members).toEqual([1, 2, 3, 4]);
-    expect(reborn.memberInfo.find((m) => m.id === 4)).toEqual({ id: 4, host: 'node4', port: 7004 });
+    expect(reborn.memberInfo.find((m) => m.id === 4))
+      .toEqual({ id: 4, host: 'node4', port: 7004, voting: false });
+    expect(reborn.voters).toEqual([1, 2, 3]);
     await reborn.stop();
+  });
+});
+
+describe('raft: learners (non-voting members)', () => {
+  it('a joiner starts as a learner: no quorum weight, no campaigning, no votes — then auto-promotes when caught up', async () => {
+    const sim = new Sim(91);
+    const net = new MemoryNetwork(sim);
+    const { makeCluster, bootNode, leaders: rawLeaders } = await import('./raft-harness.js');
+    const cluster = await makeCluster(3, sim, net);
+    await until(sim, cluster, () => rawLeaders(cluster).length === 1);
+    const leader = () => rawLeaders(cluster)[0];
+    await settle(sim, cluster, leader().node.propose(kvSet('pre', 1)));
+
+    // Join node 4 while it is OFFLINE: it becomes a learner in the log
+    // but can never catch up, so it must never be promoted or counted.
+    const joined = leader().node.handleMessage({
+      kind: 'join', member: { id: 4, host: 'node4', port: 7004 }
+    });
+    await until(sim, cluster, () => leader().node.members.includes(4));
+    const reply = await joined;
+    expect(reply.ok).toBe(true);
+    expect(reply.members.find((m) => m.id === 4).voting).toBe(false);
+    expect(leader().node.voters).toEqual([1, 2, 3]);
+
+    // Quorum is still 2-of-3 voters: kill one VOTER follower and commits
+    // must keep flowing. (Were the offline learner counted, the set
+    // would be 4 members needing 3 — and this write would hang.)
+    const deadVoter = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    net.unregister(deadVoter.node.id);
+    const w = await settle(sim, cluster, leader().node.propose(kvSet('with-learner-down', 2)));
+    expect(w.error).toBeUndefined();
+    net.register(deadVoter.node.id, (msg) => deadVoter.node.handleMessage(msg));
+
+    // A learner refuses votes outright, pre or real.
+    const { MemoryHandle: MH, EntryLog: EL } = await import('../wasm/nisaba-wasm.js');
+    const learnerLog = new EL(new MH());
+    await learnerLog.open();
+    const { RaftNode: RN } = await import('../src/raft.js');
+    const { KvMachine: KM } = await import('./raft-harness.js');
+    const learner = new RN({
+      id: 5, peers: [{ id: 1 }, { id: 5, voting: false }],
+      log: learnerLog, stateMachine: new KM(),
+      transport: { call: async () => { throw new Error('offline'); } },
+      random: sim.rng
+    });
+    await learner.start(sim.time);
+    const vote = learner.handleMessage({
+      kind: 'requestVote', term: 99, candidateId: 1, lastLogIndex: 100, lastLogTerm: 9, preVote: false
+    });
+    expect(vote.voteGranted).toBe(false);
+    // ...and never campaigns, no matter how long it waits.
+    const termBefore = learner.term;
+    for (let i = 0; i < 100; i++) learner.tick(sim.time + i * 1000);
+    expect(learner.term).toBe(termBefore);
+    expect(learner.role).toBe('follower');
+    await learner.stop();
+    await learnerLog.close();
+
+    // Now bring node 4 ONLINE: it catches up, and the leader promotes it
+    // automatically — the log ends up with voting:true and 4 voters.
+    const four = await bootNode(4, [1, 2, 3, 4], sim, net, new MH());
+    cluster.set(4, four);
+    await until(sim, cluster, () => leader().node.voters.includes(4), 20_000);
+    expect(leader().node.memberInfo.find((m) => m.id === 4).voting).toBe(true);
+    expect(four.machine.map.get('pre')).toBe(1); // fully caught up
+
+    // And as a voter it now carries quorum weight: with one other
+    // follower dead, 3-of-4 still commits through node 4.
+    net.unregister(deadVoter.node.id);
+    const w2 = await settle(sim, cluster, leader().node.propose(kvSet('post-promotion', 3)));
+    expect(w2.error).toBeUndefined();
+  });
+
+  it('an explicit changeMembership cannot accidentally promote a learner (id-only merge keeps the flag)', async () => {
+    const sim = new Sim(92);
+    const net = new MemoryNetwork(sim);
+    const { makeCluster, leaders: rawLeaders } = await import('./raft-harness.js');
+    const cluster = await makeCluster(3, sim, net);
+    await until(sim, cluster, () => rawLeaders(cluster).length === 1);
+    const leader = () => rawLeaders(cluster)[0];
+
+    // Add an offline learner, then re-propose the full set by BARE IDS.
+    const joined = leader().node.handleMessage({
+      kind: 'join', member: { id: 9, host: 'node9', port: 7009 }
+    });
+    await until(sim, cluster, () => leader().node.members.includes(9));
+    await joined;
+    const change = await settle(sim, cluster, leader().node.changeMembership([1, 2, 3, 9]));
+    expect(change.error).toBeUndefined();
+    const rec = leader().node.memberInfo.find((m) => m.id === 9);
+    expect(rec.voting).toBe(false);            // flag survived the id-only merge
+    expect(rec.host).toBe('node9');            // and so did the address
+    expect(leader().node.voters).toEqual([1, 2, 3]);
   });
 });
 

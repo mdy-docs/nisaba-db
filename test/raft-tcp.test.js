@@ -146,6 +146,9 @@ describe('tcp transport', () => {
       // The 3-node cluster commits (quorum 2 of 3).
       await booted.get(1).node.propose(kvSet('trio', 3));
       await waitFor(() => [...booted.values()].every((n) => n.machine.map.get('trio') === 3));
+      // Both joiners entered as learners and were auto-promoted to
+      // voters once caught up.
+      await waitFor(() => booted.get(1).node.voters.length === 3);
 
       // Node 3 leaves gracefully via a seed; the pair keeps committing.
       const membersAfter = await leaveGroup(s3.transport, 'kv', 3, { seeds: [s2.addr] });

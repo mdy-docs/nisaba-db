@@ -39,7 +39,7 @@ node one group dropped. Pruning dead addresses is host policy
 (`transport.removePeer`).
 
 Extra fields on a member record ride through untouched. `voting: false`
-(learner/non-voting members) is the planned next occupant.
+marks a **learner** — see below.
 
 ## Growing: join via any node
 
@@ -102,6 +102,48 @@ dead node's id (the leader detects the regression and snapshot-installs
 it — no membership change at all), or `leaveGroup` the dead id and
 `joinGroup` a fresh one.
 
+## Learners: join safely, vote when ready
+
+A **new member always enters as a learner** (`voting: false` on its
+record — `join` forces this regardless of what the request claims). A
+learner receives everything a voter does — AppendEntries, snapshot
+installs, the whole log — but:
+
+- it carries **no quorum weight**: commit arithmetic and election
+  majorities run over voters only, so adding capacity never thins the
+  failure margin while the newcomer is still syncing;
+- it **never campaigns**: election timeouts are inert on a learner;
+- it **refuses votes**, pre-vote and real, even if a stale-config
+  candidate asks.
+
+**Promotion is automatic.** On every replication success the leader
+checks whether a learner's match index covers the commit index — "has
+everything committed" — and if so proposes the same record with
+`voting: true`. That CONFIG entry commits under the existing electorate
+and, once applied, the ex-learner counts and campaigns like anyone
+else. If another membership change is in flight at that moment, the
+promotion simply retries on the next replication success. Promotion is
+the only *automatic* membership change in the system, and it can only
+ever widen the electorate with a replica proven current.
+
+Practical consequences:
+
+- The add-a-node timeline is: `joinGroup` → CONFIG(learner) commits
+  under the old quorum → catch-up (AppendEntries or snapshot install)
+  → CONFIG(voter) commits → full member. Both entries are visible in
+  the log; `node.voters` vs `node.members` shows the split at runtime.
+- A re-join of an existing member (address change, retry after a lost
+  reply) keeps its current voting status — an established voter is not
+  demoted by re-announcing itself.
+- An id-only `changeMembership([1,2,3,9])` inherits the known records,
+  flag included — you cannot accidentally promote a learner (or erase
+  an address) with a bare-id call. Explicit demotion is possible by
+  proposing a record with `voting: false`; a demoted leader steps down
+  when the entry applies.
+- The quorum-math caveat from the previous section is now closed: the
+  brief thin-margin window no longer exists, because the newcomer only
+  joins the electorate after it is provably caught up.
+
 ## Shrinking: leave
 
 ```js
@@ -121,12 +163,9 @@ is idempotent. Shut the process down afterwards; that part is yours.
   flight is refused (`{ retry: true }` on the wire; `joinGroup`
   retries). This serialization is what makes single-server changes safe
   without joint consensus.
-- **Quorum math moves immediately.** Adding a 4th member makes quorum
-  3-of-4 the moment the entry applies, so until the newcomer catches up
-  (usually seconds — snapshot install is automatic) your failure margin
-  is briefly thinner. The textbook fix is learner members that don't
-  count until promoted — the planned next step, and the reason member
-  records exist.
+- **Quorum math moves only at promotion.** A joiner is a learner until
+  caught up, so adding a member never thins the failure margin; the
+  electorate grows only when the promotion CONFIG entry applies.
 - **Full-set replacement, merge-protected.** CONFIG entries carry the
   complete member list. `changeMembership([1,2,3,4])` with bare ids
   inherits the known records, so addresses in the log can't be erased

@@ -87,6 +87,18 @@
  * seed-address loop; the bootstrap (first) node should list itself
  * WITH its address in `peers` so later joiners learn it from the log.
  *
+ * Learners: a NEW member always joins as a non-voter (`voting: false`
+ * on its record — join forces it, so adding capacity can never thin the
+ * failure margin). A learner receives everything a voter does —
+ * AppendEntries, snapshot installs — but is excluded from quorum
+ * arithmetic, never campaigns, and refuses votes. The leader promotes
+ * it automatically: on every replication success it checks whether a
+ * learner's match index covers the commit index — "has everything
+ * committed" — and if so proposes the same record with the flag
+ * dropped (one CONFIG at a time as always; a busy moment just retries
+ * on the next success). Voters-by-construction: the bootstrap set and
+ * explicit changeMembership records default to voting.
+ *
  * Quiescence (5d): quiesce() parks the timers (a leader stops
  * heartbeating, a follower stops counting down), wake() restores them;
  * incoming messages and local proposals wake implicitly. An idle group
@@ -215,6 +227,9 @@ export class RaftNode {
       .sort((a, b) => a.id - b.id);
     this.memberInfo = records;
     this.members = records.map((m) => m.id);
+    /** Quorum electorate: members without `voting: false`. Replication
+     * (this.peers) spans everyone; only voters count and campaign. */
+    this.voters = records.filter((m) => m.voting !== false).map((m) => m.id);
     this.peers = this.members.filter((p) => p !== this.id);
     if (this._next) {
       for (const p of this.peers) {
@@ -293,7 +308,8 @@ export class RaftNode {
   tick(now) {
     if (!this.isRunning || this._exclusive) return;
     this._now = Math.max(this._now, now);
-    if (!this.members.includes(this.id)) return; // removed: never campaign
+    // Removed nodes and learners never campaign (leaders still heartbeat).
+    if (!this.voters.includes(this.id) && this.role !== ROLE.LEADER) return;
     if (this.role === ROLE.LEADER) {
       if (this._now >= this._heartbeatDue) {
         this._heartbeatDue = this._now + this.heartbeatMs;
@@ -402,6 +418,13 @@ export class RaftNode {
    * upserts the record and replies { ok: true, members } once the
    * CONFIG entry commits. Idempotent: re-joining with an identical
    * record succeeds without a new entry (safe to retry).
+   *
+   * A NEW member always enters as a learner (voting: false), whatever
+   * its request claims — adding capacity must never thin the failure
+   * margin, and the leader promotes it automatically once caught up
+   * (_maybePromote). A re-join of an EXISTING member (address change,
+   * restart-with-retry) keeps its current voting status: an established
+   * voter is not demoted by re-announcing itself.
    */
   _onJoin(msg) {
     const member = msg.member;
@@ -414,7 +437,14 @@ export class RaftNode {
       return { ok: true, members: this.memberInfo };
     }
     if (this._configInFlight) return { ok: false, retry: true };
-    const next = [...this.memberInfo.filter((m) => m.id !== member.id), { ...member }];
+    const record = { ...member };
+    delete record.voting;
+    if (existing) {
+      if (existing.voting === false) record.voting = false; // still a learner
+    } else {
+      record.voting = false; // new blood starts as a learner, always
+    }
+    const next = [...this.memberInfo.filter((m) => m.id !== member.id), record];
     return this.changeMembership(next).then(
       () => ({ ok: true, members: this.memberInfo }),
       (err) => ({ ok: false, error: String(err?.message ?? err) })
@@ -475,6 +505,10 @@ export class RaftNode {
   _onRequestVote(msg) {
     const currentTerm = this.log.currentTerm;
     if (msg.term < currentTerm) return { term: currentTerm, voteGranted: false };
+
+    // Learners (and removed nodes) hold no franchise: a candidate only
+    // solicits voters, but a stale-config straggler may still ask.
+    if (!this.voters.includes(this.id)) return { term: currentTerm, voteGranted: false };
 
     const upToDate =
       msg.lastLogTerm > this.log.lastTerm ||
@@ -672,7 +706,8 @@ export class RaftNode {
     };
     let granted = 1; // self
     let settled = false;
-    for (const p of this.peers) {
+    const votingPeers = this.peers.filter((p) => this.voters.includes(p));
+    for (const p of votingPeers) {
       this.transport.call(p, req).then((reply) => {
         if (settled || !this.isRunning) return;
         if (reply.term > this.log.currentTerm) {
@@ -748,6 +783,7 @@ export class RaftNode {
           this._next.set(peer, reply.matchIndex + 1);
           this._advanceCommit();
         }
+        this._maybePromote(peer);
         again = this._next.get(peer) <= this.log.lastIndex;
       } else {
         // Back up along the follower's hint (never forward of a plain
@@ -849,12 +885,35 @@ export class RaftNode {
     }
   }
 
-  _quorum() { return Math.floor((this.peers.length + 1) / 2) + 1; }
+  /**
+   * Promote a caught-up learner: once its match index covers everything
+   * committed, propose the same record with the voting flag dropped.
+   * Checked on every replication success — a refused moment (another
+   * CONFIG in flight) simply retries on the next one. Promotion is the
+   * only automatic membership change; it can only ever WIDEN the
+   * electorate with a replica proven current.
+   */
+  _maybePromote(peer) {
+    if (this.role !== ROLE.LEADER || this._configInFlight) return;
+    const record = this.memberInfo.find((m) => m.id === peer);
+    if (!record || record.voting !== false) return;
+    if (this.commitIndex === 0 || (this._match.get(peer) ?? 0) < this.commitIndex) return;
+    // Explicit voting:true (not just dropping the flag): changeMembership
+    // merges address-less records with the known ones, and an absent key
+    // would re-inherit the old voting:false through that merge.
+    const next = this.memberInfo.map((m) => (m.id === peer ? { ...m, voting: true } : m));
+    this.changeMembership(next).catch(() => { /* retried on the next success */ });
+  }
+
+  /** Majority of VOTERS — learners add capacity, not quorum weight. */
+  _quorum() { return Math.floor(this.voters.length / 2) + 1; }
 
   _advanceCommit() {
     if (this.role !== ROLE.LEADER) return;
-    const matches = [this.log.lastIndex, ...this.peers.map((p) => this._match.get(p))]
-      .sort((a, b) => b - a);
+    const matches = [
+      this.log.lastIndex, // the leader is always a voter
+      ...this.peers.filter((p) => this.voters.includes(p)).map((p) => this._match.get(p))
+    ].sort((a, b) => b - a);
     const n = matches[this._quorum() - 1];
     // §5.4.2: only entries of the CURRENT term commit by counting; earlier
     // terms commit implicitly once a current-term entry above them does.
@@ -890,9 +949,10 @@ export class RaftNode {
 
   _adoptConfig(members) {
     this._setMembers(members);
-    if (!this.members.includes(this.id) && this.role !== ROLE.FOLLOWER) {
-      // Applied our own removal: step down; the host closes us. (As
-      // leader we first committed the entry, so the new set has it.)
+    if (!this.voters.includes(this.id) && this.role !== ROLE.FOLLOWER) {
+      // Applied our own removal (or demotion to learner): step down; the
+      // host closes a removed node. (As leader we first committed the
+      // entry, so the new set has it.)
       this._becomeFollower(this.log.currentTerm, 0);
     }
     if (this.role === ROLE.LEADER) {

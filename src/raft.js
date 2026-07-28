@@ -52,11 +52,26 @@
  * loop can never observe the swap. Without a snapshotter, such peers
  * park in `peersNeedingSnapshot` for the host to notice.
  *
- * Still to come (see roadmap): CONFIG entries for membership changes,
- * and the WalDb integration that turns proposals into database commands
- * (5c).
+ * Membership (5d): the cluster's member set travels through the log as
+ * CONFIG entries (payload: encode({ members })), proposed one at a time
+ * via changeMembership() and adopted when APPLIED — the etcd convention
+ * rather than the paper's adopt-on-append, trading the paper's edge-case
+ * arguments for truncation-proof simplicity; single-server changes stay
+ * safe because a change commits under the OLD quorum and the next one
+ * can't start until it has. On restart the committed prefix is scanned
+ * for the last CONFIG entry (static `peers` is only the bootstrap
+ * default); a snapshot install adopts the leader's members from the
+ * manifest. A node that applies its own removal steps down and stops
+ * campaigning — the host closes it.
+ *
+ * Quiescence (5d): quiesce() parks the timers (a leader stops
+ * heartbeating, a follower stops counting down), wake() restores them;
+ * incoming messages and local proposals wake implicitly. An idle group
+ * costs nothing on the wire; a leader that dies while quiesced is
+ * detected lazily, on the group's next use — the RaftGroupHost
+ * (src/raft-host.js) drives both ends.
  */
-import { ENTRYLOG_TYPE } from '../wasm/nisaba-wasm.js';
+import { ENTRYLOG_TYPE, encode, decode } from '../wasm/nisaba-wasm.js';
 
 export class NotLeaderError extends Error {
   /** @param {number} leaderId - the last known leader (0 if unknown) */
@@ -112,7 +127,7 @@ export class RaftNode {
   }) {
     if (!Number.isInteger(id) || id <= 0) throw new Error('RaftNode id must be a positive integer');
     this.id = id;
-    this.peers = peers.filter((p) => p !== id);
+    this._setMembers([...new Set([...peers, id])]);
     this.log = log;
     this.stateMachine = stateMachine;
     this.transport = transport;
@@ -144,6 +159,30 @@ export class RaftNode {
     this._applyChain = Promise.resolve();
     this._install = null;         // follower: in-progress install transaction
     this._exclusive = null;       // runExclusive gate promise, or null
+    this._quiesced = false;       // timers parked (see quiesce/wake)
+    this._configInFlight = false; // one membership change at a time
+  }
+
+  /** Adopt a member set: `members` includes every node id (self too, if
+   * still a member). Leader bookkeeping follows the set. */
+  _setMembers(members) {
+    this.members = [...members].sort((a, b) => a - b);
+    this.peers = this.members.filter((p) => p !== this.id);
+    if (this._next) {
+      for (const p of this.peers) {
+        if (!this._next.has(p)) {
+          this._next.set(p, this.log.lastIndex + 1);
+          this._match.set(p, 0);
+        }
+      }
+      for (const p of [...this._next.keys()]) {
+        if (!this.peers.includes(p)) {
+          this._next.delete(p);
+          this._match.delete(p);
+          this._needsSnapshot.delete(p);
+        }
+      }
+    }
   }
 
   /**
@@ -172,6 +211,21 @@ export class RaftNode {
     this._now = now;
     this.lastApplied = await this.stateMachine.appliedIndex();
     this.commitIndex = Math.max(this.commitIndex, this.lastApplied);
+    // Recover membership: the last CONFIG entry in the log wins over the
+    // static bootstrap `peers` (the paper's latest-in-log rule at
+    // restart; a state machine's appliedIndex may sit past CONFIG
+    // entries it never recorded, so the apply pump alone can't be relied
+    // on to re-adopt them, and a committed-but-unadvertised entry — the
+    // advisory commit index lags — must not be missed either).
+    let scan = this.log.baseIndex + 1;
+    while (scan <= this.log.lastIndex) {
+      const batch = this.log.getBatch(scan, this.maxBatchBytes);
+      if (batch.length === 0) break;
+      for (const e of batch) {
+        if (e.type === ENTRYLOG_TYPE.CONFIG) this._setMembers(decode(e.payload).members);
+      }
+      scan = batch[batch.length - 1].index + 1;
+    }
     this.isRunning = true;
     this._resetElectionTimer();
     this._pumpApply();
@@ -188,6 +242,7 @@ export class RaftNode {
   tick(now) {
     if (!this.isRunning || this._exclusive) return;
     this._now = Math.max(this._now, now);
+    if (!this.members.includes(this.id)) return; // removed: never campaign
     if (this.role === ROLE.LEADER) {
       if (this._now >= this._heartbeatDue) {
         this._heartbeatDue = this._now + this.heartbeatMs;
@@ -196,6 +251,29 @@ export class RaftNode {
     } else if (this._now >= this._electionDeadline) {
       this._startElection(true);
     }
+  }
+
+  /** Park the group: a LEADER first tells every follower to park (a
+   * final heartbeat with the quiesce flag — followers' election timeouts
+   * are shorter than any idle threshold, so without this they would
+   * misread the leader's silence as its death and churn elections), then
+   * stops heartbeating. A follower parks its election countdown. Any
+   * incoming message or local proposal wakes the node implicitly. */
+  quiesce() {
+    if (this.role === ROLE.LEADER) {
+      for (const p of this.peers) this._replicate(p, { quiesce: true });
+    }
+    this._quiesced = true;
+    this._electionDeadline = Infinity;
+    this._heartbeatDue = Infinity;
+  }
+
+  wake(now = this._now) {
+    if (!this._quiesced) return;
+    this._quiesced = false;
+    this._now = Math.max(this._now, now);
+    this._heartbeatDue = this._now;
+    this._resetElectionTimer();
   }
 
   /**
@@ -211,6 +289,7 @@ export class RaftNode {
     if (!this.isRunning || this.role !== ROLE.LEADER) {
       return Promise.reject(new NotLeaderError(this.leaderId));
     }
+    this.wake(); // a quiesced leader must resume heartbeats to replicate
     const term = this.log.currentTerm;
     const index = this.log.append(term, payload, type);
     this.log.sync();
@@ -226,6 +305,31 @@ export class RaftNode {
    * up by AppendEntries — they need an InstallSnapshot (roadmap 5b). */
   get peersNeedingSnapshot() { return [...this._needsSnapshot]; }
 
+  /**
+   * Propose a new member set (every node id, including or excluding this
+   * one). Leader-only; one change may be in flight at a time — commit it
+   * before proposing the next (the single-server-change safety argument
+   * rests on changes serializing). The change takes effect on every node
+   * when its CONFIG entry APPLIES; resolves like propose(). A brand-new
+   * member typically needs a snapshot install to catch up — the ordinary
+   * replication path handles that once it is a member.
+   */
+  async changeMembership(members) {
+    const set = [...new Set(members)];
+    if (set.length === 0 || set.some((m) => !Number.isInteger(m) || m <= 0)) {
+      throw new Error('changeMembership requires a non-empty array of positive integer node ids');
+    }
+    if (this._configInFlight) {
+      throw new Error('a membership change is already in flight; wait for it to commit');
+    }
+    this._configInFlight = true;
+    try {
+      return await this.propose(encode({ members: set }), ENTRYLOG_TYPE.CONFIG);
+    } finally {
+      this._configInFlight = false;
+    }
+  }
+
   // ---- RPC handlers -------------------------------------------------------
 
   /** The transport hands every incoming message here; the return value is
@@ -236,6 +340,7 @@ export class RaftNode {
       return this._exclusive.then(() => this.handleMessage(msg));
     }
     if (!this.isRunning) throw new Error('node is stopped');
+    this.wake(); // any traffic un-quiesces the group on this node
     switch (msg.kind) {
       case 'requestVote': return this._onRequestVote(msg);
       case 'appendEntries': return this._onAppendEntries(msg);
@@ -254,9 +359,12 @@ export class RaftNode {
 
     if (msg.preVote) {
       // Persist nothing, grant nothing durable: "would I vote for you?".
-      // Leader stickiness: refuse while a live leader is heard from.
-      const sticky = this.leaderId !== 0 &&
-        this._now - this._lastLeaderContact < this.electionTimeoutMs[0];
+      // Leader stickiness: refuse while a live leader is heard from —
+      // and a healthy leader IS that leader, so it always refuses (the
+      // classic disruptive case is a removed-but-unaware member whose
+      // log is up to date pre-voting at the still-working leader).
+      const sticky = this.role === ROLE.LEADER ||
+        (this.leaderId !== 0 && this._now - this._lastLeaderContact < this.electionTimeoutMs[0]);
       return { term: currentTerm, voteGranted: !sticky && upToDate };
     }
 
@@ -319,6 +427,11 @@ export class RaftNode {
       this.log.setCommitIndex(this.commitIndex); // advisory; rides next sync
       this._pumpApply();
     }
+    if (msg.quiesce) {
+      // The leader is parking the group: park with it (see quiesce()).
+      this._quiesced = true;
+      this._electionDeadline = Infinity;
+    }
     return { term: currentTerm, success: true, matchIndex };
   }
 
@@ -342,6 +455,7 @@ export class RaftNode {
       this._install = {
         lastIncludedIndex: msg.lastIncludedIndex,
         lastIncludedTerm: msg.lastIncludedTerm,
+        members: msg.manifest.members ?? null,
         tx: await this.snapshotter.beginInstall({
           lastIncludedIndex: msg.lastIncludedIndex,
           lastIncludedTerm: msg.lastIncludedTerm,
@@ -374,6 +488,7 @@ export class RaftNode {
         if (term > 0) this.log.setHardState(term, votedFor); // fresh logs start at 0/0
         this.lastApplied = msg.lastIncludedIndex;
         this.commitIndex = Math.max(this.commitIndex, msg.lastIncludedIndex);
+        if (install.members) this._setMembers(install.members);
         this._install = null;
       };
       const run = this._applyChain.then(finish);
@@ -476,7 +591,7 @@ export class RaftNode {
 
   // ---- replication (leader) -----------------------------------------------
 
-  async _replicate(peer) {
+  async _replicate(peer, { quiesce = false } = {}) {
     if (this.role !== ROLE.LEADER || this._inflight.has(peer)) return;
     const next = this._next.get(peer);
     if (next <= this.log.baseIndex) {
@@ -496,10 +611,12 @@ export class RaftNode {
     this._inflight.add(peer);
     let again = false;
     try {
-      const reply = await this.transport.call(peer, {
+      const msg = {
         kind: 'appendEntries', term, leaderId: this.id,
         prevLogIndex, prevLogTerm, entries, leaderCommit: this.commitIndex
-      });
+      };
+      if (quiesce) msg.quiesce = true;
+      const reply = await this.transport.call(peer, msg);
       if (!this.isRunning || this.role !== ROLE.LEADER || this.log.currentTerm !== term) return;
       if (reply.term > term) return this._becomeFollower(reply.term, 0);
       if (reply.success) {
@@ -551,7 +668,13 @@ export class RaftNode {
       };
       const manifest = {
         config: snap.config ?? null,
-        files: files.map(({ role, size, crc }) => ({ role, size, crc }))
+        files: files.map(({ role, size, crc }) => ({ role, size, crc })),
+        // The member set travels with the install so a bootstrapped node
+        // (whose log won't contain the CONFIG history) adopts it. This is
+        // the CURRENT set, an approximation of "the set at the boundary"
+        // that is exact whenever changes are committed and settled — the
+        // only time snapshots should be taken anyway.
+        members: this.members
       };
       const send = async (msg) => {
         const reply = await this.transport.call(peer, msg);
@@ -634,9 +757,22 @@ export class RaftNode {
       for (const e of this.log.getBatch(this.lastApplied + 1, this.maxBatchBytes)) {
         if (e.index > this.commitIndex) break;
         if (e.type === ENTRYLOG_TYPE.NORMAL) await this.stateMachine.apply(e);
+        else if (e.type === ENTRYLOG_TYPE.CONFIG) this._adoptConfig(decode(e.payload).members);
         this.lastApplied = e.index;
         this._settleWaiters();
       }
+    }
+  }
+
+  _adoptConfig(members) {
+    this._setMembers(members);
+    if (!this.members.includes(this.id) && this.role !== ROLE.FOLLOWER) {
+      // Applied our own removal: step down; the host closes us. (As
+      // leader we first committed the entry, so the new set has it.)
+      this._becomeFollower(this.log.currentTerm, 0);
+    }
+    if (this.role === ROLE.LEADER) {
+      for (const p of this.peers) this._replicate(p); // catch new members up
     }
   }
 

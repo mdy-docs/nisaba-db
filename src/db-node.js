@@ -128,8 +128,27 @@ class NodeFSStorageProvider {
     } catch (err) {
       if (err.code !== 'ENOENT' || !create) throw err;
       fd = fs.openSync(p, 'w+');
+      // POSIX durability for the CREATION itself: without fsyncing the
+      // parent directory, a crash can lose the directory entry even
+      // after the file's own bytes were fsynced -- which would silently
+      // drop a freshly created WAL log or snapshot generation file out
+      // from under the crash-safety reasoning built on them (roadmap
+      // step 4's fsync audit). Deletions are deliberately not dir-synced:
+      // a resurrected deleted file is a benign orphan the sweeps handle.
+      this._fsyncDir();
     }
     return new NodeFSSyncHandle(fd);
+  }
+
+  _fsyncDir() {
+    let dirFd = null;
+    try {
+      dirFd = fs.openSync(this._dir, 'r');
+      fs.fsyncSync(dirFd);
+    } catch { /* some platforms refuse dir fsync (e.g. Windows); best-effort */ }
+    finally {
+      if (dirFd !== null) fs.closeSync(dirFd);
+    }
   }
 
   async deleteFile(name) {

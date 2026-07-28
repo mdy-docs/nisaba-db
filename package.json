@@ -13,7 +13,9 @@
     "./coordinator": { "types": "./types/coordinator.d.ts", "default": "./src/db-coordinator.js" },
     "./wal": { "types": "./types/wal.d.ts", "default": "./src/db-wal.js" },
     "./raft": { "types": "./types/raft.d.ts", "default": "./src/raft.js" },
-    "./replicated": { "types": "./types/replicated.d.ts", "default": "./src/db-replicated.js" }
+    "./replicated": { "types": "./types/replicated.d.ts", "default": "./src/db-replicated.js" },
+    "./raft-host": { "types": "./types/raft-host.d.ts", "default": "./src/raft-host.js" },
+    "./raft-tcp": { "types": "./types/raft-tcp.d.ts", "default": "./src/raft-transport-tcp.js" }
   },
   "files": [
     "wasm",

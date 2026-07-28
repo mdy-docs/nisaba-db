@@ -130,10 +130,13 @@ describe('WAL: driver-shaped behavior', () => {
     await db.close();
   });
 
-  it('dropCollection is refused (needs the step-3 log-compaction barrier)', async () => {
-    const db = await connectWal(new MemoryStorageProvider());
+  it('dropCollection is refused without listFiles() (no snapshot barrier possible)', async () => {
+    const provider = new MemoryStorageProvider();
+    const bare = { openFile: provider.openFile.bind(provider), deleteFile: provider.deleteFile.bind(provider) };
+    const db = await connectWal(bare);
     await (await db.collection('users')).insertOne({ n: 1 });
-    await expect(db.dropCollection('users')).rejects.toThrow(/not supported on a WAL database/);
+    await expect(db.dropCollection('users')).rejects.toThrow(/listFiles/);
+    await expect(db.snapshot()).rejects.toThrow(/listFiles/);
     await db.close();
   });
 });

@@ -46,14 +46,30 @@
  * their own files, and a replayed entry that predates an index build was
  * by definition not yet applied when the build's backfill scanned the
  * primary, so maintenance-vs-backfill can't double-count), and compact
- * (appliedIndex is carried through, see step 1's tests). dropCollection
- * is REFUSED on a WAL database: its old entries would resurrect the
- * collection on replay; the safe barrier is log compaction (roadmap
- * step 3).
+ * (appliedIndex is carried through, see step 1's tests).
+ *
+ * Snapshots + log compaction (roadmap step 3): snapshot() streams the
+ * whole database — the catalog and every collection's structures — into
+ * an immutable SnapshotStore generation (files `<prefix>-<gen>-<role>.bj`
+ * plus a CRC-protected manifest committed last; crash-safe adoption and
+ * sweeping are the store's contract), stamps it with the log boundary
+ * (lastIncludedIndex/Term — every logged entry is applied at a quiesced
+ * moment, so the boundary is simply the log tail), then compacts the
+ * EntryLog through that boundary into the store's paired log file and
+ * adopts it, pruning predecessors. This bounds log growth, is the
+ * InstallSnapshot artifact for roadmap step 5, and provides the barrier
+ * that makes dropCollection legal: the drop takes a snapshot, so no
+ * pre-drop entry survives to resurrect the collection on replay.
+ * restoreLatestSnapshot() is the local half of an install: copy every
+ * generation file back to its live name (the manifest's config carries
+ * the mapping) and reopen — recovery then replays whatever log suffix
+ * lies beyond the boundary. Both need a provider with listFiles();
+ * without one, snapshot() and dropCollection() are refused.
  */
 import {
   connect,
   EntryLog,
+  SnapshotStore,
   ObjectId,
   encode,
   decode,
@@ -61,6 +77,27 @@ import {
 } from '../wasm/nisaba-wasm.js';
 
 const WAL_FILE = '__wal__.bj';
+const SNAP_PREFIX = '__snap';
+/** Mirrors nisaba-wasm.js's private DB_CATALOG_FILE / DB_FILE_PATTERN --
+ * what a restore must overwrite (and clear stale journals of) to put the
+ * database exactly at the snapshot. */
+const CATALOG_FILE = '__catalog__.bj';
+const DB_FILE_PATTERN = /^(?:g\d+-)?(?:coll|idx)-.*\.bj$/;
+
+/** Adapt a StorageProvider (openFile/deleteFile/listFiles) to the
+ * directory-handle shape SnapshotStore consumes (getFileHandle/
+ * removeEntry/entries). */
+function providerDirectory(provider) {
+  return {
+    async getFileHandle(name, options = {}) {
+      return { createSyncAccessHandle: () => provider.openFile(name, options) };
+    },
+    async removeEntry(name) { return provider.deleteFile(name); },
+    async *entries() {
+      for (const name of await provider.listFiles()) yield [name];
+    }
+  };
+}
 
 /** One entry ~= one collection commit. Command shapes ('c' = collection):
  *   { c, op: 'i',  doc }                  insert (doc._id resolved)
@@ -72,9 +109,11 @@ const WAL_FILE = '__wal__.bj';
  *   { c, op: 'd',  id }                   delete the document `id`
  */
 class WalDb {
-  constructor(db, log) {
+  constructor(db, log, { provider, store }) {
     this._db = db;
     this._log = log;
+    this._provider = provider;
+    this._store = store; // SnapshotStore, or null (provider lacks listFiles)
     this._collections = new Map(); // name -> WalCollection
     this._chain = Promise.resolve();
     this._broken = null; // Error that poisoned the log (failed sync), or null
@@ -83,8 +122,13 @@ class WalDb {
 
   /** The underlying EntryLog — read-only from the host's point of view
    * (lastIndex, getBatch for inspection); the Raft layer (roadmap steps
-   * 4/5) will drive it directly. */
+   * 4/5) will drive it directly. NOTE: snapshot() swaps this for the
+   * compacted log — re-read this getter rather than caching the object. */
   get log() { return this._log; }
+
+  /** The SnapshotStore (latest/verify/openFile for serving InstallSnapshot
+   * chunks in roadmap step 5), or null if the provider lacks listFiles(). */
+  get snapshots() { return this._store; }
 
   async collection(name) {
     let col = this._collections.get(name);
@@ -97,15 +141,98 @@ class WalDb {
 
   async listCollections() { return this._db.listCollections(); }
 
-  async dropCollection() {
-    throw new Error(
-      'dropCollection is not supported on a WAL database yet: the log still ' +
-      'holds the collection\'s entries, which would resurrect it on replay. ' +
-      'Log compaction (replication roadmap step 3) provides the barrier.'
-    );
+  /** Drop a collection. The drop itself is not logged; instead the drop
+   * is immediately followed by a snapshot, whose log compaction discards
+   * every entry at or below the boundary — so no pre-drop entry survives
+   * to resurrect the collection on replay. */
+  async dropCollection(name) {
+    this._requireStore('dropCollection');
+    return this._serialize(async () => {
+      const dropped = await this._db.dropCollection(name);
+      if (!dropped) return false;
+      this._collections.delete(name);
+      await this._snapshotLocked();
+      return true;
+    });
   }
 
-  async compact(options) { return this._db.compact(options); }
+  /**
+   * Stream the whole database into a new immutable snapshot generation,
+   * stamped with the current log boundary, then compact the log through
+   * that boundary and adopt the compacted file (pruning predecessors).
+   * Returns the store's adopted-snapshot descriptor ({ gen,
+   * lastIncludedIndex, lastIncludedTerm, config, files }). Host-driven,
+   * like compact()/pruneExpired(): call it on your own trigger (e.g. when
+   * `db.log.fileLen` outgrows the data). Serialized against writes; reads
+   * may run concurrently (structure compaction only reads live trees).
+   */
+  async snapshot() {
+    this._requireStore('snapshot');
+    return this._serialize(() => this._snapshotLocked());
+  }
+
+  _requireStore(what) {
+    if (!this._store) {
+      throw new Error(`${what} requires a storage provider with listFiles() (the SnapshotStore scans and sweeps by directory listing)`);
+    }
+  }
+
+  async _snapshotLocked() {
+    const log = this._log;
+    const lastIncludedIndex = log.lastIndex;
+    const lastIncludedTerm = log.lastTerm;
+
+    // Build the generation: every structure streams its live entries into
+    // a fresh role file (compact() reads from the live tree and closes the
+    // destination). `live` maps each role back to the file name the
+    // database actually opens -- what a restore/install copies onto.
+    const tx = await this._store.begin();
+    const live = [];
+    let n = 0;
+    const add = async (liveName, structure) => {
+      const role = `f${n++}`;
+      await structure.compact(await tx.createFile(role));
+      live.push({ role, name: liveName });
+    };
+    try {
+      await add(CATALOG_FILE, this._db._catalog);
+      for (const name of await this._db.listCollections()) {
+        const col = await this._db.collection(name);
+        await add(this._db._catalog.search(name).file, col._tree);
+        for (const ix of col._indexes.values()) {
+          if (ix.kind === 'equality') await add(ix.file, ix.tree);
+          else if (ix.kind === 'text') {
+            await add(ix.files.index, ix.trees.index);
+            await add(ix.files.docTerms, ix.trees.docTerms);
+            await add(ix.files.docLengths, ix.trees.docLengths);
+          } else await add(ix.file, ix.rt);
+        }
+      }
+      await tx.commit({ lastIncludedIndex, lastIncludedTerm, config: { live } });
+    } catch (err) {
+      await tx.abort();
+      throw err;
+    }
+
+    // Pair the compacted log with the generation and adopt it: the old
+    // log is only pruned once its successor is durable, so a crash
+    // anywhere in this window leaves an openable predecessor behind.
+    const { name: logName, handle } = await this._store.createLogFile();
+    await log.compact(handle, lastIncludedIndex, lastIncludedTerm);
+    await log.close();
+    const fresh = new EntryLog(await this._provider.openFile(logName, { create: false }));
+    await fresh.open();
+    this._log = fresh;
+    await this._store.pruneLogs(logName);
+    if (logName !== WAL_FILE) {
+      try { await this._provider.deleteFile(WAL_FILE); } catch { /* best-effort */ }
+    }
+    return this._store.latest;
+  }
+
+  /** Serialized against writes and snapshots -- a compact() swapping a
+   * collection's files mid-snapshot would tear the generation. */
+  async compact(options) { return this._serialize(() => this._db.compact(options)); }
 
   async close() {
     if (!this.isOpen) return;
@@ -217,9 +344,11 @@ class WalCollection {
   explain(filter) { return this._inner.explain(filter); }
   watch(options) { return this._inner.watch(options); }
   listIndexes() { return this._inner.listIndexes(); }
-  createIndex(keys, options) { return this._inner.createIndex(keys, options); }
-  dropIndex(name) { return this._inner.dropIndex(name); }
-  compact() { return this._inner.compact(); }
+  /** Index DDL and compact are serialized like WalDb.compact -- they
+   * change the collection's file set, which must not happen mid-snapshot. */
+  createIndex(keys, options) { return this._wal._serialize(() => this._inner.createIndex(keys, options)); }
+  dropIndex(name) { return this._wal._serialize(() => this._inner.dropIndex(name)); }
+  compact() { return this._wal._serialize(() => this._inner.compact()); }
   appliedIndex() { return this._inner.appliedIndex(); }
 
   // ---- logged writes ------------------------------------------------------
@@ -497,24 +626,98 @@ class WalCollection {
 }
 
 /**
- * Open a WAL-fronted database: connect the inner Db, open (or create) the
- * shared entry log, and replay whatever committed suffix the collections
- * haven't applied. Options pass through to connect() (order, autoCompact).
+ * Open a WAL-fronted database: connect the inner Db, adopt the snapshot
+ * store's newest valid generation (sweeping crashed/superseded ones),
+ * adopt the newest entry log that opens — generation-paired logs newest
+ * first (a torn newest falls back to its predecessor, which is only ever
+ * pruned after a successor is durable), then the legacy fixed-name file
+ * — and replay whatever committed suffix the collections haven't
+ * applied. Options pass through to connect() (order, autoCompact), plus
+ * `snapshotPrefix` (default '__snap').
  */
 export async function connectWal(provider, options = {}) {
-  const db = await connect(provider, options);
-  const handle = await provider.openFile(WAL_FILE, { create: true });
-  const log = new EntryLog(handle);
+  const { snapshotPrefix = SNAP_PREFIX, ...dbOptions } = options;
+  const db = await connect(provider, dbOptions);
   try {
-    await log.open();
+    let store = null;
+    if (typeof provider.listFiles === 'function') {
+      store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
+      await store.open();
+    }
+
+    let log = null;
+    let logName = null;
+    const candidates = store ? await store.logCandidates() : [];
+    candidates.push(WAL_FILE);
+    for (const name of candidates) {
+      try {
+        const l = new EntryLog(await provider.openFile(name, { create: false }));
+        await l.open();
+        log = l;
+        logName = name;
+        break;
+      } catch { /* missing or torn: try the predecessor */ }
+    }
+    if (!log) {
+      if (store && store.latest) {
+        // A snapshot with no openable log: start a fresh one at the
+        // snapshot boundary so recovery/replication resume from there.
+        const { name, handle } = await store.createLogFile();
+        handle.truncate(0); // the name may be a torn leftover
+        log = new EntryLog(handle, {
+          baseIndex: store.latest.lastIncludedIndex,
+          baseTerm: store.latest.lastIncludedTerm
+        });
+        logName = name;
+      } else {
+        log = new EntryLog(await provider.openFile(WAL_FILE, { create: true }));
+        logName = WAL_FILE;
+      }
+      await log.open();
+    }
     if (log.currentTerm === 0) log.setHardState(1);
+
+    if (store) {
+      await store.pruneLogs(logName);
+      if (logName !== WAL_FILE) {
+        try { await provider.deleteFile(WAL_FILE); } catch { /* best-effort */ }
+      }
+    }
+
+    const walDb = new WalDb(db, log, { provider, store });
+    await walDb._recover();
+    return walDb;
   } catch (err) {
     await db.close();
     throw err;
   }
-  const walDb = new WalDb(db, log);
-  await walDb._recover();
-  return walDb;
+}
+
+/**
+ * The local half of a snapshot install (and the disaster-recovery path):
+ * put the database's live files exactly at the store's adopted snapshot.
+ * Deletes the current catalog and every collection/index/journal file
+ * (a stale journal against restored files could rewind them), then
+ * stream-copies each generation file to its live name, verifying each
+ * against the manifest's CRC. Entry-log files are untouched: a following
+ * connectWal() adopts the newest log and replays the suffix beyond the
+ * snapshot boundary — delete the log files first for a boundary-exact
+ * restore. Returns the adopted snapshot descriptor.
+ */
+export async function restoreLatestSnapshot(provider, { snapshotPrefix = SNAP_PREFIX } = {}) {
+  if (typeof provider.listFiles !== 'function') {
+    throw new Error('restoreLatestSnapshot requires a storage provider with listFiles()');
+  }
+  const store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
+  await store.open();
+  if (!store.latest) throw new Error('No snapshot to restore');
+  for (const name of await provider.listFiles()) {
+    if (name === CATALOG_FILE || DB_FILE_PATTERN.test(name)) await provider.deleteFile(name);
+  }
+  for (const { role, name } of store.latest.config.live) {
+    await store.copyFile(role, await provider.openFile(name, { create: true }));
+  }
+  return store.latest;
 }
 
 export { WalDb, WalCollection, WAL_FILE };

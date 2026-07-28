@@ -2078,13 +2078,15 @@ class Collection {
    * { rc, defaultId }. Shared by replaceOne/updateOne/updateMany, which all
    * pass a filter + a second document and may need a fresh id for an
    * upsert (see the Db/Collection section's top comment for why JS always
-   * generates one rather than C inventing it).
+   * generates one rather than C inventing it). `defaultId` may be supplied
+   * by the caller -- the WAL layer (src/db-wal.js) pins the id a logged
+   * upsert command resolved at proposal time, so replaying the command
+   * upserts the identical document.
    */
-  _marshalTriple(a, b, fn) {
+  _marshalTriple(a, b, fn, defaultId = new ObjectId()) {
     const M = requireModule();
     const aBytes = encode(a);
     const bBytes = encode(b);
-    const defaultId = new ObjectId();
     const idBytes = defaultId.toBytes();
 
     const ap = aBytes.length ? M._malloc(aBytes.length) : 0;
@@ -2103,14 +2105,14 @@ class Collection {
     }
   }
 
-  async replaceOne(filter, replacement, { upsert = false } = {}) {
+  async replaceOne(filter, replacement, { upsert = false, _defaultId } = {}) {
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('replaceOne requires a replacement document object');
     }
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
     const { rc, defaultId } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp) =>
-      M._dcw_replace_one(this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0));
+      M._dcw_replace_one(this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0), _defaultId);
     if (rc < 0) throw codeError(rc, 'replaceOne');
 
     if (rc === 0) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
@@ -2134,13 +2136,13 @@ class Collection {
    * happened (or `returnDocument: 'before'` with an upsert: no prior state
    * to return, matching real MongoDB).
    */
-  async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before' } = {}) {
+  async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before', _defaultId } = {}) {
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('findOneAndReplace requires a replacement document object');
     }
     const returnNew = returnDocument === 'after';
     const { rc } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp) =>
-      M._dcw_find_one_and_replace(this._outCtx, this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0, returnNew ? 1 : 0));
+      M._dcw_find_one_and_replace(this._outCtx, this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0, returnNew ? 1 : 0), _defaultId);
     if (rc < 0) throw codeError(rc, 'findOneAndReplace');
     if (!rc) return null;
     const doc = this._readOut(requireModule());
@@ -2161,7 +2163,7 @@ class Collection {
    * must be entirely $-prefixed operators; for a full replacement document
    * use replaceOne instead.
    */
-  async updateOne(filter, update, { upsert = false } = {}) {
+  async updateOne(filter, update, { upsert = false, _defaultId } = {}) {
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateOne requires an update document object');
     }
@@ -2169,7 +2171,7 @@ class Collection {
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
     const { rc, defaultId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_update_one(this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0));
+      M._dcw_update_one(this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0), _defaultId);
     if (rc < 0) throw codeError(rc, 'updateOne');
 
     if (rc === 0) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
@@ -2191,14 +2193,14 @@ class Collection {
    * the default) or the post-image (`'after'`) — or null, following
    * findOneAndReplace's exact convention for "nothing to return".
    */
-  async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before' } = {}) {
+  async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before', _defaultId } = {}) {
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('findOneAndUpdate requires an update document object');
     }
     update = resolveCurrentDate(update);
     const returnNew = returnDocument === 'after';
     const { rc } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_find_one_and_update(this._outCtx, this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0, returnNew ? 1 : 0));
+      M._dcw_find_one_and_update(this._outCtx, this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0, returnNew ? 1 : 0), _defaultId);
     if (rc < 0) throw codeError(rc, 'findOneAndUpdate');
     if (!rc) return null;
     const doc = this._readOut(requireModule());
@@ -2216,7 +2218,7 @@ class Collection {
    * detect no-op updates (e.g. $set to a field's current value already
    * matching) — modifiedCount always mirrors matchedCount.
    */
-  async updateMany(filter, update, { upsert = false } = {}) {
+  async updateMany(filter, update, { upsert = false, _defaultId } = {}) {
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateMany requires an update document object');
     }
@@ -2224,7 +2226,7 @@ class Collection {
     const watching = this._watchers.size > 0;
     const preIds = watching ? (await this.find(filter, { projection: { _id: 1 } }).toArray()).map(d => d._id) : null;
     const { rc, defaultId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_update_many(this._outCtx, this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0));
+      M._dcw_update_many(this._outCtx, this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0), _defaultId);
     if (rc !== 0) throw codeError(rc, 'updateMany');
 
     const result = this._readOut(requireModule());
@@ -2892,6 +2894,7 @@ export {
   applyDelta,
   MemoryStorageProvider,
   OPFSStorageProvider,
+  resolveCurrentDate,
   ChangeStream,
   Collection,
   Db,

@@ -25,6 +25,10 @@ export class TextLog { [key: string]: any }
 export class TiledTextLog { [key: string]: any }
 export class TextIndex { [key: string]: any }
 export const ENTRY_TYPE: Record<string, number>;
+export class EntryLog { constructor(handle: any, options?: { baseIndex?: number; baseTerm?: number }); [key: string]: any }
+export const ENTRYLOG_TYPE: Record<string, number>;
+export class SnapshotStore { [key: string]: any }
+export function crc32(bytes: Uint8Array, prev?: number): number;
 export function exists(dir: any, name: string): Promise<boolean>;
 export function deleteFile(dir: any, name: string): Promise<void>;
 export function getFileHandle(dir: any, name: string, options?: { create?: boolean }): Promise<any>;

@@ -14,7 +14,9 @@ export default defineConfig({
     },
     // *.browser.test.js needs a real browser (Worker/BroadcastChannel/
     // navigator.locks/OPFS) -- run those via `npm run test:browser`
-    // (vitest.browser.config.js) instead.
-    exclude: ['**/node_modules/**', 'test/*.browser.test.js']
+    // (vitest.browser.config.js) instead. third_party submodules carry
+    // their own test suites (and their own devDependencies) -- run those
+    // from the submodule repos, not here.
+    exclude: ['**/node_modules/**', 'test/*.browser.test.js', 'third_party/**']
   }
 });

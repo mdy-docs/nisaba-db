@@ -419,3 +419,64 @@ describe('raft: config precedence on restart', () => {
     expect(reborn.machine.map.get('after')).toBe(2);
   });
 });
+
+describe('raft: leadership transfer (TimeoutNow, §3.10)', () => {
+  it('moves leadership to a caught-up voter: immediate election, old leader steps down, writes continue', async () => {
+    const { sim, cluster, leader } = await electedCluster(41);
+    const old = leader();
+    await settle(sim, cluster, old.node.propose(kvSet('before', 1)));
+    const target = [...cluster.values()].find((m) => m.node.id !== old.node.id);
+
+    const { error } = await settle(sim, cluster, old.node.transferLeadership(target.node.id));
+    expect(error).toBeUndefined();
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    expect(target.node.role).toBe('leader');
+    expect(old.node.role).toBe('follower');
+
+    // Committed data survived and the new leader serves writes.
+    expect(target.machine.map.get('before')).toBe(1);
+    const w = await settle(sim, cluster, target.node.propose(kvSet('after', 2)));
+    expect(w.error).toBeUndefined();
+  });
+
+  it('fences new proposals during the transfer, hinting the TARGET as the leader', async () => {
+    const { sim, cluster, leader } = await electedCluster(42);
+    const old = leader();
+    await settle(sim, cluster, old.node.propose(kvSet('a', 1)));
+    const target = [...cluster.values()].find((m) => m.node.id !== old.node.id);
+
+    const transfer = old.node.transferLeadership(target.node.id);
+    let fenced = null;
+    await old.node.propose(kvSet('b', 2)).catch((err) => (fenced = err));
+    expect(fenced).toBeInstanceOf(NotLeaderError);
+    expect(fenced.leaderId).toBe(target.node.id); // rerouting callers land where leadership is headed
+    expect((await settle(sim, cluster, transfer)).error).toBeUndefined();
+  });
+
+  it('transfer to self is a no-op; a non-voter target and a non-leader caller are refused', async () => {
+    const { sim, cluster, leader } = await electedCluster(43);
+    const old = leader();
+    await expect(old.node.transferLeadership(old.node.id)).resolves.toBeUndefined();
+    await expect(old.node.transferLeadership(99)).rejects.toThrow(/not a voting member/);
+    const follower = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    await expect(follower.node.transferLeadership(old.node.id)).rejects.toThrow(NotLeaderError);
+    // Nothing above disturbed the incumbent.
+    expect(old.node.role).toBe('leader');
+    const w = await settle(sim, cluster, old.node.propose(kvSet('x', 1)));
+    expect(w.error).toBeUndefined();
+  });
+
+  it('aborts when the target is unreachable: the fence lifts and the leader resumes serving', async () => {
+    const { sim, net, cluster, leader } = await electedCluster(44);
+    const old = leader();
+    await settle(sim, cluster, old.node.propose(kvSet('a', 1)));
+    const target = [...cluster.values()].find((m) => m.node.id !== old.node.id);
+    net.partition([...cluster.keys()].filter((id) => id !== target.node.id), [target.node.id]);
+
+    const { error } = await settle(sim, cluster, old.node.transferLeadership(target.node.id));
+    expect(String(error?.message)).toMatch(/timed out/);
+    expect(old.node.role).toBe('leader'); // still the incumbent...
+    const w = await settle(sim, cluster, old.node.propose(kvSet('b', 2)));
+    expect(w.error).toBeUndefined();      // ...and the fence is gone
+  });
+});

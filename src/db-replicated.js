@@ -117,6 +117,20 @@ export class ReplicatedDb extends WalDb {
    * clock, handleMessage() for the transport's receiving half. */
   get raft() { return this._raft; }
 
+  /**
+   * Graceful leadership transfer to another VOTING member — the
+   * zero-data-copy rebalance (RaftNode.transferLeadership, §3.10):
+   * fence new writes (they reject NotLeaderError hinting the target),
+   * catch the target up, TimeoutNow, step down when it wins. Resolves
+   * once leadership has left this node; rejects — and normal service
+   * resumes — if the target doesn't take over in time. Leader-only:
+   * callers route it like any write.
+   */
+  async transferLeadership(targetId, options) {
+    if (!this._raft) throw new Error('transferLeadership: node is not started');
+    return this._raft.transferLeadership(targetId, options);
+  }
+
   /** One JSON-able snapshot: the RaftNode's status plus the database's
    * own facts (collections, snapshot generation, applied position).
    * Async because the collection list is. */

@@ -231,6 +231,7 @@ export class RaftNode {
     this._exclusive = null;       // runExclusive gate promise, or null
     this._quiesced = false;       // timers parked (see quiesce/wake)
     this._configInFlight = false; // one membership change at a time
+    this._transfer = null;        // in-flight leadership transfer: {targetId, deadline, sent, resolve, reject}
   }
 
   /**
@@ -373,6 +374,11 @@ export class RaftNode {
   async stop() {
     if (this.isRunning) this._emit('stopped');
     this.isRunning = false;
+    if (this._transfer) {
+      const t = this._transfer;
+      this._transfer = null;
+      t.reject(new Error('node stopped during leadership transfer'));
+    }
     this._rejectWaiters(new NotLeaderError(0));
     await this._applyChain.catch(() => {});
   }
@@ -385,6 +391,15 @@ export class RaftNode {
     // Removed nodes and learners never campaign (leaders still heartbeat).
     if (!this.voters.includes(this.id) && this.role !== ROLE.LEADER) return;
     if (this.role === ROLE.LEADER) {
+      if (this._transfer && this._now >= this._transfer.deadline) {
+        // The target never took over (down, unreachable, refusing) —
+        // lift the fence and resume normal service; the caller retries
+        // or picks another target.
+        const t = this._transfer;
+        this._transfer = null;
+        this._emit('transfer', { phase: 'aborted', target: t.targetId });
+        t.reject(new Error(`leadership transfer to node ${t.targetId} timed out; resuming normal service`));
+      }
       if (this._now >= this._heartbeatDue) {
         this._heartbeatDue = this._now + this.heartbeatMs;
         for (const p of this.peers) this._replicate(p);
@@ -432,6 +447,12 @@ export class RaftNode {
     if (!this.isRunning || this.role !== ROLE.LEADER) {
       return Promise.reject(new NotLeaderError(this.leaderId));
     }
+    if (this._transfer) {
+      // Transfer fence (§3.10: a transferring leader stops taking new
+      // proposals). The TARGET rides as the leader hint, so rerouting
+      // callers land where leadership is headed.
+      return Promise.reject(new NotLeaderError(this._transfer.targetId));
+    }
     this.wake(); // a quiesced leader must resume heartbeats to replicate
     const term = this.log.currentTerm;
     const index = this.log.append(term, payload, type);
@@ -447,6 +468,70 @@ export class RaftNode {
   /** Peers the leader knows are behind its log base and cannot be caught
    * up by AppendEntries — they need an InstallSnapshot (roadmap 5b). */
   get peersNeedingSnapshot() { return [...this._needsSnapshot]; }
+
+  /**
+   * Graceful leadership transfer (the paper's §3.10 / TimeoutNow flow —
+   * the zero-data-copy rebalance a leader-skewed fleet wants). Leader
+   * only. Fences NEW proposals (they reject NotLeaderError with the
+   * TARGET as the leader hint, so rerouting callers land where
+   * leadership is headed), brings the target fully up to date, then
+   * tells it to campaign IMMEDIATELY — a real election that skips
+   * pre-vote, whose leader-stickiness exists precisely to block
+   * challengers while this still-live leader is heard from. The
+   * target's RequestVote at term+1 makes this node step down and grant.
+   *
+   * Resolves once this node has actually left leadership (however that
+   * happens — the target's election is the expected way). Rejects, and
+   * lifts the fence so normal service resumes, if leadership hasn't
+   * moved within `timeoutMs` (default 2x the max election timeout):
+   * the target is down, unreachable, or refusing. In-flight proposals
+   * ride the ordinary leadership-change semantics — committed entries
+   * resolve, uncommitted ones reject NotLeaderError at step-down.
+   * Transfer to self resolves immediately; a non-voter target is
+   * refused outright (a learner cannot win the election this triggers).
+   */
+  transferLeadership(targetId, { timeoutMs = this.electionTimeoutMs[1] * 2 } = {}) {
+    if (this._exclusive) {
+      return this._exclusive.then(() => this.transferLeadership(targetId, { timeoutMs }));
+    }
+    if (!this.isRunning || this.role !== ROLE.LEADER) {
+      return Promise.reject(new NotLeaderError(this.leaderId));
+    }
+    if (targetId === this.id) return Promise.resolve();
+    if (!this.voters.includes(targetId)) {
+      return Promise.reject(new Error(`transferLeadership: node ${targetId} is not a voting member`));
+    }
+    if (this._transfer) {
+      return Promise.reject(new Error(`a leadership transfer to node ${this._transfer.targetId} is already in flight`));
+    }
+    this.wake(); // a parked leader must replicate to catch the target up
+    const promise = new Promise((resolve, reject) => {
+      this._transfer = { targetId, deadline: this._now + timeoutMs, sent: false, resolve, reject };
+    });
+    this._emit('transfer', { phase: 'started', target: targetId });
+    this._maybeCompleteTransfer(targetId); // already caught up -> TimeoutNow right away
+    this._replicate(targetId);            // else close the gap; the ack re-checks
+    return promise;
+  }
+
+  /** The transfer's trigger point, called from every successful
+   * replication ack: once the TARGET's match reaches our last index it
+   * is as up to date as we are, so send TimeoutNow. A failed or refused
+   * send re-arms and retries on the next ack (heartbeats keep those
+   * coming); a target that never answers hits the tick() deadline. */
+  _maybeCompleteTransfer(peer) {
+    const t = this._transfer;
+    if (!t || t.sent || peer !== t.targetId) return;
+    if ((this._match.get(peer) ?? 0) < this.log.lastIndex) return;
+    t.sent = true;
+    this.transport.call(peer, { kind: 'timeoutNow', term: this.log.currentTerm, leaderId: this.id })
+      .then((reply) => {
+        if (this._transfer === t && reply && reply.ok === false) t.sent = false;
+      })
+      .catch(() => {
+        if (this._transfer === t) t.sent = false;
+      });
+  }
 
   /**
    * Propose a new member set — full replacement, as member records
@@ -574,8 +659,25 @@ export class RaftNode {
       case 'installSnapshot': return this._onInstallSnapshot(msg);
       case 'join': return this._onJoin(msg);
       case 'leave': return this._onLeave(msg);
+      case 'timeoutNow': return this._onTimeoutNow(msg);
       default: throw new Error(`raft: unknown message kind "${msg.kind}"`);
     }
+  }
+
+  /** TimeoutNow (§3.10): the transferring leader certifies we are fully
+   * caught up and asks us to campaign NOW — a real election, skipping
+   * pre-vote, whose leader-stickiness exists precisely to block
+   * challengers while that leader still lives. Refused when
+   * stale-termed, when we already lead, or when we hold no franchise
+   * (a learner cannot win the election this would start). */
+  _onTimeoutNow(msg) {
+    const currentTerm = this.log.currentTerm;
+    if (msg.term < currentTerm) return { term: currentTerm, ok: false };
+    if (this.role === ROLE.LEADER || !this.voters.includes(this.id)) {
+      return { term: currentTerm, ok: false };
+    }
+    this._startElection(false);
+    return { term: this.log.currentTerm, ok: true };
   }
 
   _onRequestVote(msg) {
@@ -767,6 +869,15 @@ export class RaftNode {
     this.role = ROLE.FOLLOWER;
     this.leaderId = leaderId;
     this._resetElectionTimer();
+    if (wasLeader && this._transfer) {
+      // Leadership has left this node — the transfer's goal state
+      // (normally via the target's election; any other usurper makes
+      // the transfer moot the same way).
+      const t = this._transfer;
+      this._transfer = null;
+      this._emit('transfer', { phase: 'finished', target: t.targetId });
+      t.resolve();
+    }
     if (wasLeader) this._rejectWaiters(new NotLeaderError(leaderId));
     if (changed) this._emit('role', { role: this.role, leaderId, wasLeader });
   }
@@ -876,6 +987,7 @@ export class RaftNode {
           this._advanceCommit();
         }
         this._maybePromote(peer);
+        this._maybeCompleteTransfer(peer);
         again = this._next.get(peer) <= this.log.lastIndex;
       } else {
         // Back up along the follower's hint (never forward of a plain

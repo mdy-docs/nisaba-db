@@ -290,6 +290,26 @@ describe('replicated db: failures and recovery', () => {
     for (const m of cluster.values()) await m.rdb.close();
   });
 
+  it('transferLeadership moves the leader with zero data copied; the new leader serves reads and writes', async () => {
+    const sim = new Sim(91);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeDbCluster(3, sim, net);
+    const old = leaderOf(cluster);
+    const users = await old.rdb.collection('users');
+    await settle(sim, cluster, users.insertOne({ _id: oid(1), name: 'Ada' }));
+
+    const target = followersOf(cluster)[0];
+    const { error } = await settle(sim, cluster, old.rdb.transferLeadership(target.id));
+    expect(error).toBeUndefined();
+    await until(sim, cluster, () => leaders(cluster).length === 1 && leaders(cluster)[0].id === target.id);
+
+    const users2 = await target.rdb.collection('users');
+    expect((await users2.findOne({ _id: oid(1) })).name).toBe('Ada'); // its own replica, no install happened
+    const w = await settle(sim, cluster, users2.insertOne({ _id: oid(2), name: 'Grace' }));
+    expect(w.error).toBeUndefined();
+    for (const m of cluster.values()) await m.rdb.close();
+  });
+
   it('a member rebooted from applied-state-only files (log lost) re-bases its log and serves again', async () => {
     // The backup-restore shape (connectWal has the single-node twin of
     // this test): the database files carry appliedIndex = N, but the

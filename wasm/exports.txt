@@ -61,6 +61,7 @@ _catw_open_plan
 _catw_list_indexes
 _catw_put_index
 _catw_drop_index
+_catw_create_plan
 _catw_ptr
 _catw_len
 

@@ -1726,7 +1726,180 @@ TEST(catalog_drop_index_leaves_the_rest_intact) {
     bj_builder_free(b2); bj_builder_free(b1); bj_builder_free(eb);
 }
 
+TEST(create_plan_names_and_classifies_indexes) {
+    struct { const char *field; int dir_is_string; const char *dir; const char *want_name; int want_kind; }
+    cases[] = {
+        { "team", 0, NULL,       "team_1",       DC_INDEX_EQUALITY },
+        { "body", 1, "text",     "body_text",    DC_INDEX_TEXT     },
+        { "loc",  1, "2dsphere", "loc_2dsphere", DC_INDEX_GEO      },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        doc *k = doc_new();
+        if (cases[i].dir_is_string) doc_str(k, cases[i].field, cases[i].dir);
+        else                        doc_int(k, cases[i].field, 1);
+        uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+        doc *o = doc_new();
+        uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+
+        dbuf plan = {0};
+        CHECK_OK(dc_index_create_plan(keys, klen, opts, olen, "users", 5, &plan));
+        CHECK(find_bytes(plan.data, plan.len, cases[i].want_name,
+                         strlen(cases[i].want_name)) != NULL);
+        dbuf_free(&plan);
+        doc_free(o); doc_free(k);
+    }
+
+    /* Compound naming joins each field's "_1". */
+    {
+        doc *k = doc_new();
+        doc_int(k, "team", 1);
+        doc_int(k, "age", 1);
+        uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+        doc *o = doc_new();
+        uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+        dbuf plan = {0};
+        CHECK_OK(dc_index_create_plan(keys, klen, opts, olen, "users", 5, &plan));
+        CHECK(find_bytes(plan.data, plan.len, "team_1_age_1", 12) != NULL);
+        CHECK(find_bytes(plan.data, plan.len, "idx-users-team_1_age_1.bj", 25) != NULL);
+        dbuf_free(&plan);
+        doc_free(o); doc_free(k);
+    }
+
+    /* A text index names its three files in attach order. */
+    {
+        doc *k = doc_new();
+        doc_str(k, "body", "text");
+        uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+        doc *o = doc_new();
+        uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+        dbuf plan = {0};
+        CHECK_OK(dc_index_create_plan(keys, klen, opts, olen, "posts", 5, &plan));
+        const uint8_t *t = find_bytes(plan.data, plan.len, "body_text-terms.bj", 18);
+        const uint8_t *d = find_bytes(plan.data, plan.len, "body_text-documents.bj", 22);
+        const uint8_t *l = find_bytes(plan.data, plan.len, "body_text-lengths.bj", 20);
+        CHECK(t && d && l);
+        if (t && d && l) { CHECK(t < d); CHECK(d < l); }
+        dbuf_free(&plan);
+        doc_free(o); doc_free(k);
+    }
+
+    /* options.name overrides the convention, and the file follows it. */
+    {
+        doc *k = doc_new();
+        doc_int(k, "team", 1);
+        uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+        doc *o = doc_new();
+        doc_str(o, "name", "by_team");
+        uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+        dbuf plan = {0};
+        CHECK_OK(dc_index_create_plan(keys, klen, opts, olen, "users", 5, &plan));
+        CHECK(find_bytes(plan.data, plan.len, "idx-users-by_team.bj", 20) != NULL);
+        dbuf_free(&plan);
+        doc_free(o); doc_free(k);
+    }
+}
+
+TEST(create_plan_enforces_the_option_rules) {
+    /* Equality-only options on a special index. */
+    {
+        doc *k = doc_new();
+        doc_str(k, "body", "text");
+        uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+        doc *o = doc_new();
+        doc_key(o, "unique");
+        bj_put_bool(o->b, 1);
+        uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+        dbuf plan = {0};
+        CHECK_RC(dc_index_create_plan(keys, klen, opts, olen, "p", 1, &plan),
+                 DC_ERR_INDEX_OPTION_UNSUPPORTED);
+        dbuf_free(&plan);
+        doc_free(o); doc_free(k);
+    }
+    /* ...but an explicitly FALSE one is not "supplied": a caller spreading
+     * a defaults object must still be able to create a text index. */
+    {
+        doc *k = doc_new();
+        doc_str(k, "body", "text");
+        uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+        doc *o = doc_new();
+        doc_key(o, "unique");
+        bj_put_bool(o->b, 0);
+        doc_key(o, "sparse");
+        bj_put_bool(o->b, 0);
+        uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+        dbuf plan = {0};
+        CHECK_OK(dc_index_create_plan(keys, klen, opts, olen, "p", 1, &plan));
+        dbuf_free(&plan);
+        doc_free(o); doc_free(k);
+    }
+    /* A TTL needs one field to expire on. */
+    {
+        doc *k = doc_new();
+        doc_int(k, "a", 1);
+        doc_int(k, "b", 1);
+        uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+        doc *o = doc_new();
+        doc_int(o, "expireAfterSeconds", 60);
+        uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+        dbuf plan = {0};
+        CHECK_RC(dc_index_create_plan(keys, klen, opts, olen, "u", 1, &plan),
+                 DC_ERR_TTL_NEEDS_SINGLE_FIELD);
+        dbuf_free(&plan);
+        doc_free(o); doc_free(k);
+    }
+    /* A descending spec is still refused, by the same validator
+     * createIndex always used. */
+    {
+        doc *k = doc_new();
+        doc_int(k, "team", -1);
+        uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+        doc *o = doc_new();
+        uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+        dbuf plan = {0};
+        CHECK_RC(dc_index_create_plan(keys, klen, opts, olen, "u", 1, &plan),
+                 DC_ERR_NON_ASCENDING_KEY);
+        dbuf_free(&plan);
+        doc_free(o); doc_free(k);
+    }
+}
+
+TEST(create_plan_output_is_what_the_catalog_stores_and_replays) {
+    /*
+     * One shape, all the way round: create -> store -> open. If these three
+     * ever disagree, an index is created under one name and reopened under
+     * another, or with a file that was never made.
+     */
+    doc *k = doc_new();
+    doc_str(k, "body", "text");
+    uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+    doc *o = doc_new();
+    uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+
+    dbuf plan = {0};
+    CHECK_OK(dc_index_create_plan(keys, klen, opts, olen, "posts", 5, &plan));
+
+    const uint8_t *entry; size_t entry_len;
+    bj_builder *eb = empty_entry(&entry, &entry_len);
+    dbuf stored = {0};
+    CHECK_OK(dc_catalog_put_index(entry, entry_len, plan.data, plan.len, &stored));
+
+    dbuf reopened = {0};
+    CHECK_OK(dc_catalog_open_plan(stored.data, stored.len, "posts", 5, &reopened));
+
+    /* Every file the create plan named must appear in the open plan. */
+    CHECK(find_bytes(reopened.data, reopened.len, "body_text-terms.bj", 18) != NULL);
+    CHECK(find_bytes(reopened.data, reopened.len, "body_text-documents.bj", 22) != NULL);
+    CHECK(find_bytes(reopened.data, reopened.len, "body_text-lengths.bj", 20) != NULL);
+    CHECK(find_bytes(reopened.data, reopened.len, "body_text", 9) != NULL);
+
+    dbuf_free(&reopened); dbuf_free(&stored); dbuf_free(&plan);
+    bj_builder_free(eb); doc_free(o); doc_free(k);
+}
+
 int main(void) {
+    RUN(create_plan_names_and_classifies_indexes);
+    RUN(create_plan_enforces_the_option_rules);
+    RUN(create_plan_output_is_what_the_catalog_stores_and_replays);
     RUN(catalog_write_and_read_sides_agree);
     RUN(catalog_put_index_replaces_rather_than_duplicates);
     RUN(catalog_drop_index_leaves_the_rest_intact);

@@ -3,11 +3,20 @@
  */
 #include "db_catalog.h"
 #include "db_names.h"
+#include "db_validate.h"
 #include "bjcursor.h"
 
 #include <string.h>
 
 /* ---- small readers over an encoded entry ------------------------------- */
+
+/* Element count of a binjson ARRAY, or -1. */
+static long arr_len_of(const uint8_t *arr, size_t len) {
+    cur c = { arr, len, 0 };
+    uint32_t n;
+    if (array_begin(&c, &n) != BJ_OK) return -1;
+    return (long)n;
+}
 
 /* A STRING field's bytes, or found = 0. */
 static int str_field(const uint8_t *obj, size_t obj_len, const char *key,
@@ -498,4 +507,175 @@ int dc_catalog_put_index(const uint8_t *entry, size_t entry_len,
 int dc_catalog_drop_index(const uint8_t *entry, size_t entry_len,
                           const char *name, size_t name_len, dbuf *out) {
     return rewrite_indexes(entry, entry_len, name, name_len, NULL, 0, out);
+}
+
+/* ---- planning a new index ---------------------------------------------- */
+
+/* Does `options` carry any of the equality-only options? */
+static int has_equality_only_option(const uint8_t *opt, size_t opt_len) {
+    static const char *const KEYS[] = {
+        "unique", "sparse", "partialFilterExpression", "expireAfterSeconds"
+    };
+    for (size_t i = 0; i < sizeof(KEYS) / sizeof(KEYS[0]); i++) {
+        const uint8_t *v; size_t vlen; int found = 0;
+        if (obj_get_field(opt, opt_len, (const uint8_t *)KEYS[i],
+                          (uint32_t)strlen(KEYS[i]), &v, &vlen, &found) != BJ_OK) continue;
+        /* Explicitly false/null is not "supplied" -- a caller spreading a
+         * default options object should not be refused a text index. */
+        if (!found || vlen < 1) continue;
+        if (v[0] == BJ_TYPE_FALSE || v[0] == BJ_TYPE_NULL) continue;
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * The single field of a one-field spec whose value is the STRING `want`,
+ * e.g. {body: "text"}. Returns 1 and fills the field span on a match.
+ */
+static int special_spec(const uint8_t *keys, size_t keys_len, const char *want,
+                        const uint8_t **field, uint32_t *field_len) {
+    cur c = { keys, keys_len, 0 };
+    uint32_t n;
+    if (object_begin(&c, &n) != BJ_OK || n != 1) return 0;
+    const uint8_t *kp; uint32_t klen;
+    if (take_key(&c, &kp, &klen) != BJ_OK) return 0;
+    const uint8_t *sp; uint32_t slen;
+    if (take_string(&c, &sp, &slen) != BJ_OK) return 0;
+    if (slen != strlen(want) || memcmp(sp, want, slen) != 0) return 0;
+    *field = kp; *field_len = klen;
+    return 1;
+}
+
+/* options.name, or NULL. */
+static int explicit_name(const uint8_t *opt, size_t opt_len,
+                         const uint8_t **np, uint32_t *nlen) {
+    int found = 0;
+    if (str_field(opt, opt_len, "name", np, nlen, &found) != BJ_OK) return 0;
+    return found;
+}
+
+int dc_index_create_plan(const uint8_t *keys, size_t keys_len,
+                         const uint8_t *options, size_t options_len,
+                         const char *coll, size_t coll_len, dbuf *out) {
+    if (keys_len < 1 || keys[0] != BJ_TYPE_OBJECT) return DC_ERR_EMPTY_KEY_SPEC;
+    int has_opts = options && options_len >= 1 && options[0] == BJ_TYPE_OBJECT;
+
+    const uint8_t *field; uint32_t field_len;
+    int is_text = special_spec(keys, keys_len, "text", &field, &field_len);
+    int is_geo  = !is_text && special_spec(keys, keys_len, "2dsphere", &field, &field_len);
+
+    if ((is_text || is_geo) && has_opts && has_equality_only_option(options, options_len))
+        return DC_ERR_INDEX_OPTION_UNSUPPORTED;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = BJ_OK;
+    dbuf name = {0}, f0 = {0}, f1 = {0}, f2 = {0}, fields = {0};
+
+    /* Name: options.name, else the driver's convention. */
+    {
+        const uint8_t *np; uint32_t nlen;
+        if (has_opts && explicit_name(options, options_len, &np, &nlen)) {
+            e = dbuf_put(&name, np, nlen);
+        } else if (is_text || is_geo) {
+            e = dbuf_put(&name, field, field_len);
+            if (!e) e = dbuf_put(&name, (const uint8_t *)(is_text ? "_text" : "_2dsphere"),
+                                 is_text ? 5 : 9);
+        } else {
+            /* "team_1", "team_1_age_1" -- each field, then "_1", joined
+             * by "_". Validation happens below; this only needs the keys. */
+            cur c = { keys, keys_len, 0 };
+            uint32_t n;
+            if ((e = object_begin(&c, &n))) goto done;
+            if (n == 0) { e = DC_ERR_EMPTY_KEY_SPEC; goto done; }
+            for (uint32_t i = 0; i < n && !e; i++) {
+                const uint8_t *kp; uint32_t klen;
+                if ((e = take_key(&c, &kp, &klen))) break;
+                if ((e = skip_value(&c))) break;
+                if (i) e = dbuf_put(&name, (const uint8_t *)"_", 1);
+                if (!e) e = dbuf_put(&name, kp, klen);
+                if (!e) e = dbuf_put(&name, (const uint8_t *)"_1", 2);
+            }
+        }
+        if (e) goto done;
+    }
+
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"name", 4);
+    bj_put_string(b, name.data, (uint32_t)name.len);
+    bj_put_key(b, (const uint8_t *)"kind", 4);
+    bj_put_int(b, is_text ? DC_INDEX_TEXT : is_geo ? DC_INDEX_GEO : DC_INDEX_EQUALITY);
+
+    bj_put_key(b, (const uint8_t *)"files", 5);
+    bj_begin_array(b);
+    if (is_text) {
+        /* Attach order, same as everywhere else this triple appears. */
+        e = dc_text_index_file_name(&f0, coll, coll_len, (const char *)name.data, name.len,
+                                    0, DC_TEXT_ROLE_TERMS);
+        if (!e) e = dc_text_index_file_name(&f1, coll, coll_len, (const char *)name.data,
+                                            name.len, 0, DC_TEXT_ROLE_DOCUMENTS);
+        if (!e) e = dc_text_index_file_name(&f2, coll, coll_len, (const char *)name.data,
+                                            name.len, 0, DC_TEXT_ROLE_LENGTHS);
+        if (e) goto done;
+        bj_put_string(b, f0.data, (uint32_t)f0.len);
+        bj_put_string(b, f1.data, (uint32_t)f1.len);
+        bj_put_string(b, f2.data, (uint32_t)f2.len);
+    } else {
+        e = dc_index_file_name(&f0, coll, coll_len, (const char *)name.data, name.len, 0);
+        if (e) goto done;
+        bj_put_string(b, f0.data, (uint32_t)f0.len);
+    }
+    bj_end_array(b);
+
+    if (is_text || is_geo) {
+        bj_put_key(b, (const uint8_t *)"field", 5);
+        bj_put_string(b, field, field_len);
+    } else {
+        /* Validating here rather than earlier keeps the special-index path
+         * from being refused by a rule that does not apply to it: {body:
+         * "text"} is not an ascending spec and must not be judged as one. */
+        if ((e = dc_check_index_key_spec(keys, keys_len, &fields))) goto done;
+        bj_put_key(b, (const uint8_t *)"fields", 6);
+        bj_put_raw(b, fields.data, (uint32_t)fields.len);
+
+        int unique = has_opts && flag_field(options, options_len, "unique");
+        int sparse = has_opts && flag_field(options, options_len, "sparse");
+        bj_put_key(b, (const uint8_t *)"unique", 6);
+        bj_put_bool(b, unique);
+        bj_put_key(b, (const uint8_t *)"sparse", 6);
+        bj_put_bool(b, sparse);
+        if (has_opts) {
+            pass_through(b, options, options_len, "partialFilterExpression");
+
+            const uint8_t *ttl; size_t ttl_len; int has_ttl = 0;
+            if ((e = obj_get_field(options, options_len,
+                                   (const uint8_t *)"expireAfterSeconds", 18,
+                                   &ttl, &ttl_len, &has_ttl))) goto done;
+            if (has_ttl && ttl_len >= 1 && ttl[0] != BJ_TYPE_NULL) {
+                /* A TTL index is an ordinary index over one Date field; a
+                 * compound one has no single field to expire on. */
+                if (arr_len_of(fields.data, fields.len) != 1) {
+                    e = DC_ERR_TTL_NEEDS_SINGLE_FIELD;
+                    goto done;
+                }
+                bj_put_key(b, (const uint8_t *)"expireAfterSeconds", 18);
+                bj_put_raw(b, ttl, (uint32_t)ttl_len);
+            }
+        }
+    }
+    bj_end_object(b);
+
+    if ((e = bj_builder_error(b))) goto done;
+    {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        if (!data) { e = BJ_ERR_STATE; goto done; }
+        e = dbuf_put(out, data, len);
+    }
+
+done:
+    dbuf_free(&fields); dbuf_free(&f2); dbuf_free(&f1); dbuf_free(&f0); dbuf_free(&name);
+    bj_builder_free(b);
+    return e;
 }

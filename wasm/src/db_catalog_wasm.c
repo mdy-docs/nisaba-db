@@ -55,6 +55,15 @@ EMSCRIPTEN_KEEPALIVE int catw_drop_index(catw *w, const uint8_t *entry, int entr
     return dc_catalog_drop_index(entry, (size_t)entry_len, name, (size_t)name_len, &w->buf);
 }
 
+EMSCRIPTEN_KEEPALIVE int catw_create_plan(catw *w, const uint8_t *keys, int keys_len,
+                                          const uint8_t *options, int options_len,
+                                          const char *coll, int coll_len) {
+    if (keys_len < 0 || options_len < 0 || coll_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    return dc_index_create_plan(keys, (size_t)keys_len, options, (size_t)options_len,
+                                coll, (size_t)coll_len, &w->buf);
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *catw_ptr(const catw *w) { return w->buf.data; }
 
 EMSCRIPTEN_KEEPALIVE int catw_len(const catw *w) {

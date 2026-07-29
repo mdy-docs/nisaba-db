@@ -61,6 +61,11 @@ const char *dc_strerror(int code) {
         case DC_ERR_CATALOG_ENTRY:
             return "Catalog entry is malformed or written by an incompatible "
                    "version (docs/format-compatibility.md)";
+        case DC_ERR_INDEX_OPTION_UNSUPPORTED:
+            return "createIndex: unique/sparse/partialFilterExpression/expireAfterSeconds "
+                   "are only supported for equality indexes";
+        case DC_ERR_TTL_NEEDS_SINGLE_FIELD:
+            return "createIndex: expireAfterSeconds requires a single-field index";
         case DC_ERR_BULK_EMPTY:
             return "bulkWrite requires a non-empty array of operations";
         case DC_ERR_BULK_UNKNOWN_OP:

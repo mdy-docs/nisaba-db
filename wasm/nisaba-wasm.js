@@ -826,6 +826,26 @@ function catalogCall(fn) {
  * defined in three JS places that could not consult each other:
  * _persistIndexes wrote it, _open parsed it, listIndexes projected it.
  */
+/**
+ * Plan a new index: kind, name and the files to create. Pure -- it names
+ * files, it does not create them, so this side creates exactly what it
+ * named. The naming convention lives with listIndexes' reconstruction of
+ * `key`, which is the other half of the same convention (db_catalog.h).
+ */
+function indexCreatePlan(keys, options, collName) {
+  return catalogCall((M, ctx) => {
+    const ke = encode(keys), oe = encode(options || {});
+    const kp = M._malloc(ke.length || 1);
+    const op = M._malloc(oe.length || 1);
+    const n = allocStr(M, collName);
+    try {
+      if (ke.length) M.HEAPU8.set(ke, kp);
+      if (oe.length) M.HEAPU8.set(oe, op);
+      return M._catw_create_plan(ctx, kp, ke.length, op, oe.length, n.ptr, n.len);
+    } finally { n.free(); M._free(op); M._free(kp); }
+  });
+}
+
 function catalogOpenPlan(entry, collName) {
   return catalogCall((M, ctx) => {
     const enc = encode(entry);
@@ -1580,34 +1600,25 @@ class Collection {
    * Returns the index name (options.name, or a MongoDB-shaped default).
    */
   async createIndex(keys, options = {}) {
-    const keyFields = Object.keys(keys);
-    const isSpecial = keyFields.length === 1 && (keys[keyFields[0]] === 'text' || keys[keyFields[0]] === '2dsphere');
-    if (isSpecial && (options.unique || options.sparse || options.partialFilterExpression || options.expireAfterSeconds !== undefined)) {
-      throw new Error('createIndex: unique/sparse/partialFilterExpression/expireAfterSeconds are only supported for equality indexes');
-    }
-    if (keyFields.length === 1 && keys[keyFields[0]] === 'text') {
-      return this._createTextIndex(keyFields[0], options);
-    }
-    if (keyFields.length === 1 && keys[keyFields[0]] === '2dsphere') {
-      return this._createGeoIndex(keyFields[0], options);
-    }
-
-    const fields = checkIndexKeySpec(keys);
-    if (options.expireAfterSeconds !== undefined && fields.length !== 1) {
-      throw new Error('createIndex: expireAfterSeconds requires a single-field index');
-    }
-    const name = options.name || fields.map(f => `${f}_1`).join('_');
+    // C decides what kind of index this is, what it is called, and which
+    // files it needs -- all pure, all before anything is created. This
+    // method then creates exactly the files the plan named.
+    const plan = indexCreatePlan(keys, options, this.name);
+    const name = plan.name;
     if (this._indexes.has(name)) throw new Error(`Index already exists: ${name}`);
+    if (plan.kind === 1) return this._createTextIndex(plan, options);
+    if (plan.kind === 2) return this._createGeoIndex(plan, options);
 
-    const fileName = indexFileName(this.name, name);
+    const fields = plan.fields;
+    const fileName = plan.files[0];
     await this._provider.deleteFile(fileName); // clean slate in case a prior attempt was aborted
     const tree = new BPlusTree(await this._provider.openFile(fileName, { create: true }), this._order);
     await tree.open();
 
     const M = requireModule();
     const n = allocStr(M, name);
-    const unique = !!options.unique, sparse = !!options.sparse;
-    const partialFilterExpression = options.partialFilterExpression || null;
+    const unique = !!plan.unique, sparse = !!plan.sparse;
+    const partialFilterExpression = plan.partialFilterExpression || null;
     let rc;
     try {
       rc = this._marshalPair(fields, partialFilterExpression, (M2, fp, flen, pp, plen) =>
@@ -1625,25 +1636,26 @@ class Collection {
 
     this._indexes.set(name, {
       kind: 'equality', fields, tree, file: fileName, unique, sparse, partialFilterExpression,
-      expireAfterSeconds: options.expireAfterSeconds
+      expireAfterSeconds: plan.expireAfterSeconds
     });
-    const def = { name, kind: 0, files: [fileName], fields, unique, sparse };
-    if (partialFilterExpression) def.partialFilterExpression = partialFilterExpression;
-    if (options.expireAfterSeconds !== undefined) def.expireAfterSeconds = options.expireAfterSeconds;
-    this._catalogPutIndex(def);
+    // The plan is already the stored shape's input -- one definition
+    // flows create -> catalog -> open, rather than being rebuilt here.
+    this._catalogPutIndex(plan);
     return name;
   }
 
-  async _createTextIndex(field, options = {}) {
-    const name = options.name || `${field}_text`;
-    if (this._indexes.has(name)) throw new Error(`Index already exists: ${name}`);
-
-    const files = textIndexFileNames(this.name, name);
+  async _createTextIndex(plan, options = {}) {
+    const name = plan.name;
+    const field = plan.field;
+    // plan.files is in attach order; the role names are only for the
+    // in-memory bookkeeping below.
+    const roles = ['index', 'docTerms', 'docLengths'];
+    const files = { index: plan.files[0], docTerms: plan.files[1], docLengths: plan.files[2] };
     const trees = {};
-    for (const role of Object.keys(files)) {
-      await this._provider.deleteFile(files[role]);
-      trees[role] = new BPlusTree(await this._provider.openFile(files[role], { create: true }), this._order);
-      await trees[role].open();
+    for (let i = 0; i < roles.length; i++) {
+      await this._provider.deleteFile(plan.files[i]);
+      trees[roles[i]] = new BPlusTree(await this._provider.openFile(plan.files[i], { create: true }), this._order);
+      await trees[roles[i]].open();
     }
 
     const M = requireModule();
@@ -1667,20 +1679,14 @@ class Collection {
     }
 
     this._indexes.set(name, { kind: 'text', field, trees, files });
-    // files[] in attach order -- the same order the plan hands back, and
-    // the order dc_collection_attach_text_index takes its trees.
-    this._catalogPutIndex({
-      name, kind: 1, field,
-      files: [files.index, files.docTerms, files.docLengths]
-    });
+    this._catalogPutIndex(plan);
     return name;
   }
 
-  async _createGeoIndex(field, options = {}) {
-    const name = options.name || `${field}_2dsphere`;
-    if (this._indexes.has(name)) throw new Error(`Index already exists: ${name}`);
-
-    const fileName = indexFileName(this.name, name);
+  async _createGeoIndex(plan, options = {}) {
+    const name = plan.name;
+    const field = plan.field;
+    const fileName = plan.files[0];
     await this._provider.deleteFile(fileName);
     const rt = new RTree(await this._provider.openFile(fileName, { create: true }));
     await rt.open();
@@ -1702,7 +1708,7 @@ class Collection {
     }
 
     this._indexes.set(name, { kind: 'geo', field, rt, file: fileName });
-    this._catalogPutIndex({ name, kind: 2, files: [fileName], field });
+    this._catalogPutIndex(plan);
     return name;
   }
 

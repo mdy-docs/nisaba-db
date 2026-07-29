@@ -46,7 +46,9 @@ extern "C" {
 #endif
 
 /* Continuing the DC_ERR_* range (db_update.h ends at -28). */
-#define DC_ERR_CATALOG_ENTRY (-29)
+#define DC_ERR_CATALOG_ENTRY         (-29)
+#define DC_ERR_INDEX_OPTION_UNSUPPORTED (-30)
+#define DC_ERR_TTL_NEEDS_SINGLE_FIELD   (-31)
 
 /* Index kinds, as they appear in a plan. Distinct from the `kind` STRING
  * stored in the catalog, which stays a string for readability and
@@ -129,6 +131,36 @@ int dc_catalog_put_index(const uint8_t *entry, size_t entry_len,
  */
 int dc_catalog_drop_index(const uint8_t *entry, size_t entry_len,
                           const char *name, size_t name_len, dbuf *out);
+
+/*
+ * Plan a NEW index from a createIndex call: what kind it is, what it will
+ * be called, and which files it needs created. Appends one plan-shaped
+ * definition to `out` -- the same shape dc_catalog_open_plan emits and
+ * dc_catalog_put_index stores, so one shape flows all the way from create
+ * through the catalog and back out at open.
+ *
+ * Pure: it names files, it does not create them. The caller creates
+ * exactly the names in `files` and then attaches.
+ *
+ * The conventions gathered here were scattered through createIndex:
+ *
+ *   - a single field whose value is the STRING "text" or "2dsphere" is a
+ *     special index, not an ascending one;
+ *   - special indexes take none of unique / sparse /
+ *     partialFilterExpression / expireAfterSeconds
+ *     (DC_ERR_INDEX_OPTION_UNSUPPORTED);
+ *   - expireAfterSeconds needs a single-field index
+ *     (DC_ERR_TTL_NEEDS_SINGLE_FIELD);
+ *   - the default name mirrors the driver's: "team_1", "team_1_age_1",
+ *     "body_text", "location_2dsphere", overridable with options.name.
+ *
+ * Default naming in particular has to agree with dc_catalog_list_indexes'
+ * reconstruction of `key`, which is the other half of the same
+ * convention -- so they live in one file.
+ */
+int dc_index_create_plan(const uint8_t *keys, size_t keys_len,
+                         const uint8_t *options, size_t options_len,
+                         const char *coll, size_t coll_len, dbuf *out);
 
 #ifdef __cplusplus
 }

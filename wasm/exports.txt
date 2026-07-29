@@ -46,6 +46,14 @@ _ttlw_filter
 _ttlw_ptr
 _ttlw_len
 
+# bulkWrite grammar (db_bulk.h)
+_bkw_new
+_bkw_free
+_bkw_parse
+_bkw_bad_index
+_bkw_ptr
+_bkw_len
+
 # lifecycle
 _dcw_collection_open
 _dcw_collection_free

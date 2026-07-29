@@ -3,6 +3,7 @@
  */
 #include "db_validate.h"
 #include "db_names.h"
+#include "db_bulk.h"
 #include "db.h"
 #include "bjcursor.h"
 
@@ -47,6 +48,15 @@ const char *dc_strerror(int code) {
             return "createIndex requires at least one field";
         case DC_ERR_NON_ASCENDING_KEY:
             return "createIndex: only ascending (1) fields are supported so far";
+        /* db_bulk.h */
+        case DC_ERR_BULK_EMPTY:
+            return "bulkWrite requires a non-empty array of operations";
+        case DC_ERR_BULK_UNKNOWN_OP:
+            return "bulkWrite: each operation must be an object with exactly one known "
+                   "key (insertOne, updateOne, updateMany, replaceOne, deleteOne, deleteMany)";
+        case DC_ERR_BULK_MISSING_FIELD:
+            return "bulkWrite: operation is missing a required field "
+                   "(document / filter / update / replacement)";
         default:                    return "unknown error";
     }
 }

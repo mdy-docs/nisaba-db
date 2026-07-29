@@ -62,6 +62,7 @@ NATIVE_EXCLUDE=(
   wasm/src/db_names_wasm.c
   wasm/src/db_validate_wasm.c
   wasm/src/db_ttl_wasm.c
+  wasm/src/db_bulk_wasm.c
   wasm/src/db_wasm.c
 )
 

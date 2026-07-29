@@ -786,6 +786,100 @@ function isDbFile(name) {
  * caller can already get by reversing results, so it's deferred rather than
  * plumbed through the composite-key encoding (keyenc.h) for no behavioral
  * gain yet. */
+let bulkCtx = 0;
+
+/**
+ * Run a bulkWrite against `target` -- any object with the collection
+ * write methods, so both Collection and WalCollection share this one loop
+ * instead of the two near-identical copies they used to carry
+ * (src/db-wal.js's own comment: "Same loop as the inner bulkWrite").
+ *
+ * The grammar -- which operation names exist, which fields each requires
+ * -- is C's (db_bulk.h), validated for the whole list before anything
+ * runs. That ordering matters for more than tidiness: an unordered
+ * bulkWrite is supposed to attempt every operation, which it cannot do if
+ * operation seven is malformed in a way that only surfaces after one
+ * through six have already been applied.
+ *
+ * The loop itself stays here because it is orchestration over async
+ * public methods, which is exactly the layer JavaScript should own.
+ */
+async function runBulkWrite(target, operations, ordered) {
+  const M = requireModule();
+  if (!bulkCtx) {
+    bulkCtx = M._bkw_new();
+    if (!bulkCtx) throw codeError(-1, 'bkw_new');
+  }
+  const encoded = encode(operations);
+  const ptr = M._malloc(encoded.length || 1);
+  let types;
+  try {
+    if (encoded.length) M.HEAPU8.set(encoded, ptr);
+    const rc = M._bkw_parse(bulkCtx, ptr, encoded.length);
+    if (rc !== 0) {
+      const at = M._bkw_bad_index(bulkCtx);
+      throw codeError(rc, at >= 0 ? `operation ${at}` : 'bulkWrite');
+    }
+    const len = M._bkw_len(bulkCtx);
+    check(len < 0 ? len : 0);
+    types = decode(M.HEAPU8.slice(M._bkw_ptr(bulkCtx), M._bkw_ptr(bulkCtx) + len));
+  } finally { M._free(ptr); }
+
+  const result = {
+    acknowledged: true, insertedCount: 0, matchedCount: 0, modifiedCount: 0,
+    deletedCount: 0, upsertedCount: 0, insertedIds: {}, upsertedIds: {}
+  };
+  const errors = [];
+  for (let i = 0; i < operations.length; i++) {
+    const spec = Object.values(operations[i])[0];
+    try {
+      switch (types[i]) {
+        case 0: {  // DC_BULK_INSERT_ONE
+          const { insertedId } = await target.insertOne(spec.document);
+          result.insertedIds[i] = insertedId;
+          result.insertedCount++;
+          break;
+        }
+        case 1:    // DC_BULK_UPDATE_ONE
+        case 2:    // DC_BULK_UPDATE_MANY
+        case 3: {  // DC_BULK_REPLACE_ONE
+          const r = types[i] === 1
+            ? await target.updateOne(spec.filter, spec.update, { upsert: spec.upsert })
+            : types[i] === 2
+              ? await target.updateMany(spec.filter, spec.update, { upsert: spec.upsert })
+              : await target.replaceOne(spec.filter, spec.replacement, { upsert: spec.upsert });
+          result.matchedCount += r.matchedCount;
+          result.modifiedCount += r.modifiedCount;
+          if (r.upsertedId) { result.upsertedIds[i] = r.upsertedId; result.upsertedCount++; }
+          break;
+        }
+        case 4: {  // DC_BULK_DELETE_ONE
+          const r = await target.deleteOne(spec.filter);
+          result.deletedCount += r.deletedCount;
+          break;
+        }
+        default: { // DC_BULK_DELETE_MANY
+          const r = await target.deleteMany(spec.filter);
+          result.deletedCount += r.deletedCount;
+          break;
+        }
+      }
+    } catch (err) {
+      errors.push({ index: i, error: err });
+      if (ordered) break;
+    }
+  }
+  if (errors.length > 0) {
+    const err = new Error(
+      `bulkWrite: ${errors.length} operation(s) failed (first at index ${errors[0].index}: ${errors[0].error.message})`
+    );
+    err.result = result;
+    err.writeErrors = errors;
+    throw err;
+  }
+  return result;
+}
+
 let ttlCtx = 0;
 
 /**
@@ -2485,65 +2579,10 @@ class Collection {
    * error afterward if any failed.
    */
   async bulkWrite(operations, { ordered = true } = {}) {
-    if (!Array.isArray(operations) || operations.length === 0) {
+    if (!Array.isArray(operations)) {
       throw new Error('bulkWrite requires a non-empty array of operations');
     }
-    const result = {
-      acknowledged: true, insertedCount: 0, matchedCount: 0, modifiedCount: 0,
-      deletedCount: 0, upsertedCount: 0, insertedIds: {}, upsertedIds: {}
-    };
-    const errors = [];
-    for (let i = 0; i < operations.length; i++) {
-      const op = operations[i];
-      const type = Object.keys(op)[0];
-      const spec = op[type];
-      try {
-        switch (type) {
-          case 'insertOne': {
-            const { insertedId } = await this.insertOne(spec.document);
-            result.insertedIds[i] = insertedId;
-            result.insertedCount++;
-            break;
-          }
-          case 'updateOne':
-          case 'updateMany':
-          case 'replaceOne': {
-            const method = type === 'replaceOne' ? spec.replacement : spec.update;
-            const r = type === 'updateOne' ? await this.updateOne(spec.filter, method, { upsert: spec.upsert })
-              : type === 'updateMany' ? await this.updateMany(spec.filter, method, { upsert: spec.upsert })
-              : await this.replaceOne(spec.filter, method, { upsert: spec.upsert });
-            result.matchedCount += r.matchedCount;
-            result.modifiedCount += r.modifiedCount;
-            if (r.upsertedId) { result.upsertedIds[i] = r.upsertedId; result.upsertedCount++; }
-            break;
-          }
-          case 'deleteOne': {
-            const r = await this.deleteOne(spec.filter);
-            result.deletedCount += r.deletedCount;
-            break;
-          }
-          case 'deleteMany': {
-            const r = await this.deleteMany(spec.filter);
-            result.deletedCount += r.deletedCount;
-            break;
-          }
-          default:
-            throw new Error(`bulkWrite: unknown operation type "${type}"`);
-        }
-      } catch (err) {
-        errors.push({ index: i, error: err });
-        if (ordered) break;
-      }
-    }
-    if (errors.length > 0) {
-      const err = new Error(
-        `bulkWrite: ${errors.length} operation(s) failed (first at index ${errors[0].index}: ${errors[0].error.message})`
-      );
-      err.result = result;
-      err.writeErrors = errors;
-      throw err;
-    }
-    return result;
+    return runBulkWrite(this, operations, ordered);
   }
 
   /**
@@ -3059,6 +3098,7 @@ export {
   MemoryStorageProvider,
   OPFSStorageProvider,
   resolveCurrentDate,
+  runBulkWrite,
   ttlFilters,
   // File naming and the format stamp (db_names.h). Exported so no other
   // layer has to restate the convention -- src/db-wal.js carried its own

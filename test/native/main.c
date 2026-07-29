@@ -23,6 +23,7 @@
 #include "db_names.h"
 #include "db_validate.h"
 #include "db_ttl.h"
+#include "db_bulk.h"
 #include "dbuf.h"
 
 #include "docs.h"
@@ -718,6 +719,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_MISSING_INDEXED_FIELD, DC_ERR_UNINDEXABLE_VALUE,
         DC_ERR_INVALID_COLLECTION_NAME, DC_ERR_INVALID_DB_NAME,
         DC_ERR_RESERVED_NAME, DC_ERR_EMPTY_KEY_SPEC, DC_ERR_NON_ASCENDING_KEY,
+        DC_ERR_BULK_EMPTY, DC_ERR_BULK_UNKNOWN_OP, DC_ERR_BULK_MISSING_FIELD,
     };
     for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
         const char *s = dc_strerror(codes[i]);
@@ -873,7 +875,113 @@ TEST(ttl_cutoff_and_filter) {
     dbuf_free(&empty);
 }
 
+/* ---- db_bulk ----------------------------------------------------------- */
+
+/* One bulkWrite operation: {<name>: {<field>: {...}}}. Nested objects
+ * only, which is all the grammar cares about. */
+static void put_op(bj_builder *b, const char *name, const char *field, const char *field2) {
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)name, (uint32_t)strlen(name));
+    bj_begin_object(b);
+    if (field) {
+        bj_put_key(b, (const uint8_t *)field, (uint32_t)strlen(field));
+        bj_begin_object(b);
+        bj_end_object(b);
+    }
+    if (field2) {
+        bj_put_key(b, (const uint8_t *)field2, (uint32_t)strlen(field2));
+        bj_begin_object(b);
+        bj_end_object(b);
+    }
+    bj_end_object(b);
+    bj_end_object(b);
+}
+
+TEST(bulk_grammar_accepts_every_operation_and_orders_the_codes) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_array(b);
+    put_op(b, "insertOne",  "document", NULL);
+    put_op(b, "updateOne",  "filter",   "update");
+    put_op(b, "updateMany", "filter",   "update");
+    put_op(b, "replaceOne", "filter",   "replacement");
+    put_op(b, "deleteOne",  "filter",   NULL);
+    put_op(b, "deleteMany", "filter",   NULL);
+    bj_end_array(b);
+    size_t len = 0;
+    const uint8_t *ops = bj_builder_data(b, &len);
+
+    dbuf out = {0};
+    int bad = -2;
+    CHECK_OK(dc_bulk_parse(ops, len, &out, &bad));
+    CHECK_I64(bad, -1);
+    CHECK_I64(arr_count(out.data, out.len), 6);
+    dbuf_free(&out);
+    bj_builder_free(b);
+}
+
+TEST(bulk_grammar_rejects_malformed_lists_and_names_the_index) {
+    /* Empty list. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b); bj_end_array(b);
+        size_t len = 0; const uint8_t *ops = bj_builder_data(b, &len);
+        dbuf out = {0}; int bad = -2;
+        CHECK_RC(dc_bulk_parse(ops, len, &out, &bad), DC_ERR_BULK_EMPTY);
+        dbuf_free(&out); bj_builder_free(b);
+    }
+    /* Unknown operation name, at index 1. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b);
+        put_op(b, "insertOne", "document", NULL);
+        put_op(b, "upsertOne", "document", NULL);
+        bj_end_array(b);
+        size_t len = 0; const uint8_t *ops = bj_builder_data(b, &len);
+        dbuf out = {0}; int bad = -2;
+        CHECK_RC(dc_bulk_parse(ops, len, &out, &bad), DC_ERR_BULK_UNKNOWN_OP);
+        CHECK_I64(bad, 1);
+        /* Nothing emitted: an unordered bulkWrite must be able to attempt
+         * every operation, so a malformed one has to surface before any
+         * of them run. */
+        CHECK_I64(out.len, 0);
+        dbuf_free(&out); bj_builder_free(b);
+    }
+    /* Missing required field, at index 2. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b);
+        put_op(b, "deleteOne", "filter", NULL);
+        put_op(b, "insertOne", "document", NULL);
+        put_op(b, "updateOne", "filter", NULL);   /* no `update` */
+        bj_end_array(b);
+        size_t len = 0; const uint8_t *ops = bj_builder_data(b, &len);
+        dbuf out = {0}; int bad = -2;
+        CHECK_RC(dc_bulk_parse(ops, len, &out, &bad), DC_ERR_BULK_MISSING_FIELD);
+        CHECK_I64(bad, 2);
+        dbuf_free(&out); bj_builder_free(b);
+    }
+    /* An operation object with two keys is ambiguous, not a merge. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"insertOne", 9);
+        bj_begin_object(b); bj_end_object(b);
+        bj_put_key(b, (const uint8_t *)"deleteOne", 9);
+        bj_begin_object(b); bj_end_object(b);
+        bj_end_object(b);
+        bj_end_array(b);
+        size_t len = 0; const uint8_t *ops = bj_builder_data(b, &len);
+        dbuf out = {0}; int bad = -2;
+        CHECK_RC(dc_bulk_parse(ops, len, &out, &bad), DC_ERR_BULK_UNKNOWN_OP);
+        CHECK_I64(bad, 0);
+        dbuf_free(&out); bj_builder_free(b);
+    }
+}
+
 int main(void) {
+    RUN(bulk_grammar_accepts_every_operation_and_orders_the_codes);
+    RUN(bulk_grammar_rejects_malformed_lists_and_names_the_index);
     RUN(ttl_cutoff_and_filter);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(name_validation_matches_the_js_rules);

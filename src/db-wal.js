@@ -74,6 +74,7 @@ import {
   encode,
   decode,
   resolveCurrentDate,
+  runBulkWrite,
   ttlFilters,
   dbCatalogFile,
   isDbFile
@@ -593,65 +594,13 @@ class WalCollection {
    * to this class's logged methods; each sub-operation proposes and
    * applies individually, exactly as the inner one commits per call. */
   async bulkWrite(operations, { ordered = true } = {}) {
-    if (!Array.isArray(operations) || operations.length === 0) {
+    if (!Array.isArray(operations)) {
       throw new Error('bulkWrite requires a non-empty array of operations');
     }
-    const result = {
-      acknowledged: true, insertedCount: 0, matchedCount: 0, modifiedCount: 0,
-      deletedCount: 0, upsertedCount: 0, insertedIds: {}, upsertedIds: {}
-    };
-    const errors = [];
-    for (let i = 0; i < operations.length; i++) {
-      const op = operations[i];
-      const type = Object.keys(op)[0];
-      const spec = op[type];
-      try {
-        switch (type) {
-          case 'insertOne': {
-            const { insertedId } = await this.insertOne(spec.document);
-            result.insertedIds[i] = insertedId;
-            result.insertedCount++;
-            break;
-          }
-          case 'updateOne':
-          case 'updateMany':
-          case 'replaceOne': {
-            const method = type === 'replaceOne' ? spec.replacement : spec.update;
-            const r = type === 'updateOne' ? await this.updateOne(spec.filter, method, { upsert: spec.upsert })
-              : type === 'updateMany' ? await this.updateMany(spec.filter, method, { upsert: spec.upsert })
-              : await this.replaceOne(spec.filter, method, { upsert: spec.upsert });
-            result.matchedCount += r.matchedCount;
-            result.modifiedCount += r.modifiedCount;
-            if (r.upsertedId) { result.upsertedIds[i] = r.upsertedId; result.upsertedCount++; }
-            break;
-          }
-          case 'deleteOne': {
-            const r = await this.deleteOne(spec.filter);
-            result.deletedCount += r.deletedCount;
-            break;
-          }
-          case 'deleteMany': {
-            const r = await this.deleteMany(spec.filter);
-            result.deletedCount += r.deletedCount;
-            break;
-          }
-          default:
-            throw new Error(`bulkWrite: unknown operation type "${type}"`);
-        }
-      } catch (err) {
-        errors.push({ index: i, error: err });
-        if (ordered) break;
-      }
-    }
-    if (errors.length > 0) {
-      const err = new Error(
-        `bulkWrite: ${errors.length} operation(s) failed (first at index ${errors[0].index}: ${errors[0].error.message})`
-      );
-      err.result = result;
-      err.writeErrors = errors;
-      throw err;
-    }
-    return result;
+    // The same shared loop the inner collection uses; `this` is what makes
+    // it the logged one, since every sub-operation goes through this
+    // class's own write methods.
+    return runBulkWrite(this, operations, ordered);
   }
 
   /** Same TTL loop as the inner pruneExpired, but the cutoffs become

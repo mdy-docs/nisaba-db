@@ -53,23 +53,26 @@ const EV = {
   OBJ_BEGIN: 12, KEY: 13, OBJ_END: 14
 };
 
-// Error codes — must match the BJ_ERR_* constants in c/binjson.h.
-const ERR = {
-  [-1]: 'out of memory',
-  [-2]: 'builder state error',
-  [-3]: 'Unexpected end of data',
-  [-4]: 'Unknown type byte',
-  [-5]: 'Decoded integer exceeds safe range',
-  [-6]: 'Pointer offset out of valid range',
-  [-7]: 'Maximum nesting depth exceeded',
-  [-8]: 'Structural invariant violated',
-  [-9]: 'Argument out of range',
-  [-10]: 'Duplicate _id',
-  [-11]: 'replaceOne cannot change the _id of an existing document',
-  [-12]: 'Duplicate key: a unique index already has a document with these field values',
-  [-13]: 'Document is missing a field required by a non-sparse index (create the index with sparse: true to skip such documents)',
-  [-14]: 'Indexed field value cannot be key-encoded: only numbers, strings, and Dates are indexable (no NaN, no strings containing U+0000)'
-};
+// Error messages come from C (dc_strerror in wasm/src/db_validate.c).
+// They used to be a literal map here, under a comment reading "must match
+// the BJ_ERR_* constants in c/binjson.h" -- a hand-maintained second copy
+// of C's own error vocabulary, kept in sync by nothing.
+//
+// Memoized because a message is fetched on every thrown error, and the
+// text for a given code cannot change within a process.
+const errTextCache = new Map();
+
+function errText(code) {
+  let text = errTextCache.get(code);
+  if (text === undefined) {
+    if (!Module) return `error ${code}`;   // pre-ready: don't mask the real failure
+    const len = Module._dvw_strerror_len(code);
+    const ptr = Module._dvw_strerror(code);
+    text = textDecoder.decode(Module.HEAPU8.slice(ptr, ptr + len));
+    errTextCache.set(code, text);
+  }
+  return text;
+}
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -132,17 +135,34 @@ class ChangeStreamOverflowError extends NisabaError {}
  * (docs/roadmap.md P0 #3 records the spike). Keep natural keys in their
  * own field with a unique index instead. */
 class InvalidIdError extends NisabaError {}
+/** A collection or database name broke the rules in db_validate.h
+ * (-15/-16 malformed, -17 the reserved format-stamp key). */
+class InvalidNameError extends NisabaError {}
+/** A createIndex key spec was empty (-18) or named a non-ascending
+ * field (-19). */
+class InvalidIndexSpecError extends NisabaError {}
 
-/** code -> class for codeError; anything unlisted raises plain NisabaError. */
+/**
+ * code -> class for codeError; anything unlisted raises plain NisabaError.
+ *
+ * This stays in JavaScript deliberately, unlike the message text: it is a
+ * JavaScript type taxonomy, not a database rule, and C has no opinion
+ * about which of its codes deserve their own subclass here.
+ */
 const ERR_CLASS = {
   [-10]: DuplicateKeyError,
   [-12]: DuplicateKeyError,
   [-13]: MissingIndexedFieldError,
-  [-14]: UnindexableValueError
+  [-14]: UnindexableValueError,
+  [-15]: InvalidNameError,
+  [-16]: InvalidNameError,
+  [-17]: InvalidNameError,
+  [-18]: InvalidIndexSpecError,
+  [-19]: InvalidIndexSpecError
 };
 
 function codeError(code, context) {
-  const msg = ERR[code] || `binjson error ${code}`;
+  const msg = errText(code);
   const cls = ERR_CLASS[code] || NisabaError;
   const error = new cls(context ? `${msg} (${context})` : msg, code);
   if (bjioLastError) {
@@ -667,20 +687,37 @@ function toObjectId(id) {
   );
 }
 
+// Name and key-spec validation lives in wasm/src/db_validate.c. Only the
+// JS-type gate stays here: C is handed bytes, so "is this even a string"
+// is a question only JavaScript can ask. Everything past that -- empty,
+// contains '/', contains NUL, is the reserved format-stamp key -- is C's.
+//
+// The offending value rides along as codeError's `context`, so messages
+// keep naming what was rejected without the message text living here.
+
 function checkCollectionName(name) {
-  if (typeof name !== 'string' || name.length === 0 || name.includes('/') || name.includes('\0')) {
-    throw new Error(`Invalid collection name: ${JSON.stringify(name)}`);
-  }
-  if (name === dbFormatKey()) {
-    throw new Error(`Invalid collection name: "${dbFormatKey()}" is reserved for the format stamp (docs/format-compatibility.md)`);
-  }
+  if (typeof name !== 'string') throw codeError(-15, JSON.stringify(name));
+  const M = requireModule();
+  const s = allocStr(M, name);
+  try {
+    const rc = M._dvw_check_collection_name(s.ptr, s.len);
+    if (rc !== 0) throw codeError(rc, JSON.stringify(name));
+  } finally { s.free(); }
 }
 
-/** Same constraints as a collection name -- a database name becomes a real path segment (OPFSStorageProvider.subProvider) or a Map key (MemoryStorageProvider.subProvider) either way. */
+/** Same constraints as a collection name, minus the reserved-key rule -- a
+ * database name becomes a real path segment (OPFSStorageProvider
+ * .subProvider) or a Map key (MemoryStorageProvider.subProvider) either
+ * way. Hosts may add their own rules on top; NodeFSStorageProvider also
+ * rejects '\' and '..' because its names become real filesystem paths. */
 function checkDbName(name) {
-  if (typeof name !== 'string' || name.length === 0 || name.includes('/') || name.includes('\0')) {
-    throw new Error(`Invalid database name: ${JSON.stringify(name)}`);
-  }
+  if (typeof name !== 'string') throw codeError(-16, JSON.stringify(name));
+  const M = requireModule();
+  const s = allocStr(M, name);
+  try {
+    const rc = M._dvw_check_db_name(s.ptr, s.len);
+    if (rc !== 0) throw codeError(rc, JSON.stringify(name));
+  } finally { s.free(); }
 }
 
 /** Compaction generations: see db_names.h and docs/compaction.md. */
@@ -749,15 +786,31 @@ function isDbFile(name) {
  * caller can already get by reversing results, so it's deferred rather than
  * plumbed through the composite-key encoding (keyenc.h) for no behavioral
  * gain yet. */
+let validateCtx = 0;
+
+/**
+ * Validate a createIndex key spec and return its field names in spec
+ * order. C does both in one pass (dc_check_index_key_spec), because the
+ * binjson ARRAY it emits is exactly what dc_collection_add_index takes for
+ * `fields` -- so the array JS used to build with Object.keys() and then
+ * re-encode is now produced once, by the code that validated it.
+ */
 function checkIndexKeySpec(keys) {
-  const fields = Object.keys(keys);
-  if (fields.length === 0) throw new Error('createIndex requires at least one field');
-  for (const f of fields) {
-    if (keys[f] !== 1) {
-      throw new Error(`createIndex: only ascending (1) fields are supported so far (got ${f}: ${keys[f]})`);
-    }
+  const M = requireModule();
+  if (!validateCtx) {
+    validateCtx = M._dvw_new();
+    if (!validateCtx) throw codeError(-1, 'dvw_new');
   }
-  return fields;
+  const spec = encode(keys);
+  const ptr = M._malloc(spec.length || 1);
+  try {
+    if (spec.length) M.HEAPU8.set(spec, ptr);
+    const rc = M._dvw_check_index_key_spec(validateCtx, ptr, spec.length);
+    if (rc !== 0) throw codeError(rc, JSON.stringify(keys));
+    const len = M._dvw_len(validateCtx);
+    check(len < 0 ? len : 0);
+    return decode(M.HEAPU8.slice(M._dvw_ptr(validateCtx), M._dvw_ptr(validateCtx) + len));
+  } finally { M._free(ptr); }
 }
 
 /**
@@ -2932,6 +2985,8 @@ export {
   UnindexableValueError,
   ChangeStreamOverflowError,
   InvalidIdError,
+  InvalidNameError,
+  InvalidIndexSpecError,
   ObjectId,
   Pointer,
   encode,
@@ -2970,6 +3025,9 @@ export {
   // copy of the catalog name and the orphan-sweep pattern, with a comment
   // saying so.
   dbCatalogFile,
+  // Exported so a host provider can compose its own platform rules on top
+  // of the format-level ones rather than restating them (src/db-node.js).
+  checkDbName,
   dbFormatKey,
   dbFormatVersion,
   collectionFileName,

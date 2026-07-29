@@ -25,6 +25,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { checkDbName } from '../wasm/nisaba-wasm.js';
 
 const LOCK_FILE = '.nisaba-lock';
 
@@ -176,8 +177,13 @@ class NodeFSStorageProvider {
     this._init();
     const cached = this._children.get(name);
     if (cached) return cached;
-    if (typeof name !== 'string' || name.length === 0 || name.includes('/') || name.includes('\\') || name.includes('\0') || name === '..') {
-      throw new Error(`Invalid database name: ${JSON.stringify(name)}`);
+    // The format-level rules (non-empty, no '/', no NUL) are C's --
+    // db_validate.h -- and shared with every other provider. The two extra
+    // rules here are this platform's: a name becomes a real filesystem path
+    // segment, where '\\' is also a separator and '..' escapes the directory.
+    checkDbName(name);
+    if (name.includes('\\') || name === '..') {
+      throw new Error(`Invalid database name: ${JSON.stringify(name)} -- not usable as a filesystem path segment`);
     }
     const child = new NodeFSStorageProvider(path.join(this._dir, name));
     this._children.set(name, child);

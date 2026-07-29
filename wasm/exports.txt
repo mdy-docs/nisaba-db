@@ -28,6 +28,17 @@ _dnw_is_db_file
 _dnw_ptr
 _dnw_len
 
+# validation + error text (db_validate.h)
+_dvw_new
+_dvw_free
+_dvw_strerror
+_dvw_strerror_len
+_dvw_check_collection_name
+_dvw_check_db_name
+_dvw_check_index_key_spec
+_dvw_ptr
+_dvw_len
+
 # lifecycle
 _dcw_collection_open
 _dcw_collection_free

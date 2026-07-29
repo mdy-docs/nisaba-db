@@ -21,6 +21,7 @@
 #include "binjson.h"
 #include "keyenc.h"
 #include "db_names.h"
+#include "db_validate.h"
 #include "dbuf.h"
 
 #include "docs.h"
@@ -692,7 +693,141 @@ TEST(orphan_sweep_pattern_matches_exactly_what_js_matched) {
         if (dc_is_db_file(no[i], strlen(no[i]))) TAP_FAIL("should NOT match: %s", no[i]);
 }
 
+/* ---- db_validate ------------------------------------------------------- */
+
+/* memmem is a BSD/GNU extension, absent under -std=c11 on glibc without
+ * _GNU_SOURCE -- and this harness is meant to build with any compiler. */
+static const uint8_t *find_bytes(const uint8_t *hay, size_t hay_len,
+                                 const char *needle, size_t n) {
+    if (n > hay_len) return NULL;
+    for (size_t i = 0; i + n <= hay_len; i++)
+        if (memcmp(hay + i, needle, n) == 0) return hay + i;
+    return NULL;
+}
+
+TEST(strerror_covers_every_code_the_layer_can_raise) {
+    /* Every code the JS ERR table used to carry, plus the validation codes
+     * that replaced its hand-written throws. A code with no text would
+     * surface to a user as "unknown error", which is worse than useless. */
+    static const int codes[] = {
+        BJ_ERR_OOM, BJ_ERR_STATE, BJ_ERR_EOF, BJ_ERR_UNKNOWN_TYPE,
+        BJ_ERR_INT_RANGE, BJ_ERR_POINTER_RANGE, BJ_ERR_DEPTH, BJ_ERR_VERIFY,
+        BJ_ERR_RANGE,
+        DC_ERR_DUPLICATE, DC_ERR_ID_MISMATCH, DC_ERR_DUPLICATE_KEY,
+        DC_ERR_MISSING_INDEXED_FIELD, DC_ERR_UNINDEXABLE_VALUE,
+        DC_ERR_INVALID_COLLECTION_NAME, DC_ERR_INVALID_DB_NAME,
+        DC_ERR_RESERVED_NAME, DC_ERR_EMPTY_KEY_SPEC, DC_ERR_NON_ASCENDING_KEY,
+    };
+    for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+        const char *s = dc_strerror(codes[i]);
+        if (!s || !*s) { TAP_FAIL("code %d has no text", codes[i]); continue; }
+        if (strcmp(s, "unknown error") == 0)
+            TAP_FAIL("code %d falls through to the default", codes[i]);
+    }
+    /* Callers match on these prefixes; db.test.js and db.client-wasm
+     * .test.js assert them by regex. */
+    CHECK(strstr(dc_strerror(DC_ERR_INVALID_COLLECTION_NAME), "Invalid collection name") != NULL);
+    CHECK(strstr(dc_strerror(DC_ERR_RESERVED_NAME), "Invalid collection name") != NULL);
+    CHECK(strstr(dc_strerror(DC_ERR_INVALID_DB_NAME), "Invalid database name") != NULL);
+    CHECK_STR(dc_strerror(DC_ERR_EMPTY_KEY_SPEC), "createIndex requires at least one field");
+    /* An unmapped code still returns something printable. */
+    CHECK(dc_strerror(-9999) != NULL);
+}
+
+TEST(name_validation_matches_the_js_rules) {
+    CHECK_OK(dc_check_collection_name("users", 5));
+    CHECK_OK(dc_check_collection_name("users.g2", 8));
+    CHECK_OK(dc_check_collection_name("a", 1));
+    CHECK_RC(dc_check_collection_name("", 0), DC_ERR_INVALID_COLLECTION_NAME);
+    CHECK_RC(dc_check_collection_name("a/b", 3), DC_ERR_INVALID_COLLECTION_NAME);
+    CHECK_RC(dc_check_collection_name("a\0b", 3), DC_ERR_INVALID_COLLECTION_NAME);
+    /* The format stamp shares the catalog keyspace with collections. */
+    CHECK_RC(dc_check_collection_name(DC_FORMAT_KEY, strlen(DC_FORMAT_KEY)),
+             DC_ERR_RESERVED_NAME);
+
+    CHECK_OK(dc_check_db_name("main", 4));
+    CHECK_RC(dc_check_db_name("", 0), DC_ERR_INVALID_DB_NAME);
+    CHECK_RC(dc_check_db_name("a/b", 3), DC_ERR_INVALID_DB_NAME);
+    /* A database name is a directory, not a catalog key, so the reserved
+     * key is a perfectly good database name. */
+    CHECK_OK(dc_check_db_name(DC_FORMAT_KEY, strlen(DC_FORMAT_KEY)));
+}
+
+TEST(index_key_spec_validates_and_emits_its_fields) {
+    /* {team: 1} -> ["team"] */
+    {
+        doc *d = doc_new();
+        doc_int(d, "team", 1);
+        uint32_t len; const uint8_t *spec = doc_done(d, &len);
+        dbuf fields = {0};
+        CHECK_OK(dc_check_index_key_spec(spec, len, &fields));
+        CHECK_I64(arr_count(fields.data, fields.len), 1);
+        dbuf_free(&fields);
+        doc_free(d);
+    }
+    /* Compound, and field order is spec order -- composite keys depend on it. */
+    {
+        doc *d = doc_new();
+        doc_int(d, "team", 1);
+        doc_int(d, "age", 1);
+        uint32_t len; const uint8_t *spec = doc_done(d, &len);
+        dbuf fields = {0};
+        CHECK_OK(dc_check_index_key_spec(spec, len, &fields));
+        CHECK_I64(arr_count(fields.data, fields.len), 2);
+        /* "team" must appear before "age" in the emitted array. */
+        const uint8_t *t = find_bytes(fields.data, fields.len, "team", 4);
+        const uint8_t *a = find_bytes(fields.data, fields.len, "age", 3);
+        CHECK(t != NULL && a != NULL && t < a);
+        dbuf_free(&fields);
+        doc_free(d);
+    }
+    /* Empty spec. */
+    {
+        doc *d = doc_new();
+        uint32_t len; const uint8_t *spec = doc_done(d, &len);
+        dbuf fields = {0};
+        CHECK_RC(dc_check_index_key_spec(spec, len, &fields), DC_ERR_EMPTY_KEY_SPEC);
+        dbuf_free(&fields);
+        doc_free(d);
+    }
+    /* Descending, and a non-numeric direction. */
+    {
+        doc *d = doc_new();
+        doc_int(d, "team", -1);
+        uint32_t len; const uint8_t *spec = doc_done(d, &len);
+        dbuf fields = {0};
+        CHECK_RC(dc_check_index_key_spec(spec, len, &fields), DC_ERR_NON_ASCENDING_KEY);
+        dbuf_free(&fields);
+        doc_free(d);
+    }
+    {
+        doc *d = doc_new();
+        doc_str(d, "team", "text");
+        uint32_t len; const uint8_t *spec = doc_done(d, &len);
+        dbuf fields = {0};
+        CHECK_RC(dc_check_index_key_spec(spec, len, &fields), DC_ERR_NON_ASCENDING_KEY);
+        dbuf_free(&fields);
+        doc_free(d);
+    }
+    /* A rejected spec must leave nothing behind: the caller may reuse the
+     * buffer, and a half-built array would be silently wrong. */
+    {
+        doc *d = doc_new();
+        doc_int(d, "ok", 1);
+        doc_int(d, "bad", -1);
+        uint32_t len; const uint8_t *spec = doc_done(d, &len);
+        dbuf fields = {0};
+        CHECK_RC(dc_check_index_key_spec(spec, len, &fields), DC_ERR_NON_ASCENDING_KEY);
+        CHECK_I64(fields.len, 0);
+        dbuf_free(&fields);
+        doc_free(d);
+    }
+}
+
 int main(void) {
+    RUN(strerror_covers_every_code_the_layer_can_raise);
+    RUN(name_validation_matches_the_js_rules);
+    RUN(index_key_spec_validates_and_emits_its_fields);
     RUN(file_names_match_the_original_js_scheme);
     RUN(orphan_sweep_pattern_matches_exactly_what_js_matched);
     RUN(keyenc_matches_the_original_js_encoder);

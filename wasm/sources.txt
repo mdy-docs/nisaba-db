@@ -1,0 +1,24 @@
+# C sources this package contributes to a build, one per line, relative
+# to the package root. Consumed by build-wasm.sh (emscripten) and
+# build-native.sh (native cc / wasi-sdk) so the two targets can never
+# disagree about what this package is made of -- the same reasoning
+# third_party/binjson-structures/wasm/sources.txt documents for that
+# package. The submodules' own sources are not listed here; each build
+# script reads their manifests (or, for binjson and regex-engine, their
+# two fixed files) alongside this one.
+#
+# Order matters only for the reader: link order is irrelevant to a single
+# emcc/cc invocation, but this list is grouped bottom-up (leaf helpers
+# first, the wasm glue last) so a diff reads as a dependency order.
+#
+# Files named *_wasm.c are the JS-ABI adapter layer, NOT logic. The
+# native build filters them out along with binjson-structures' hostio.c
+# and supplies its own bj_io/bj_ns adapters instead -- see
+# build-native.sh, and third_party/binjson-structures/test/fuzz.sh for
+# the pattern this follows.
+wasm/src/db_keyenc.c
+wasm/src/regex.c
+wasm/src/db_query.c
+wasm/src/db_update.c
+wasm/src/db.c
+wasm/src/db_wasm.c

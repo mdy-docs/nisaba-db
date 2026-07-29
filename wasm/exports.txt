@@ -1,0 +1,64 @@
+# WASM exported functions for the document-collection layer in this
+# package, one per line -- everything wasm/nisaba-wasm.js's Collection/Db
+# classes call. Consumed by build-wasm.sh, which appends this list to
+# -sEXPORTED_FUNCTIONS alongside binjson's _bjw_* codec symbols and
+# third_party/binjson-structures/wasm/exports.txt.
+#
+# These symbols also carry EMSCRIPTEN_KEEPALIVE in db_wasm.c, which is
+# what actually forces them into the binary; listing them here is the
+# manifest that lets a consumer linking these sources into its own
+# combined binary reproduce the surface without hand-mirroring it, and
+# gives the export set one reviewable home instead of a heredoc.
+#
+# The native build (build-native.sh) ignores this file entirely: it links
+# db.c and calls the dc_* internal API directly, with no JS ABI in
+# between.
+
+# lifecycle
+_dcw_collection_open
+_dcw_collection_free
+_dcw_collection_recover
+
+# replicated-log integration
+_dcw_applied_index
+_dcw_set_applied_index
+
+# index attach/create/drop
+_dcw_collection_attach_index
+_dcw_collection_add_index
+_dcw_collection_remove_index
+_dcw_collection_attach_text_index
+_dcw_collection_add_text_index
+_dcw_collection_attach_geo_index
+_dcw_collection_add_geo_index
+_dcw_find_by_index
+
+# reads
+_dcw_find_one
+_dcw_find
+_dcw_count
+_dcw_distinct
+_dcw_explain
+
+# cursors
+_dcw_cursor_open
+_dcw_cursor_next_batch
+_dcw_cursor_close
+
+# writes
+_dcw_insert_one
+_dcw_insert_many
+_dcw_delete_one
+_dcw_delete_many
+_dcw_replace_one
+_dcw_update_one
+_dcw_update_many
+_dcw_find_one_and_update
+_dcw_find_one_and_replace
+_dcw_find_one_and_delete
+
+# output slot
+_dcw_out_new
+_dcw_out_free
+_dcw_out_ptr
+_dcw_out_len

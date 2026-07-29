@@ -1,7 +1,16 @@
 # CI (docs/roadmap.md P0 #5). wasm/lib is gitignored (artifacts are built
-# at `npm pack` time via prepack, never committed), so every job starts by
-# building the WASM module from the C sources with a pinned emsdk -- which
-# also means every run verifies sources and JS wrapper agree. Two suites:
+# at `npm pack` time via prepack, never committed), so the emsdk jobs start
+# by building the WASM module from the C sources with a pinned emsdk --
+# which also means every run verifies sources and JS wrapper agree. Three
+# suites:
+#   native:  the C layer compiled by a plain cc under ASan+UBSan, with no
+#            emscripten, no WASM and no JavaScript -- plus the structures'
+#            hostile-file fuzz harness. Runs first because it needs no
+#            toolchain setup and finishes in seconds, so a C-level break is
+#            reported long before the emsdk jobs have finished installing.
+#            It is also the only job that can catch a memory error at all:
+#            the JS suites drive the same C, but a use-after-free there is
+#            invisible.
 #   node:    the full node suite, including the real OPFS code paths
 #            (node-opfs shims navigator.storage in Node).
 #   browser: the *.browser.test.js suite under Playwright Chromium -- real
@@ -14,6 +23,20 @@ on:
   pull_request:
 
 jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # test/native/ drives wasm/include/db.h's dc_* API directly. No npm
+      # install, no emsdk -- if this needs either, something has leaked
+      # back across the boundary this job exists to defend.
+      - name: C harness (ASan + UBSan)
+        run: ./wasm/build-native.sh
+      - name: Structures fuzz (ASan + UBSan)
+        run: ./wasm/build-native.sh --fuzz 20000
+
   node:
     runs-on: ubuntu-latest
     steps:

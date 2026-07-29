@@ -836,3 +836,148 @@ int upd_apply(const uint8_t *doc, size_t doc_len,
     bj_builder_free(b);
     return e;
 }
+
+/* ---- $currentDate ------------------------------------------------------
+ *
+ * See db_update.h. The rewrite is here rather than in the host because
+ * its rules are this file's rules: a field targeted by $currentDate must
+ * not be targeted by anything else, which is the same path-collision
+ * invariant parse_update enforces for every other operator.
+ */
+
+/* Is `field` targeted by some operator other than $currentDate, or by an
+ * existing $set? */
+static int cd_targeted_elsewhere(const uint8_t *update, size_t update_len,
+                                 const uint8_t *field, uint32_t field_len) {
+    cur c = { update, update_len, 0 };
+    uint32_t n;
+    if (object_begin(&c, &n) != BJ_OK) return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *kp; uint32_t klen;
+        if (take_key(&c, &kp, &klen) != BJ_OK) return 0;
+        size_t vstart = c.pos;
+        if (skip_value(&c) != BJ_OK) return 0;
+        if (klen == 12 && memcmp(kp, "$currentDate", 12) == 0) continue;
+        if (klen < 1 || kp[0] != '$') continue;
+
+        const uint8_t *ov = update + vstart;
+        size_t ov_len = c.pos - vstart;
+        if (ov_len < 1 || ov[0] != BJ_TYPE_OBJECT) continue;
+        cur oc = { ov, ov_len, 0 };
+        uint32_t on;
+        if (object_begin(&oc, &on) != BJ_OK) continue;
+        for (uint32_t j = 0; j < on; j++) {
+            const uint8_t *fk; uint32_t fklen;
+            if (take_key(&oc, &fk, &fklen) != BJ_OK) break;
+            if (skip_value(&oc) != BJ_OK) break;
+            if (fklen == field_len && memcmp(fk, field, field_len) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
+/* TRUE, or {$type: "date"}. Anything else is rejected rather than
+ * silently treated as a timestamp request. */
+static int cd_spec_is_valid(const uint8_t *v, size_t len) {
+    if (len >= 1 && v[0] == BJ_TYPE_TRUE) return 1;
+    if (len < 1 || v[0] != BJ_TYPE_OBJECT) return 0;
+    const uint8_t *tv; size_t tlen; int found = 0;
+    if (obj_get_field(v, len, (const uint8_t *)"$type", 5, &tv, &tlen, &found) != BJ_OK) return 0;
+    if (!found) return 0;
+    cur c = { tv, tlen, 0 };
+    const uint8_t *sp; uint32_t slen;
+    if (take_string(&c, &sp, &slen) != BJ_OK) return 0;
+    return slen == 4 && memcmp(sp, "date", 4) == 0;
+}
+
+int upd_resolve_current_date(const uint8_t *update, size_t update_len,
+                             int64_t now_ms, dbuf *out) {
+    const uint8_t *cd; size_t cd_len; int has_cd = 0;
+    int e = obj_get_field(update, update_len, (const uint8_t *)"$currentDate", 12,
+                          &cd, &cd_len, &has_cd);
+    if (e) return e;
+    if (!has_cd) return dbuf_put(out, update, update_len);   /* unchanged */
+    if (cd_len < 1 || cd[0] != BJ_TYPE_OBJECT) return DC_ERR_BAD_CURRENT_DATE;
+
+    /* Validate every entry before emitting anything. */
+    {
+        cur c = { cd, cd_len, 0 };
+        uint32_t n;
+        if ((e = object_begin(&c, &n))) return e;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t *fk; uint32_t fklen;
+            if ((e = take_key(&c, &fk, &fklen))) return e;
+            size_t vstart = c.pos;
+            if ((e = skip_value(&c))) return e;
+            if (!cd_spec_is_valid(cd + vstart, c.pos - vstart))
+                return DC_ERR_BAD_CURRENT_DATE;
+            if (cd_targeted_elsewhere(update, update_len, fk, fklen))
+                return DC_ERR_CURRENT_DATE_CONFLICT;
+        }
+    }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_object(b);
+
+    /* Every operator except $currentDate and $set, verbatim. */
+    cur c = { update, update_len, 0 };
+    uint32_t n;
+    if ((e = object_begin(&c, &n))) { bj_builder_free(b); return e; }
+    const uint8_t *existing_set = NULL; size_t existing_set_len = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *kp; uint32_t klen;
+        if ((e = take_key(&c, &kp, &klen))) { bj_builder_free(b); return e; }
+        size_t vstart = c.pos;
+        if ((e = skip_value(&c))) { bj_builder_free(b); return e; }
+        if (klen == 12 && memcmp(kp, "$currentDate", 12) == 0) continue;
+        if (klen == 4 && memcmp(kp, "$set", 4) == 0) {
+            existing_set = update + vstart;
+            existing_set_len = c.pos - vstart;
+            continue;
+        }
+        bj_put_key(b, kp, klen);
+        bj_put_raw(b, update + vstart, (uint32_t)(c.pos - vstart));
+    }
+
+    /* One merged $set: the original entries, then the resolved dates. */
+    bj_put_key(b, (const uint8_t *)"$set", 4);
+    bj_begin_object(b);
+    if (existing_set && existing_set_len >= 1 && existing_set[0] == BJ_TYPE_OBJECT) {
+        cur sc = { existing_set, existing_set_len, 0 };
+        uint32_t sn;
+        if ((e = object_begin(&sc, &sn))) { bj_builder_free(b); return e; }
+        for (uint32_t i = 0; i < sn; i++) {
+            const uint8_t *sk; uint32_t sklen;
+            if ((e = take_key(&sc, &sk, &sklen))) { bj_builder_free(b); return e; }
+            size_t vstart = sc.pos;
+            if ((e = skip_value(&sc))) { bj_builder_free(b); return e; }
+            /* A $set entry colliding with a $currentDate field was already
+             * refused above, so this cannot shadow a date. */
+            bj_put_key(b, sk, sklen);
+            bj_put_raw(b, existing_set + vstart, (uint32_t)(sc.pos - vstart));
+        }
+    }
+    {
+        cur cc = { cd, cd_len, 0 };
+        uint32_t cn;
+        if ((e = object_begin(&cc, &cn))) { bj_builder_free(b); return e; }
+        for (uint32_t i = 0; i < cn; i++) {
+            const uint8_t *fk; uint32_t fklen;
+            if ((e = take_key(&cc, &fk, &fklen))) { bj_builder_free(b); return e; }
+            if ((e = skip_value(&cc))) { bj_builder_free(b); return e; }
+            bj_put_key(b, fk, fklen);
+            bj_put_date(b, now_ms);
+        }
+    }
+    bj_end_object(b);
+    bj_end_object(b);
+
+    if ((e = bj_builder_error(b))) { bj_builder_free(b); return e; }
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    if (!data) { bj_builder_free(b); return BJ_ERR_STATE; }
+    e = dbuf_put(out, data, len);
+    bj_builder_free(b);
+    return e;
+}

@@ -5,6 +5,7 @@
 #include "db_names.h"
 #include "db_bulk.h"
 #include "db_agg.h"
+#include "db_update.h"
 #include "db.h"
 #include "bjcursor.h"
 
@@ -50,6 +51,11 @@ const char *dc_strerror(int code) {
         case DC_ERR_NON_ASCENDING_KEY:
             return "createIndex: only ascending (1) fields are supported so far";
         /* db_bulk.h */
+        /* db_update.h */
+        case DC_ERR_BAD_CURRENT_DATE:
+            return "$currentDate: each field must be true or {$type: \"date\"}";
+        case DC_ERR_CURRENT_DATE_CONFLICT:
+            return "$currentDate: field is already targeted by another operator";
         case DC_ERR_BULK_EMPTY:
             return "bulkWrite requires a non-empty array of operations";
         case DC_ERR_BULK_UNKNOWN_OP:

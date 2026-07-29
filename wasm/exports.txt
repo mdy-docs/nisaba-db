@@ -97,6 +97,13 @@ _dcw_find_one_and_update
 _dcw_find_one_and_replace
 _dcw_find_one_and_delete
 
+# $currentDate resolution (db_update.h)
+_cdw_new
+_cdw_free
+_cdw_resolve
+_cdw_ptr
+_cdw_len
+
 # aggregation pipeline (db_agg.h)
 _dcw_aggregate
 

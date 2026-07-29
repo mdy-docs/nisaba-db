@@ -31,3 +31,4 @@ wasm/src/db_ttl_wasm.c
 wasm/src/db_bulk_wasm.c
 wasm/src/db_wasm.c
 wasm/src/db_agg_wasm.c
+wasm/src/db_currentdate_wasm.c

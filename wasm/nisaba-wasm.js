@@ -1043,37 +1043,40 @@ class OPFSStorageProvider {
  * `{ $type: 'date' }` (no timestamp wire type exists) and must not already
  * be targeted by another top-level operator.
  */
-function resolveCurrentDate(update) {
+let currentDateCtx = 0;
+
+/**
+ * Rewrite {$currentDate: {...}} into {$set: {...}} carrying `nowMs`.
+ *
+ * The rewrite lives in C (upd_resolve_current_date) because its rules are
+ * the update layer's rules: a $currentDate field must not collide with
+ * any other operator's target, which is the same path-collision
+ * invariant db_update.c already enforces for everything else. Only the
+ * clock is the host's -- WASM has no portable one.
+ *
+ * An update with no $currentDate is returned unchanged, and the rewrite
+ * is idempotent on an already-resolved update, which is what lets the WAL
+ * resolve at proposal time and the apply path run it again without a
+ * second clock reading changing the result.
+ */
+function resolveCurrentDate(update, nowMs = Date.now()) {
   if (!update || typeof update !== 'object' || !('$currentDate' in update)) return update;
-  const spec = update.$currentDate;
-  if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) {
-    throw new Error('$currentDate requires an object mapping field names to true or {$type: "date"}');
+  const M = requireModule();
+  if (!currentDateCtx) {
+    currentDateCtx = M._cdw_new();
+    if (!currentDateCtx) throw codeError(-1, 'cdw_new');
   }
-
-  const targetedElsewhere = new Set();
-  for (const [key, val] of Object.entries(update)) {
-    if (key === '$currentDate' || key[0] !== '$') continue;
-    if (val && typeof val === 'object') {
-      for (const f of Object.keys(val)) targetedElsewhere.add(f);
-    }
-  }
-
-  const result = { ...update };
-  delete result.$currentDate;
-  const set = { ...(update.$set || {}) };
-  for (const [field, fieldSpec] of Object.entries(spec)) {
-    const isPlainTrue = fieldSpec === true;
-    const isDateType = fieldSpec !== null && typeof fieldSpec === 'object' && fieldSpec.$type === 'date';
-    if (!isPlainTrue && !isDateType) {
-      throw new Error(`$currentDate: field "${field}" must be true or {$type: "date"} (got ${JSON.stringify(fieldSpec)})`);
-    }
-    if (targetedElsewhere.has(field) || Object.prototype.hasOwnProperty.call(set, field)) {
-      throw new Error(`$currentDate: field "${field}" is already targeted by another operator`);
-    }
-    set[field] = new Date();
-  }
-  result.$set = set;
-  return result;
+  const encoded = encode(update);
+  const ptr = M._malloc(encoded.length || 1);
+  try {
+    if (encoded.length) M.HEAPU8.set(encoded, ptr);
+    const rc = M._cdw_resolve(currentDateCtx, ptr, encoded.length, nowMs);
+    if (rc !== 0) throw codeError(rc, JSON.stringify(update.$currentDate));
+    const len = M._cdw_len(currentDateCtx);
+    check(len < 0 ? len : 0);
+    const out = M._cdw_ptr(currentDateCtx);
+    return decode(M.HEAPU8.slice(out, out + len));
+  } finally { M._free(ptr); }
 }
 
 /** Default bound on unconsumed change events buffered for a stream's

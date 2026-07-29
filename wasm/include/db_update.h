@@ -7,10 +7,12 @@
  * to an operand; a plain field (a full replacement document) is rejected
  * (BJ_ERR_STATE), since that is replaceOne's job, not updateOne/
  * updateMany's, matching the modern MongoDB driver's own validation.
- * $currentDate is *not* handled here at all — src/binjson-wasm.js resolves
- * it into $set before a document ever crosses the WASM bridge, since only
- * the JS host has a clock (the same reasoning that already puts _id
- * generation in JS, not C).
+ * $currentDate is resolved into $set by upd_resolve_current_date (below)
+ * before upd_apply ever sees an update, so the operator table here has no
+ * entry for it. The clock stays a caller-supplied parameter -- WASM has no
+ * portable one, the same reasoning that puts _id generation in the host --
+ * but the REWRITE, including its collision rules against every other
+ * operator, is update logic and lives here.
  *
  * Scope, deliberately conservative (matching how db_query.h and keyenc.h
  * scope their own first cuts):
@@ -85,6 +87,11 @@
 #include <stddef.h>
 
 #include "binjson.h"
+#include "dbuf.h"
+
+/* Continuing the DC_ERR_* range (db_agg.h ends at -26). */
+#define DC_ERR_BAD_CURRENT_DATE      (-27)
+#define DC_ERR_CURRENT_DATE_CONFLICT (-28)
 
 #ifdef __cplusplus
 extern "C" {
@@ -108,6 +115,26 @@ int upd_apply(const uint8_t *doc, size_t doc_len,
  * touching any particular document) without needing a document at hand —
  * for validating an update spec up front, before scanning for matches.
  */
+/*
+ * Rewrite {$currentDate: {...}} into an equivalent {$set: {...}} carrying
+ * `now_ms`, appending the resulting update document to `out`.
+ *
+ * Each $currentDate entry must be TRUE or {$type: "date"}
+ * (DC_ERR_BAD_CURRENT_DATE otherwise), and its field must not already be
+ * targeted by another operator or by an existing $set
+ * (DC_ERR_CURRENT_DATE_CONFLICT) -- the same path-collision rule the rest
+ * of this file enforces, which is exactly why the rewrite belongs here
+ * rather than in a host that would have to restate it.
+ *
+ * An update with no $currentDate is copied through unchanged, so callers
+ * can run everything through this unconditionally. It is also idempotent
+ * on an already-resolved update, which is what lets the WAL pre-resolve a
+ * command at proposal time and the apply path run the same helper again
+ * without a second clock reading changing the outcome.
+ */
+int upd_resolve_current_date(const uint8_t *update, size_t update_len,
+                             int64_t now_ms, dbuf *out);
+
 int upd_validate(const uint8_t *update, size_t update_len);
 
 #ifdef __cplusplus

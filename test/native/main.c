@@ -25,6 +25,7 @@
 #include "db_ttl.h"
 #include "db_bulk.h"
 #include "db_agg.h"
+#include "db_update.h"
 #include "dbuf.h"
 
 #include "docs.h"
@@ -1108,7 +1109,146 @@ TEST(aggregate_later_match_has_the_full_engine_grammar) {
     fx_close(&fx);
 }
 
+/* ---- $currentDate ------------------------------------------------------ */
+
+TEST(current_date_rewrites_into_set) {
+    /* {$currentDate: {seen: true}, $inc: {n: 1}} */
+    doc *u = doc_new();
+    doc_begin_obj(u, "$currentDate");
+    doc_key(u, "seen");
+    bj_put_bool(u->b, 1);
+    doc_end_obj(u);
+    doc_begin_obj(u, "$inc");
+    doc_int(u, "n", 1);
+    doc_end_obj(u);
+    uint32_t len; const uint8_t *up = doc_done(u, &len);
+
+    dbuf out = {0};
+    CHECK_OK(upd_resolve_current_date(up, len, 1700000000000LL, &out));
+    /* $currentDate is gone, $set carries a DATE, $inc survives. */
+    CHECK(find_bytes(out.data, out.len, "$currentDate", 12) == NULL);
+    CHECK(find_bytes(out.data, out.len, "$set", 4) != NULL);
+    CHECK(find_bytes(out.data, out.len, "$inc", 4) != NULL);
+    {
+        int saw_date = 0;
+        for (size_t i = 0; i < out.len; i++) if (out.data[i] == BJ_TYPE_DATE) saw_date = 1;
+        CHECK(saw_date);
+    }
+    dbuf_free(&out);
+    doc_free(u);
+}
+
+TEST(current_date_is_idempotent_and_passes_others_through) {
+    /* No $currentDate: byte-identical passthrough, so a caller can run
+     * every update through this unconditionally. */
+    doc *u = doc_new();
+    doc_begin_obj(u, "$set");
+    doc_int(u, "n", 1);
+    doc_end_obj(u);
+    uint32_t len; const uint8_t *up = doc_done(u, &len);
+
+    dbuf out = {0};
+    CHECK_OK(upd_resolve_current_date(up, len, 123, &out));
+    CHECK_I64(out.len, len);
+    CHECK(memcmp(out.data, up, len) == 0);
+
+    /* Running it again on the resolved form changes nothing -- which is
+     * what lets the WAL resolve at proposal time and apply-time run it
+     * again without a second clock reading moving the value. */
+    dbuf twice = {0};
+    CHECK_OK(upd_resolve_current_date(out.data, out.len, 999, &twice));
+    CHECK_I64(twice.len, out.len);
+    CHECK(memcmp(twice.data, out.data, out.len) == 0);
+    dbuf_free(&twice);
+    dbuf_free(&out);
+    doc_free(u);
+}
+
+TEST(current_date_refuses_bad_specs_and_collisions) {
+    /* A field spec that is neither true nor {$type: "date"}. */
+    {
+        doc *u = doc_new();
+        doc_begin_obj(u, "$currentDate");
+        doc_str(u, "seen", "yes");
+        doc_end_obj(u);
+        uint32_t len; const uint8_t *up = doc_done(u, &len);
+        dbuf out = {0};
+        CHECK_RC(upd_resolve_current_date(up, len, 0, &out), DC_ERR_BAD_CURRENT_DATE);
+        CHECK_I64(out.len, 0);
+        dbuf_free(&out);
+        doc_free(u);
+    }
+    /* {$type: "timestamp"} is a real MongoDB option this engine does not
+     * implement -- refused, not silently treated as a date. */
+    {
+        doc *u = doc_new();
+        doc_begin_obj(u, "$currentDate");
+        doc_begin_obj(u, "seen");
+        doc_str(u, "$type", "timestamp");
+        doc_end_obj(u);
+        doc_end_obj(u);
+        uint32_t len; const uint8_t *up = doc_done(u, &len);
+        dbuf out = {0};
+        CHECK_RC(upd_resolve_current_date(up, len, 0, &out), DC_ERR_BAD_CURRENT_DATE);
+        dbuf_free(&out);
+        doc_free(u);
+    }
+    /* The same field targeted by $currentDate and $inc. */
+    {
+        doc *u = doc_new();
+        doc_begin_obj(u, "$currentDate");
+        doc_key(u, "seen");
+        bj_put_bool(u->b, 1);
+        doc_end_obj(u);
+        doc_begin_obj(u, "$inc");
+        doc_int(u, "seen", 1);
+        doc_end_obj(u);
+        uint32_t len; const uint8_t *up = doc_done(u, &len);
+        dbuf out = {0};
+        CHECK_RC(upd_resolve_current_date(up, len, 0, &out), DC_ERR_CURRENT_DATE_CONFLICT);
+        dbuf_free(&out);
+        doc_free(u);
+    }
+    /* ...and by an existing $set, which merges rather than collides
+     * unless it names the same field. */
+    {
+        doc *u = doc_new();
+        doc_begin_obj(u, "$currentDate");
+        doc_key(u, "seen");
+        bj_put_bool(u->b, 1);
+        doc_end_obj(u);
+        doc_begin_obj(u, "$set");
+        doc_int(u, "seen", 1);
+        doc_end_obj(u);
+        uint32_t len; const uint8_t *up = doc_done(u, &len);
+        dbuf out = {0};
+        CHECK_RC(upd_resolve_current_date(up, len, 0, &out), DC_ERR_CURRENT_DATE_CONFLICT);
+        dbuf_free(&out);
+        doc_free(u);
+    }
+    {
+        doc *u = doc_new();
+        doc_begin_obj(u, "$currentDate");
+        doc_key(u, "seen");
+        bj_put_bool(u->b, 1);
+        doc_end_obj(u);
+        doc_begin_obj(u, "$set");
+        doc_int(u, "other", 1);
+        doc_end_obj(u);
+        uint32_t len; const uint8_t *up = doc_done(u, &len);
+        dbuf out = {0};
+        CHECK_OK(upd_resolve_current_date(up, len, 42, &out));
+        CHECK(find_bytes(out.data, out.len, "other", 5) != NULL);
+        CHECK(find_bytes(out.data, out.len, "seen", 4) != NULL);
+        dbuf_free(&out);
+        doc_free(u);
+    }
+}
+
 int main(void) {
+    RUN(current_date_rewrites_into_set);
+    RUN(current_date_is_idempotent_and_passes_others_through);
+    RUN(current_date_refuses_bad_specs_and_collisions);
     RUN(aggregate_group_uses_encoded_bytes_for_identity);
     RUN(aggregate_reports_the_stage_that_failed);
     RUN(aggregate_later_match_has_the_full_engine_grammar);

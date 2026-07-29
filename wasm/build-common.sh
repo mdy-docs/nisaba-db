@@ -65,6 +65,7 @@ NATIVE_EXCLUDE=(
   wasm/src/db_bulk_wasm.c
   wasm/src/db_wasm.c
   wasm/src/db_agg_wasm.c
+  wasm/src/db_currentdate_wasm.c
 )
 
 # All C sources for a target, one per line.

@@ -2045,7 +2045,75 @@ TEST(sweep_plan_on_an_empty_catalog_still_spares_foreign_files) {
     bj_builder_free(cat);
 }
 
+TEST(collection_files_and_the_sweep_agree_by_construction) {
+    /*
+     * dropCollection deletes what an entry claims; the sweep spares what
+     * an entry claims. They must be the same set, so they share one
+     * implementation -- and this test pins the consequence: every file
+     * dc_collection_files lists is a file the sweep refuses to delete.
+     */
+    const uint8_t *entry; size_t entry_len;
+    bj_builder *eb = empty_entry(&entry, &entry_len);
+    const uint8_t *def; size_t def_len;
+    bj_builder *db_ = eq_def("team_1", "idx-users-team_1.bj", "team", 0, &def, &def_len);
+    dbuf full = {0};
+    CHECK_OK(dc_catalog_put_index(entry, entry_len, def, def_len, &full));
+
+    dbuf files = {0};
+    CHECK_OK(dc_collection_files(full.data, full.len, "users", 5, &files));
+    /* primary + journal + one index */
+    CHECK_I64(arr_count(files.data, files.len), 3);
+    CHECK(find_bytes(files.data, files.len, "coll-users.bj", 13) != NULL);
+    CHECK(find_bytes(files.data, files.len, "coll-users-journal.bj", 21) != NULL);
+    CHECK(find_bytes(files.data, files.len, "idx-users-team_1.bj", 19) != NULL);
+
+    /* The same entry, seen by the sweep: none of those three is a victim. */
+    bj_builder *cat = bj_builder_new();
+    bj_begin_array(cat);
+    bj_begin_object(cat);
+    bj_put_key(cat, (const uint8_t *)"key", 3);
+    bj_put_string(cat, (const uint8_t *)"users", 5);
+    bj_put_key(cat, (const uint8_t *)"value", 5);
+    bj_put_raw(cat, full.data, (uint32_t)full.len);
+    bj_end_object(cat);
+    bj_end_array(cat);
+    size_t cat_len = 0;
+    const uint8_t *catalog = bj_builder_data(cat, &cat_len);
+
+    static const char *const names[] = {
+        "coll-users.bj", "coll-users-journal.bj", "idx-users-team_1.bj", "g9-coll-users.bj"
+    };
+    dbuf ls = {0};
+    listing(&ls, names, 4);
+    dbuf victims = {0};
+    CHECK_OK(dc_sweep_plan(catalog, cat_len, (const char *)ls.data, ls.len, &victims));
+    CHECK_I64(arr_count(victims.data, victims.len), 1);
+    CHECK(victim_listed(&victims, "g9-coll-users.bj"));
+
+    dbuf_free(&victims); dbuf_free(&ls); dbuf_free(&files); dbuf_free(&full);
+    bj_builder_free(cat); bj_builder_free(db_); bj_builder_free(eb);
+}
+
+TEST(a_fresh_entry_carries_only_what_it_has_earned) {
+    dbuf entry = {0};
+    CHECK_OK(dc_catalog_new_entry("users", 5, &entry));
+    CHECK(find_bytes(entry.data, entry.len, "coll-users.bj", 13) != NULL);
+    /* No journal, gen or indexes yet -- they arrive when earned, which is
+     * why every reader treats them as optional. */
+    CHECK(find_bytes(entry.data, entry.len, "journal", 7) == NULL);
+    CHECK(find_bytes(entry.data, entry.len, "gen", 3) == NULL);
+
+    /* ...and it still plans, deriving the journal it never stored. */
+    dbuf plan = {0};
+    CHECK_OK(dc_catalog_open_plan(entry.data, entry.len, "users", 5, &plan));
+    CHECK(find_bytes(plan.data, plan.len, "coll-users-journal.bj", 21) != NULL);
+
+    dbuf_free(&plan); dbuf_free(&entry);
+}
+
 int main(void) {
+    RUN(collection_files_and_the_sweep_agree_by_construction);
+    RUN(a_fresh_entry_carries_only_what_it_has_earned);
     RUN(sweep_plan_deletes_orphans_and_nothing_else);
     RUN(sweep_plan_spares_a_journal_an_old_entry_never_recorded);
     RUN(sweep_plan_on_an_empty_catalog_still_spares_foreign_files);

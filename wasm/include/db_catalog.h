@@ -188,6 +188,32 @@ int dc_index_create_plan(const uint8_t *keys, size_t keys_len,
 int dc_sweep_plan(const uint8_t *catalog, size_t catalog_len,
                   const char *names, size_t names_len, dbuf *out);
 
+/*
+ * Every file one catalog entry lays claim to, as a binjson ARRAY of
+ * STRINGs: the primary, the journal, and each index's file or files.
+ *
+ * This is dropCollection's plan -- the files to delete once the entry is
+ * gone -- and it is the same computation the orphan sweep does per entry,
+ * sharing one implementation. That sharing is the point: a file kind the
+ * sweep knows about but drop does not becomes an orphan on every drop,
+ * and a file kind drop knows about but the sweep does not gets deleted
+ * from under a live collection.
+ *
+ * Applies the same generation-0 journal fallback as the open plan, for
+ * entries written before that field existed.
+ */
+int dc_collection_files(const uint8_t *entry, size_t entry_len,
+                        const char *coll, size_t coll_len, dbuf *out);
+
+/*
+ * A fresh catalog entry for a collection that does not exist yet: just
+ * the primary file name, derived from the naming scheme. Later fields
+ * (journal, gen, compactedBytes, indexes) are added as they are earned,
+ * which is what keeps an untouched collection's entry small and is why
+ * every reader treats them as optional.
+ */
+int dc_catalog_new_entry(const char *coll, size_t coll_len, dbuf *out);
+
 #ifdef __cplusplus
 }
 #endif

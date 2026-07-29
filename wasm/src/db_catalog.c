@@ -825,3 +825,60 @@ int dc_sweep_plan(const uint8_t *catalog, size_t catalog_len,
     bj_builder_free(b);
     return e;
 }
+
+/* ---- per-entry file lists ----------------------------------------------- */
+
+int dc_collection_files(const uint8_t *entry, size_t entry_len,
+                        const char *coll, size_t coll_len, dbuf *out) {
+    /* Reuses the sweep's own reference collector, so drop and sweep can
+     * never disagree about what a collection owns. */
+    dbuf refs = {0};
+    int e = refs_of_entry(&refs, (const uint8_t *)coll, (uint32_t)coll_len,
+                          entry, entry_len);
+    if (e) { dbuf_free(&refs); return e; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&refs); return BJ_ERR_OOM; }
+    bj_begin_array(b);
+    {
+        size_t at = 0;
+        while (at < refs.len) {
+            const char *nm = (const char *)refs.data + at;
+            size_t nlen = strlen(nm);
+            if (nlen) bj_put_string(b, (const uint8_t *)nm, (uint32_t)nlen);
+            at += nlen + 1;
+        }
+    }
+    bj_end_array(b);
+    dbuf_free(&refs);
+
+    if ((e = bj_builder_error(b))) { bj_builder_free(b); return e; }
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    if (!data) { bj_builder_free(b); return BJ_ERR_STATE; }
+    e = dbuf_put(out, data, len);
+    bj_builder_free(b);
+    return e;
+}
+
+int dc_catalog_new_entry(const char *coll, size_t coll_len, dbuf *out) {
+    dbuf file = {0};
+    int e = dc_collection_file_name(&file, coll, coll_len, 0);
+    if (e) { dbuf_free(&file); return e; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&file); return BJ_ERR_OOM; }
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"file", 4);
+    bj_put_string(b, file.data, (uint32_t)file.len);
+    bj_end_object(b);
+    dbuf_free(&file);
+
+    if ((e = bj_builder_error(b))) { bj_builder_free(b); return e; }
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    if (!data) { bj_builder_free(b); return BJ_ERR_STATE; }
+    e = dbuf_put(out, data, len);
+    bj_builder_free(b);
+    return e;
+}

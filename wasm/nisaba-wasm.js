@@ -2780,7 +2780,14 @@ class Db {
       try {
         let entry = this._catalog.search(name);
         if (!entry) {
-          entry = { file: collectionFileName(name) };
+          // A fresh entry is just the primary file name; every later
+          // field (journal, gen, compactedBytes, indexes) is added as it
+          // is earned, which is why every reader treats them as optional.
+          entry = catalogCall((M, ctx) => {
+            const n = allocStr(M, name);
+            try { return M._catw_new_entry(ctx, n.ptr, n.len); }
+            finally { n.free(); }
+          });
           this._catalog.add(name, entry);
         }
         const handle = await this._provider.openFile(entry.file, { create: true });
@@ -2814,16 +2821,22 @@ class Db {
       await cached._close();
       this._collections.delete(name);
     }
+    // Which files an entry claims is the same question the orphan sweep
+    // asks, answered by the same C (db_catalog.h). Sharing it is what
+    // stops the two from disagreeing: a file kind drop misses becomes an
+    // orphan on every drop, and one the sweep misses gets deleted from
+    // under a live collection.
+    const files = catalogCall((M, ctx) => {
+      const ee = encode(entry);
+      const ep = M._malloc(ee.length || 1);
+      const n = allocStr(M, name);
+      try {
+        if (ee.length) M.HEAPU8.set(ee, ep);
+        return M._catw_collection_files(ctx, ep, ee.length, n.ptr, n.len);
+      } finally { n.free(); M._free(ep); }
+    });
     this._catalog.delete(name);
-    for (const def of entry.indexes || []) {
-      if (def.kind === 'text') {
-        for (const role of Object.keys(def.files)) await this._provider.deleteFile(def.files[role]);
-      } else {
-        await this._provider.deleteFile(def.file);
-      }
-    }
-    await this._provider.deleteFile(entry.file);
-    await this._provider.deleteFile(entry.journal || journalFileName(name));
+    for (const f of files) await this._provider.deleteFile(f);
     return true;
   }
 

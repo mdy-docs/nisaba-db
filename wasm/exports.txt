@@ -39,6 +39,13 @@ _dvw_check_index_key_spec
 _dvw_ptr
 _dvw_len
 
+# TTL expiry policy (db_ttl.h)
+_ttlw_new
+_ttlw_free
+_ttlw_filter
+_ttlw_ptr
+_ttlw_len
+
 # lifecycle
 _dcw_collection_open
 _dcw_collection_free

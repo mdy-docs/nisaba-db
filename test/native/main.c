@@ -22,6 +22,7 @@
 #include "keyenc.h"
 #include "db_names.h"
 #include "db_validate.h"
+#include "db_ttl.h"
 #include "dbuf.h"
 
 #include "docs.h"
@@ -824,7 +825,56 @@ TEST(index_key_spec_validates_and_emits_its_fields) {
     }
 }
 
+/* ---- db_ttl ------------------------------------------------------------ */
+
+TEST(ttl_cutoff_and_filter) {
+    int64_t cutoff = 0;
+
+    /* 1 hour TTL at epoch 10_000_000 ms -> 10_000_000 - 3_600_000. */
+    CHECK_OK(dc_ttl_cutoff_ms(10000000, 3600, &cutoff));
+    CHECK_I64(cutoff, 6400000);
+
+    /* Zero means "expire immediately": the cutoff is now. */
+    CHECK_OK(dc_ttl_cutoff_ms(1700000000000LL, 0, &cutoff));
+    CHECK_I64(cutoff, 1700000000000LL);
+
+    /* Fractional seconds are legal (MongoDB permits them). */
+    CHECK_OK(dc_ttl_cutoff_ms(1000, 0.5, &cutoff));
+    CHECK_I64(cutoff, 500);
+
+    /* NaN and infinities would silently produce a cutoff matching
+     * everything or nothing -- refuse rather than delete the collection. */
+    CHECK_RC(dc_ttl_cutoff_ms(0, 0.0 / 0.0, &cutoff), BJ_ERR_RANGE);
+    CHECK_RC(dc_ttl_cutoff_ms(0, 1.0 / 0.0, &cutoff), BJ_ERR_RANGE);
+    CHECK_RC(dc_ttl_cutoff_ms(0, -1.0 / 0.0, &cutoff), BJ_ERR_RANGE);
+    /* A TTL past the representable range is refused, not cast (which
+     * would be undefined behavior). */
+    CHECK_RC(dc_ttl_cutoff_ms(0, 1e18, &cutoff), BJ_ERR_RANGE);
+
+    /* The filter is {field: {$lt: Date(cutoff)}} -- decodable, one
+     * top-level field, and the $lt value really is a DATE. */
+    dbuf f = {0};
+    CHECK_OK(dc_ttl_filter(&f, "createdAt", 9, 6400000));
+    CHECK(f.len > 0);
+    CHECK_I64(f.data[0], BJ_TYPE_OBJECT);
+    CHECK(find_bytes(f.data, f.len, "createdAt", 9) != NULL);
+    CHECK(find_bytes(f.data, f.len, "$lt", 3) != NULL);
+    /* The DATE type byte must appear -- a number here would compare
+     * against Date-encoded index keys and silently match nothing. */
+    {
+        int saw_date = 0;
+        for (size_t i = 0; i < f.len; i++) if (f.data[i] == BJ_TYPE_DATE) saw_date = 1;
+        CHECK(saw_date);
+    }
+    dbuf_free(&f);
+
+    dbuf empty = {0};
+    CHECK_RC(dc_ttl_filter(&empty, "", 0, 0), BJ_ERR_RANGE);
+    dbuf_free(&empty);
+}
+
 int main(void) {
+    RUN(ttl_cutoff_and_filter);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(name_validation_matches_the_js_rules);
     RUN(index_key_spec_validates_and_emits_its_fields);

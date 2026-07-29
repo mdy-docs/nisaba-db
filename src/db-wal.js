@@ -74,6 +74,7 @@ import {
   encode,
   decode,
   resolveCurrentDate,
+  ttlFilters,
   dbCatalogFile,
   isDbFile
 } from '../wasm/nisaba-wasm.js';
@@ -658,11 +659,14 @@ class WalCollection {
    * read in the write path, resolved at proposal time like everything
    * else. */
   async pruneExpired() {
+    // Same policy as the inner collection (db_ttl.h computes both the
+    // cutoff and the filter shape); the difference that matters is what
+    // happens next -- these deletes go through the logged path, so the
+    // cutoff is a concrete Date inside an ordinary logged command rather
+    // than a rule re-evaluated at apply time.
     let deletedCount = 0;
-    for (const ix of this._inner._indexes.values()) {
-      if (ix.kind !== 'equality' || ix.expireAfterSeconds === undefined) continue;
-      const cutoff = new Date(Date.now() - ix.expireAfterSeconds * 1000);
-      const { deletedCount: n } = await this.deleteMany({ [ix.fields[0]]: { $lt: cutoff } });
+    for (const filter of ttlFilters(this._inner._indexes, Date.now())) {
+      const { deletedCount: n } = await this.deleteMany(filter);
       deletedCount += n;
     }
     return deletedCount;

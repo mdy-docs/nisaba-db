@@ -786,6 +786,47 @@ function isDbFile(name) {
  * caller can already get by reversing results, so it's deferred rather than
  * plumbed through the composite-key encoding (keyenc.h) for no behavioral
  * gain yet. */
+let ttlCtx = 0;
+
+/**
+ * The expiry filters a collection's TTL indexes imply at instant `nowMs`,
+ * one per TTL index, in index order.
+ *
+ * Both the cutoff arithmetic and the filter shape are C's (db_ttl.h) --
+ * they were duplicated verbatim between Collection.pruneExpired and
+ * WalCollection.pruneExpired, which differ only in what they then DO with
+ * the filter (delete directly, or log a delete command first). That
+ * difference is real and stays theirs; the policy is shared.
+ *
+ * The index *registry* is still JS, so the loop is too. When Phase 3 moves
+ * index metadata into the C catalog, this becomes a single dc_ttl_plan
+ * call and the loop goes with it.
+ *
+ * @param {Map} indexes Collection._indexes
+ * @param {number} nowMs the host's clock reading
+ * @returns {object[]} decoded filters, ready for deleteMany
+ */
+function ttlFilters(indexes, nowMs) {
+  const M = requireModule();
+  const filters = [];
+  for (const ix of indexes.values()) {
+    if (ix.kind !== 'equality' || ix.expireAfterSeconds === undefined) continue;
+    if (!ttlCtx) {
+      ttlCtx = M._ttlw_new();
+      if (!ttlCtx) throw codeError(-1, 'ttlw_new');
+    }
+    const field = allocStr(M, ix.fields[0]);
+    try {
+      check(M._ttlw_filter(ttlCtx, field.ptr, field.len, nowMs, ix.expireAfterSeconds));
+      const len = M._ttlw_len(ttlCtx);
+      check(len < 0 ? len : 0);
+      const ptr = M._ttlw_ptr(ttlCtx);
+      filters.push(decode(M.HEAPU8.slice(ptr, ptr + len)));
+    } finally { field.free(); }
+  }
+  return filters;
+}
+
 let validateCtx = 0;
 
 /**
@@ -2516,10 +2557,8 @@ class Collection {
    */
   async pruneExpired() {
     let deletedCount = 0;
-    for (const ix of this._indexes.values()) {
-      if (ix.kind !== 'equality' || ix.expireAfterSeconds === undefined) continue;
-      const cutoff = new Date(Date.now() - ix.expireAfterSeconds * 1000);
-      const { deletedCount: n } = await this.deleteMany({ [ix.fields[0]]: { $lt: cutoff } });
+    for (const filter of ttlFilters(this._indexes, Date.now())) {
+      const { deletedCount: n } = await this.deleteMany(filter);
       deletedCount += n;
     }
     return deletedCount;
@@ -3020,6 +3059,7 @@ export {
   MemoryStorageProvider,
   OPFSStorageProvider,
   resolveCurrentDate,
+  ttlFilters,
   // File naming and the format stamp (db_names.h). Exported so no other
   // layer has to restate the convention -- src/db-wal.js carried its own
   // copy of the catalog name and the orphan-sweep pattern, with a comment

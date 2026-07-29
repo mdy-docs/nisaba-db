@@ -61,6 +61,7 @@ NATIVE_EXCLUDE=(
   third_party/binjson-structures/src/textindex_wasm.c
   wasm/src/db_names_wasm.c
   wasm/src/db_validate_wasm.c
+  wasm/src/db_ttl_wasm.c
   wasm/src/db_wasm.c
 )
 

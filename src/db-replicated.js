@@ -51,7 +51,7 @@ import { connect, EntryLog, encode, decode, crc32 } from '../wasm/nisaba-wasm.js
 import { RaftNode, NotLeaderError } from './raft.js';
 import {
   WalDb, WAL_FILE, SNAP_PREFIX,
-  openWalStorage, restoreFromStore
+  openWalStorage, restoreFromStore, reconcileLogWithAppliedFloor
 } from './db-wal.js';
 
 /** How many recent per-entry results the state machine retains for local
@@ -313,7 +313,10 @@ export async function connectReplicated(provider, options = {}) {
   }
   const db = await connect(provider, dbOptions);
   try {
-    const { store, log } = await openWalStorage(provider, { snapshotPrefix });
+    const { store, log: rawLog, logName } = await openWalStorage(provider, { snapshotPrefix });
+    // Restored-applied-state shape (log behind the replay floor): re-base
+    // before the RaftNode ever sees the log — see the helper's contract.
+    const log = await reconcileLogWithAppliedFloor(db, rawLog, logName, provider);
     const rdb = new ReplicatedDb(db, log, { provider, store, dbOptions });
     const machine = new DbStateMachine(rdb);
     const node = new RaftNode({

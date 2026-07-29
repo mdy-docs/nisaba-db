@@ -289,4 +289,41 @@ describe('replicated db: failures and recovery', () => {
       (await (await replacement.rdb.collection('users')).findOne({ _id: oid(6) })) !== null);
     for (const m of cluster.values()) await m.rdb.close();
   });
+
+  it('a member rebooted from applied-state-only files (log lost) re-bases its log and serves again', async () => {
+    // The backup-restore shape (connectWal has the single-node twin of
+    // this test): the database files carry appliedIndex = N, but the
+    // entry log and snapshot store are gone. Unreconciled, the reborn
+    // member pairs lastApplied = N with a log restarting at index 1 —
+    // every new entry sits below the commit floor and its propose hangs
+    // forever. reconcileLogWithAppliedFloor re-bases the fresh log at N.
+    const sim = new Sim(77);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeDbCluster(1, sim, net);
+    const solo = leaderOf(cluster);
+    const users = await solo.rdb.collection('users');
+    for (let i = 1; i <= 3; i++) {
+      const { error } = await settle(sim, cluster, users.insertOne({ _id: oid(i), i }));
+      expect(error).toBeUndefined();
+    }
+    const floor = await users.appliedIndex(); // the persisted replay floor
+    expect(floor).toBeGreaterThan(0);
+    await solo.rdb.close();
+
+    for (const name of await solo.provider.listFiles()) {
+      if (name.startsWith('__wal') || name.startsWith('__snap')) await solo.provider.deleteFile(name);
+    }
+
+    const reborn = await bootMember(1, [1], sim, net, solo.provider);
+    cluster.set(1, reborn);
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    expect(reborn.node.log.baseIndex).toBe(floor); // re-based, appends resume past the floor
+
+    const users2 = await reborn.rdb.collection('users');
+    expect(await users2.countDocuments({})).toBe(3);
+    const w = await settle(sim, cluster, users2.insertOne({ _id: oid(9), i: 9 }));
+    expect(w.error).toBeUndefined();
+    expect(await users2.countDocuments({})).toBe(4);
+    await reborn.rdb.close();
+  });
 });

@@ -736,13 +736,53 @@ export async function openWalStorage(provider, { snapshotPrefix = SNAP_PREFIX } 
   return { store, log, logName };
 }
 
+/**
+ * Reconcile a just-opened entry log with the database's replay floor —
+ * the max persisted appliedIndex across collections. A log BEHIND the
+ * floor cannot arise from any crash the commit journals cover: an entry
+ * is durable in the log before it is ever applied, and appliedIndex
+ * persists atomically with the applied mutation. It appears exactly when
+ * the log was lost while the applied state survived — restoring a backup
+ * that captured applied state only (nisaba-web's backup-store), or a
+ * hand-deleted WAL file. Left alone, that shape is poison either way:
+ * single-node, the next write's setAppliedIndex is refused ("never
+ * decreases") and every write fails; replicated, the next entry's index
+ * sits below the commit floor, its apply never fires, and the propose
+ * hangs forever. The applied state IS a snapshot through the floor, so
+ * adopt snapshot semantics (the same shape openWalStorage builds for a
+ * snapshot with no openable log): replace the log with an empty one
+ * based at the floor — appends resume at floor + 1 — carrying the old
+ * log's hard state, and discarding its entries: all at or below the
+ * floor, hence already applied and prunable by definition. baseTerm is
+ * the old log's lastTerm — an under-approximation is election-safe (a
+ * node never over-claims history it no longer has). Returns the log to
+ * use; the original, untouched, when no re-base is needed.
+ */
+export async function reconcileLogWithAppliedFloor(db, log, logName, provider) {
+  let floor = 0;
+  for (const name of await db.listCollections()) {
+    floor = Math.max(floor, await (await db.collection(name)).appliedIndex());
+  }
+  if (floor <= log.lastIndex) return log;
+
+  const { currentTerm, votedFor, lastTerm } = log;
+  await log.close();
+  const handle = await provider.openFile(logName, { create: true });
+  handle.truncate(0);
+  const fresh = new EntryLog(handle, { baseIndex: floor, baseTerm: lastTerm });
+  await fresh.open();
+  if (currentTerm > 0) fresh.setHardState(currentTerm, votedFor);
+  return fresh;
+}
+
 export async function connectWal(provider, options = {}) {
   const { snapshotPrefix = SNAP_PREFIX, ...dbOptions } = options;
   const db = await connect(provider, dbOptions);
   try {
-    const { store, log } = await openWalStorage(provider, { snapshotPrefix });
-    if (log.currentTerm === 0) log.setHardState(1);
-    const walDb = new WalDb(db, log, { provider, store });
+    const { store, log, logName } = await openWalStorage(provider, { snapshotPrefix });
+    const reconciled = await reconcileLogWithAppliedFloor(db, log, logName, provider);
+    if (reconciled.currentTerm === 0) reconciled.setHardState(1);
+    const walDb = new WalDb(db, reconciled, { provider, store });
     await walDb._recover();
     return walDb;
   } catch (err) {

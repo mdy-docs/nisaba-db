@@ -40,6 +40,7 @@
 
 #include "binjson.h"
 #include "dbuf.h"
+#include "bjns.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -241,6 +242,28 @@ int dc_catalog_new_entry(const char *coll, size_t coll_len, dbuf *out);
  */
 int dc_compact_plan(const uint8_t *entry, size_t entry_len,
                     const char *coll, size_t coll_len, dbuf *out);
+
+/*
+ * Compute the orphan sweep AND carry it out, through `ns`.
+ *
+ * Same decision as dc_sweep_plan -- it calls it -- but C also does the
+ * deleting, which makes this the first operation to drive a bj_ns rather
+ * than hand names back for a host to act on. `*deleted` receives the
+ * count.
+ *
+ * The two adapters differ in exactly the way bjns.h anticipates, and
+ * neither difference is visible here: bjio_posix unlinks immediately,
+ * while bjns_bridge queues the name for the host to drain once this
+ * synchronous call returns. Deferring is safe because a sweep only ever
+ * removes files the catalog already does not reference -- an undeleted
+ * one is an orphan the next sweep collects, never a correctness problem.
+ *
+ * A single removal failing does not abort the sweep: the remaining
+ * orphans are still worth collecting, and whatever refused to unlink will
+ * be offered again next time.
+ */
+int dc_sweep_execute(bj_ns *ns, const uint8_t *catalog, size_t catalog_len,
+                     const char *names, size_t names_len, uint32_t *deleted);
 
 #ifdef __cplusplus
 }

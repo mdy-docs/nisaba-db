@@ -2212,7 +2212,77 @@ TEST(compact_plan_advances_from_the_recorded_generation) {
     bj_builder_free(e0);
 }
 
+TEST(sweep_execute_drives_a_real_namespace) {
+    /*
+     * The same dc_sweep_execute the browser calls, here over bjio_posix
+     * and real files. One C function, two adapters -- which is the whole
+     * claim of the bj_ns seam, and the thing that would quietly stop
+     * being true if the two paths ever diverged.
+     *
+     * The adapters differ in one visible way and it is deliberate: this
+     * one unlinks immediately, while the browser's queues the name for
+     * the host to drain. dc_sweep_execute cannot tell.
+     */
+    char tmpl[] = "/tmp/nisaba-sweep-XXXXXX";
+    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    static const char *const files[] = {
+        "coll-users.bj",          /* live      */
+        "coll-users-journal.bj",  /* live      */
+        "g1-coll-users.bj",       /* orphan    */
+        "g2-idx-users-i_1.bj",    /* orphan    */
+        "notes.txt",              /* not ours  */
+        "__catalog__.bj",         /* never     */
+    };
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        bj_io io;
+        CHECK_FATAL(ns.open(ns.ctx, files[i], (uint32_t)strlen(files[i]),
+                            BJ_NS_CREATE, &io) == BJ_OK);
+        CHECK_OK(io.write(io.ctx, 0, (const uint8_t *)"x", 1));
+        CHECK_OK(ns.close(ns.ctx, &io));
+    }
+
+    bj_builder *cat = bj_builder_new();
+    bj_begin_array(cat);
+    put_row(cat, "users", "coll-users.bj", "coll-users-journal.bj", NULL);
+    bj_end_array(cat);
+    size_t cat_len = 0;
+    const uint8_t *catalog = bj_builder_data(cat, &cat_len);
+
+    dbuf ls = {0};
+    listing(&ls, files, 6);
+
+    uint32_t deleted = 0;
+    CHECK_OK(dc_sweep_execute(&ns, catalog, cat_len, (const char *)ls.data, ls.len, &deleted));
+    CHECK_I64(deleted, 2);
+
+    /* The orphans are really gone from the filesystem... */
+    bj_io probe;
+    CHECK_RC(ns.open(ns.ctx, "g1-coll-users.bj", 16, 0, &probe), BJ_ERR_STATE);
+    CHECK_RC(ns.open(ns.ctx, "g2-idx-users-i_1.bj", 19, 0, &probe), BJ_ERR_STATE);
+    /* ...and everything else is untouched. */
+    for (const char *keep[] = { "coll-users.bj", "coll-users-journal.bj",
+                                "notes.txt", "__catalog__.bj" }, **k = keep;
+         k < keep + 4; k++) {
+        CHECK_OK(ns.open(ns.ctx, *k, (uint32_t)strlen(*k), 0, &probe));
+        CHECK_OK(ns.close(ns.ctx, &probe));
+    }
+
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++)
+        ns.remove(ns.ctx, files[i], (uint32_t)strlen(files[i]));
+    dbuf_free(&ls);
+    bj_builder_free(cat);
+    bjns_posix_free(&ns);
+    close(dirfd);
+    rmdir(tmpl);
+}
+
 int main(void) {
+    RUN(sweep_execute_drives_a_real_namespace);
     RUN(compact_plan_regenerates_every_name_and_keeps_every_option);
     RUN(compact_plan_advances_from_the_recorded_generation);
     RUN(collection_files_and_the_sweep_agree_by_construction);

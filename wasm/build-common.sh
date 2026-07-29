@@ -52,6 +52,7 @@ require_submodules() {
 NATIVE_EXCLUDE=(
   third_party/binjson/src/binjson_wasm.c
   third_party/binjson-structures/src/hostio.c
+  third_party/binjson-structures/src/bjns_bridge.c
   third_party/binjson-structures/src/bjfile_wasm.c
   third_party/binjson-structures/src/bplustree_wasm.c
   third_party/binjson-structures/src/keyenc_wasm.c

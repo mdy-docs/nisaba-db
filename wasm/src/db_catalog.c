@@ -1109,3 +1109,28 @@ done:
     bj_builder_free(bld); bj_builder_free(ent); bj_builder_free(b);
     return e;
 }
+
+/* ---- executing the sweep ------------------------------------------------ */
+
+int dc_sweep_execute(bj_ns *ns, const uint8_t *catalog, size_t catalog_len,
+                     const char *names, size_t names_len, uint32_t *deleted) {
+    *deleted = 0;
+    if (!ns || !ns->remove) return BJ_ERR_STATE;
+
+    dbuf victims = {0};
+    int e = dc_sweep_plan(catalog, catalog_len, names, names_len, &victims);
+    if (e) { dbuf_free(&victims); return e; }
+
+    cur c = { victims.data, victims.len, 0 };
+    uint32_t n;
+    e = array_begin(&c, &n);
+    for (uint32_t i = 0; !e && i < n; i++) {
+        const uint8_t *sp; uint32_t slen;
+        if (take_string(&c, &sp, &slen) != BJ_OK) { e = BJ_ERR_STATE; break; }
+        /* Best-effort per file: one stubborn orphan must not strand the
+         * rest, and it will be offered again at the next open. */
+        if (ns->remove(ns->ctx, (const char *)sp, slen) == BJ_OK) (*deleted)++;
+    }
+    dbuf_free(&victims);
+    return e;
+}

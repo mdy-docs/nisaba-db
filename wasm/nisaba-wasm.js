@@ -801,6 +801,12 @@ function isDbFile(name) {
  * gain yet. */
 let catalogCtx = 0;
 
+/* Namespace scope ids for bjns_bridge.c: one per open Db, so two
+ * databases in one module never share a pre-opened-name table or a
+ * pending-delete queue. Monotonic and never reused, like the fd counter,
+ * so a stale reference can only miss -- never hit the wrong scope. */
+let nextNsScope = 1;
+
 /** Run a pure catalog-schema call and decode its result. */
 function catalogCall(fn) {
   const M = requireModule();
@@ -2674,6 +2680,7 @@ for (const name of [
 
 class Db {
   constructor(provider, { order = DB_DEFAULT_ORDER, autoCompact = null } = {}) {
+    this._nsScope = nextNsScope++;
     this._provider = provider;
     this._order = order;
     this._catalog = null;
@@ -2746,29 +2753,36 @@ class Db {
    */
   async _sweepOrphans() {
     if (typeof this._provider.listFiles !== 'function') return;
+    const M = requireModule();
     const names = await this._provider.listFiles();
-    // The listing goes IN as a NUL-separated buffer rather than C calling
-    // back for it: enumeration is async in OPFS and a callback would need
-    // a JS function pointer in the WASM table, which
-    // -sALLOW_TABLE_GROWTH=0 forbids on purpose (bjns.h).
+
+    // C both decides and deletes here, through the browser's bj_ns
+    // adapter (bjns_bridge.c). The adapter cannot unlink synchronously --
+    // OPFS removeEntry returns a promise -- so it queues each name and
+    // this side drains the queue once the synchronous call returns.
     //
-    // C decides, this side deletes. Which files a catalog entry lays
-    // claim to -- including the generation-0 journal an old entry never
-    // recorded -- is schema knowledge, and getting it wrong here deletes
-    // live data.
-    const victims = catalogCall((M, ctx) => {
-      const cat = encode(this._catalog.toArray());
-      const cp = M._malloc(cat.length || 1);
-      const joined = textEncoder.encode(names.length ? names.join('\0') + '\0' : '');
-      const np = M._malloc(joined.length || 1);
-      try {
-        if (cat.length) M.HEAPU8.set(cat, cp);
-        if (joined.length) M.HEAPU8.set(joined, np);
-        return M._catw_sweep_plan(ctx, cp, cat.length, np, joined.length);
-      } finally { M._free(np); M._free(cp); }
-    });
-    for (const f of victims) await this._provider.deleteFile(f);
+    // Deferring is safe for exactly this operation: a sweep only removes
+    // files the catalog already does not reference, so one left behind is
+    // an orphan the next sweep collects, never a correctness problem.
+    const scope = this._nsScope;
+    const cat = encode(this._catalog.toArray());
+    const cp = M._malloc(cat.length || 1);
+    const joined = textEncoder.encode(names.length ? names.join('\0') + '\0' : '');
+    const np = M._malloc(joined.length || 1);
+    try {
+      if (cat.length) M.HEAPU8.set(cat, cp);
+      if (joined.length) M.HEAPU8.set(joined, np);
+      const rc = M._catw_sweep_execute(scope, cp, cat.length, np, joined.length);
+      if (rc < 0) throw codeError(rc, 'sweepOrphans');
+    } finally { M._free(np); M._free(cp); }
+
+    const pending = M.bjnsPending && M.bjnsPending[scope];
+    if (pending && pending.length) {
+      M.bjnsPending[scope] = [];
+      for (const f of pending) await this._provider.deleteFile(f);
+    }
   }
+
 
 
   async close() {

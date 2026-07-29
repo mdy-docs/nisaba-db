@@ -7,6 +7,7 @@
  * asynchronous -- the plan is computed before any of them happen.
  */
 #include "db_catalog.h"
+#include "bjns_bridge.h"
 #include "dbuf.h"
 
 #include <limits.h>
@@ -92,6 +93,28 @@ EMSCRIPTEN_KEEPALIVE int catw_compact_plan(catw *w, const uint8_t *entry, int en
     if (entry_len < 0 || coll_len < 0) return BJ_ERR_RANGE;
     w->buf.len = 0;
     return dc_compact_plan(entry, (size_t)entry_len, coll, (size_t)coll_len, &w->buf);
+}
+
+/*
+ * Sweep through the browser's bj_ns adapter. `scope` identifies the
+ * host's pre-opened-name table; removals are queued into
+ * Module.bjnsPending[scope] for the host to drain once this returns,
+ * because OPFS cannot unlink synchronously.
+ *
+ * This is the first call to drive a bj_ns rather than return names, so it
+ * is also what proves the adapter works at all.
+ */
+EMSCRIPTEN_KEEPALIVE int catw_sweep_execute(int scope,
+                                            const uint8_t *catalog, int catalog_len,
+                                            const char *names, int names_len) {
+    if (catalog_len < 0 || names_len < 0) return BJ_ERR_RANGE;
+    bj_ns ns;
+    int e = bjns_bridge_open(scope, &ns);
+    if (e) return e;
+    uint32_t deleted = 0;
+    e = dc_sweep_execute(&ns, catalog, (size_t)catalog_len, names, (size_t)names_len, &deleted);
+    bjns_bridge_free(&ns);
+    return e ? e : (int)deleted;
 }
 
 EMSCRIPTEN_KEEPALIVE const uint8_t *catw_ptr(const catw *w) { return w->buf.data; }

@@ -64,6 +64,16 @@ EMSCRIPTEN_KEEPALIVE int catw_create_plan(catw *w, const uint8_t *keys, int keys
                                 coll, (size_t)coll_len, &w->buf);
 }
 
+/* `names` is the directory listing as a NUL-separated buffer -- see
+ * dc_sweep_plan and bjns.h on why a listing is an input rather than a
+ * callback. */
+EMSCRIPTEN_KEEPALIVE int catw_sweep_plan(catw *w, const uint8_t *catalog, int catalog_len,
+                                         const char *names, int names_len) {
+    if (catalog_len < 0 || names_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    return dc_sweep_plan(catalog, (size_t)catalog_len, names, (size_t)names_len, &w->buf);
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *catw_ptr(const catw *w) { return w->buf.data; }
 
 EMSCRIPTEN_KEEPALIVE int catw_len(const catw *w) {

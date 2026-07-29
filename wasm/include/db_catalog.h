@@ -162,6 +162,32 @@ int dc_index_create_plan(const uint8_t *keys, size_t keys_len,
                          const uint8_t *options, size_t options_len,
                          const char *coll, size_t coll_len, dbuf *out);
 
+/*
+ * Decide which files the orphan sweep may delete.
+ *
+ * `catalog` is the whole catalog as an ARRAY of {key, value} pairs -- the
+ * shape BPlusTree.toArray() produces -- and `names` is the directory
+ * listing as a NUL-separated buffer. Appends the victims to `out` as a
+ * binjson ARRAY of STRINGs.
+ *
+ * The listing is an INPUT rather than a callback for the reason bjns.h
+ * gives: directory enumeration is asynchronous in OPFS, and a callback
+ * would need a JS function pointer in the WASM table, which
+ * -sALLOW_TABLE_GROWTH=0 forbids on purpose. So the host reads the
+ * directory, C decides, and the host deletes.
+ *
+ * A file is a victim only if it is BOTH unreferenced by the catalog AND
+ * one this layer could have created (dc_is_db_file). Both halves matter:
+ * the first alone would delete a host's own files sitting in the same
+ * directory, and the second alone would delete every live collection.
+ *
+ * The catalog file itself and the format-stamp row are never victims --
+ * the stamp owns no files, and deleting the catalog would destroy the
+ * database it is sweeping.
+ */
+int dc_sweep_plan(const uint8_t *catalog, size_t catalog_len,
+                  const char *names, size_t names_len, dbuf *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1896,7 +1896,159 @@ TEST(create_plan_output_is_what_the_catalog_stores_and_replays) {
     bj_builder_free(eb); doc_free(o); doc_free(k);
 }
 
+/* A catalog as BPlusTree.toArray() yields it: [{key, value}, ...]. */
+static void put_row(bj_builder *b, const char *name, const char *file,
+                    const char *journal, const char *idx_file) {
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"key", 3);
+    bj_put_string(b, (const uint8_t *)name, (uint32_t)strlen(name));
+    bj_put_key(b, (const uint8_t *)"value", 5);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"file", 4);
+    bj_put_string(b, (const uint8_t *)file, (uint32_t)strlen(file));
+    if (journal) {
+        bj_put_key(b, (const uint8_t *)"journal", 7);
+        bj_put_string(b, (const uint8_t *)journal, (uint32_t)strlen(journal));
+    }
+    bj_put_key(b, (const uint8_t *)"indexes", 7);
+    bj_begin_array(b);
+    if (idx_file) {
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"name", 4);
+        bj_put_string(b, (const uint8_t *)"i_1", 3);
+        bj_put_key(b, (const uint8_t *)"file", 4);
+        bj_put_string(b, (const uint8_t *)idx_file, (uint32_t)strlen(idx_file));
+        bj_put_key(b, (const uint8_t *)"fields", 6);
+        bj_begin_array(b);
+        bj_put_string(b, (const uint8_t *)"i", 1);
+        bj_end_array(b);
+        bj_end_object(b);
+    }
+    bj_end_array(b);
+    bj_end_object(b);
+    bj_end_object(b);
+}
+
+/* Build a NUL-separated listing. */
+static void listing(dbuf *out, const char *const *names, int n) {
+    for (int i = 0; i < n; i++) {
+        dbuf_put(out, (const uint8_t *)names[i], strlen(names[i]));
+        static const uint8_t nul = 0;
+        dbuf_put(out, &nul, 1);
+    }
+}
+
+static int victim_listed(const dbuf *victims, const char *name) {
+    return find_bytes(victims->data, victims->len, name, strlen(name)) != NULL;
+}
+
+TEST(sweep_plan_deletes_orphans_and_nothing_else) {
+    bj_builder *cat = bj_builder_new();
+    bj_begin_array(cat);
+    put_row(cat, "users", "coll-users.bj", "coll-users-journal.bj", "idx-users-i_1.bj");
+    /* A format-stamp row: a catalog key that owns no files. */
+    bj_begin_object(cat);
+    bj_put_key(cat, (const uint8_t *)"key", 3);
+    bj_put_string(cat, (const uint8_t *)"__format__", 10);
+    bj_put_key(cat, (const uint8_t *)"value", 5);
+    bj_begin_object(cat);
+    bj_put_key(cat, (const uint8_t *)"v", 1);
+    bj_put_int(cat, 1);
+    bj_end_object(cat);
+    bj_end_object(cat);
+    bj_end_array(cat);
+    size_t cat_len = 0;
+    const uint8_t *catalog = bj_builder_data(cat, &cat_len);
+
+    static const char *const names[] = {
+        "coll-users.bj",            /* live primary          */
+        "coll-users-journal.bj",    /* live journal          */
+        "idx-users-i_1.bj",         /* live index            */
+        "g1-coll-users.bj",         /* orphaned generation   */
+        "g1-idx-users-i_1.bj",      /* orphaned generation   */
+        "__catalog__.bj",           /* never a victim        */
+        "__wal__.bj",               /* not ours              */
+        "notes.txt",                /* a host's own file     */
+    };
+    dbuf ls = {0};
+    listing(&ls, names, 8);
+
+    dbuf victims = {0};
+    CHECK_OK(dc_sweep_plan(catalog, cat_len, (const char *)ls.data, ls.len, &victims));
+
+    /* Exactly the two orphaned generation files. */
+    CHECK_I64(arr_count(victims.data, victims.len), 2);
+    CHECK(victim_listed(&victims, "g1-coll-users.bj"));
+    CHECK(victim_listed(&victims, "g1-idx-users-i_1.bj"));
+
+    /* Everything whose deletion would be data loss or rudeness. */
+    CHECK(!victim_listed(&victims, "__catalog__.bj"));
+    CHECK(!victim_listed(&victims, "__wal__.bj"));
+    CHECK(!victim_listed(&victims, "notes.txt"));
+
+    dbuf_free(&victims); dbuf_free(&ls);
+    bj_builder_free(cat);
+}
+
+TEST(sweep_plan_spares_a_journal_an_old_entry_never_recorded) {
+    /*
+     * An entry written before compact() gave each generation its own
+     * journal has no `journal` field, but the generation-0 journal is
+     * still live. Sweeping it would silently destroy crash recovery for
+     * that collection -- the database would keep working until the moment
+     * it needed to recover.
+     */
+    bj_builder *cat = bj_builder_new();
+    bj_begin_array(cat);
+    put_row(cat, "users", "coll-users.bj", /*journal*/NULL, NULL);
+    bj_end_array(cat);
+    size_t cat_len = 0;
+    const uint8_t *catalog = bj_builder_data(cat, &cat_len);
+
+    static const char *const names[] = { "coll-users.bj", "coll-users-journal.bj" };
+    dbuf ls = {0};
+    listing(&ls, names, 2);
+
+    dbuf victims = {0};
+    CHECK_OK(dc_sweep_plan(catalog, cat_len, (const char *)ls.data, ls.len, &victims));
+    CHECK_I64(arr_count(victims.data, victims.len), 0);
+
+    dbuf_free(&victims); dbuf_free(&ls);
+    bj_builder_free(cat);
+}
+
+TEST(sweep_plan_on_an_empty_catalog_still_spares_foreign_files) {
+    /* The dangerous case: nothing is referenced, so only "is it ours?"
+     * stands between the sweep and a host's directory. */
+    bj_builder *cat = bj_builder_new();
+    bj_begin_array(cat);
+    bj_end_array(cat);
+    size_t cat_len = 0;
+    const uint8_t *catalog = bj_builder_data(cat, &cat_len);
+
+    static const char *const names[] = {
+        "coll-gone.bj", "idx-gone-x_1.bj", "__catalog__.bj", "notes.txt", "app.db"
+    };
+    dbuf ls = {0};
+    listing(&ls, names, 5);
+
+    dbuf victims = {0};
+    CHECK_OK(dc_sweep_plan(catalog, cat_len, (const char *)ls.data, ls.len, &victims));
+    CHECK_I64(arr_count(victims.data, victims.len), 2);
+    CHECK(victim_listed(&victims, "coll-gone.bj"));
+    CHECK(victim_listed(&victims, "idx-gone-x_1.bj"));
+    CHECK(!victim_listed(&victims, "__catalog__.bj"));
+    CHECK(!victim_listed(&victims, "notes.txt"));
+    CHECK(!victim_listed(&victims, "app.db"));
+
+    dbuf_free(&victims); dbuf_free(&ls);
+    bj_builder_free(cat);
+}
+
 int main(void) {
+    RUN(sweep_plan_deletes_orphans_and_nothing_else);
+    RUN(sweep_plan_spares_a_journal_an_old_entry_never_recorded);
+    RUN(sweep_plan_on_an_empty_catalog_still_spares_foreign_files);
     RUN(create_plan_names_and_classifies_indexes);
     RUN(create_plan_enforces_the_option_rules);
     RUN(create_plan_output_is_what_the_catalog_stores_and_replays);

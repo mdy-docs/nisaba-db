@@ -2730,20 +2730,30 @@ class Db {
    */
   async _sweepOrphans() {
     if (typeof this._provider.listFiles !== 'function') return;
-    const referenced = new Set([dbCatalogFile()]);
-    for (const { key: name, value: entry } of this._catalog.toArray()) {
-      if (name === dbFormatKey()) continue; // the format stamp owns no files
-      referenced.add(entry.file);
-      referenced.add(entry.journal || journalFileName(name));
-      for (const def of entry.indexes || []) {
-        if (def.kind === 'text') { for (const role of Object.keys(def.files)) referenced.add(def.files[role]); }
-        else referenced.add(def.file);
-      }
-    }
-    for (const f of await this._provider.listFiles()) {
-      if (!referenced.has(f) && isDbFile(f)) await this._provider.deleteFile(f);
-    }
+    const names = await this._provider.listFiles();
+    // The listing goes IN as a NUL-separated buffer rather than C calling
+    // back for it: enumeration is async in OPFS and a callback would need
+    // a JS function pointer in the WASM table, which
+    // -sALLOW_TABLE_GROWTH=0 forbids on purpose (bjns.h).
+    //
+    // C decides, this side deletes. Which files a catalog entry lays
+    // claim to -- including the generation-0 journal an old entry never
+    // recorded -- is schema knowledge, and getting it wrong here deletes
+    // live data.
+    const victims = catalogCall((M, ctx) => {
+      const cat = encode(this._catalog.toArray());
+      const cp = M._malloc(cat.length || 1);
+      const joined = textEncoder.encode(names.length ? names.join('\0') + '\0' : '');
+      const np = M._malloc(joined.length || 1);
+      try {
+        if (cat.length) M.HEAPU8.set(cat, cp);
+        if (joined.length) M.HEAPU8.set(joined, np);
+        return M._catw_sweep_plan(ctx, cp, cat.length, np, joined.length);
+      } finally { M._free(np); M._free(cp); }
+    });
+    for (const f of victims) await this._provider.deleteFile(f);
   }
+
 
   async close() {
     if (!this.isOpen) return;

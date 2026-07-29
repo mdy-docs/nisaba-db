@@ -679,3 +679,149 @@ done:
     bj_builder_free(b);
     return e;
 }
+
+/* ---- the orphan sweep --------------------------------------------------- */
+
+/* Is `name` among the NUL-separated `refs`? */
+static int name_in(const dbuf *refs, const char *name, size_t name_len) {
+    size_t at = 0;
+    while (at < refs->len) {
+        const char *r = (const char *)refs->data + at;
+        size_t rlen = strlen(r);
+        if (rlen == name_len && memcmp(r, name, rlen) == 0) return 1;
+        at += rlen + 1;
+    }
+    return 0;
+}
+
+static int ref_add(dbuf *refs, const uint8_t *s, uint32_t len) {
+    int e = dbuf_put(refs, s, len);
+    if (e) return e;
+    static const uint8_t nul = 0;
+    return dbuf_put(refs, &nul, 1);
+}
+
+/* Every file one catalog entry lays claim to. */
+static int refs_of_entry(dbuf *refs, const uint8_t *name, uint32_t name_len,
+                         const uint8_t *entry, size_t entry_len) {
+    if (entry_len < 1 || entry[0] != BJ_TYPE_OBJECT) return DC_ERR_CATALOG_ENTRY;
+
+    const uint8_t *sp; uint32_t slen; int found = 0;
+    int e = str_field(entry, entry_len, "file", &sp, &slen, &found);
+    if (e) return e;
+    if (found && (e = ref_add(refs, sp, slen))) return e;
+
+    /* Same journal fallback the open plan applies -- an entry written
+     * before that field existed still owns its generation-0 journal, and
+     * sweeping it would destroy crash recovery for that collection. */
+    if ((e = str_field(entry, entry_len, "journal", &sp, &slen, &found))) return e;
+    if (found) {
+        if ((e = ref_add(refs, sp, slen))) return e;
+    } else {
+        dbuf jn = {0};
+        e = dc_journal_file_name(&jn, (const char *)name, name_len, 0);
+        if (!e) e = ref_add(refs, jn.data, (uint32_t)jn.len);
+        dbuf_free(&jn);
+        if (e) return e;
+    }
+
+    const uint8_t *idxs; size_t idxs_len; int has_idxs = 0;
+    if ((e = obj_get_field(entry, entry_len, (const uint8_t *)"indexes", 7,
+                           &idxs, &idxs_len, &has_idxs))) return e;
+    if (!has_idxs || idxs_len < 1 || idxs[0] != BJ_TYPE_ARRAY) return BJ_OK;
+
+    cur c = { idxs, idxs_len, 0 };
+    uint32_t n;
+    if ((e = array_begin(&c, &n))) return e;
+    for (uint32_t i = 0; i < n; i++) {
+        size_t dstart = c.pos;
+        if ((e = skip_value(&c))) return e;
+        const uint8_t *def = idxs + dstart;
+        size_t def_len = c.pos - dstart;
+        if (def_kind(def, def_len) == DC_INDEX_TEXT) {
+            const uint8_t *files; size_t files_len; int has_files = 0;
+            if ((e = obj_get_field(def, def_len, (const uint8_t *)"files", 5,
+                                   &files, &files_len, &has_files))) return e;
+            if (!has_files || files_len < 1 || files[0] != BJ_TYPE_OBJECT) continue;
+            /* Iterate whatever roles are present rather than the three we
+             * expect: a future role must not be swept away by an older
+             * reader that does not know its name. */
+            cur fc = { files, files_len, 0 };
+            uint32_t fn;
+            if ((e = object_begin(&fc, &fn))) return e;
+            for (uint32_t j = 0; j < fn; j++) {
+                const uint8_t *fk; uint32_t fklen;
+                if ((e = take_key(&fc, &fk, &fklen))) return e;
+                const uint8_t *fv; uint32_t fvlen;
+                cur vc = fc;
+                if (take_string(&vc, &fv, &fvlen) == BJ_OK) {
+                    if ((e = ref_add(refs, fv, fvlen))) return e;
+                }
+                if ((e = skip_value(&fc))) return e;
+            }
+        } else {
+            if ((e = str_field(def, def_len, "file", &sp, &slen, &found))) return e;
+            if (found && (e = ref_add(refs, sp, slen))) return e;
+        }
+    }
+    return BJ_OK;
+}
+
+int dc_sweep_plan(const uint8_t *catalog, size_t catalog_len,
+                  const char *names, size_t names_len, dbuf *out) {
+    dbuf refs = {0};
+    int e = ref_add(&refs, (const uint8_t *)DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE));
+    if (e) { dbuf_free(&refs); return e; }
+
+    if (catalog_len >= 1 && catalog[0] == BJ_TYPE_ARRAY) {
+        cur c = { catalog, catalog_len, 0 };
+        uint32_t n;
+        if ((e = array_begin(&c, &n))) { dbuf_free(&refs); return e; }
+        for (uint32_t i = 0; i < n; i++) {
+            size_t rstart = c.pos;
+            if ((e = skip_value(&c))) break;
+            const uint8_t *row = catalog + rstart;
+            size_t row_len = c.pos - rstart;
+
+            const uint8_t *kp; uint32_t klen; int found = 0;
+            if ((e = str_field(row, row_len, "key", &kp, &klen, &found))) break;
+            if (!found) continue;
+            /* The format stamp is a catalog row that owns no files. */
+            if (klen == strlen(DC_FORMAT_KEY) && memcmp(kp, DC_FORMAT_KEY, klen) == 0) continue;
+
+            const uint8_t *val; size_t val_len; int has_val = 0;
+            if ((e = obj_get_field(row, row_len, (const uint8_t *)"value", 5,
+                                   &val, &val_len, &has_val))) break;
+            if (!has_val) continue;
+            if ((e = refs_of_entry(&refs, kp, klen, val, val_len))) break;
+        }
+    }
+    if (e) { dbuf_free(&refs); return e; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&refs); return BJ_ERR_OOM; }
+    bj_begin_array(b);
+    {
+        size_t at = 0;
+        while (at < names_len) {
+            const char *nm = names + at;
+            size_t nlen = strnlen(nm, names_len - at);
+            if (nlen == 0) { at += 1; continue; }
+            /* Unreferenced AND ours: either condition alone deletes the
+             * wrong thing. */
+            if (!name_in(&refs, nm, nlen) && dc_is_db_file(nm, nlen))
+                bj_put_string(b, (const uint8_t *)nm, (uint32_t)nlen);
+            at += nlen + 1;
+        }
+    }
+    bj_end_array(b);
+    dbuf_free(&refs);
+
+    if ((e = bj_builder_error(b))) { bj_builder_free(b); return e; }
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    if (!data) { bj_builder_free(b); return BJ_ERR_STATE; }
+    e = dbuf_put(out, data, len);
+    bj_builder_free(b);
+    return e;
+}

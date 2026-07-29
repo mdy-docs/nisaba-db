@@ -59,6 +59,8 @@ _catw_new
 _catw_free
 _catw_open_plan
 _catw_list_indexes
+_catw_put_index
+_catw_drop_index
 _catw_ptr
 _catw_len
 

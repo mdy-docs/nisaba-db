@@ -1586,7 +1586,150 @@ TEST(catalog_list_indexes_inverts_what_create_index_stored) {
     bj_builder_free(b);
 }
 
+/* A minimal catalog entry with no indexes. */
+static bj_builder *empty_entry(const uint8_t **out, size_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"file", 4);
+    bj_put_string(b, (const uint8_t *)"coll-users.bj", 13);
+    bj_put_key(b, (const uint8_t *)"journal", 7);
+    bj_put_string(b, (const uint8_t *)"coll-users-journal.bj", 21);
+    bj_end_object(b);
+    *out = bj_builder_data(b, out_len);
+    return b;
+}
+
+/* A plan-shaped equality definition, as createIndex now hands over. */
+static bj_builder *eq_def(const char *name, const char *file, const char *field,
+                          int unique, const uint8_t **out, size_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"name", 4);
+    bj_put_string(b, (const uint8_t *)name, (uint32_t)strlen(name));
+    bj_put_key(b, (const uint8_t *)"kind", 4);
+    bj_put_int(b, DC_INDEX_EQUALITY);
+    bj_put_key(b, (const uint8_t *)"files", 5);
+    bj_begin_array(b);
+    bj_put_string(b, (const uint8_t *)file, (uint32_t)strlen(file));
+    bj_end_array(b);
+    bj_put_key(b, (const uint8_t *)"fields", 6);
+    bj_begin_array(b);
+    bj_put_string(b, (const uint8_t *)field, (uint32_t)strlen(field));
+    bj_end_array(b);
+    bj_put_key(b, (const uint8_t *)"unique", 6);
+    bj_put_bool(b, unique);
+    bj_put_key(b, (const uint8_t *)"sparse", 6);
+    bj_put_bool(b, 0);
+    bj_end_object(b);
+    *out = bj_builder_data(b, out_len);
+    return b;
+}
+
+TEST(catalog_write_and_read_sides_agree) {
+    /*
+     * The point of putting the schema in one file: what put_index writes,
+     * open_plan must read back identically. When these were separate JS
+     * functions nothing checked that, and a field added to one and missed
+     * in the other is a silently half-persisted index.
+     */
+    const uint8_t *entry; size_t entry_len;
+    bj_builder *eb = empty_entry(&entry, &entry_len);
+
+    const uint8_t *def; size_t def_len;
+    bj_builder *db_ = eq_def("team_1", "idx-users-team_1.bj", "team", 1, &def, &def_len);
+
+    dbuf updated = {0};
+    CHECK_OK(dc_catalog_put_index(entry, entry_len, def, def_len, &updated));
+
+    /* Stored form: a STRING kind and a single `file`, not the plan's int
+     * and array. */
+    CHECK(find_bytes(updated.data, updated.len, "equality", 8) != NULL);
+    CHECK(find_bytes(updated.data, updated.len, "idx-users-team_1.bj", 19) != NULL);
+    /* Fields that were false must not be stored at all. */
+    CHECK(find_bytes(updated.data, updated.len, "sparse", 6) == NULL);
+    CHECK(find_bytes(updated.data, updated.len, "unique", 6) != NULL);
+    /* The rest of the entry survived the rewrite. */
+    CHECK(find_bytes(updated.data, updated.len, "coll-users-journal.bj", 21) != NULL);
+
+    /* ...and it plans back to what went in. */
+    dbuf plan = {0};
+    CHECK_OK(dc_catalog_open_plan(updated.data, updated.len, "users", 5, &plan));
+    CHECK(find_bytes(plan.data, plan.len, "team_1", 6) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "idx-users-team_1.bj", 19) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "fields", 6) != NULL);
+
+    dbuf_free(&plan);
+    dbuf_free(&updated);
+    bj_builder_free(db_);
+    bj_builder_free(eb);
+}
+
+TEST(catalog_put_index_replaces_rather_than_duplicates) {
+    const uint8_t *entry; size_t entry_len;
+    bj_builder *eb = empty_entry(&entry, &entry_len);
+
+    const uint8_t *d1; size_t d1_len;
+    bj_builder *b1 = eq_def("team_1", "old.bj", "team", 0, &d1, &d1_len);
+    dbuf once = {0};
+    CHECK_OK(dc_catalog_put_index(entry, entry_len, d1, d1_len, &once));
+
+    /* Same name, different backing file: createIndex's delete-then-create
+     * clean slate. Appending instead would leave the entry describing one
+     * index twice, and _open would attach it twice. */
+    const uint8_t *d2; size_t d2_len;
+    bj_builder *b2 = eq_def("team_1", "new.bj", "team", 0, &d2, &d2_len);
+    dbuf twice = {0};
+    CHECK_OK(dc_catalog_put_index(once.data, once.len, d2, d2_len, &twice));
+
+    dbuf listed = {0};
+    CHECK_OK(dc_catalog_list_indexes(twice.data, twice.len, &listed));
+    CHECK_I64(arr_count(listed.data, listed.len), 1);
+    CHECK(find_bytes(twice.data, twice.len, "new.bj", 6) != NULL);
+    CHECK(find_bytes(twice.data, twice.len, "old.bj", 6) == NULL);
+
+    dbuf_free(&listed);
+    dbuf_free(&twice); dbuf_free(&once);
+    bj_builder_free(b2); bj_builder_free(b1); bj_builder_free(eb);
+}
+
+TEST(catalog_drop_index_leaves_the_rest_intact) {
+    const uint8_t *entry; size_t entry_len;
+    bj_builder *eb = empty_entry(&entry, &entry_len);
+
+    const uint8_t *d1; size_t d1_len;
+    bj_builder *b1 = eq_def("team_1", "a.bj", "team", 0, &d1, &d1_len);
+    dbuf one = {0};
+    CHECK_OK(dc_catalog_put_index(entry, entry_len, d1, d1_len, &one));
+
+    const uint8_t *d2; size_t d2_len;
+    bj_builder *b2 = eq_def("age_1", "b.bj", "age", 0, &d2, &d2_len);
+    dbuf two = {0};
+    CHECK_OK(dc_catalog_put_index(one.data, one.len, d2, d2_len, &two));
+
+    dbuf dropped = {0};
+    CHECK_OK(dc_catalog_drop_index(two.data, two.len, "team_1", 6, &dropped));
+    dbuf listed = {0};
+    CHECK_OK(dc_catalog_list_indexes(dropped.data, dropped.len, &listed));
+    CHECK_I64(arr_count(listed.data, listed.len), 1);
+    CHECK(find_bytes(listed.data, listed.len, "age_1", 5) != NULL);
+    CHECK(find_bytes(listed.data, listed.len, "team_1", 6) == NULL);
+    /* The collection's own fields are untouched by an index change. */
+    CHECK(find_bytes(dropped.data, dropped.len, "coll-users.bj", 13) != NULL);
+
+    /* Dropping an absent name is a no-op, so a retry after a partial
+     * failure is not refused. */
+    dbuf again = {0};
+    CHECK_OK(dc_catalog_drop_index(dropped.data, dropped.len, "team_1", 6, &again));
+
+    dbuf_free(&again); dbuf_free(&listed); dbuf_free(&dropped);
+    dbuf_free(&two); dbuf_free(&one);
+    bj_builder_free(b2); bj_builder_free(b1); bj_builder_free(eb);
+}
+
 int main(void) {
+    RUN(catalog_write_and_read_sides_agree);
+    RUN(catalog_put_index_replaces_rather_than_duplicates);
+    RUN(catalog_drop_index_leaves_the_rest_intact);
     RUN(catalog_plan_names_every_file_in_attach_order);
     RUN(catalog_plan_keeps_old_databases_openable);
     RUN(catalog_plan_refuses_an_entry_it_cannot_honor);

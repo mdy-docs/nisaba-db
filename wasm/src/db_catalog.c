@@ -77,7 +77,7 @@ static dc_index_plan_kind def_kind(const uint8_t *def, size_t def_len) {
 /* ---- dc_catalog_open_plan --------------------------------------------- */
 
 /* The three text-index files, in the order attach_text_index takes them. */
-static const char *TEXT_ROLE_KEYS[3] = { "index", "docTerms", "docLengths" };
+static const char *const TEXT_ROLE_KEYS[3] = { "index", "docTerms", "docLengths" };
 
 static int put_text_files(bj_builder *b, const uint8_t *def, size_t def_len) {
     const uint8_t *files; size_t files_len; int found = 0;
@@ -325,4 +325,177 @@ int dc_catalog_list_indexes(const uint8_t *entry, size_t entry_len, dbuf *out) {
 fail:
     bj_builder_free(b);
     return e;
+}
+
+/* ---- writing ------------------------------------------------------------ */
+
+/* Copy every field of `entry` except `indexes`, which the caller rebuilds. */
+static int copy_entry_except_indexes(bj_builder *b, const uint8_t *entry, size_t entry_len) {
+    cur c = { entry, entry_len, 0 };
+    uint32_t n;
+    int e = object_begin(&c, &n);
+    if (e) return e;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *kp; uint32_t klen;
+        if ((e = take_key(&c, &kp, &klen))) return e;
+        size_t vstart = c.pos;
+        if ((e = skip_value(&c))) return e;
+        if (klen == 7 && memcmp(kp, "indexes", 7) == 0) continue;
+        bj_put_key(b, kp, klen);
+        bj_put_raw(b, entry + vstart, (uint32_t)(c.pos - vstart));
+    }
+    return BJ_OK;
+}
+
+/*
+ * Write one plan-shaped definition out in the STORED form. The two shapes
+ * differ deliberately: a plan says `kind: <int>` and `files: [...]`
+ * because that is what a host loop needs, while the catalog stores
+ * `kind: "<name>"` and `file`/`files` because that is what is readable in
+ * a dump and what older readers already understand.
+ */
+static int put_stored_def(bj_builder *b, const uint8_t *def, size_t def_len) {
+    const uint8_t *np; uint32_t nlen; int found = 0;
+    int e = str_field(def, def_len, "name", &np, &nlen, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_CATALOG_ENTRY;
+
+    double kd = 0; int has_kind = 0;
+    if ((e = num_field(def, def_len, "kind", &kd, &has_kind))) return e;
+    dc_index_plan_kind kind = has_kind ? (dc_index_plan_kind)(int)kd : DC_INDEX_EQUALITY;
+
+    const uint8_t *files; size_t files_len; int has_files = 0;
+    if ((e = obj_get_field(def, def_len, (const uint8_t *)"files", 5,
+                           &files, &files_len, &has_files))) return e;
+    if (!has_files || files_len < 1 || files[0] != BJ_TYPE_ARRAY) return DC_ERR_CATALOG_ENTRY;
+    cur fc = { files, files_len, 0 };
+    uint32_t fn;
+    if ((e = array_begin(&fc, &fn))) return e;
+
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"name", 4);
+    bj_put_string(b, np, nlen);
+    bj_put_key(b, (const uint8_t *)"kind", 4);
+    bj_put_string(b, (const uint8_t *)(kind == DC_INDEX_TEXT ? "text"
+                                     : kind == DC_INDEX_GEO  ? "geo" : "equality"),
+                  (uint32_t)(kind == DC_INDEX_TEXT ? 4 : kind == DC_INDEX_GEO ? 3 : 8));
+
+    if (kind == DC_INDEX_TEXT) {
+        if (fn != 3) return DC_ERR_CATALOG_ENTRY;
+        bj_put_key(b, (const uint8_t *)"files", 5);
+        bj_begin_object(b);
+        for (int r = 0; r < 3; r++) {
+            const uint8_t *sp; uint32_t slen;
+            if (take_string(&fc, &sp, &slen) != BJ_OK) return DC_ERR_CATALOG_ENTRY;
+            bj_put_key(b, (const uint8_t *)TEXT_ROLE_KEYS[r],
+                       (uint32_t)strlen(TEXT_ROLE_KEYS[r]));
+            bj_put_string(b, sp, slen);
+        }
+        bj_end_object(b);
+    } else {
+        if (fn != 1) return DC_ERR_CATALOG_ENTRY;
+        const uint8_t *sp; uint32_t slen;
+        if (take_string(&fc, &sp, &slen) != BJ_OK) return DC_ERR_CATALOG_ENTRY;
+        bj_put_key(b, (const uint8_t *)"file", 4);
+        bj_put_string(b, sp, slen);
+    }
+
+    if (kind == DC_INDEX_EQUALITY) {
+        const uint8_t *f; size_t flen; int has_fields = 0;
+        if ((e = obj_get_field(def, def_len, (const uint8_t *)"fields", 6,
+                               &f, &flen, &has_fields))) return e;
+        if (!has_fields || flen < 1 || f[0] != BJ_TYPE_ARRAY) return DC_ERR_CATALOG_ENTRY;
+        bj_put_key(b, (const uint8_t *)"fields", 6);
+        bj_put_raw(b, f, (uint32_t)flen);
+        /* Optional flags are stored only when true, which is what keeps a
+         * simple entry small and readable -- and what listIndexes'
+         * report-only-when-set behavior mirrors. */
+        if (flag_field(def, def_len, "unique")) {
+            bj_put_key(b, (const uint8_t *)"unique", 6);
+            bj_put_bool(b, 1);
+        }
+        if (flag_field(def, def_len, "sparse")) {
+            bj_put_key(b, (const uint8_t *)"sparse", 6);
+            bj_put_bool(b, 1);
+        }
+        pass_through(b, def, def_len, "partialFilterExpression");
+        pass_through(b, def, def_len, "expireAfterSeconds");
+    } else {
+        const uint8_t *fp; uint32_t fplen; int has_field = 0;
+        if ((e = str_field(def, def_len, "field", &fp, &fplen, &has_field))) return e;
+        if (!has_field) return DC_ERR_CATALOG_ENTRY;
+        bj_put_key(b, (const uint8_t *)"field", 5);
+        bj_put_string(b, fp, fplen);
+    }
+    bj_end_object(b);
+    return BJ_OK;
+}
+
+/* Shared body: rebuild `indexes`, dropping any definition named `skip`
+ * and appending `add` (either may be absent). */
+static int rewrite_indexes(const uint8_t *entry, size_t entry_len,
+                           const char *skip, size_t skip_len,
+                           const uint8_t *add, size_t add_len, dbuf *out) {
+    if (entry_len < 1 || entry[0] != BJ_TYPE_OBJECT) return DC_ERR_CATALOG_ENTRY;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_object(b);
+    int e = copy_entry_except_indexes(b, entry, entry_len);
+    if (e) goto fail;
+
+    bj_put_key(b, (const uint8_t *)"indexes", 7);
+    bj_begin_array(b);
+    {
+        const uint8_t *idxs; size_t idxs_len; int has_idxs = 0;
+        if ((e = obj_get_field(entry, entry_len, (const uint8_t *)"indexes", 7,
+                               &idxs, &idxs_len, &has_idxs))) goto fail;
+        if (has_idxs && idxs_len >= 1 && idxs[0] == BJ_TYPE_ARRAY) {
+            cur c = { idxs, idxs_len, 0 };
+            uint32_t n;
+            if ((e = array_begin(&c, &n))) goto fail;
+            for (uint32_t i = 0; i < n; i++) {
+                size_t dstart = c.pos;
+                if ((e = skip_value(&c))) goto fail;
+                const uint8_t *def = idxs + dstart;
+                size_t def_len = c.pos - dstart;
+                const uint8_t *np; uint32_t nlen; int has_name = 0;
+                if ((e = str_field(def, def_len, "name", &np, &nlen, &has_name))) goto fail;
+                if (has_name && skip && nlen == skip_len &&
+                    memcmp(np, skip, nlen) == 0) continue;      /* dropped or replaced */
+                bj_put_raw(b, def, (uint32_t)def_len);
+            }
+        }
+        if (add) {
+            if ((e = put_stored_def(b, add, add_len))) goto fail;
+        }
+    }
+    bj_end_array(b);
+    bj_end_object(b);
+
+    if ((e = bj_builder_error(b))) goto fail;
+    {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        if (!data) { e = BJ_ERR_STATE; goto fail; }
+        e = dbuf_put(out, data, len);
+    }
+
+fail:
+    bj_builder_free(b);
+    return e;
+}
+
+int dc_catalog_put_index(const uint8_t *entry, size_t entry_len,
+                         const uint8_t *def, size_t def_len, dbuf *out) {
+    const uint8_t *np; uint32_t nlen; int found = 0;
+    int e = str_field(def, def_len, "name", &np, &nlen, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_CATALOG_ENTRY;
+    return rewrite_indexes(entry, entry_len, (const char *)np, nlen, def, def_len, out);
+}
+
+int dc_catalog_drop_index(const uint8_t *entry, size_t entry_len,
+                          const char *name, size_t name_len, dbuf *out) {
+    return rewrite_indexes(entry, entry_len, name, name_len, NULL, 0, out);
 }

@@ -1518,22 +1518,45 @@ class Collection {
     return decode(M.HEAPU8.slice(ptr, ptr + len));
   }
 
-  _persistIndexes() {
+  /**
+   * Record one index in the catalog entry. C converts the plan-shaped
+   * definition into the stored form (db_catalog.h) -- the only place that
+   * conversion exists.
+   *
+   * This replaced _persistIndexes, which rebuilt the entire `indexes`
+   * array from this class's in-memory Map on every change. That made the
+   * Map the effective source of truth for on-disk data; the entry is now,
+   * and the Map is a cache of live handles.
+   */
+  _catalogPutIndex(def) {
     const entry = this._catalog.search(this.name);
-    entry.indexes = [...this._indexes.entries()].map(([name, ix]) => {
-      if (ix.kind === 'equality') {
-        const def = { name, kind: 'equality', fields: ix.fields, file: ix.file };
-        if (ix.unique) def.unique = true;
-        if (ix.sparse) def.sparse = true;
-        if (ix.partialFilterExpression) def.partialFilterExpression = ix.partialFilterExpression;
-        if (ix.expireAfterSeconds !== undefined) def.expireAfterSeconds = ix.expireAfterSeconds;
-        return def;
-      }
-      if (ix.kind === 'text') return { name, kind: 'text', field: ix.field, files: ix.files };
-      return { name, kind: 'geo', field: ix.field, file: ix.file };
+    const updated = catalogCall((M, ctx) => {
+      const ee = encode(entry), de = encode(def);
+      const ep = M._malloc(ee.length || 1);
+      const dp = M._malloc(de.length || 1);
+      try {
+        if (ee.length) M.HEAPU8.set(ee, ep);
+        if (de.length) M.HEAPU8.set(de, dp);
+        return M._catw_put_index(ctx, ep, ee.length, dp, de.length);
+      } finally { M._free(dp); M._free(ep); }
     });
-    this._catalog.add(this.name, entry);
+    this._catalog.add(this.name, updated);
   }
+
+  _catalogDropIndex(name) {
+    const entry = this._catalog.search(this.name);
+    const updated = catalogCall((M, ctx) => {
+      const ee = encode(entry);
+      const ep = M._malloc(ee.length || 1);
+      const n = allocStr(M, name);
+      try {
+        if (ee.length) M.HEAPU8.set(ee, ep);
+        return M._catw_drop_index(ctx, ep, ee.length, n.ptr, n.len);
+      } finally { n.free(); M._free(ep); }
+    });
+    this._catalog.add(this.name, updated);
+  }
+
 
   /**
    * Create a secondary index:
@@ -1604,7 +1627,10 @@ class Collection {
       kind: 'equality', fields, tree, file: fileName, unique, sparse, partialFilterExpression,
       expireAfterSeconds: options.expireAfterSeconds
     });
-    this._persistIndexes();
+    const def = { name, kind: 0, files: [fileName], fields, unique, sparse };
+    if (partialFilterExpression) def.partialFilterExpression = partialFilterExpression;
+    if (options.expireAfterSeconds !== undefined) def.expireAfterSeconds = options.expireAfterSeconds;
+    this._catalogPutIndex(def);
     return name;
   }
 
@@ -1641,7 +1667,12 @@ class Collection {
     }
 
     this._indexes.set(name, { kind: 'text', field, trees, files });
-    this._persistIndexes();
+    // files[] in attach order -- the same order the plan hands back, and
+    // the order dc_collection_attach_text_index takes its trees.
+    this._catalogPutIndex({
+      name, kind: 1, field,
+      files: [files.index, files.docTerms, files.docLengths]
+    });
     return name;
   }
 
@@ -1671,7 +1702,7 @@ class Collection {
     }
 
     this._indexes.set(name, { kind: 'geo', field, rt, file: fileName });
-    this._persistIndexes();
+    this._catalogPutIndex({ name, kind: 2, files: [fileName], field });
     return name;
   }
 
@@ -1699,7 +1730,7 @@ class Collection {
       await this._provider.deleteFile(entry.file);
     }
     this._indexes.delete(name);
-    this._persistIndexes();
+    this._catalogDropIndex(name);
   }
 
   async listIndexes() {

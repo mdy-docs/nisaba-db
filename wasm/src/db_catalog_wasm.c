@@ -41,6 +41,20 @@ EMSCRIPTEN_KEEPALIVE int catw_list_indexes(catw *w, const uint8_t *entry, int en
     return dc_catalog_list_indexes(entry, (size_t)entry_len, &w->buf);
 }
 
+EMSCRIPTEN_KEEPALIVE int catw_put_index(catw *w, const uint8_t *entry, int entry_len,
+                                        const uint8_t *def, int def_len) {
+    if (entry_len < 0 || def_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    return dc_catalog_put_index(entry, (size_t)entry_len, def, (size_t)def_len, &w->buf);
+}
+
+EMSCRIPTEN_KEEPALIVE int catw_drop_index(catw *w, const uint8_t *entry, int entry_len,
+                                         const char *name, int name_len) {
+    if (entry_len < 0 || name_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    return dc_catalog_drop_index(entry, (size_t)entry_len, name, (size_t)name_len, &w->buf);
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *catw_ptr(const catw *w) { return w->buf.data; }
 
 EMSCRIPTEN_KEEPALIVE int catw_len(const catw *w) {

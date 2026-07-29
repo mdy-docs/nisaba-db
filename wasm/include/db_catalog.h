@@ -101,6 +101,35 @@ int dc_catalog_open_plan(const uint8_t *entry, size_t entry_len,
  */
 int dc_catalog_list_indexes(const uint8_t *entry, size_t entry_len, dbuf *out);
 
+/*
+ * Add or replace one index definition in `entry`, appending the updated
+ * entry to `out`. `def` is a plan-shaped index definition -- the same
+ * shape dc_catalog_open_plan emits -- and is converted to the stored form
+ * here, which is the only place that conversion exists.
+ *
+ * Replacing rather than appending when the name already exists matches
+ * createIndex's delete-then-create clean slate, and keeps the entry from
+ * accumulating two definitions of one index if a caller retries.
+ *
+ * This is what retired _persistIndexes. That function rebuilt the whole
+ * `indexes` array from JavaScript's in-memory Map on every change, which
+ * made the Map the effective source of truth for on-disk data and put a
+ * third copy of the schema in the writer. Updating the entry in place
+ * means the entry is the source of truth, and the Map is just a cache of
+ * the live handles.
+ */
+int dc_catalog_put_index(const uint8_t *entry, size_t entry_len,
+                         const uint8_t *def, size_t def_len, dbuf *out);
+
+/*
+ * Remove the index named `name` from `entry`, appending the updated entry
+ * to `out`. Removing an absent name is not an error: dropIndex has
+ * already established the index exists, and a retry after a partial
+ * failure must not be refused.
+ */
+int dc_catalog_drop_index(const uint8_t *entry, size_t entry_len,
+                          const char *name, size_t name_len, dbuf *out);
+
 #ifdef __cplusplus
 }
 #endif

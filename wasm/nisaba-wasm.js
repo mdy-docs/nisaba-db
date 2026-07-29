@@ -677,7 +677,7 @@ const DB_FILE_PATTERN = /^(?:g\d+-)?(?:coll|idx)-.*\.bj$/;
  * "team_1_age_1" for a compound index. Only ascending (1) fields are
  * supported so far — descending order only changes scan direction, which a
  * caller can already get by reversing results, so it's deferred rather than
- * plumbed through the composite-key encoding (db_keyenc.h) for no behavioral
+ * plumbed through the composite-key encoding (keyenc.h) for no behavioral
  * gain yet. */
 function checkIndexKeySpec(keys) {
   const fields = Object.keys(keys);

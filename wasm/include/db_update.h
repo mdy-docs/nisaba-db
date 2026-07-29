@@ -12,7 +12,7 @@
  * the JS host has a clock (the same reasoning that already puts _id
  * generation in JS, not C).
  *
- * Scope, deliberately conservative (matching how db_query.h and db_keyenc.h
+ * Scope, deliberately conservative (matching how db_query.h and keyenc.h
  * scope their own first cuts):
  *   - Target field names are top-level only — no dotted paths yet, so
  *     {$set: {"a.b": 1}} is rejected rather than silently doing something

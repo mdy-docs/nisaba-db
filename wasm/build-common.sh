@@ -54,6 +54,7 @@ NATIVE_EXCLUDE=(
   third_party/binjson-structures/src/hostio.c
   third_party/binjson-structures/src/bjfile_wasm.c
   third_party/binjson-structures/src/bplustree_wasm.c
+  third_party/binjson-structures/src/keyenc_wasm.c
   third_party/binjson-structures/src/rtree_wasm.c
   third_party/binjson-structures/src/textlog_wasm.c
   third_party/binjson-structures/src/entrylog_wasm.c

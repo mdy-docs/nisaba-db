@@ -6,10 +6,10 @@
  * host tree the way binjson.h's visitor-based bj_decode does — field lookup
  * and filter matching only ever need "where does this field's value start
  * and end", which skip_value gives directly. Composite index keys are built
- * with db_keyenc.h.
+ * with keyenc.h (binjson-structures).
  */
 #include "db.h"
-#include "db_keyenc.h"
+#include "keyenc.h"
 #include "db_query.h"
 #include "db_update.h"
 #include "bjcursor.h"
@@ -742,7 +742,7 @@ static int equality_index_applies(const dc_index *ix, const uint8_t *doc, size_t
  * Whether `doc`'s field values already have an entry in unique index `ix`
  * belonging to some other document. Range-scans [prefix, prefix+upper
  * bound) on ix->tree -- the same bound-building dc_collection_find_by_index
- * already does via db_keyenc.h -- for any entry at all. No self-id
+ * already does via keyenc.h -- for any entry at all. No self-id
  * exclusion is needed: by the time add_to_one_index runs for a document's
  * *new* state, its own *old* entry has already been removed
  * (dc_update_one/dc_replace_one/dc_update_many all call

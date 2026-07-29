@@ -5,7 +5,7 @@
  * A collection is a `dc_collection`: one primary bpt (documents keyed by the
  * raw 12-byte ObjectId, an opaque byte-string key) plus zero or more
  * attached secondary indexes, each its own bpt keyed by a composite of
- * ordered field values + an id suffix (db_keyenc.h), per the convention
+ * ordered field values + an id suffix (keyenc.h), per the convention
  * documented in bplustree.h. `dc_collection` only *coordinates* already-open
  * bpt handles — every bpt (primary and each index) is opened/closed by the
  * host (JS), exactly as milestone 1's plain `bpt*` was.
@@ -117,10 +117,10 @@ extern "C" {
  * on write maintenance or createIndex backfill. The rejection itself is
  * the documented all-or-nothing contract (create the index with `sparse`
  * to skip such documents); this code exists so it surfaces as what it is
- * rather than as db_keyenc.h's generic BJ_ERR_STATE. */
+ * rather than as keyenc.h's generic BJ_ERR_STATE. */
 #define DC_ERR_MISSING_INDEXED_FIELD (-13)
 /* An indexed field's value has no order-preserving key encoding
- * (db_keyenc.h: number/string/Date only; no NaN, no strings containing
+ * (keyenc.h: number/string/Date only; no NaN, no strings containing
  * U+0000). Same rationale as DC_ERR_MISSING_INDEXED_FIELD. */
 #define DC_ERR_UNINDEXABLE_VALUE (-14)
 

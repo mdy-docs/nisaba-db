@@ -85,7 +85,7 @@ Verified empirically: `{ _id: 'user-42' }` and `{ _id: 1 }` both throw
 
 - Preferred: allow string/number/Date `_id`s. The key encoder already
   handles exactly those types for secondary indexes (see the -14 error
-  text), so the primary key can plausibly reuse `db_keyenc.c`'s
+  text), so the primary key can plausibly reuse `keyenc.c`'s
   ordered encoding. Audit every `_id` touchpoint: insert paths, filter
   fast-paths (`filter._id !== undefined`), change events' documentKey,
   the CLI's arg parsing, RPC codec round-trip.
@@ -244,7 +244,7 @@ leading `$match` into the engine and documents its JS-side subset.
   1k/100k docs, node + browser) guarding the WASM-boundary cost from
   regressions.
 - **Scalar `_id` support (format v2)** — the P0 #3 spike's finding:
-  variable-length primary keys via `db_keyenc`'s ordered encoding, new
+  variable-length primary keys via `keyenc`'s ordered encoding, new
   index-row back-pointer format, migration per
   `docs/format-compatibility.md`'s rules. A real project; the format
   stamp machinery it needs now exists.

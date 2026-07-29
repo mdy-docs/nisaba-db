@@ -32,9 +32,16 @@ export function crc32(bytes: Uint8Array, prev?: number): number;
 export function exists(dir: any, name: string): Promise<boolean>;
 export function deleteFile(dir: any, name: string): Promise<void>;
 export function getFileHandle(dir: any, name: string, options?: { create?: boolean }): Promise<any>;
-export function orderedKey(value: any): Uint8Array;
-export function compositeKey(values: any[]): Uint8Array;
-export function compositeUpperBound(values: any[]): Uint8Array;
+/**
+ * Composite-key encoding (keyenc.h). These are variadic, not array-taking:
+ * compositeKey('core', 36), never compositeKey(['core', 36]) -- an array
+ * argument throws "unsupported part type: object". The declarations said
+ * `any[]` until the keyenc de-duplication, which is a shape no caller
+ * could ever have used successfully.
+ */
+export function orderedKey(value: number | string): Uint8Array;
+export function compositeKey(...parts: Array<number | string>): Uint8Array;
+export function compositeUpperBound(...parts: Array<number | string>): Uint8Array;
 export function haversineDistance(a: [number, number], b: [number, number]): number;
 export function stemmer(word: string): string;
 export function createPatch(before: string, after: string): any;

@@ -370,3 +370,52 @@ describe('raft: failures and partitions', () => {
     expect([...cluster.values()].every((m) => m.machine.map.get('k4') === 4)).toBe(true);
   });
 });
+
+describe('raft: config precedence on restart', () => {
+  it('a restarted survivor keeps the latest-in-log CONFIG over older replayed ones (leader removed itself)', async () => {
+    // The stuck-survivor shape behind graceful node retirement (drain):
+    // in a two-voter group the leader commits its OWN removal and steps
+    // down at apply, possibly before the survivor ever learns the new
+    // commit index. The survivor restarts to heal: the boot scan adopts
+    // the removal CONFIG (latest in log, uncommitted locally), but the
+    // apply pump then replays from the state machine's floor — which
+    // sits BELOW the older, committed CONFIG entries. Those replayed
+    // configs must not regress membership over the scan's newer one
+    // (RaftNode._configIndex), or the survivor solicits votes from the
+    // removed leader forever and the group is dead.
+    const { sim, net, cluster, leader } = await electedCluster(31, 2);
+    const L = leader();
+    const F = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    const [lid, fid] = [L.node.id, F.node.id];
+
+    await settle(sim, cluster, L.node.propose(kvSet('kept', 1)));
+    // Two CONFIG entries below the final one: add an absent member 9,
+    // remove it again — the history the pump will later replay.
+    expect((await settle(sim, cluster, L.node.changeMembership([lid, fid, { id: 9, host: 'node9', port: 7009 }]))).error).toBeUndefined();
+    expect((await settle(sim, cluster, L.node.changeMembership([lid, fid]))).error).toBeUndefined();
+
+    // The leader removes ITSELF: the entry commits under the old quorum
+    // (both nodes ack), the leader steps down at apply — its in-flight
+    // propose may reject NotLeaderError even though the change is in.
+    const { error } = await settle(sim, cluster, L.node.changeMembership([fid]));
+    if (error) expect(error).toBeInstanceOf(NotLeaderError);
+    await until(sim, cluster, () => F.log.lastIndex === L.log.lastIndex);
+    expect(L.node.role).not.toBe('leader');
+
+    // The survivor is stuck live (its applied config still names both
+    // voters and the removed leader refuses to vote) — restart it, the
+    // documented heal.
+    await stopNode(net, F);
+    const reborn = await bootNode(fid, [lid, fid], sim, net, F.handle);
+    cluster.set(fid, reborn);
+
+    // The latest-in-log CONFIG survived the replay of its predecessors...
+    await until(sim, cluster, () => reborn.node.voters.length === 1 && reborn.node.role === 'leader');
+    expect(reborn.node.voters).toEqual([fid]);
+    // ...and the sole survivor serves again, data intact.
+    expect(reborn.machine.map.get('kept')).toBe(1);
+    const w = await settle(sim, cluster, reborn.node.propose(kvSet('after', 2)));
+    expect(w.error).toBeUndefined();
+    expect(reborn.machine.map.get('after')).toBe(2);
+  });
+});

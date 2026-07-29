@@ -187,6 +187,16 @@ export class RaftNode {
       boot.set(record.id, record);
     }
     if (!boot.has(id)) boot.set(id, { id });
+    /** Log index of the CONFIG entry currently in force (0 = the static
+     * bootstrap peers). Guards the apply pump against REGRESSING
+     * membership: the restart scan adopts the latest-in-log config —
+     * possibly uncommitted, deliberately — while lastApplied resumes
+     * from the state machine's floor, so the pump may re-encounter
+     * OLDER committed CONFIG entries on its way up. Without this index
+     * it would re-adopt them over the newer set, which un-heals exactly
+     * the stuck-survivor case the scan exists for (a two-voter group
+     * whose leader committed its own removal and stepped down). */
+    this._configIndex = 0;
     this._setMembers([...boot.values()]);
     this.log = log;
     this.stateMachine = stateMachine;
@@ -347,7 +357,10 @@ export class RaftNode {
       const batch = this.log.getBatch(scan, this.maxBatchBytes);
       if (batch.length === 0) break;
       for (const e of batch) {
-        if (e.type === ENTRYLOG_TYPE.CONFIG) this._setMembers(decode(e.payload).members);
+        if (e.type === ENTRYLOG_TYPE.CONFIG) {
+          this._setMembers(decode(e.payload).members);
+          this._configIndex = e.index;
+        }
       }
       scan = batch[batch.length - 1].index + 1;
     }
@@ -710,7 +723,10 @@ export class RaftNode {
         if (term > 0) this.log.setHardState(term, votedFor); // fresh logs start at 0/0
         this.lastApplied = msg.lastIncludedIndex;
         this.commitIndex = Math.max(this.commitIndex, msg.lastIncludedIndex);
-        if (install.members) this._setMembers(install.members);
+        if (install.members) {
+          this._setMembers(install.members);
+          this._configIndex = msg.lastIncludedIndex; // the manifest's set stands in for every CONFIG at or below the boundary
+        }
         this._install = null;
       };
       const run = this._applyChain.then(finish);
@@ -1025,15 +1041,19 @@ export class RaftNode {
       for (const e of this.log.getBatch(this.lastApplied + 1, this.maxBatchBytes)) {
         if (e.index > this.commitIndex) break;
         if (e.type === ENTRYLOG_TYPE.NORMAL) await this.stateMachine.apply(e);
-        else if (e.type === ENTRYLOG_TYPE.CONFIG) this._adoptConfig(decode(e.payload).members);
+        // The index guard skips CONFIG entries older than the one in
+        // force (adopted by the restart scan or a snapshot install) —
+        // replaying them would regress membership; see _configIndex.
+        else if (e.type === ENTRYLOG_TYPE.CONFIG && e.index >= this._configIndex) this._adoptConfig(decode(e.payload).members, e.index);
         this.lastApplied = e.index;
         this._settleWaiters();
       }
     }
   }
 
-  _adoptConfig(members) {
+  _adoptConfig(members, index) {
     this._setMembers(members);
+    this._configIndex = index;
     if (!this.voters.includes(this.id) && this.role !== ROLE.FOLLOWER) {
       // Applied our own removal (or demotion to learner): step down; the
       // host closes a removed node. (As leader we first committed the

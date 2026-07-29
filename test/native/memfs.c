@@ -53,12 +53,31 @@ static int32_t mf_truncate(void *ctx, uint64_t len) {
     return BJ_OK;
 }
 
+/*
+ * Designated initializer, assigned whole -- NOT field-by-field into the
+ * caller's struct.
+ *
+ * This distinction is not style. Field-by-field assignment leaves any
+ * member it does not mention holding whatever was on the caller's stack,
+ * so when bj_io grew `sync` and `close` this function started handing out
+ * ios with garbage function pointers in them -- a crash on the first
+ * durability point, or worse, a jump to whatever the garbage addressed.
+ * Assigning a complete initializer means a future member arrives as NULL,
+ * which for both of these is the correct meaning: no sync (memory writes
+ * are already as durable as memory gets, per bjio.h) and no close (the
+ * namespace owns the lifetime).
+ */
 static void bind_io(memfile *f, bj_io *out) {
-    out->ctx      = f;
-    out->size     = mf_size;
-    out->read     = mf_read;
-    out->write    = mf_write;
-    out->truncate = mf_truncate;
+    bj_io io = {
+        .ctx      = f,
+        .size     = mf_size,
+        .read     = mf_read,
+        .write    = mf_write,
+        .truncate = mf_truncate,
+        .sync     = NULL,
+        .close    = NULL,
+    };
+    *out = io;
 }
 
 /* ---- namespace -------------------------------------------------------- */

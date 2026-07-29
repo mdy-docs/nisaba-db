@@ -5,10 +5,11 @@
  * anywhere" only, never capture groups, so this never touches
  * regex_captures_ptr()/regex_group_count().
  *
- * The compile cache is a plain global, not thread-safe -- fine for this
- * project's actual execution model (single-threaded WASM driven by JS;
- * see docs/platform-strategy.md), not fine for a hypothetical
- * multi-threaded native embedding without adding a lock around it.
+ * The compile cache has per-thread storage on any target where more than
+ * one thread is possible (see REGEX_CACHE_TLS below), so a native server
+ * handling concurrent requests gets a cache per thread rather than a data
+ * race. On the single-threaded browser build it stays a plain global at
+ * zero cost, which is what it always was.
  */
 #include "regex.h"
 #include "binjson.h"
@@ -128,8 +129,28 @@ typedef struct {
     unsigned long last_used;
 } regex_cache_entry;
 
-static regex_cache_entry g_regex_cache[REGEX_CACHE_CAPACITY];
-static unsigned long g_regex_cache_clock = 0;
+/*
+ * Per-thread cache storage where threads exist.
+ *
+ * The cache holds compiled-pattern handles owned by regex-engine, and its
+ * LRU clock is mutated on every lookup -- so two threads sharing it would
+ * race on both the entries and the clock, and could free a handle another
+ * thread is matching against. A lock would serialize every $regex
+ * evaluation in the process; giving each thread its own small cache costs
+ * nothing and races on nothing.
+ *
+ * The browser build is single-threaded by construction (JS drives one
+ * WASM instance), so there it resolves to plain statics and the generated
+ * code is unchanged.
+ */
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#define REGEX_CACHE_TLS   /* single-threaded: plain statics */
+#else
+#define REGEX_CACHE_TLS _Thread_local
+#endif
+
+static REGEX_CACHE_TLS regex_cache_entry g_regex_cache[REGEX_CACHE_CAPACITY];
+static REGEX_CACHE_TLS unsigned long g_regex_cache_clock = 0;
 
 static uintptr_t regex_cache_lookup(const uint8_t *pattern, uint32_t pattern_len, int flags) {
     for (int i = 0; i < REGEX_CACHE_CAPACITY; i++) {

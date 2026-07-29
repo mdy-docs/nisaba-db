@@ -27,13 +27,16 @@
 #include "db_agg.h"
 #include "db_update.h"
 #include "dbuf.h"
+#include "bjio_posix.h"
 
 #include "docs.h"
 #include "memfs.h"
 #include "tap.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define ORDER 32   /* matches DB_DEFAULT_ORDER in wasm/nisaba-wasm.js */
 
@@ -1245,7 +1248,135 @@ TEST(current_date_refuses_bad_specs_and_collisions) {
     }
 }
 
+/* ---- the POSIX adapter (bjio_posix.c) ---------------------------------- */
+
+TEST(posix_namespace_backs_a_real_database) {
+    /* The whole point of Phase 2: the same dc_* layer, over real files,
+     * through bj_ns instead of a JS bridge. If this passes, the server
+     * target is an adapter swap rather than a port. */
+    char tmpl[] = "/tmp/nisaba-native-XXXXXX";
+    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    /* An adapter that forgot sync would be silently non-durable, which is
+     * the defect this phase exists to close -- so check the wiring, not
+     * just that writes land. */
+    bj_io io;
+    CHECK_FATAL(ns.open(ns.ctx, "coll-people.bj", 14, BJ_NS_CREATE, &io) == BJ_OK);
+    CHECK(io.sync != NULL);
+    CHECK(io.close != NULL);
+    CHECK_OK(bjio_check(&io));
+
+    {
+        bpt *t = bpt_create(&io, ORDER);
+        CHECK_FATAL(t != NULL);
+        dc_collection *c = dc_collection_open(t);
+        CHECK_FATAL(c != NULL);
+        CHECK_OK(insert_person(c, 1, "Ada", "core", 36));
+        CHECK_OK(insert_person(c, 2, "Grace", "core", 45));
+
+        const uint8_t *f; uint32_t flen;
+        bj_builder *fb = empty_filter(&f, &flen);
+        int64_t count = 0;
+        CHECK_OK(dc_count(c, f, flen, &count));
+        CHECK_I64(count, 2);
+        bj_builder_free(fb);
+
+        /* A real fsync must succeed on a real file. */
+        CHECK_OK(io.sync(io.ctx));
+        dc_collection_free(c);
+        bpt_free(t);
+    }
+    CHECK_OK(ns.close(ns.ctx, &io));
+
+    /* Reopen through the namespace: the bytes are on disk, not in a
+     * buffer that died with the handle. */
+    bj_io again;
+    CHECK_FATAL(ns.open(ns.ctx, "coll-people.bj", 14, 0, &again) == BJ_OK);
+    CHECK(again.size(again.ctx) > 0);
+    {
+        bpt *t = bpt_open(&again);
+        CHECK_FATAL(t != NULL);
+        dc_collection *c = dc_collection_open(t);
+        CHECK_FATAL(c != NULL);
+        const uint8_t *f; uint32_t flen;
+        bj_builder *fb = empty_filter(&f, &flen);
+        int64_t count = 0;
+        CHECK_OK(dc_count(c, f, flen, &count));
+        CHECK_I64(count, 2);
+        bj_builder_free(fb);
+        dc_collection_free(c);
+        bpt_free(t);
+    }
+    CHECK_OK(ns.close(ns.ctx, &again));
+
+    /* remove, and removing the already-gone (a sweep racing a sweep). */
+    CHECK_OK(ns.remove(ns.ctx, "coll-people.bj", 14));
+    CHECK_OK(ns.remove(ns.ctx, "coll-people.bj", 14));
+    CHECK_RC(ns.open(ns.ctx, "coll-people.bj", 14, 0, &io), BJ_ERR_STATE);
+
+    /* A name that would escape the scope is refused at the adapter, even
+     * though db_validate.h already refuses it upstream. */
+    CHECK_RC(ns.open(ns.ctx, "../escape", 9, BJ_NS_CREATE, &io), BJ_ERR_RANGE);
+    CHECK_RC(ns.remove(ns.ctx, "a/b", 3), BJ_ERR_RANGE);
+    CHECK_RC(ns.open(ns.ctx, "", 0, BJ_NS_CREATE, &io), BJ_ERR_RANGE);
+
+    /* BJ_NS_TRUNC is what replaces delete-then-create, so it must
+     * actually zero an existing file. */
+    CHECK_FATAL(ns.open(ns.ctx, "scratch.bj", 10, BJ_NS_CREATE, &io) == BJ_OK);
+    CHECK_OK(io.write(io.ctx, 0, (const uint8_t *)"hello", 5));
+    CHECK_I64(io.size(io.ctx), 5);
+    CHECK_OK(ns.close(ns.ctx, &io));
+    CHECK_FATAL(ns.open(ns.ctx, "scratch.bj", 10, BJ_NS_CREATE | BJ_NS_TRUNC, &io) == BJ_OK);
+    CHECK_I64(io.size(io.ctx), 0);
+    CHECK_OK(ns.close(ns.ctx, &io));
+
+    /* BJ_NS_EXCL refuses an existing name. */
+    CHECK_RC(ns.open(ns.ctx, "scratch.bj", 10, BJ_NS_CREATE | BJ_NS_EXCL, &io), BJ_ERR_STATE);
+
+    CHECK_OK(ns.sync(ns.ctx));   /* directory-entry durability */
+
+    ns.remove(ns.ctx, "scratch.bj", 10);
+    bjns_posix_free(&ns);
+    close(dirfd);
+    rmdir(tmpl);
+}
+
+TEST(memory_io_is_accepted_without_a_sync_callback) {
+    /*
+     * A writable io with no sync is legitimate for memory and a durability
+     * bug for a file. Which one a binary contains is a property of the
+     * BUILD, not of an individual call, so bjio_check is compiled in or
+     * out (BJIO_REQUIRE_SYNC) rather than decided per open.
+     *
+     * This binary does not enable it -- its harness runs entirely on
+     * memfs -- so a sync-less memory io must open fine. The WASI build
+     * does enable it, and would refuse the very same io. Asserting the
+     * permissive half here is what stops a later phase from turning the
+     * flag on for this target and silently breaking every memory-backed
+     * test with BJ_ERR_STATE from bjfile_init.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "x.bj", &io) == BJ_OK);
+    CHECK(io.write != NULL);
+    CHECK(io.sync == NULL);        /* memfs deliberately has none */
+    CHECK_OK(bjio_check(&io));     /* ...and that is accepted here */
+
+    bpt *t = bpt_create(&io, ORDER);
+    CHECK(t != NULL);              /* bjfile_init did not refuse it */
+    bpt_free(t);
+    memfs_free(fs);
+}
+
 int main(void) {
+    RUN(posix_namespace_backs_a_real_database);
+    RUN(memory_io_is_accepted_without_a_sync_callback);
     RUN(current_date_rewrites_into_set);
     RUN(current_date_is_idempotent_and_passes_others_through);
     RUN(current_date_refuses_bad_specs_and_collisions);

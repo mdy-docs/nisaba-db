@@ -508,6 +508,19 @@ function bridgeHandle(h) {
       // hostio.c's truncate contract is void/best-effort (mut_end's
       // rewind is itself best-effort); record and continue.
       try { h.truncate(len); } catch (err) { bjioLastError = err; }
+    },
+    // Durability, reached from C through bj_io.sync (bjfile_sync, and
+    // through it elog_sync). Always defined here even when the underlying
+    // handle has none: a MemoryHandle's writes are already as durable as
+    // memory gets, so a no-op is the correct answer for it. Defining it
+    // unconditionally is what stops hostio.c's "no flush" branch from
+    // silently standing in for a real fsync on a real file.
+    //
+    // Unlike write(), a failure here is REPORTED rather than swallowed
+    // into a short op: the caller asked for durability and did not get it,
+    // and elog_sync's return is what Raft's sync-before-ack rests on.
+    flush() {
+      try { h.flush?.(); return 0; } catch (err) { bjioLastError = err; return -2; }
     }
   };
 }

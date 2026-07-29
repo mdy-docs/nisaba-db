@@ -76,6 +76,13 @@ if [ "$WASI" = 1 ]; then
     # smaller, so hostile input smashes the stack instead of being
     # rejected. Keep this in lockstep with build-wasm.sh's value.
     -Wl,-z,stack-size=1048576
+    # A WASI artifact backs its files with real descriptors, so a writable
+    # bj_io with no sync callback is a durability bug rather than a
+    # legitimate memory-backed io -- bjio_check refuses one at open. The
+    # default native build does NOT set this: its harness runs entirely on
+    # memfs, whose writes are as durable as memory gets, which bjio.h
+    # documents as the case where a NULL sync is correct.
+    -DBJIO_REQUIRE_SYNC
   )
 else
   CC="${CC:-cc}"

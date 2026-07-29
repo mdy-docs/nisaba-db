@@ -68,6 +68,14 @@ NATIVE_EXCLUDE=(
   wasm/src/db_currentdate_wasm.c
 )
 
+# Sources only a non-emscripten build links: the POSIX bj_io/bj_ns adapter
+# that stands in for hostio.c's EM_JS bridge. Its mirror image is the
+# hostio.c entry in NATIVE_EXCLUDE above -- exactly one of the two is
+# compiled into any given binary.
+NATIVE_EXTRA=(
+  third_party/binjson-structures/src/bjio_posix.c
+)
+
 # All C sources for a target, one per line.
 #   all_sources wasm|native
 all_sources() {
@@ -89,6 +97,9 @@ all_sources() {
     fi
     printf '%s\n' "$src"
   done
+  if [ "$mode" = native ]; then
+    for src in "${NATIVE_EXTRA[@]}"; do printf '%s\n' "$src"; done
+  fi
 }
 
 # Include paths shared by every target.

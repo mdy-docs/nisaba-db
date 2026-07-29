@@ -72,6 +72,10 @@ export declare class RaftNode {
     /** Fired with the full member-record list on every membership
      * adoption — the peer-table sync hook (docs/clustering.md). */
     onConfig?: (members: MemberRecord[]) => void;
+    /** Observability stream: state-transition events ({ type, time,
+     * node, term, ... }) — elections, role changes, config, promotions,
+     * installs, peer reachability edges, quiesce/wake, halts. */
+    onEvent?: (event: object) => void;
     log: any; // an open EntryLog (`nisaba/wasm`)
     stateMachine: RaftStateMachine;
     transport: RaftTransport;
@@ -95,6 +99,10 @@ export declare class RaftNode {
   /** Current member records — ids and addresses, from the log. */
   readonly memberInfo: MemberRecord[];
   onConfig: ((members: MemberRecord[]) => void) | null;
+  onEvent: ((event: object) => void) | null;
+  /** One JSON-able "what is true right now" snapshot (role, term, log
+   * bounds, members, the leader's per-peer replication view). */
+  status(): object;
   leaderId: number;
   commitIndex: number;
   lastApplied: number;

@@ -16,7 +16,8 @@
     "./replicated": { "types": "./types/replicated.d.ts", "default": "./src/db-replicated.js" },
     "./raft-host": { "types": "./types/raft-host.d.ts", "default": "./src/raft-host.js" },
     "./raft-tcp": { "types": "./types/raft-tcp.d.ts", "default": "./src/raft-transport-tcp.js" },
-    "./raft-http": { "types": "./types/raft-http.d.ts", "default": "./src/raft-transport-http.js" }
+    "./raft-http": { "types": "./types/raft-http.d.ts", "default": "./src/raft-transport-http.js" },
+    "./raft-monitor": { "types": "./types/raft-monitor.d.ts", "default": "./src/raft-monitor.js" }
   },
   "files": [
     "wasm",

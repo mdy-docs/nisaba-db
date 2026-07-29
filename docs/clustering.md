@@ -157,6 +157,45 @@ survivors even if it *doesn't* learn of the removal (a healthy leader
 refuses pre-votes — see `src/raft.js`). Removing an already-absent id
 is idempotent. Shut the process down afterwards; that part is yours.
 
+## Observability: status and events
+
+Two complementary surfaces, following the classic snapshot/timeline
+split (`nisaba/raft-monitor`):
+
+```js
+import { RaftMonitor } from "@mdy-docs/nisaba-db/raft-monitor";
+const monitor = new RaftMonitor(host, { listenPort: 9001 });
+await monitor.start();
+```
+
+- **`GET /status`** — one-off JSON: every hosted group's role, term,
+  leader, log bounds, commit/apply positions, member records with
+  voting flags, and (on a leader) the per-peer replication view —
+  match index, lag, in-flight, needs-snapshot, reachable. What you
+  `curl node:9001/status | jq` when investigating, and what a poller
+  scrapes. Also available in-process: `node.status()`,
+  `host.status()`, `rdb.status()` (adds db facts).
+
+- **`GET /events`** — a live stream (Server-Sent Events; `curl -N`, or
+  `new EventSource(url)` in a browser). The first event on connect is a
+  full status snapshot, so consumers never race a separate fetch; after
+  that, every state TRANSITION arrives tagged with its group id:
+  elections and role changes, config adoptions, learner promotions,
+  snapshot installs (started/finished/failed, both sides),
+  edge-triggered peer reachability (one event per transition, not per
+  retry), quiesce/wake, conflict truncations — and the critical
+  **`halt`**, emitted when a state machine throws on a committed entry
+  and the node deliberately stops rather than diverge. If you page on
+  one event, page on that one.
+
+The monitor is a **separate server** from the cluster transport: TCP
+clusters get the same observability, and the debug port is firewalled
+independently. It is read-only and unauthenticated — it binds to
+loopback by default; widen consciously or front it with auth. The
+in-process hooks (`node.onEvent`, aggregated at `host.onEvent`) are
+the same stream, for piping into your own logging or metrics without
+HTTP.
+
 ## Semantics and honest caveats
 
 - **One change at a time.** A second `changeMembership` while one is in

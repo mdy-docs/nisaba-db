@@ -45,13 +45,40 @@ export class RaftGroupHost {
    * @param {() => number} [options.now=Date.now] - clock (injectable for
    *   the simulator)
    */
-  constructor({ transport, tickMs = 25, quiesceAfterMs = 5000, now = Date.now }) {
+  constructor({ transport, tickMs = 25, quiesceAfterMs = 5000, now = Date.now, onEvent = null }) {
     this._transport = transport;
     this.tickMs = tickMs;
     this.quiesceAfterMs = quiesceAfterMs;
     this._now = now;
     this._groups = new Map(); // groupId -> { node, value, lastActivity }
     this._interval = null;
+    /** Aggregated observability stream: every group's RaftNode events,
+     * tagged with { group } — set it (or pass the option) and addGroup
+     * chains each node's onEvent into it. RaftMonitor consumes this. */
+    this.onEvent = onEvent;
+  }
+
+  /**
+   * One JSON-able snapshot across every hosted group — node.status()
+   * per group plus the host's own idle bookkeeping. The "what is true
+   * right now" half; the onEvent stream is the "what changed" half.
+   */
+  status() {
+    const now = this._now();
+    const groups = {};
+    for (const [gid, g] of this._groups) {
+      groups[gid] = {
+        ...g.node.status(),
+        idleMs: now - g.lastActivity
+      };
+    }
+    return {
+      time: now,
+      tickMs: this.tickMs,
+      quiesceAfterMs: this.quiesceAfterMs,
+      groupCount: this._groups.size,
+      groups
+    };
   }
 
   /** Per-group transport shim: wraps each message in this group's
@@ -88,6 +115,16 @@ export class RaftGroupHost {
         if (previous) previous(members);
       };
       node.onConfig(node.memberInfo); // sync what it already knows
+    }
+    {
+      // Aggregate the node's event stream, tagged with the group id.
+      const previous = node.onEvent;
+      node.onEvent = (event) => {
+        if (this.onEvent) {
+          try { this.onEvent({ group: groupId, ...event }); } catch { /* observer's problem */ }
+        }
+        if (previous) previous(event);
+      };
     }
     this._groups.set(groupId, { node, value, lastActivity: this._now() });
     return value;

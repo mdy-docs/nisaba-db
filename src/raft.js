@@ -136,6 +136,14 @@ export class RaftNode {
    *   with the full member-record list on EVERY adoption (bootstrap,
    *   apply, restart, install) — the hook that keeps a transport's peer
    *   table in sync with the log; RaftGroupHost wires it automatically.
+   * @param {(event: object) => void} [options.onEvent] - observability
+   *   stream: called with { type, time, node, term, ...fields } on state
+   *   TRANSITIONS only (elections, role changes, config adoptions,
+   *   promotions, snapshot installs, edge-triggered peer reachability,
+   *   quiesce/wake, conflict truncations, and the critical 'halt' when
+   *   the apply loop stops on divergence) — never per-heartbeat or
+   *   per-commit noise. RaftGroupHost aggregates these across groups;
+   *   RaftMonitor (src/raft-monitor.js) serves them over HTTP/SSE.
    * @param {object} options.log - an OPEN EntryLog
    * @param {object} options.stateMachine - { apply(entry) -> any|Promise,
    *   appliedIndex() -> number|Promise } — apply receives {index, term,
@@ -164,13 +172,15 @@ export class RaftNode {
    */
   constructor({
     id, peers, log, stateMachine, transport,
-    snapshotter = null, rebaseLog = null, onConfig = null,
+    snapshotter = null, rebaseLog = null, onConfig = null, onEvent = null,
     electionTimeoutMs = [150, 300], heartbeatMs = 50,
     maxBatchBytes = 65536, snapshotChunkBytes = 65536, random = Math.random
   }) {
     if (!Number.isInteger(id) || id <= 0) throw new Error('RaftNode id must be a positive integer');
     this.id = id;
     this.onConfig = onConfig;
+    this.onEvent = onEvent;
+    this._reachable = new Map(); // peer -> bool (edge-triggered events)
     const boot = new Map();
     for (const m of peers) {
       const record = typeof m === 'number' ? { id: m } : { ...m };
@@ -249,6 +259,7 @@ export class RaftNode {
     if (this.onConfig) {
       try { this.onConfig(this.memberInfo); } catch { /* host hook; never ours to crash on */ }
     }
+    this._emit('config', { members: this.memberInfo, voters: this.voters });
   }
 
   /**
@@ -273,6 +284,54 @@ export class RaftNode {
 
   get term() { return this.log.currentTerm; }
 
+  /** Emit one observability event (see the onEvent option). Never
+   * throws; a broken listener must not break consensus. */
+  _emit(type, fields = {}) {
+    if (!this.onEvent) return;
+    try {
+      this.onEvent({ type, time: this._now, node: this.id, term: this.log.currentTerm, ...fields });
+    } catch { /* observer's problem */ }
+  }
+
+  /**
+   * One JSON-able snapshot of everything this node knows about itself —
+   * the "what is true right now" half of observability (the onEvent
+   * stream is the "what changed" half). Peer replication state is the
+   * leader's view and null elsewhere.
+   */
+  status() {
+    return {
+      id: this.id,
+      role: this.role,
+      term: this.log.currentTerm,
+      leaderId: this.leaderId,
+      isRunning: this.isRunning,
+      quiesced: this._quiesced,
+      commitIndex: this.commitIndex,
+      lastApplied: this.lastApplied,
+      configInFlight: this._configInFlight,
+      log: {
+        baseIndex: this.log.baseIndex,
+        lastIndex: this.log.lastIndex,
+        lastTerm: this.log.lastTerm,
+        bytes: this.log.syncAccessHandle?.getSize?.() ?? null
+      },
+      members: this.memberInfo,
+      voters: this.voters,
+      peers: this.role === ROLE.LEADER
+        ? this.peers.map((p) => ({
+            id: p,
+            match: this._match.get(p) ?? 0,
+            next: this._next.get(p) ?? 0,
+            lag: this.log.lastIndex - (this._match.get(p) ?? 0),
+            inflight: this._inflight.has(p),
+            needsSnapshot: this._needsSnapshot.has(p),
+            reachable: this._reachable.get(p) !== false
+          }))
+        : null
+    };
+  }
+
   async start(now = 0) {
     this._now = now;
     this.lastApplied = await this.stateMachine.appliedIndex();
@@ -295,9 +354,11 @@ export class RaftNode {
     this.isRunning = true;
     this._resetElectionTimer();
     this._pumpApply();
+    this._emit('started', { lastApplied: this.lastApplied, commitIndex: this.commitIndex });
   }
 
   async stop() {
+    if (this.isRunning) this._emit('stopped');
     this.isRunning = false;
     this._rejectWaiters(new NotLeaderError(0));
     await this._applyChain.catch(() => {});
@@ -333,11 +394,13 @@ export class RaftNode {
     this._quiesced = true;
     this._electionDeadline = Infinity;
     this._heartbeatDue = Infinity;
+    this._emit('quiesce', { asleep: true });
   }
 
   wake(now = this._now) {
     if (!this._quiesced) return;
     this._quiesced = false;
+    this._emit('quiesce', { asleep: false });
     this._now = Math.max(this._now, now);
     this._heartbeatDue = this._now;
     this._resetElectionTimer();
@@ -571,6 +634,7 @@ export class RaftNode {
         // The conflict rule (§5.3): ours is wrong, discard our suffix.
         // Raft guarantees no conflict at or below the commit index —
         // EntryLog's own truncate guard enforces exactly that invariant.
+        this._emit('truncate', { from: e.index, oldLastIndex: this.log.lastIndex });
         this.log.truncateFrom(e.index);
       }
       this.log.append(e.term, e.payload, e.type);
@@ -608,6 +672,7 @@ export class RaftNode {
 
     if (msg.manifest) {
       // First chunk of a (re)started install: supersede anything staged.
+      this._emit('install', { phase: 'started', lastIncludedIndex: msg.lastIncludedIndex, from: msg.leaderId });
       await this._abortInstall();
       this._install = {
         lastIncludedIndex: msg.lastIncludedIndex,
@@ -652,10 +717,12 @@ export class RaftNode {
       this._applyChain = run.catch(() => {});
       try {
         await run;
-      } catch {
+        this._emit('install', { phase: 'finished', lastIncludedIndex: msg.lastIncludedIndex });
+      } catch (err) {
         // A failed commit (e.g. checksum mismatch on a corrupted
         // transfer) adopts nothing; have the leader start over.
         this._install = null;
+        this._emit('install', { phase: 'failed', lastIncludedIndex: msg.lastIncludedIndex, error: String(err?.message ?? err) });
         return { term: this.log.currentTerm, success: false, restart: true };
       }
     }
@@ -678,12 +745,14 @@ export class RaftNode {
   }
 
   _becomeFollower(term, leaderId) {
+    const changed = this.role !== ROLE.FOLLOWER || term > this.log.currentTerm;
     if (term > this.log.currentTerm) this.log.setHardState(term);
     const wasLeader = this.role === ROLE.LEADER;
     this.role = ROLE.FOLLOWER;
     this.leaderId = leaderId;
     this._resetElectionTimer();
     if (wasLeader) this._rejectWaiters(new NotLeaderError(leaderId));
+    if (changed) this._emit('role', { role: this.role, leaderId, wasLeader });
   }
 
   _startElection(preVote) {
@@ -694,7 +763,9 @@ export class RaftNode {
       this.role = ROLE.CANDIDATE;
       this.leaderId = 0;
       this._abortInstall(); // a half-staged install belongs to the old world
+      this._emit('role', { role: this.role });
     }
+    this._emit('election', { preVote, forTerm: term });
     this._resetElectionTimer();
     const quorum = this._quorum();
     if (quorum === 1) {
@@ -732,6 +803,7 @@ export class RaftNode {
   _becomeLeader() {
     this.role = ROLE.LEADER;
     this.leaderId = this.id;
+    this._emit('role', { role: this.role });
     this._heartbeatDue = this._now; // heartbeat on the next tick
     for (const p of this.peers) {
       this._next.set(p, this.log.lastIndex + 1);
@@ -776,6 +848,10 @@ export class RaftNode {
       if (quiesce) msg.quiesce = true;
       const reply = await this.transport.call(peer, msg);
       if (!this.isRunning || this.role !== ROLE.LEADER || this.log.currentTerm !== term) return;
+      if (this._reachable.get(peer) === false) {
+        this._reachable.set(peer, true);
+        this._emit('peer', { id: peer, reachable: true });
+      }
       if (reply.term > term) return this._becomeFollower(reply.term, 0);
       if (reply.success) {
         if (reply.matchIndex > this._match.get(peer)) {
@@ -799,7 +875,12 @@ export class RaftNode {
         again = true;
       }
     } catch {
-      // Unreachable; the next heartbeat retries.
+      // Unreachable; the next heartbeat retries. Edge-triggered event:
+      // announce the transition, not every failed attempt.
+      if (this._reachable.get(peer) !== false) {
+        this._reachable.set(peer, false);
+        this._emit('peer', { id: peer, reachable: false });
+      }
     } finally {
       this._inflight.delete(peer);
     }
@@ -816,6 +897,7 @@ export class RaftNode {
     const term = this.log.currentTerm;
     let installed = false;
     let boundary = 0;
+    this._emit('send-snapshot', { phase: 'started', peer });
     try {
       const snap = this.snapshotter.latest();
       const { lastIncludedIndex, lastIncludedTerm } = snap;
@@ -879,6 +961,7 @@ export class RaftNode {
       // Peer unreachable mid-transfer; the next heartbeat starts over.
     } finally {
       this._inflight.delete(peer);
+      this._emit('send-snapshot', { phase: installed ? 'finished' : 'failed', peer, boundary });
     }
     if (installed && this.role === ROLE.LEADER && this._next.get(peer) <= this.log.lastIndex) {
       this._replicate(peer);
@@ -901,6 +984,7 @@ export class RaftNode {
     // Explicit voting:true (not just dropping the flag): changeMembership
     // merges address-less records with the known ones, and an absent key
     // would re-inherit the old voting:false through that merge.
+    this._emit('promote', { id: peer, match: this._match.get(peer) ?? 0 });
     const next = this.memberInfo.map((m) => (m.id === peer ? { ...m, voting: true } : m));
     this.changeMembership(next).catch(() => { /* retried on the next success */ });
   }
@@ -931,6 +1015,7 @@ export class RaftNode {
       // A state machine that throws on a committed entry is unrecoverable
       // divergence; stop rather than skip (skipping would fork replicas).
       this.isRunning = false;
+      this._emit('halt', { error: String(err?.message ?? err), lastApplied: this.lastApplied, commitIndex: this.commitIndex });
       this._rejectWaiters(err);
     });
   }

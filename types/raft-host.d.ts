@@ -25,6 +25,11 @@ export declare class RaftGroupHost {
   group(groupId: string): unknown;
   /** Mark local activity so a quiesced group wakes for a client request. */
   touch(groupId: string): void;
+  /** Aggregated observability stream: every group's node events tagged
+   * with { group } — RaftMonitor consumes this. */
+  onEvent: ((event: object) => void) | null;
+  /** One JSON-able snapshot across every hosted group. */
+  status(): object;
   /** The transport's receiving half. */
   handleEnvelope(envelope: { group: string; msg: object }): object | Promise<object>;
   tick(now?: number): void;

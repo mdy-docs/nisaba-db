@@ -117,6 +117,26 @@ export class ReplicatedDb extends WalDb {
    * clock, handleMessage() for the transport's receiving half. */
   get raft() { return this._raft; }
 
+  /** One JSON-able snapshot: the RaftNode's status plus the database's
+   * own facts (collections, snapshot generation, applied position).
+   * Async because the collection list is. */
+  async status() {
+    return {
+      ...this._raft.status(),
+      db: {
+        collections: await this._db.listCollections(),
+        appliedIndex: await this._machine.appliedIndex(),
+        snapshot: this._store.latest
+          ? {
+              gen: this._store.latest.gen,
+              lastIncludedIndex: this._store.latest.lastIncludedIndex,
+              lastIncludedTerm: this._store.latest.lastIncludedTerm
+            }
+          : null
+      }
+    };
+  }
+
   /** Commit engine override: propose each command through Raft; the
    * result is whatever the local apply of the committed entry produced.
    * A NotLeaderError aborts the whole operation immediately — it is a

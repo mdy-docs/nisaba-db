@@ -882,3 +882,230 @@ int dc_catalog_new_entry(const char *coll, size_t coll_len, dbuf *out) {
     bj_builder_free(b);
     return e;
 }
+
+/* ---- planning a compaction ---------------------------------------------- */
+
+/* Emit an index definition with its files renamed into `gen`, and record
+ * both the new names (into `build`) and the old ones (into `old`). */
+static int regen_index(bj_builder *entry_out, bj_builder *build_out, dbuf *old,
+                       const uint8_t *def, size_t def_len,
+                       const char *coll, size_t coll_len, uint32_t gen) {
+    const uint8_t *np; uint32_t nlen; int found = 0;
+    int e = str_field(def, def_len, "name", &np, &nlen, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_CATALOG_ENTRY;
+    dc_index_plan_kind kind = def_kind(def, def_len);
+
+    /* Copy the definition through, replacing only its file names -- so
+     * options (unique, sparse, partialFilterExpression, TTL) survive a
+     * compaction untouched, which a hand-built replacement can forget. */
+    bj_begin_object(entry_out);
+    bj_begin_object(build_out);
+    bj_put_key(build_out, (const uint8_t *)"name", 4);
+    bj_put_string(build_out, np, nlen);
+    bj_put_key(build_out, (const uint8_t *)"kind", 4);
+    bj_put_int(build_out, (int64_t)kind);
+    bj_put_key(build_out, (const uint8_t *)"files", 5);
+    bj_begin_array(build_out);
+
+    cur c = { def, def_len, 0 };
+    uint32_t n;
+    if ((e = object_begin(&c, &n))) return e;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *kp; uint32_t klen;
+        if ((e = take_key(&c, &kp, &klen))) return e;
+        size_t vstart = c.pos;
+        if ((e = skip_value(&c))) return e;
+        const uint8_t *v = def + vstart;
+        size_t vlen = c.pos - vstart;
+
+        if (klen == 4 && memcmp(kp, "file", 4) == 0) {
+            /* Old name goes on the delete list; new name replaces it. */
+            const uint8_t *sp; uint32_t slen;
+            cur vc = { v, vlen, 0 };
+            if (take_string(&vc, &sp, &slen) != BJ_OK) return DC_ERR_CATALOG_ENTRY;
+            if ((e = ref_add(old, sp, slen))) return e;
+            dbuf nf = {0};
+            e = dc_index_file_name(&nf, coll, coll_len, (const char *)np, nlen, gen);
+            if (!e) {
+                bj_put_key(entry_out, (const uint8_t *)"file", 4);
+                bj_put_string(entry_out, nf.data, (uint32_t)nf.len);
+                bj_put_string(build_out, nf.data, (uint32_t)nf.len);
+            }
+            dbuf_free(&nf);
+            if (e) return e;
+        } else if (klen == 5 && memcmp(kp, "files", 5) == 0) {
+            if (vlen < 1 || v[0] != BJ_TYPE_OBJECT) return DC_ERR_CATALOG_ENTRY;
+            bj_put_key(entry_out, (const uint8_t *)"files", 5);
+            bj_begin_object(entry_out);
+            for (int r = 0; r < 3; r++) {
+                const uint8_t *sp; uint32_t slen; int have = 0;
+                if ((e = str_field(v, vlen, TEXT_ROLE_KEYS[r], &sp, &slen, &have))) return e;
+                if (!have) return DC_ERR_CATALOG_ENTRY;
+                if ((e = ref_add(old, sp, slen))) return e;
+                dbuf nf = {0};
+                e = dc_text_index_file_name(&nf, coll, coll_len, (const char *)np, nlen,
+                                            gen, (dc_text_role)r);
+                if (!e) {
+                    bj_put_key(entry_out, (const uint8_t *)TEXT_ROLE_KEYS[r],
+                               (uint32_t)strlen(TEXT_ROLE_KEYS[r]));
+                    bj_put_string(entry_out, nf.data, (uint32_t)nf.len);
+                    bj_put_string(build_out, nf.data, (uint32_t)nf.len);
+                }
+                dbuf_free(&nf);
+                if (e) return e;
+            }
+            bj_end_object(entry_out);
+        } else {
+            bj_put_key(entry_out, kp, klen);
+            bj_put_raw(entry_out, v, (uint32_t)vlen);
+        }
+    }
+    bj_end_array(build_out);
+    bj_end_object(build_out);
+    bj_end_object(entry_out);
+    return BJ_OK;
+}
+
+int dc_compact_plan(const uint8_t *entry, size_t entry_len,
+                    const char *coll, size_t coll_len, dbuf *out) {
+    if (entry_len < 1 || entry[0] != BJ_TYPE_OBJECT) return DC_ERR_CATALOG_ENTRY;
+
+    double gen_d = 0; int has_gen = 0;
+    int e = num_field(entry, entry_len, "gen", &gen_d, &has_gen);
+    if (e) return e;
+    uint32_t gen = ((has_gen && gen_d > 0) ? (uint32_t)gen_d : 0) + 1;
+
+    dbuf old = {0}, newfile = {0}, newjournal = {0};
+    bj_builder *b = bj_builder_new();
+    bj_builder *ent = bj_builder_new();
+    bj_builder *bld = bj_builder_new();
+    if (!b || !ent || !bld) { e = BJ_ERR_OOM; goto done; }
+
+    if ((e = dc_collection_file_name(&newfile, coll, coll_len, gen))) goto done;
+    if ((e = dc_journal_file_name(&newjournal, coll, coll_len, gen))) goto done;
+
+    /* Old primary and journal, with the usual gen-0 journal fallback. */
+    {
+        const uint8_t *sp; uint32_t slen; int found = 0;
+        if ((e = str_field(entry, entry_len, "file", &sp, &slen, &found))) goto done;
+        if (!found) { e = DC_ERR_CATALOG_ENTRY; goto done; }
+        if ((e = ref_add(&old, sp, slen))) goto done;
+
+        if ((e = str_field(entry, entry_len, "journal", &sp, &slen, &found))) goto done;
+        if (found) {
+            if ((e = ref_add(&old, sp, slen))) goto done;
+        } else {
+            dbuf j0 = {0};
+            e = dc_journal_file_name(&j0, coll, coll_len, 0);
+            if (!e) e = ref_add(&old, j0.data, (uint32_t)j0.len);
+            dbuf_free(&j0);
+            if (e) goto done;
+        }
+    }
+
+    /* The new entry: the old one with gen, file and journal replaced and
+     * every index's files regenerated. Copying rather than rebuilding is
+     * what carries compactedBytes-style fields and any future field
+     * through a compaction untouched. */
+    bj_begin_object(ent);
+    bj_begin_array(bld);
+    {
+        cur c = { entry, entry_len, 0 };
+        uint32_t n;
+        if ((e = object_begin(&c, &n))) goto done;
+        int wrote_indexes = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t *kp; uint32_t klen;
+            if ((e = take_key(&c, &kp, &klen))) goto done;
+            size_t vstart = c.pos;
+            if ((e = skip_value(&c))) goto done;
+            const uint8_t *v = entry + vstart;
+            size_t vlen = c.pos - vstart;
+
+            if (klen == 4 && memcmp(kp, "file", 4) == 0) continue;      /* replaced below */
+            if (klen == 7 && memcmp(kp, "journal", 7) == 0) continue;   /* replaced below */
+            if (klen == 3 && memcmp(kp, "gen", 3) == 0) continue;       /* replaced below */
+            if (klen == 7 && memcmp(kp, "indexes", 7) == 0) {
+                wrote_indexes = 1;
+                bj_put_key(ent, (const uint8_t *)"indexes", 7);
+                bj_begin_array(ent);
+                if (vlen >= 1 && v[0] == BJ_TYPE_ARRAY) {
+                    cur ic = { v, vlen, 0 };
+                    uint32_t in;
+                    if ((e = array_begin(&ic, &in))) goto done;
+                    for (uint32_t j = 0; j < in; j++) {
+                        size_t dstart = ic.pos;
+                        if ((e = skip_value(&ic))) goto done;
+                        if ((e = regen_index(ent, bld, &old, v + dstart, ic.pos - dstart,
+                                             coll, coll_len, gen))) goto done;
+                    }
+                }
+                bj_end_array(ent);
+                continue;
+            }
+            bj_put_key(ent, kp, klen);
+            bj_put_raw(ent, v, (uint32_t)vlen);
+        }
+        if (!wrote_indexes) {
+            bj_put_key(ent, (const uint8_t *)"indexes", 7);
+            bj_begin_array(ent);
+            bj_end_array(ent);
+        }
+    }
+    bj_put_key(ent, (const uint8_t *)"file", 4);
+    bj_put_string(ent, newfile.data, (uint32_t)newfile.len);
+    bj_put_key(ent, (const uint8_t *)"journal", 7);
+    bj_put_string(ent, newjournal.data, (uint32_t)newjournal.len);
+    bj_put_key(ent, (const uint8_t *)"gen", 3);
+    bj_put_int(ent, (int64_t)gen);
+    bj_end_object(ent);
+    bj_end_array(bld);
+
+    if ((e = bj_builder_error(ent))) goto done;
+    if ((e = bj_builder_error(bld))) goto done;
+
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"gen", 3);
+    bj_put_int(b, (int64_t)gen);
+    bj_put_key(b, (const uint8_t *)"newEntry", 8);
+    {
+        size_t l = 0;
+        const uint8_t *d = bj_builder_data(ent, &l);
+        if (!d) { e = BJ_ERR_STATE; goto done; }
+        bj_put_raw(b, d, (uint32_t)l);
+    }
+    bj_put_key(b, (const uint8_t *)"build", 5);
+    {
+        size_t l = 0;
+        const uint8_t *d = bj_builder_data(bld, &l);
+        if (!d) { e = BJ_ERR_STATE; goto done; }
+        bj_put_raw(b, d, (uint32_t)l);
+    }
+    bj_put_key(b, (const uint8_t *)"oldFiles", 8);
+    bj_begin_array(b);
+    {
+        size_t at = 0;
+        while (at < old.len) {
+            const char *nm = (const char *)old.data + at;
+            size_t nlen = strlen(nm);
+            if (nlen) bj_put_string(b, (const uint8_t *)nm, (uint32_t)nlen);
+            at += nlen + 1;
+        }
+    }
+    bj_end_array(b);
+    bj_end_object(b);
+
+    if ((e = bj_builder_error(b))) goto done;
+    {
+        size_t l = 0;
+        const uint8_t *d = bj_builder_data(b, &l);
+        if (!d) { e = BJ_ERR_STATE; goto done; }
+        e = dbuf_put(out, d, l);
+    }
+
+done:
+    dbuf_free(&newjournal); dbuf_free(&newfile); dbuf_free(&old);
+    bj_builder_free(bld); bj_builder_free(ent); bj_builder_free(b);
+    return e;
+}

@@ -2532,7 +2532,27 @@ class Collection {
     let flipped = false;
     try {
       const entry = this._catalog.search(this.name);
-      const generation = (entry.gen || 0) + 1;
+      // C names the entire new generation before any of it exists: the
+      // generation number, every new file, the catalog entry to flip to,
+      // and the old files to drop afterwards. This side then creates
+      // exactly those files and deletes exactly those -- with one catalog
+      // write in between.
+      //
+      // The new entry is COPIED from the old one with names replaced,
+      // rather than rebuilt, so index options and any future field
+      // survive a compaction untouched. The JS this replaced spread the
+      // old entry and patched names into the copy, at the one moment
+      // where getting the schema wrong strands a whole generation.
+      const cplan = catalogCall((M, ctx) => {
+        const ee = encode(entry);
+        const ep = M._malloc(ee.length || 1);
+        const n = allocStr(M, this.name);
+        try {
+          if (ee.length) M.HEAPU8.set(ee, ep);
+          return M._catw_compact_plan(ctx, ep, ee.length, n.ptr, n.len);
+        } finally { n.free(); M._free(ep); }
+      });
+      const generation = cplan.gen;
       const bytesBefore = this._storageBytes();
 
       // ---- Build: stream every live structure into gen-prefixed files.
@@ -2547,32 +2567,28 @@ class Collection {
         bytesBuilt += newSize;
       };
 
-      const oldFiles = [entry.file, entry.journal || journalFileName(this.name)];
-      const newEntry = { ...entry, gen: generation, file: collectionFileName(this.name, generation), indexes: [] };
+      const oldFiles = cplan.oldFiles;
+      const newEntry = cplan.newEntry;
       await compactInto(this._tree, newEntry.file);
 
-      for (const def of entry.indexes || []) {
+      // cplan.build lines up with the new entry's indexes, each carrying
+      // its new files in attach order; this side only has to know which
+      // live structure corresponds to each.
+      const TEXT_ROLES = ['index', 'docTerms', 'docLengths'];
+      for (const def of cplan.build) {
         const ix = this._indexes.get(def.name);
-        const kind = def.kind || 'equality';
-        if (kind === 'text') {
-          const files = textIndexFileNames(this.name, def.name, generation);
-          for (const role of Object.keys(def.files)) {
-            oldFiles.push(def.files[role]);
-            await compactInto(ix.trees[role], files[role]);
+        if (def.kind === 1) {
+          for (let r = 0; r < TEXT_ROLES.length; r++) {
+            await compactInto(ix.trees[TEXT_ROLES[r]], def.files[r]);
           }
-          newEntry.indexes.push({ ...def, files });
         } else {
-          const file = indexFileName(this.name, def.name, generation);
-          oldFiles.push(def.file);
-          await compactInto(kind === 'geo' ? ix.rt : ix.tree, file);
-          newEntry.indexes.push({ ...def, file });
+          await compactInto(def.kind === 2 ? ix.rt : ix.tree, def.files[0]);
         }
       }
 
       // The new generation starts with its own empty journal: the old
       // one's recorded lengths describe the old files only. truncate(0)
       // clears a stale leftover from a crashed earlier attempt.
-      newEntry.journal = journalFileName(this.name, generation);
       const jh = await this._provider.openFile(newEntry.journal, { create: true });
       created.push(newEntry.journal);
       jh.truncate(0);

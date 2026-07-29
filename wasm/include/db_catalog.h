@@ -214,6 +214,34 @@ int dc_collection_files(const uint8_t *entry, size_t entry_len,
  */
 int dc_catalog_new_entry(const char *coll, size_t coll_len, dbuf *out);
 
+/*
+ * Plan a compaction (docs/compaction.md).
+ *
+ * Appends one binjson OBJECT to `out`:
+ *
+ *   { gen: <int>,                 // the generation being built
+ *     newEntry: { ... },          // the catalog entry to flip to
+ *     build: [ { name, kind, files: [<new file>, ...] } ],
+ *     oldFiles: [ <file>, ... ] } // to delete AFTER the flip
+ *
+ * `build` is in the same plan shape as everywhere else, and its entries
+ * line up with newEntry's indexes: for each one the caller streams the
+ * matching live structure into each named file, in order. The primary and
+ * the journal are newEntry's own `file` and `journal`.
+ *
+ * Pure -- it names the whole new generation without creating any of it,
+ * which is what lets the caller create exactly these files and delete
+ * exactly `oldFiles`, with the single catalog write between them.
+ *
+ * Everything here was JavaScript spreading the old entry and patching
+ * names into the copy: `{...entry, gen, file: collectionFileName(name,
+ * gen), indexes: []}` and then `{...def, file}` per index. That is the
+ * catalog schema being rewritten by hand at the one moment when getting
+ * it wrong strands a whole generation -- so it belongs with the schema.
+ */
+int dc_compact_plan(const uint8_t *entry, size_t entry_len,
+                    const char *coll, size_t coll_len, dbuf *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -65,6 +65,7 @@ _catw_create_plan
 _catw_sweep_plan
 _catw_collection_files
 _catw_new_entry
+_catw_compact_plan
 _catw_ptr
 _catw_len
 

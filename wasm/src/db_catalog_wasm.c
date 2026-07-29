@@ -87,6 +87,13 @@ EMSCRIPTEN_KEEPALIVE int catw_new_entry(catw *w, const char *coll, int coll_len)
     return dc_catalog_new_entry(coll, (size_t)coll_len, &w->buf);
 }
 
+EMSCRIPTEN_KEEPALIVE int catw_compact_plan(catw *w, const uint8_t *entry, int entry_len,
+                                           const char *coll, int coll_len) {
+    if (entry_len < 0 || coll_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    return dc_compact_plan(entry, (size_t)entry_len, coll, (size_t)coll_len, &w->buf);
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *catw_ptr(const catw *w) { return w->buf.data; }
 
 EMSCRIPTEN_KEEPALIVE int catw_len(const catw *w) {

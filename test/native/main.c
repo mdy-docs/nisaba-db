@@ -26,6 +26,7 @@
 #include "db_bulk.h"
 #include "db_agg.h"
 #include "db_catalog.h"
+#include "bjcursor.h"
 #include "db_update.h"
 #include "dbuf.h"
 #include "bjio_posix.h"
@@ -702,6 +703,15 @@ TEST(orphan_sweep_pattern_matches_exactly_what_js_matched) {
 }
 
 /* ---- db_validate ------------------------------------------------------- */
+
+/* obj_get_field wants a length-counted key; this wraps the common
+ * C-string case. bjcursor.h is an internal header, hence the local
+ * helper rather than an addition to it. */
+static int obj_get_field_probe(const uint8_t *obj, size_t len, const char *key,
+                               const uint8_t **val, size_t *val_len, int *found) {
+    return obj_get_field(obj, len, (const uint8_t *)key, (uint32_t)strlen(key),
+                         val, val_len, found);
+}
 
 /* memmem is a BSD/GNU extension, absent under -std=c11 on glibc without
  * _GNU_SOURCE -- and this harness is meant to build with any compiler. */
@@ -2111,7 +2121,100 @@ TEST(a_fresh_entry_carries_only_what_it_has_earned) {
     dbuf_free(&plan); dbuf_free(&entry);
 }
 
+TEST(compact_plan_regenerates_every_name_and_keeps_every_option) {
+    /* An entry with a unique, sparse, TTL equality index -- the options a
+     * hand-rebuilt entry is most likely to drop. */
+    bj_builder *e0 = bj_builder_new();
+    bj_begin_object(e0);
+    bj_put_key(e0, (const uint8_t *)"file", 4);
+    bj_put_string(e0, (const uint8_t *)"coll-users.bj", 13);
+    bj_put_key(e0, (const uint8_t *)"journal", 7);
+    bj_put_string(e0, (const uint8_t *)"coll-users-journal.bj", 21);
+    bj_put_key(e0, (const uint8_t *)"compactedBytes", 14);
+    bj_put_int(e0, 4096);
+    bj_put_key(e0, (const uint8_t *)"indexes", 7);
+    bj_begin_array(e0);
+    bj_begin_object(e0);
+    bj_put_key(e0, (const uint8_t *)"name", 4);
+    bj_put_string(e0, (const uint8_t *)"seen_1", 6);
+    bj_put_key(e0, (const uint8_t *)"kind", 4);
+    bj_put_string(e0, (const uint8_t *)"equality", 8);
+    bj_put_key(e0, (const uint8_t *)"file", 4);
+    bj_put_string(e0, (const uint8_t *)"idx-users-seen_1.bj", 19);
+    bj_put_key(e0, (const uint8_t *)"fields", 6);
+    bj_begin_array(e0);
+    bj_put_string(e0, (const uint8_t *)"seen", 4);
+    bj_end_array(e0);
+    bj_put_key(e0, (const uint8_t *)"unique", 6);
+    bj_put_bool(e0, 1);
+    bj_put_key(e0, (const uint8_t *)"expireAfterSeconds", 18);
+    bj_put_int(e0, 3600);
+    bj_end_object(e0);
+    bj_end_array(e0);
+    bj_end_object(e0);
+
+    size_t len = 0;
+    const uint8_t *entry = bj_builder_data(e0, &len);
+    dbuf plan = {0};
+    CHECK_OK(dc_compact_plan(entry, len, "users", 5, &plan));
+
+    /* Generation 0 -> 1, with every name regenerated. */
+    CHECK(find_bytes(plan.data, plan.len, "g1-coll-users.bj", 16) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "g1-coll-users-journal.bj", 24) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "g1-idx-users-seen_1.bj", 22) != NULL);
+
+    /* Options survive: a compaction rewrites bytes, not definitions. A
+     * lost `unique` here silently drops a constraint, and a lost
+     * expireAfterSeconds silently stops expiring. */
+    CHECK(find_bytes(plan.data, plan.len, "unique", 6) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "expireAfterSeconds", 18) != NULL);
+    /* Unrelated fields are carried through, not dropped. */
+    CHECK(find_bytes(plan.data, plan.len, "compactedBytes", 14) != NULL);
+
+    /* Old files are listed for deletion AFTER the flip. */
+    CHECK(find_bytes(plan.data, plan.len, "coll-users-journal.bj", 21) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "idx-users-seen_1.bj", 19) != NULL);
+
+    dbuf_free(&plan);
+    bj_builder_free(e0);
+}
+
+TEST(compact_plan_advances_from_the_recorded_generation) {
+    bj_builder *e0 = bj_builder_new();
+    bj_begin_object(e0);
+    bj_put_key(e0, (const uint8_t *)"file", 4);
+    bj_put_string(e0, (const uint8_t *)"g7-coll-users.bj", 16);
+    bj_put_key(e0, (const uint8_t *)"journal", 7);
+    bj_put_string(e0, (const uint8_t *)"g7-coll-users-journal.bj", 24);
+    bj_put_key(e0, (const uint8_t *)"gen", 3);
+    bj_put_int(e0, 7);
+    bj_end_object(e0);
+    size_t len = 0;
+    const uint8_t *entry = bj_builder_data(e0, &len);
+
+    dbuf plan = {0};
+    CHECK_OK(dc_compact_plan(entry, len, "users", 5, &plan));
+    CHECK(find_bytes(plan.data, plan.len, "g8-coll-users.bj", 16) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "g8-coll-users-journal.bj", 24) != NULL);
+
+    /* The planned entry must itself be openable -- a generation that
+     * cannot be planned back is a stranded one. */
+    const uint8_t *ne; size_t ne_len; int found = 0;
+    CHECK_OK(obj_get_field_probe(plan.data, plan.len, "newEntry", &ne, &ne_len, &found));
+    CHECK(found);
+    if (found) {
+        dbuf reopened = {0};
+        CHECK_OK(dc_catalog_open_plan(ne, ne_len, "users", 5, &reopened));
+        CHECK(find_bytes(reopened.data, reopened.len, "g8-coll-users.bj", 16) != NULL);
+        dbuf_free(&reopened);
+    }
+    dbuf_free(&plan);
+    bj_builder_free(e0);
+}
+
 int main(void) {
+    RUN(compact_plan_regenerates_every_name_and_keeps_every_option);
+    RUN(compact_plan_advances_from_the_recorded_generation);
     RUN(collection_files_and_the_sweep_agree_by_construction);
     RUN(a_fresh_entry_carries_only_what_it_has_earned);
     RUN(sweep_plan_deletes_orphans_and_nothing_else);

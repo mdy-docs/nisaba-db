@@ -20,6 +20,7 @@
 #include "bplustree.h"
 #include "binjson.h"
 #include "keyenc.h"
+#include "db_names.h"
 #include "dbuf.h"
 
 #include "docs.h"
@@ -592,7 +593,108 @@ TEST(keyenc_rejects_unorderable_values) {
     dbuf_free(&b);
 }
 
+/* ---- db_names ---------------------------------------------------------- */
+
+static void check_name(const char *what, int rc, const dbuf *got, const char *want) {
+    if (rc != 0) { TAP_FAIL("%s: rc %d", what, rc); return; }
+    if (got->len != strlen(want) || memcmp(got->data, want, got->len) != 0)
+        TAP_FAIL("%s: got \"%.*s\", want \"%s\"", what, (int)got->len, (char *)got->data, want);
+}
+
+TEST(file_names_match_the_original_js_scheme) {
+    struct { uint32_t gen; const char *want; } coll[] = {
+        { 0, "coll-users.bj" },
+        { 1, "g1-coll-users.bj" },
+        { 42, "g42-coll-users.bj" },
+        { 1000000, "g1000000-coll-users.bj" },
+    };
+    for (size_t i = 0; i < sizeof(coll) / sizeof(coll[0]); i++) {
+        dbuf b = {0};
+        int rc = dc_collection_file_name(&b, "users", 5, coll[i].gen);
+        check_name("collection", rc, &b, coll[i].want);
+        dbuf_free(&b);
+    }
+    {
+        dbuf b = {0};
+        check_name("index", dc_index_file_name(&b, "users", 5, "team_1", 6, 0),
+                   &b, "idx-users-team_1.bj");
+        dbuf_free(&b);
+    }
+    {
+        dbuf b = {0};
+        check_name("index gen", dc_index_file_name(&b, "users", 5, "team_1", 6, 3),
+                   &b, "g3-idx-users-team_1.bj");
+        dbuf_free(&b);
+    }
+    {
+        dbuf b = {0};
+        check_name("journal", dc_journal_file_name(&b, "users", 5, 0),
+                   &b, "coll-users-journal.bj");
+        dbuf_free(&b);
+    }
+    {
+        dbuf b = {0};
+        check_name("journal gen", dc_journal_file_name(&b, "users", 5, 2),
+                   &b, "g2-coll-users-journal.bj");
+        dbuf_free(&b);
+    }
+    struct { dc_text_role role; const char *want; } text[] = {
+        { DC_TEXT_ROLE_TERMS,     "idx-posts-body_text-terms.bj" },
+        { DC_TEXT_ROLE_DOCUMENTS, "idx-posts-body_text-documents.bj" },
+        { DC_TEXT_ROLE_LENGTHS,   "idx-posts-body_text-lengths.bj" },
+    };
+    for (size_t i = 0; i < sizeof(text) / sizeof(text[0]); i++) {
+        dbuf b = {0};
+        int rc = dc_text_index_file_name(&b, "posts", 5, "body_text", 9, 0, text[i].role);
+        check_name("text index", rc, &b, text[i].want);
+        dbuf_free(&b);
+    }
+    /* A collection name may legally contain dots -- the whole reason the
+     * generation marker is a prefix rather than a `.g<N>` suffix. */
+    {
+        dbuf b = {0};
+        check_name("dotted name", dc_collection_file_name(&b, "users.g2", 8, 0),
+                   &b, "coll-users.g2.bj");
+        dbuf_free(&b);
+    }
+}
+
+TEST(orphan_sweep_pattern_matches_exactly_what_js_matched) {
+    /* Matches: what this layer creates, at any generation. */
+    static const char *yes[] = {
+        "coll-users.bj", "idx-users-team_1.bj", "coll-users-journal.bj",
+        "g1-coll-users.bj", "g42-idx-users-team_1.bj", "g7-coll-users-journal.bj",
+        "idx-posts-body_text-terms.bj", "coll-users.g2.bj",
+        "coll-.bj",                     /* the JS `.*` accepted an empty middle */
+        "idx-.bj",
+    };
+    for (size_t i = 0; i < sizeof(yes) / sizeof(yes[0]); i++)
+        if (!dc_is_db_file(yes[i], strlen(yes[i]))) TAP_FAIL("should match: %s", yes[i]);
+
+    /* Non-matches: the catalog, host files, and near misses. The catalog
+     * one matters most -- the sweep deleting it would destroy the
+     * database. */
+    static const char *no[] = {
+        "__catalog__.bj",
+        "__wal__.bj",
+        "notes.txt",
+        "coll-users.txt",               /* wrong extension     */
+        "collusers.bj",                 /* no separator        */
+        "xcoll-users.bj",               /* prefix isn't at the start */
+        "g-coll-users.bj",              /* g with no digits    */
+        "g12coll-users.bj",             /* digits with no dash */
+        "g1-notes.bj",                  /* generation on a non-db name */
+        "",
+        "coll-",                        /* no extension        */
+        ".bj",
+    };
+    for (size_t i = 0; i < sizeof(no) / sizeof(no[0]); i++)
+        if (dc_is_db_file(no[i], strlen(no[i]))) TAP_FAIL("should NOT match: %s", no[i]);
+}
+
 int main(void) {
+    RUN(file_names_match_the_original_js_scheme);
+    RUN(orphan_sweep_pattern_matches_exactly_what_js_matched);
     RUN(keyenc_matches_the_original_js_encoder);
     RUN(keyenc_byte_order_matches_numeric_order);
     RUN(keyenc_rejects_unorderable_values);

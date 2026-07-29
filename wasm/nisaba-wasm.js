@@ -574,20 +574,77 @@ const {
 // passes it as `default_id`; C only consults it when it decides to upsert.
 // ---------------------------------------------------------------------------
 
-const DB_CATALOG_FILE = '__catalog__.bj';
 const DB_DEFAULT_ORDER = 32;
 
-/**
- * On-disk format version (docs/format-compatibility.md). Stamped into the
- * catalog under DB_FORMAT_KEY on every open; Db.open() refuses a database
- * stamped with a NEWER version than this reader understands, loudly and
- * before touching anything (in particular before the orphan sweep, which
- * must never judge a future format's files by this version's naming
- * rules). Bump it only with a written migration story: an older stamp
- * must either open unchanged (pure additions) or be migrated explicitly.
- */
-const DB_FORMAT_VERSION = 1;
-const DB_FORMAT_KEY = '__format__'; // reserved catalog key -- not a collection
+// ---------------------------------------------------------------------------
+// File naming and the format stamp: marshalling only.
+//
+// The scheme itself lives in wasm/src/db_names.c (see db_names.h for the
+// generation-prefix rationale and docs/format-compatibility.md for what the
+// stamp covers). It used to live here, on the argument -- recorded in
+// docs/db-plan.md -- that JS must compute a file name before it can open
+// the file, so the name can't be learned from the catalog first. That's
+// true, and it's an argument for JS *asking* for a name, not for JS
+// *owning* the scheme: the catalog, the compaction generation flip and the
+// orphan sweep all reason about these names, and all three are C's now (or
+// about to be). DB_FORMAT_VERSION in particular was a JS constant stamping
+// a C-owned format.
+//
+// The constants are functions rather than consts because they come from
+// the module, which isn't loaded at module-evaluation time.
+// ---------------------------------------------------------------------------
+
+let namesCtx = 0;
+
+function namesBuilder(M) {
+  if (!namesCtx) {
+    namesCtx = M._dnw_new();
+    if (!namesCtx) throw codeError(-1, 'dnw_new'); // BJ_ERR_OOM
+  }
+  return namesCtx;
+}
+
+/** Run a C name-builder call and decode the result. Re-reads HEAPU8: the
+ *  call may have grown the heap and swapped the ArrayBuffer. */
+function takeName(M, rc) {
+  check(rc);
+  const len = M._dnw_len(namesCtx);
+  check(len < 0 ? len : 0);
+  const ptr = M._dnw_ptr(namesCtx);
+  return textDecoder.decode(M.HEAPU8.slice(ptr, ptr + len));
+}
+
+/** Call a C name builder with one or two (string, gen) style arguments. */
+function buildName(fn) {
+  const M = requireModule();
+  const ctx = namesBuilder(M);
+  return fn(M, ctx);
+}
+
+let formatVersionCache = null;
+let catalogFileCache = null;
+let formatKeyCache = null;
+
+/** On-disk format version (docs/format-compatibility.md). */
+function dbFormatVersion() {
+  if (formatVersionCache === null) formatVersionCache = requireModule()._dnw_format_version();
+  return formatVersionCache;
+}
+
+function dbCatalogFile() {
+  if (catalogFileCache === null) {
+    catalogFileCache = buildName((M, ctx) => takeName(M, M._dnw_catalog_file(ctx)));
+  }
+  return catalogFileCache;
+}
+
+/** Reserved catalog key holding the format stamp -- not a collection. */
+function dbFormatKey() {
+  if (formatKeyCache === null) {
+    formatKeyCache = buildName((M, ctx) => takeName(M, M._dnw_format_key(ctx)));
+  }
+  return formatKeyCache;
+}
 
 /**
  * Duck-types rather than strict `instanceof ObjectId`: a caller that built
@@ -614,8 +671,8 @@ function checkCollectionName(name) {
   if (typeof name !== 'string' || name.length === 0 || name.includes('/') || name.includes('\0')) {
     throw new Error(`Invalid collection name: ${JSON.stringify(name)}`);
   }
-  if (name === DB_FORMAT_KEY) {
-    throw new Error(`Invalid collection name: "${DB_FORMAT_KEY}" is reserved for the format stamp (docs/format-compatibility.md)`);
+  if (name === dbFormatKey()) {
+    throw new Error(`Invalid collection name: "${dbFormatKey()}" is reserved for the format stamp (docs/format-compatibility.md)`);
   }
 }
 
@@ -626,34 +683,34 @@ function checkDbName(name) {
   }
 }
 
-/**
- * Compaction generations (docs/compaction.md): Collection.compact() rewrites
- * a collection's whole file set into fresh files carrying a `g<N>-` prefix
- * and records the new names in the catalog -- the catalog entry, not this
- * naming convention, is what _open() trusts. A *prefix* rather than a
- * `.g<N>` suffix so a generation can never collide with a gen-0 name:
- * every gen-0 file starts with `coll-`/`idx-` while every gen>0 file
- * starts with `g<digits>-`, and collection/index names may legally contain
- * dots (a collection literally named "users.g2" must not claim generation
- * 2 of "users"). gen 0 keeps the historical un-prefixed names, so
- * pre-compaction databases open unchanged.
- */
-function genPrefix(gen) {
-  return gen ? `g${gen}-` : '';
-}
-
+/** Compaction generations: see db_names.h and docs/compaction.md. */
 function collectionFileName(name, gen = 0) {
-  return `${genPrefix(gen)}coll-${name}.bj`;
+  return buildName((M, ctx) => {
+    const s = allocStr(M, name);
+    try { return takeName(M, M._dnw_collection_file(ctx, s.ptr, s.len, gen)); }
+    finally { s.free(); }
+  });
 }
 
 function indexFileName(collectionName, indexName, gen = 0) {
-  return `${genPrefix(gen)}idx-${collectionName}-${indexName}.bj`;
+  return buildName((M, ctx) => {
+    const c = allocStr(M, collectionName);
+    const i = allocStr(M, indexName);
+    try { return takeName(M, M._dnw_index_file(ctx, c.ptr, c.len, i.ptr, i.len, gen)); }
+    finally { i.free(); c.free(); }
+  });
 }
 
-/** A text index needs the same three files a TextIndex always does. */
+/** A text index needs the same three files a TextIndex always does.
+ *  Roles must match dc_text_role in db_names.h. */
 function textIndexFileNames(collectionName, indexName, gen = 0) {
-  const base = `${genPrefix(gen)}idx-${collectionName}-${indexName}`;
-  return { index: `${base}-terms.bj`, docTerms: `${base}-documents.bj`, docLengths: `${base}-lengths.bj` };
+  const one = (role) => buildName((M, ctx) => {
+    const c = allocStr(M, collectionName);
+    const i = allocStr(M, indexName);
+    try { return takeName(M, M._dnw_text_index_file(ctx, c.ptr, c.len, i.ptr, i.len, gen, role)); }
+    finally { i.free(); c.free(); }
+  });
+  return { index: one(0), docTerms: one(1), docLengths: one(2) };
 }
 
 /** Cross-file commit journal (milestone 5, docs/db-plan.md): makes every
@@ -664,14 +721,27 @@ function textIndexFileNames(collectionName, indexName, gen = 0) {
  * `journal`; readers fall back to the gen-0 name for entries written
  * before that field existed. */
 function journalFileName(collectionName, gen = 0) {
-  return `${genPrefix(gen)}coll-${collectionName}-journal.bj`;
+  return buildName((M, ctx) => {
+    const s = allocStr(M, collectionName);
+    try { return takeName(M, M._dnw_journal_file(ctx, s.ptr, s.len, gen)); }
+    finally { s.free(); }
+  });
 }
 
-/** Every file name this layer can create for itself -- any generation of a
- * collection/index/journal file. What Db.open()'s orphan sweep is allowed
- * to delete when the catalog doesn't reference it; deliberately excludes
- * the catalog file and anything a host put in the same directory. */
-const DB_FILE_PATTERN = /^(?:g\d+-)?(?:coll|idx)-.*\.bj$/;
+/** True for any file name this layer can create for itself -- any
+ * generation of a collection/index/journal file. What Db.open()'s orphan
+ * sweep is allowed to delete when the catalog doesn't reference it;
+ * deliberately excludes the catalog file and anything a host put in the
+ * same directory. */
+function isDbFile(name) {
+  const M = requireModule();
+  const s = allocStr(M, name);
+  try {
+    const rc = M._dnw_is_db_file(s.ptr, s.len);
+    check(rc < 0 ? rc : 0);
+    return rc === 1;
+  } finally { s.free(); }
+}
 
 /** Default index name mirroring the real driver's convention: "team_1",
  * "team_1_age_1" for a compound index. Only ascending (1) fields are
@@ -2610,24 +2680,24 @@ class Db {
 
   async open() {
     if (this.isOpen) throw new Error('Db is already open');
-    const handle = await this._provider.openFile(DB_CATALOG_FILE, { create: true });
+    const handle = await this._provider.openFile(dbCatalogFile(), { create: true });
     this._catalog = new BPlusTree(handle, this._order);
     await this._catalog.open();
     // Format gate before anything else touches the files (see
-    // DB_FORMAT_VERSION's doc and docs/format-compatibility.md). A
+    // db_names.h's DC_FORMAT_VERSION and docs/format-compatibility.md). A
     // database without a stamp predates the stamp and is by definition
     // version 1; it gets stamped now, as does a fresh one.
-    const stamp = this._catalog.search(DB_FORMAT_KEY);
-    if (stamp && stamp.v > DB_FORMAT_VERSION) {
+    const stamp = this._catalog.search(dbFormatKey());
+    if (stamp && stamp.v > dbFormatVersion()) {
       await this._catalog.close();
       this._catalog = null;
       throw new Error(
         `Database format is version ${stamp.v}, but this build of nisaba only understands up to ` +
-        `version ${DB_FORMAT_VERSION} -- upgrade nisaba to open it (docs/format-compatibility.md)`
+        `version ${dbFormatVersion()} -- upgrade nisaba to open it (docs/format-compatibility.md)`
       );
     }
-    if (!stamp || stamp.v < DB_FORMAT_VERSION) {
-      this._catalog.add(DB_FORMAT_KEY, { v: DB_FORMAT_VERSION });
+    if (!stamp || stamp.v < dbFormatVersion()) {
+      this._catalog.add(dbFormatKey(), { v: dbFormatVersion() });
       this._catalog.flush();
     }
     await this._sweepOrphans();
@@ -2648,7 +2718,7 @@ class Db {
   }
 
   /**
-   * Delete any database-owned file (DB_FILE_PATTERN) the catalog doesn't
+   * Delete any database-owned file (isDbFile) the catalog doesn't
    * reference -- the leftovers of a compact() or dropCollection that
    * crashed between its atomic catalog commit and its file deletes. The
    * catalog is the sole source of truth for which generation of a
@@ -2659,9 +2729,9 @@ class Db {
    */
   async _sweepOrphans() {
     if (typeof this._provider.listFiles !== 'function') return;
-    const referenced = new Set([DB_CATALOG_FILE]);
+    const referenced = new Set([dbCatalogFile()]);
     for (const { key: name, value: entry } of this._catalog.toArray()) {
-      if (name === DB_FORMAT_KEY) continue; // the format stamp owns no files
+      if (name === dbFormatKey()) continue; // the format stamp owns no files
       referenced.add(entry.file);
       referenced.add(entry.journal || journalFileName(name));
       for (const def of entry.indexes || []) {
@@ -2670,7 +2740,7 @@ class Db {
       }
     }
     for (const f of await this._provider.listFiles()) {
-      if (!referenced.has(f) && DB_FILE_PATTERN.test(f)) await this._provider.deleteFile(f);
+      if (!referenced.has(f) && isDbFile(f)) await this._provider.deleteFile(f);
     }
   }
 
@@ -2721,7 +2791,7 @@ class Db {
   }
 
   async listCollections() {
-    return this._catalog.toArray().map(({ key }) => key).filter((k) => k !== DB_FORMAT_KEY);
+    return this._catalog.toArray().map(({ key }) => key).filter((k) => k !== dbFormatKey());
   }
 
   async dropCollection(name) {
@@ -2895,6 +2965,18 @@ export {
   MemoryStorageProvider,
   OPFSStorageProvider,
   resolveCurrentDate,
+  // File naming and the format stamp (db_names.h). Exported so no other
+  // layer has to restate the convention -- src/db-wal.js carried its own
+  // copy of the catalog name and the orphan-sweep pattern, with a comment
+  // saying so.
+  dbCatalogFile,
+  dbFormatKey,
+  dbFormatVersion,
+  collectionFileName,
+  indexFileName,
+  textIndexFileNames,
+  journalFileName,
+  isDbFile,
   ChangeStream,
   Collection,
   Db,

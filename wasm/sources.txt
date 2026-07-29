@@ -16,8 +16,10 @@
 # and supplies its own bj_io/bj_ns adapters instead -- see
 # build-native.sh, and third_party/binjson-structures/test/fuzz.sh for
 # the pattern this follows.
+wasm/src/db_names.c
 wasm/src/regex.c
 wasm/src/db_query.c
 wasm/src/db_update.c
 wasm/src/db.c
+wasm/src/db_names_wasm.c
 wasm/src/db_wasm.c

@@ -3,7 +3,7 @@
  * replication roadmap step 2 (docs/replicaton-roadmap.md), Raft minus
  * networking. Every write becomes a binjson-encoded command appended to a
  * shared EntryLog (`__wal__.bj`, outside the orphan sweep's
- * DB_FILE_PATTERN) and made durable (sync()) BEFORE it is applied to the
+ * isDbFile) and made durable (sync()) BEFORE it is applied to the
  * collections; recovery replays the committed log suffix each collection
  * hasn't seen (its appliedIndex(), roadmap step 1). The propose/apply/
  * recover machinery here is exactly what the replicated apply path will
@@ -73,16 +73,13 @@ import {
   ObjectId,
   encode,
   decode,
-  resolveCurrentDate
+  resolveCurrentDate,
+  dbCatalogFile,
+  isDbFile
 } from '../wasm/nisaba-wasm.js';
 
 const WAL_FILE = '__wal__.bj';
 const SNAP_PREFIX = '__snap';
-/** Mirrors nisaba-wasm.js's private DB_CATALOG_FILE / DB_FILE_PATTERN --
- * what a restore must overwrite (and clear stale journals of) to put the
- * database exactly at the snapshot. */
-const CATALOG_FILE = '__catalog__.bj';
-const DB_FILE_PATTERN = /^(?:g\d+-)?(?:coll|idx)-.*\.bj$/;
 
 /** Adapt a StorageProvider (openFile/deleteFile/listFiles) to the
  * directory-handle shape SnapshotStore consumes (getFileHandle/
@@ -205,7 +202,7 @@ class WalDb {
       live.push({ role, name: liveName });
     };
     try {
-      await add(CATALOG_FILE, this._db._catalog);
+      await add(dbCatalogFile(), this._db._catalog);
       for (const name of await this._db.listCollections()) {
         const col = await this._db.collection(name);
         await add(this._db._catalog.search(name).file, col._tree);
@@ -776,7 +773,7 @@ export async function restoreLatestSnapshot(provider, { snapshotPrefix = SNAP_PR
 export async function restoreFromStore(provider, store) {
   if (!store.latest) throw new Error('No snapshot to restore');
   for (const name of await provider.listFiles()) {
-    if (name === CATALOG_FILE || DB_FILE_PATTERN.test(name)) await provider.deleteFile(name);
+    if (name === dbCatalogFile() || isDbFile(name)) await provider.deleteFile(name);
   }
   for (const { role, name } of store.latest.config.live) {
     await store.copyFile(role, await provider.openFile(name, { create: true }));

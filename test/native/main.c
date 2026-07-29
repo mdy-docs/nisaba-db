@@ -25,6 +25,7 @@
 #include "db_ttl.h"
 #include "db_bulk.h"
 #include "db_agg.h"
+#include "db_catalog.h"
 #include "db_update.h"
 #include "dbuf.h"
 #include "bjio_posix.h"
@@ -1374,7 +1375,222 @@ TEST(memory_io_is_accepted_without_a_sync_callback) {
     memfs_free(fs);
 }
 
+/* ---- db_catalog -------------------------------------------------------- */
+
+/* Add an equality index definition to an `indexes` array under construction. */
+static void put_eq_index(bj_builder *b, const char *name, const char *file,
+                         const char *const *fields, int nfields,
+                         int unique, int with_kind) {
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"name", 4);
+    bj_put_string(b, (const uint8_t *)name, (uint32_t)strlen(name));
+    if (with_kind) {
+        bj_put_key(b, (const uint8_t *)"kind", 4);
+        bj_put_string(b, (const uint8_t *)"equality", 8);
+    }
+    bj_put_key(b, (const uint8_t *)"file", 4);
+    bj_put_string(b, (const uint8_t *)file, (uint32_t)strlen(file));
+    bj_put_key(b, (const uint8_t *)"fields", 6);
+    bj_begin_array(b);
+    for (int i = 0; i < nfields; i++)
+        bj_put_string(b, (const uint8_t *)fields[i], (uint32_t)strlen(fields[i]));
+    bj_end_array(b);
+    if (unique) {
+        bj_put_key(b, (const uint8_t *)"unique", 6);
+        bj_put_bool(b, 1);
+    }
+    bj_end_object(b);
+}
+
+TEST(catalog_plan_names_every_file_in_attach_order) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"file", 4);
+    bj_put_string(b, (const uint8_t *)"coll-users.bj", 13);
+    bj_put_key(b, (const uint8_t *)"journal", 7);
+    bj_put_string(b, (const uint8_t *)"coll-users-journal.bj", 21);
+    bj_put_key(b, (const uint8_t *)"indexes", 7);
+    bj_begin_array(b);
+    {
+        const char *fields[] = { "team", "age" };
+        put_eq_index(b, "team_1_age_1", "idx-users-team_1_age_1.bj", fields, 2, 1, 1);
+    }
+    /* A text index carries three files, and the plan must order them the
+     * way dc_collection_attach_text_index takes its trees -- a host that
+     * had to know that ordering would be reimplementing the schema. */
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"name", 4);
+    bj_put_string(b, (const uint8_t *)"body_text", 9);
+    bj_put_key(b, (const uint8_t *)"kind", 4);
+    bj_put_string(b, (const uint8_t *)"text", 4);
+    bj_put_key(b, (const uint8_t *)"field", 5);
+    bj_put_string(b, (const uint8_t *)"body", 4);
+    bj_put_key(b, (const uint8_t *)"files", 5);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"docLengths", 10);   /* deliberately out of order */
+    bj_put_string(b, (const uint8_t *)"L.bj", 4);
+    bj_put_key(b, (const uint8_t *)"index", 5);
+    bj_put_string(b, (const uint8_t *)"T.bj", 4);
+    bj_put_key(b, (const uint8_t *)"docTerms", 8);
+    bj_put_string(b, (const uint8_t *)"D.bj", 4);
+    bj_end_object(b);
+    bj_end_object(b);
+    bj_end_array(b);
+    bj_end_object(b);
+
+    size_t len = 0;
+    const uint8_t *entry = bj_builder_data(b, &len);
+    dbuf plan = {0};
+    CHECK_OK(dc_catalog_open_plan(entry, len, "users", 5, &plan));
+
+    CHECK(find_bytes(plan.data, plan.len, "coll-users.bj", 13) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "coll-users-journal.bj", 21) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "idx-users-team_1_age_1.bj", 25) != NULL);
+
+    /* The three text files must appear in attach order regardless of the
+     * order the catalog happened to store them in. */
+    const uint8_t *t = find_bytes(plan.data, plan.len, "T.bj", 4);
+    const uint8_t *d = find_bytes(plan.data, plan.len, "D.bj", 4);
+    const uint8_t *l = find_bytes(plan.data, plan.len, "L.bj", 4);
+    CHECK(t != NULL && d != NULL && l != NULL);
+    if (t && d && l) { CHECK(t < d); CHECK(d < l); }
+
+    dbuf_free(&plan);
+    bj_builder_free(b);
+}
+
+TEST(catalog_plan_keeps_old_databases_openable) {
+    /*
+     * Two backward-compatibility rules that databases in the wild depend
+     * on. Both were JS conditionals; if either is lost, an existing
+     * database stops opening -- which no other test would catch, because
+     * every test fixture is written by the current code.
+     */
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"file", 4);
+    bj_put_string(b, (const uint8_t *)"coll-users.bj", 13);
+    /* No `journal` field: written before each generation got its own. */
+    bj_put_key(b, (const uint8_t *)"indexes", 7);
+    bj_begin_array(b);
+    {
+        /* No `kind` field: written before milestone 6, means equality. */
+        const char *fields[] = { "team" };
+        put_eq_index(b, "team_1", "idx-users-team_1.bj", fields, 1, 0, /*with_kind*/0);
+    }
+    bj_end_array(b);
+    bj_end_object(b);
+
+    size_t len = 0;
+    const uint8_t *entry = bj_builder_data(b, &len);
+    dbuf plan = {0};
+    CHECK_OK(dc_catalog_open_plan(entry, len, "users", 5, &plan));
+
+    /* The generation-0 journal name is derived, not stored. */
+    CHECK(find_bytes(plan.data, plan.len, "coll-users-journal.bj", 21) != NULL);
+    /* ...and the kind-less index planned as equality, so it carries
+     * `fields` rather than a single `field`. */
+    CHECK(find_bytes(plan.data, plan.len, "fields", 6) != NULL);
+    CHECK(find_bytes(plan.data, plan.len, "team", 4) != NULL);
+
+    dbuf_free(&plan);
+    bj_builder_free(b);
+}
+
+TEST(catalog_plan_refuses_an_entry_it_cannot_honor) {
+    dbuf plan = {0};
+    /* Not an object. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_put_int(b, 1);
+        size_t len = 0; const uint8_t *e = bj_builder_data(b, &len);
+        CHECK_RC(dc_catalog_open_plan(e, len, "u", 1, &plan), DC_ERR_CATALOG_ENTRY);
+        bj_builder_free(b);
+    }
+    /* No primary file -- the one thing an entry cannot be without. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"indexes", 7);
+        bj_begin_array(b); bj_end_array(b);
+        bj_end_object(b);
+        size_t len = 0; const uint8_t *e = bj_builder_data(b, &len);
+        CHECK_RC(dc_catalog_open_plan(e, len, "u", 1, &plan), DC_ERR_CATALOG_ENTRY);
+        bj_builder_free(b);
+    }
+    /* An index definition with no file. Refusing beats planning to open a
+     * file called "undefined". */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"file", 4);
+        bj_put_string(b, (const uint8_t *)"coll-u.bj", 9);
+        bj_put_key(b, (const uint8_t *)"indexes", 7);
+        bj_begin_array(b);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"name", 4);
+        bj_put_string(b, (const uint8_t *)"x_1", 3);
+        bj_end_object(b);
+        bj_end_array(b);
+        bj_end_object(b);
+        size_t len = 0; const uint8_t *e = bj_builder_data(b, &len);
+        CHECK_RC(dc_catalog_open_plan(e, len, "u", 1, &plan), DC_ERR_CATALOG_ENTRY);
+        bj_builder_free(b);
+    }
+    dbuf_free(&plan);
+}
+
+TEST(catalog_list_indexes_inverts_what_create_index_stored) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"file", 4);
+    bj_put_string(b, (const uint8_t *)"coll-users.bj", 13);
+    bj_put_key(b, (const uint8_t *)"indexes", 7);
+    bj_begin_array(b);
+    {
+        const char *fields[] = { "team", "age" };
+        put_eq_index(b, "team_1_age_1", "i.bj", fields, 2, /*unique*/1, 1);
+    }
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"name", 4);
+    bj_put_string(b, (const uint8_t *)"loc_2dsphere", 12);
+    bj_put_key(b, (const uint8_t *)"kind", 4);
+    bj_put_string(b, (const uint8_t *)"geo", 3);
+    bj_put_key(b, (const uint8_t *)"field", 5);
+    bj_put_string(b, (const uint8_t *)"loc", 3);
+    bj_put_key(b, (const uint8_t *)"file", 4);
+    bj_put_string(b, (const uint8_t *)"g.bj", 4);
+    bj_end_object(b);
+    bj_end_array(b);
+    bj_end_object(b);
+
+    size_t len = 0;
+    const uint8_t *entry = bj_builder_data(b, &len);
+    dbuf out = {0};
+    CHECK_OK(dc_catalog_list_indexes(entry, len, &out));
+    CHECK_I64(arr_count(out.data, out.len), 2);
+
+    /* Stored `fields` come back as key entries; a geo `field` comes back
+     * as the '2dsphere' marker the caller originally passed in. */
+    CHECK(find_bytes(out.data, out.len, "team", 4) != NULL);
+    CHECK(find_bytes(out.data, out.len, "age", 3) != NULL);
+    CHECK(find_bytes(out.data, out.len, "2dsphere", 8) != NULL);
+    CHECK(find_bytes(out.data, out.len, "unique", 6) != NULL);
+    /* An option that was not set must not be reported at all. */
+    CHECK(find_bytes(out.data, out.len, "sparse", 6) == NULL);
+    /* Backing file names are an implementation detail, not part of the
+     * driver-shaped answer. */
+    CHECK(find_bytes(out.data, out.len, "i.bj", 4) == NULL);
+
+    dbuf_free(&out);
+    bj_builder_free(b);
+}
+
 int main(void) {
+    RUN(catalog_plan_names_every_file_in_attach_order);
+    RUN(catalog_plan_keeps_old_databases_openable);
+    RUN(catalog_plan_refuses_an_entry_it_cannot_honor);
+    RUN(catalog_list_indexes_inverts_what_create_index_stored);
     RUN(posix_namespace_backs_a_real_database);
     RUN(memory_io_is_accepted_without_a_sync_callback);
     RUN(current_date_rewrites_into_set);

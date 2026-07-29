@@ -1,0 +1,48 @@
+/*
+ * db_catalog_wasm.c — Emscripten glue over db_catalog.h.
+ *
+ * Both entry points are pure: they read an encoded catalog entry and
+ * produce an encoded result, touching no file. That is what makes
+ * dc_catalog_open_plan usable from a host whose file opens are
+ * asynchronous -- the plan is computed before any of them happen.
+ */
+#include "db_catalog.h"
+#include "dbuf.h"
+
+#include <limits.h>
+#include <stdlib.h>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#else
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+
+typedef struct { dbuf buf; } catw;
+
+EMSCRIPTEN_KEEPALIVE catw *catw_new(void) { return (catw *)calloc(1, sizeof(catw)); }
+
+EMSCRIPTEN_KEEPALIVE void catw_free(catw *c) {
+    if (!c) return;
+    dbuf_free(&c->buf);
+    free(c);
+}
+
+EMSCRIPTEN_KEEPALIVE int catw_open_plan(catw *w, const uint8_t *entry, int entry_len,
+                                        const char *coll, int coll_len) {
+    if (entry_len < 0 || coll_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    return dc_catalog_open_plan(entry, (size_t)entry_len, coll, (size_t)coll_len, &w->buf);
+}
+
+EMSCRIPTEN_KEEPALIVE int catw_list_indexes(catw *w, const uint8_t *entry, int entry_len) {
+    if (entry_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    return dc_catalog_list_indexes(entry, (size_t)entry_len, &w->buf);
+}
+
+EMSCRIPTEN_KEEPALIVE const uint8_t *catw_ptr(const catw *w) { return w->buf.data; }
+
+EMSCRIPTEN_KEEPALIVE int catw_len(const catw *w) {
+    return w->buf.len > (size_t)INT_MAX ? BJ_ERR_INT_RANGE : (int)w->buf.len;
+}

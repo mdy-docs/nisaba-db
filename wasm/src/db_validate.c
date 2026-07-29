@@ -6,6 +6,7 @@
 #include "db_bulk.h"
 #include "db_agg.h"
 #include "db_update.h"
+#include "db_catalog.h"
 #include "db.h"
 #include "bjcursor.h"
 
@@ -56,6 +57,10 @@ const char *dc_strerror(int code) {
             return "$currentDate: each field must be true or {$type: \"date\"}";
         case DC_ERR_CURRENT_DATE_CONFLICT:
             return "$currentDate: field is already targeted by another operator";
+        /* db_catalog.h */
+        case DC_ERR_CATALOG_ENTRY:
+            return "Catalog entry is malformed or written by an incompatible "
+                   "version (docs/format-compatibility.md)";
         case DC_ERR_BULK_EMPTY:
             return "bulkWrite requires a non-empty array of operations";
         case DC_ERR_BULK_UNKNOWN_OP:

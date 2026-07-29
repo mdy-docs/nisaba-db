@@ -54,6 +54,14 @@ _bkw_bad_index
 _bkw_ptr
 _bkw_len
 
+# catalog entry schema (db_catalog.h)
+_catw_new
+_catw_free
+_catw_open_plan
+_catw_list_indexes
+_catw_ptr
+_catw_len
+
 # lifecycle
 _dcw_collection_open
 _dcw_collection_free

@@ -799,6 +799,45 @@ function isDbFile(name) {
  * caller can already get by reversing results, so it's deferred rather than
  * plumbed through the composite-key encoding (keyenc.h) for no behavioral
  * gain yet. */
+let catalogCtx = 0;
+
+/** Run a pure catalog-schema call and decode its result. */
+function catalogCall(fn) {
+  const M = requireModule();
+  if (!catalogCtx) {
+    catalogCtx = M._catw_new();
+    if (!catalogCtx) throw codeError(-1, 'catw_new');
+  }
+  const rc = fn(M, catalogCtx);
+  if (rc !== 0) throw codeError(rc, 'catalog');
+  const len = M._catw_len(catalogCtx);
+  check(len < 0 ? len : 0);
+  const ptr = M._catw_ptr(catalogCtx);
+  return decode(M.HEAPU8.slice(ptr, ptr + len));
+}
+
+/**
+ * The plan for opening a collection: which files, in which order, with
+ * everything needed to attach each one. Pure -- no I/O -- which is what
+ * lets a host whose opens are asynchronous compute it first and then open
+ * exactly the named files (bjns.h).
+ *
+ * The catalog entry schema lives in C (db_catalog.h) because it was
+ * defined in three JS places that could not consult each other:
+ * _persistIndexes wrote it, _open parsed it, listIndexes projected it.
+ */
+function catalogOpenPlan(entry, collName) {
+  return catalogCall((M, ctx) => {
+    const enc = encode(entry);
+    const ep = M._malloc(enc.length || 1);
+    const n = allocStr(M, collName);
+    try {
+      if (enc.length) M.HEAPU8.set(enc, ep);
+      return M._catw_open_plan(ctx, ep, enc.length, n.ptr, n.len);
+    } finally { n.free(); M._free(ep); }
+  });
+}
+
 let bulkCtx = 0;
 
 /**
@@ -1337,12 +1376,21 @@ class Collection {
     this._collCtx = M._dcw_collection_open(this._tree.ctx);
     if (!this._collCtx) throw new Error('Failed to allocate collection handle');
 
+    // C computes the whole open plan from the catalog entry -- which files,
+    // in attach order, with each index's options -- and this loop opens
+    // exactly what it named. The backward-compatibility rules (a missing
+    // `kind` means equality; a missing `journal` means the generation-0
+    // name) are the schema's, so they are in db_catalog.c with it.
     const entry = this._catalog.search(this.name);
-    for (const def of entry.indexes || []) {
-      const kind = def.kind || 'equality'; // pre-milestone-6 catalog entries have no kind
-      if (kind === 'equality') {
-        const handle = await this._provider.openFile(def.file, { create: false });
-        const tree = new BPlusTree(handle, this._order);
+    const plan = catalogOpenPlan(entry, this.name);
+
+    for (const def of plan.indexes) {
+      const handles = [];
+      for (const file of def.files) {
+        handles.push(await this._provider.openFile(file, { create: false }));
+      }
+      if (def.kind === 0) {          // DC_INDEX_EQUALITY
+        const tree = new BPlusTree(handles[0], this._order);
         await tree.open();
         const n = allocStr(M, def.name);
         let rc;
@@ -1355,17 +1403,19 @@ class Collection {
         }
         if (rc !== 0) throw codeError(rc, 'attachIndex');
         this._indexes.set(def.name, {
-          kind: 'equality', fields: def.fields, tree, file: def.file,
+          kind: 'equality', fields: def.fields, tree, file: def.files[0],
           unique: !!def.unique, sparse: !!def.sparse,
           partialFilterExpression: def.partialFilterExpression || null,
           expireAfterSeconds: def.expireAfterSeconds
         });
-      } else if (kind === 'text') {
+      } else if (def.kind === 1) {   // DC_INDEX_TEXT
+        // files[] is in attach order -- that ordering is the plan's job,
+        // not this loop's.
         const trees = {};
-        for (const role of Object.keys(def.files)) {
-          const handle = await this._provider.openFile(def.files[role], { create: false });
-          trees[role] = new BPlusTree(handle, this._order);
-          await trees[role].open();
+        const roles = ['index', 'docTerms', 'docLengths'];
+        for (let i = 0; i < roles.length; i++) {
+          trees[roles[i]] = new BPlusTree(handles[i], this._order);
+          await trees[roles[i]].open();
         }
         const n = allocStr(M, def.name);
         const f = allocStr(M, def.field);
@@ -1380,10 +1430,12 @@ class Collection {
           n.free(); f.free();
         }
         if (rc !== 0) throw codeError(rc, 'attachTextIndex');
-        this._indexes.set(def.name, { kind: 'text', field: def.field, trees, files: def.files });
-      } else {
-        const handle = await this._provider.openFile(def.file, { create: false });
-        const rt = new RTree(handle);
+        this._indexes.set(def.name, {
+          kind: 'text', field: def.field, trees,
+          files: { index: def.files[0], docTerms: def.files[1], docLengths: def.files[2] }
+        });
+      } else {                       // DC_INDEX_GEO
+        const rt = new RTree(handles[0]);
         await rt.open();
         const n = allocStr(M, def.name);
         const f = allocStr(M, def.field);
@@ -1394,17 +1446,15 @@ class Collection {
           n.free(); f.free();
         }
         if (rc !== 0) throw codeError(rc, 'attachGeoIndex');
-        this._indexes.set(def.name, { kind: 'geo', field: def.field, rt, file: def.file });
+        this._indexes.set(def.name, { kind: 'geo', field: def.field, rt, file: def.files[0] });
       }
     }
 
     // Cross-file commit journal (milestone 5): must be recovered only after
     // every index above is attached, mirroring TextIndex's tix_recover
     // contract ("right after all trees are open"). Always on -- every
-    // collection gets this consistency guarantee automatically. The name
-    // is catalog-recorded once compact() has run (each generation gets its
-    // own journal); entries older than that field use the gen-0 name.
-    this._journal = await this._provider.openFile(entry.journal || journalFileName(this.name), { create: true });
+    // collection gets this consistency guarantee automatically.
+    this._journal = await this._provider.openFile(plan.journal, { create: true });
     this._journalFd = registerHandle(M, this._journal);
     const rc = M._dcw_collection_recover(this._collCtx, this._journalFd);
     if (rc !== 0) {
@@ -1653,19 +1703,20 @@ class Collection {
   }
 
   async listIndexes() {
-    return [...this._indexes.entries()].map(([name, ix]) => {
-      if (ix.kind === 'equality') {
-        const def = { name, key: Object.fromEntries(ix.fields.map(f => [f, 1])) };
-        if (ix.unique) def.unique = true;
-        if (ix.sparse) def.sparse = true;
-        if (ix.partialFilterExpression) def.partialFilterExpression = ix.partialFilterExpression;
-        if (ix.expireAfterSeconds !== undefined) def.expireAfterSeconds = ix.expireAfterSeconds;
-        return def;
-      }
-      if (ix.kind === 'text') return { name, key: { [ix.field]: 'text' } };
-      return { name, key: { [ix.field]: '2dsphere' } };
+    // Reconstructing `key` from the stored `fields` is the inverse of what
+    // createIndex did, so the two have to agree -- which is why it lives
+    // with the schema (db_catalog.h) rather than here.
+    const entry = this._catalog.search(this.name);
+    return catalogCall((M, ctx) => {
+      const enc = encode(entry);
+      const ep = M._malloc(enc.length || 1);
+      try {
+        if (enc.length) M.HEAPU8.set(enc, ep);
+        return M._catw_list_indexes(ctx, ep, enc.length);
+      } finally { M._free(ep); }
     });
   }
+
 
   /**
    * Every document whose indexed fields equal `values` (in the index's

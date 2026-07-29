@@ -20,6 +20,7 @@ wasm/src/db_names.c
 wasm/src/db_validate.c
 wasm/src/db_ttl.c
 wasm/src/db_bulk.c
+wasm/src/db_catalog.c
 wasm/src/regex.c
 wasm/src/db_query.c
 wasm/src/db_update.c
@@ -29,6 +30,7 @@ wasm/src/db_names_wasm.c
 wasm/src/db_validate_wasm.c
 wasm/src/db_ttl_wasm.c
 wasm/src/db_bulk_wasm.c
+wasm/src/db_catalog_wasm.c
 wasm/src/db_wasm.c
 wasm/src/db_agg_wasm.c
 wasm/src/db_currentdate_wasm.c

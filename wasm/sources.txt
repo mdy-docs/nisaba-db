@@ -24,8 +24,10 @@ wasm/src/regex.c
 wasm/src/db_query.c
 wasm/src/db_update.c
 wasm/src/db.c
+wasm/src/db_agg.c
 wasm/src/db_names_wasm.c
 wasm/src/db_validate_wasm.c
 wasm/src/db_ttl_wasm.c
 wasm/src/db_bulk_wasm.c
 wasm/src/db_wasm.c
+wasm/src/db_agg_wasm.c

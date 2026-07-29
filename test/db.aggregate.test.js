@@ -121,14 +121,36 @@ describe('db: aggregate()', () => {
     await db.close();
   });
 
-  it('rejects unsupported stages and post-engine operators loudly', async () => {
+  it('rejects unsupported stages loudly, naming the offending stage', async () => {
     const { db, sales } = await salesDb();
-    await expect(sales.aggregate([{ $unwind: '$qty' }]).toArray())
-      .rejects.toThrow(/unsupported stage "\$unwind"/);
-    await expect(sales.aggregate([
+    const err = await sales.aggregate([{ $unwind: '$qty' }]).toArray().catch((e) => e);
+    expect(err.message).toMatch(/unsupported stage/);
+    // C reports which stage index failed; this side quotes it from the
+    // pipeline it already holds.
+    expect(err.message).toMatch(/stage 0/);
+    expect(err.message).toMatch(/\$unwind/);
+    await db.close();
+  });
+
+  it('gives a later $match the full engine grammar', async () => {
+    // Previously the post-first-stage $match was a nine-operator JS
+    // subset that threw on anything else -- a second, weaker matcher
+    // alongside db_query.c's. Now every stage matches with the one
+    // engine evaluator, so operators like $regex work throughout.
+    const { db, sales } = await salesDb();
+    const out = await sales.aggregate([
       { $group: { _id: '$region', n: { $sum: 1 } } },
-      { $match: { _id: { $regex: 'e' } } } // $regex only exists in the engine's grammar
-    ]).toArray()).rejects.toThrow(/unsupported \$match operator "\$regex" after the first stage/);
+      { $match: { _id: { $regex: '^a' } } },
+      { $sort: { _id: 1 } }
+    ]).toArray();
+    expect(out.map((r) => r._id)).toEqual(['ap']);
+
+    // ...and operators the subset never had, on synthesized documents.
+    const typed = await sales.aggregate([
+      { $group: { _id: '$region', n: { $sum: 1 } } },
+      { $match: { n: { $type: 'number' } } }
+    ]).toArray();
+    expect(typed.length).toBeGreaterThan(0);
     await db.close();
   });
 });

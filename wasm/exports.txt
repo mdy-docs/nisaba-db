@@ -97,6 +97,9 @@ _dcw_find_one_and_update
 _dcw_find_one_and_replace
 _dcw_find_one_and_delete
 
+# aggregation pipeline (db_agg.h)
+_dcw_aggregate
+
 # output slot
 _dcw_out_new
 _dcw_out_free

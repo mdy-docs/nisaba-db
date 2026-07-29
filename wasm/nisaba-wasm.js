@@ -1173,250 +1173,6 @@ class ChangeStream {
   }
 }
 
-// ---- aggregation pipeline (JS-side) -----------------------------------------
-// Collection.aggregate() executes a deliberately small stage subset in JS
-// over materialized find() results (docs/db-api.md "Aggregation"). Only a
-// leading $match reaches the engine (with its full operator grammar and
-// index planning -- see aggregate()'s doc comment); everything after runs
-// on plain decoded documents, so these helpers define their own explicit,
-// documented semantics rather than mirroring db_query.c's evaluator.
-
-/** Dotted-path lookup; undefined for any missing hop. */
-function aggGet(doc, path) {
-  let v = doc;
-  for (const part of path.split('.')) {
-    if (v === null || typeof v !== 'object') return undefined;
-    v = v[part];
-  }
-  return v;
-}
-
-/** '$path' resolves against the document; anything else is a literal. */
-function aggExpr(doc, expr) {
-  if (typeof expr === 'string' && expr.startsWith('$')) return aggGet(doc, expr.slice(1));
-  return expr;
-}
-
-/** Type rank for the total order aggCompare imposes -- fixed and
- * documented (missing < null < number < string < Date < ObjectId <
- * boolean < everything else), a simplification of BSON's canonical
- * ordering that stays deterministic for every input. */
-function aggTypeRank(v) {
-  if (v === undefined) return 0;
-  if (v === null) return 1;
-  if (typeof v === 'number') return 2;
-  if (typeof v === 'string') return 3;
-  if (v instanceof Date) return 4;
-  if (v instanceof ObjectId || (v && typeof v.toHexString === 'function')) return 5;
-  if (typeof v === 'boolean') return 6;
-  return 7;
-}
-
-function aggCompare(a, b) {
-  const ra = aggTypeRank(a), rb = aggTypeRank(b);
-  if (ra !== rb) return ra < rb ? -1 : 1;
-  switch (ra) {
-    case 0: case 1: return 0;
-    case 2: return a < b ? -1 : a > b ? 1 : 0;
-    case 3: return a < b ? -1 : a > b ? 1 : 0;
-    case 4: return a.getTime() - b.getTime() < 0 ? -1 : a.getTime() > b.getTime() ? 1 : 0;
-    case 5: return a.toHexString() < b.toHexString() ? -1 : a.toHexString() > b.toHexString() ? 1 : 0;
-    case 6: return a === b ? 0 : a ? 1 : -1;
-    default: return 0; // objects/arrays: equal-ranked, order among themselves unspecified
-  }
-}
-
-function aggEquals(a, b) {
-  if (aggTypeRank(a) !== aggTypeRank(b)) return false;
-  if (a instanceof Date) return a.getTime() === b.getTime();
-  if (a && typeof a.toHexString === 'function') return a.toHexString() === b.toHexString();
-  if (a !== null && typeof a === 'object') return JSON.stringify(a) === JSON.stringify(b); // documents-as-values: structural
-  return a === b;
-}
-
-/** Canonical map key for $addToSet / $group _id identity. */
-function aggKey(v) {
-  if (v === undefined) return 'u';
-  if (v === null) return 'n';
-  if (v instanceof Date) return `d${v.getTime()}`;
-  if (v && typeof v.toHexString === 'function') return `o${v.toHexString()}`;
-  if (typeof v === 'object') return `j${JSON.stringify(v)}`;
-  return `${(typeof v)[0]}${JSON.stringify(v)}`; // s/n/b prefix keeps 1 and "1" distinct
-}
-
-const AGG_MATCH_OPS = new Set(['$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin', '$exists']);
-
-/** The post-engine $match subset: literals, comparison/$in/$exists
- * operators, top-level $and/$or. A leading $match never comes here (it
- * runs in the engine with the full grammar); a later one lives on
- * synthesized documents ($group output) where this subset is the
- * documented contract -- anything else throws rather than silently
- * not-matching. */
-function aggMatch(doc, filter) {
-  for (const [key, cond] of Object.entries(filter)) {
-    if (key === '$and') { if (!cond.every((f) => aggMatch(doc, f))) return false; continue; }
-    if (key === '$or') { if (!cond.some((f) => aggMatch(doc, f))) return false; continue; }
-    if (key.startsWith('$')) throw new Error(`aggregate: unsupported $match operator "${key}" after the first stage (supported: field conditions, $and, $or)`);
-    const value = aggGet(doc, key);
-    const isOpExpr = cond !== null && typeof cond === 'object' && !Array.isArray(cond) &&
-      !(cond instanceof Date) && typeof cond.toHexString !== 'function' &&
-      Object.keys(cond).some((k) => k.startsWith('$'));
-    if (!isOpExpr) { if (!aggEquals(value, cond)) return false; continue; }
-    for (const [op, operand] of Object.entries(cond)) {
-      if (!AGG_MATCH_OPS.has(op)) throw new Error(`aggregate: unsupported $match operator "${op}" after the first stage`);
-      const cmp = () => aggTypeRank(value) === aggTypeRank(operand) ? aggCompare(value, operand) : null;
-      let ok;
-      switch (op) {
-        case '$eq': ok = aggEquals(value, operand); break;
-        case '$ne': ok = !aggEquals(value, operand); break;
-        case '$gt': ok = cmp() !== null && cmp() > 0; break;
-        case '$gte': ok = cmp() !== null && cmp() >= 0; break;
-        case '$lt': ok = cmp() !== null && cmp() < 0; break;
-        case '$lte': ok = cmp() !== null && cmp() <= 0; break;
-        case '$in': ok = operand.some((o) => aggEquals(value, o)); break;
-        case '$nin': ok = !operand.some((o) => aggEquals(value, o)); break;
-        case '$exists': ok = (value !== undefined) === !!operand; break;
-      }
-      if (!ok) return false;
-    }
-  }
-  return true;
-}
-
-function aggSort(docs, spec) {
-  const keys = Object.entries(spec);
-  return [...docs].sort((a, b) => {
-    for (const [path, dir] of keys) {
-      const c = aggCompare(aggGet(a, path), aggGet(b, path));
-      if (c !== 0) return dir < 0 ? -c : c;
-    }
-    return 0;
-  });
-}
-
-/** $project: 1/true include, 0/false exclude, '$path' computed copy.
- * Inclusion XOR exclusion (computed fields count as inclusion); _id
- * included by default, excludable explicitly -- find()'s own rules. */
-function aggProject(docs, spec) {
-  const entries = Object.entries(spec).filter(([k]) => k !== '_id');
-  const excluding = entries.some(([, v]) => v === 0 || v === false);
-  if (excluding && entries.some(([, v]) => v !== 0 && v !== false)) {
-    throw new Error('aggregate: $project cannot mix inclusion and exclusion (except _id)');
-  }
-  const dropId = spec._id === 0 || spec._id === false;
-  return docs.map((doc) => {
-    const out = {};
-    if (excluding) {
-      const dropped = new Set(entries.map(([k]) => k));
-      for (const [k, v] of Object.entries(doc)) {
-        if (!dropped.has(k) && !(k === '_id' && dropId)) out[k] = v;
-      }
-      return out;
-    }
-    if (!dropId && doc._id !== undefined) out._id = doc._id;
-    for (const [k, v] of entries) {
-      const value = (v === 1 || v === true) ? aggGet(doc, k) : aggExpr(doc, v);
-      if (value !== undefined) out[k] = value;
-    }
-    return out;
-  });
-}
-
-const AGG_ACCUMULATORS = new Set(['$sum', '$avg', '$min', '$max', '$first', '$last', '$push', '$addToSet', '$count']);
-
-function aggGroup(docs, spec) {
-  const { _id: idExpr = null, ...accs } = spec;
-  for (const [field, acc] of Object.entries(accs)) {
-    const ops = Object.keys(acc || {});
-    if (ops.length !== 1 || !AGG_ACCUMULATORS.has(ops[0])) {
-      throw new Error(`aggregate: $group field "${field}" must be exactly one of ${[...AGG_ACCUMULATORS].join(', ')}`);
-    }
-  }
-  const idOf = (doc) => {
-    if (idExpr === null) return null;
-    if (typeof idExpr === 'string') return aggExpr(doc, idExpr);
-    const composite = {};
-    for (const [k, e] of Object.entries(idExpr)) composite[k] = aggExpr(doc, e);
-    return composite;
-  };
-
-  const groups = new Map(); // canonical key -> { _id, docs }
-  for (const doc of docs) {
-    const id = idOf(doc);
-    const key = aggKey(id);
-    let g = groups.get(key);
-    if (!g) { g = { _id: id, docs: [] }; groups.set(key, g); }
-    g.docs.push(doc);
-  }
-
-  const out = [];
-  for (const g of groups.values()) {
-    const row = { _id: g._id };
-    for (const [field, acc] of Object.entries(accs)) {
-      const [op] = Object.keys(acc);
-      const expr = acc[op];
-      const values = () => g.docs.map((d) => aggExpr(d, expr));
-      switch (op) {
-        case '$count':
-          row[field] = g.docs.length;
-          break;
-        case '$sum': {
-          if (typeof expr === 'number') { row[field] = expr * g.docs.length; break; }
-          row[field] = values().reduce((s, v) => typeof v === 'number' ? s + v : s, 0);
-          break;
-        }
-        case '$avg': {
-          const nums = values().filter((v) => typeof v === 'number');
-          row[field] = nums.length ? nums.reduce((s, v) => s + v, 0) / nums.length : null;
-          break;
-        }
-        case '$min': case '$max': {
-          const present = values().filter((v) => v !== undefined && v !== null);
-          if (!present.length) { row[field] = null; break; }
-          row[field] = present.reduce((best, v) =>
-            (op === '$min' ? aggCompare(v, best) < 0 : aggCompare(v, best) > 0) ? v : best);
-          break;
-        }
-        case '$first': row[field] = aggExpr(g.docs[0], expr); break;
-        case '$last': row[field] = aggExpr(g.docs[g.docs.length - 1], expr); break;
-        case '$push': row[field] = values().filter((v) => v !== undefined); break;
-        case '$addToSet': {
-          const seen = new Map();
-          for (const v of values()) { if (v !== undefined) seen.set(aggKey(v), v); }
-          row[field] = [...seen.values()];
-          break;
-        }
-      }
-    }
-    out.push(row);
-  }
-  return out;
-}
-
-/** Run every post-pushdown stage over materialized documents. Not
- * exported: under connectShared the leader executes the whole
- * aggregate() itself -- one execution path (executeOnRealDb). */
-function aggApplyStages(docs, stages) {
-  for (const stage of stages) {
-    const keys = Object.keys(stage);
-    if (keys.length !== 1) throw new Error(`aggregate: each stage must have exactly one key (got ${JSON.stringify(keys)})`);
-    const [op] = keys;
-    const spec = stage[op];
-    switch (op) {
-      case '$match': docs = docs.filter((d) => aggMatch(d, spec)); break;
-      case '$sort': docs = aggSort(docs, spec); break;
-      case '$skip': docs = docs.slice(spec); break;
-      case '$limit': docs = docs.slice(0, spec); break;
-      case '$project': docs = aggProject(docs, spec); break;
-      case '$group': docs = aggGroup(docs, spec); break;
-      case '$count': docs = [{ [spec]: docs.length }]; break;
-      default:
-        throw new Error(`aggregate: unsupported stage "${op}" (supported: $match, $sort, $skip, $limit, $project, $group, $count)`);
-    }
-  }
-  return docs;
-}
-
 /**
  * Safety net for abandoned streaming cursors (docs/roadmap.md P1 #10): a
  * find() cursor that was pulled from but never exhausted or close()d
@@ -1443,9 +1199,8 @@ const cursorFinalizer = typeof FinalizationRegistry === 'function'
 
 /** Mint an _openCursors token. Module-level on purpose: a function
  * defined lexically inside find() -- even one referencing no variables
- * from it -- chains its [[Environment]] to find()'s context, which holds
- * the cursor object, and that one edge would keep every abandoned cursor
- * alive and the registry above permanently silent. */
+ * from that scope -- would keep the whole scope, and therefore the cursor
+ * object, reachable from the registry's held value. */
 function makeCursorToken(ptr) {
   return {
     ptr,
@@ -2240,16 +1995,27 @@ class Collection {
     const collection = this;
     let items = null;
     let idx = 0;
+    // The whole pipeline runs in C (db_agg.h), including the decision to
+    // push a leading $match into the scan so the planner and any index
+    // can serve it. This layer only marshals the stages in and the
+    // documents out.
     const run = async () => {
-      let stages = pipeline;
-      let docs;
-      if (stages.length && stages[0] && Object.keys(stages[0]).length === 1 && '$match' in stages[0]) {
-        docs = await collection.find(stages[0].$match).toArray(); // engine-side: indexes + full grammar
-        stages = stages.slice(1);
-      } else {
-        docs = await collection.find({}).toArray();
-      }
-      return aggApplyStages(docs, stages);
+      const M = requireModule();
+      const encoded = encode(pipeline);
+      const ptr = M._malloc(encoded.length || 1);
+      const badP = M._malloc(4);
+      try {
+        if (encoded.length) M.HEAPU8.set(encoded, ptr);
+        const rc = M._dcw_aggregate(collection._outCtx, collection._collCtx, ptr, encoded.length, badP);
+        if (rc !== 0) {
+          // C reports which stage failed; this side holds the pipeline, so
+          // it can quote the stage without C formatting user data.
+          const at = readI32(M, badP);
+          const stage = at >= 0 && at < pipeline.length ? JSON.stringify(pipeline[at]) : null;
+          throw codeError(rc, stage ? `stage ${at}: ${stage}` : 'aggregate');
+        }
+        return collection._readOut(M) ?? [];
+      } finally { M._free(badP); M._free(ptr); }
     };
     const cursor = {
       async toArray() {

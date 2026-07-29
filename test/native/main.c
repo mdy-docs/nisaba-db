@@ -24,6 +24,7 @@
 #include "db_validate.h"
 #include "db_ttl.h"
 #include "db_bulk.h"
+#include "db_agg.h"
 #include "dbuf.h"
 
 #include "docs.h"
@@ -979,7 +980,138 @@ TEST(bulk_grammar_rejects_malformed_lists_and_names_the_index) {
     }
 }
 
+/* ---- db_agg ------------------------------------------------------------ */
+
+/* Run a pipeline built by `build` and return the result array. */
+static int run_pipeline(dc_collection *c, bj_builder *stages,
+                        uint8_t **out, size_t *out_len, int *bad) {
+    size_t len = 0;
+    const uint8_t *p = bj_builder_data(stages, &len);
+    return dc_aggregate(c, p, len, bad, out, out_len);
+}
+
+TEST(aggregate_group_uses_encoded_bytes_for_identity) {
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-sales.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada",   "core",     36));
+    CHECK_OK(insert_person(fx.coll, 2, "Grace", "core",     45));
+    CHECK_OK(insert_person(fx.coll, 3, "Alan",  "research", 41));
+
+    /* [{$group: {_id: "$team", n: {$sum: 1}}}] */
+    bj_builder *b = bj_builder_new();
+    bj_begin_array(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"$group", 6);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"_id", 3);
+    bj_put_string(b, (const uint8_t *)"$team", 5);
+    bj_put_key(b, (const uint8_t *)"n", 1);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"$sum", 4);
+    bj_put_int(b, 1);
+    bj_end_object(b);
+    bj_end_object(b);
+    bj_end_object(b);
+    bj_end_array(b);
+
+    uint8_t *out = NULL; size_t out_len = 0; int bad = -2;
+    CHECK_OK(run_pipeline(fx.coll, b, &out, &out_len, &bad));
+    CHECK_I64(bad, -1);
+    CHECK_I64(arr_count(out, out_len), 2);   /* core, research */
+    free(out);
+    bj_builder_free(b);
+    fx_close(&fx);
+}
+
+TEST(aggregate_reports_the_stage_that_failed) {
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-sales.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+
+    /* [{$match: {}}, {$unwind: "$x"}] -- the failure is stage 1, not 0. */
+    bj_builder *b = bj_builder_new();
+    bj_begin_array(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"$match", 6);
+    bj_begin_object(b); bj_end_object(b);
+    bj_end_object(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"$unwind", 7);
+    bj_put_string(b, (const uint8_t *)"$x", 2);
+    bj_end_object(b);
+    bj_end_array(b);
+
+    uint8_t *out = NULL; size_t out_len = 0; int bad = -2;
+    CHECK_RC(run_pipeline(fx.coll, b, &out, &out_len, &bad), DC_ERR_AGG_UNKNOWN_STAGE);
+    CHECK_I64(bad, 1);
+    free(out);
+    bj_builder_free(b);
+
+    /* An unknown $group accumulator is its own code. */
+    bj_builder *g = bj_builder_new();
+    bj_begin_array(g);
+    bj_begin_object(g);
+    bj_put_key(g, (const uint8_t *)"$group", 6);
+    bj_begin_object(g);
+    bj_put_key(g, (const uint8_t *)"_id", 3);
+    bj_put_null(g);
+    bj_put_key(g, (const uint8_t *)"n", 1);
+    bj_begin_object(g);
+    bj_put_key(g, (const uint8_t *)"$median", 7);
+    bj_put_int(g, 1);
+    bj_end_object(g);
+    bj_end_object(g);
+    bj_end_object(g);
+    bj_end_array(g);
+    out = NULL; out_len = 0; bad = -2;
+    CHECK_RC(run_pipeline(fx.coll, g, &out, &out_len, &bad), DC_ERR_AGG_BAD_ACCUMULATOR);
+    CHECK_I64(bad, 0);
+    free(out);
+    bj_builder_free(g);
+    fx_close(&fx);
+}
+
+TEST(aggregate_later_match_has_the_full_engine_grammar) {
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-sales.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada",   "core",     36));
+    CHECK_OK(insert_person(fx.coll, 2, "Alan",  "research", 41));
+
+    /* [{$group: {_id: "$team"}}, {$match: {_id: {$regex: "^re"}}}]
+     * $regex did not exist in the JS pipeline's nine-operator subset. */
+    bj_builder *b = bj_builder_new();
+    bj_begin_array(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"$group", 6);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"_id", 3);
+    bj_put_string(b, (const uint8_t *)"$team", 5);
+    bj_end_object(b);
+    bj_end_object(b);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"$match", 6);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"_id", 3);
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"$regex", 6);
+    bj_put_string(b, (const uint8_t *)"^re", 3);
+    bj_end_object(b);
+    bj_end_object(b);
+    bj_end_object(b);
+    bj_end_array(b);
+
+    uint8_t *out = NULL; size_t out_len = 0; int bad = -2;
+    CHECK_OK(run_pipeline(fx.coll, b, &out, &out_len, &bad));
+    CHECK_I64(arr_count(out, out_len), 1);   /* just "research" */
+    free(out);
+    bj_builder_free(b);
+    fx_close(&fx);
+}
+
 int main(void) {
+    RUN(aggregate_group_uses_encoded_bytes_for_identity);
+    RUN(aggregate_reports_the_stage_that_failed);
+    RUN(aggregate_later_match_has_the_full_engine_grammar);
     RUN(bulk_grammar_accepts_every_operation_and_orders_the_codes);
     RUN(bulk_grammar_rejects_malformed_lists_and_names_the_index);
     RUN(ttl_cutoff_and_filter);

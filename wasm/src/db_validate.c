@@ -4,6 +4,7 @@
 #include "db_validate.h"
 #include "db_names.h"
 #include "db_bulk.h"
+#include "db_agg.h"
 #include "db.h"
 #include "bjcursor.h"
 
@@ -54,6 +55,18 @@ const char *dc_strerror(int code) {
         case DC_ERR_BULK_UNKNOWN_OP:
             return "bulkWrite: each operation must be an object with exactly one known "
                    "key (insertOne, updateOne, updateMany, replaceOne, deleteOne, deleteMany)";
+        /* db_agg.h */
+        case DC_ERR_AGG_BAD_STAGE:
+            return "aggregate: each stage must be an object with exactly one key, "
+                   "and its argument must have the right shape";
+        case DC_ERR_AGG_UNKNOWN_STAGE:
+            return "aggregate: unsupported stage (supported: $match, $sort, $skip, "
+                   "$limit, $project, $group, $count)";
+        case DC_ERR_AGG_BAD_ACCUMULATOR:
+            return "aggregate: each $group field must be exactly one of $sum, $avg, "
+                   "$min, $max, $first, $last, $push, $addToSet, $count";
+        case DC_ERR_AGG_PROJECT_MIXED:
+            return "aggregate: $project cannot mix inclusion and exclusion (except _id)";
         case DC_ERR_BULK_MISSING_FIELD:
             return "bulkWrite: operation is missing a required field "
                    "(document / filter / update / replacement)";

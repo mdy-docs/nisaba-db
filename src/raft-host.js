@@ -177,7 +177,7 @@ export class RaftGroupHost {
       const node = g.node;
       if (!node.isRunning) continue;
       if (this._shouldQuiesce(g, now)) {
-        if (!node._quiesced) node.quiesce();
+        if (!node.quiesced) node.quiesce();
         continue;
       }
       node.tick(now);
@@ -198,7 +198,7 @@ export class RaftGroupHost {
     if (node.lastApplied !== node.commitIndex) return false;
     if (node.commitIndex !== node.log.lastIndex) return false;
     for (const p of node.peers) {
-      if ((node._match.get(p) ?? 0) < node.log.lastIndex) return false;
+      if (node.matchOf(p) < node.log.lastIndex) return false;
     }
     return true;
   }

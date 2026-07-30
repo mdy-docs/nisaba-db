@@ -30,6 +30,47 @@ Now the replication roadmap. Having read the new primitives' contracts, here's t
      · Observability (`nisaba/raft-monitor`, docs/clustering.md): RaftNode gained onEvent (state-TRANSITION events only — elections/role changes/config/promotions/installs/edge-triggered peer reachability/quiesce/conflict truncations/the critical apply-halt — never per-heartbeat noise) and status() (one JSON-able snapshot incl. the leader's per-peer match/lag/reachable view); RaftGroupHost aggregates events across groups (tagged {group}) and snapshots all of them; ReplicatedDb.status() adds db facts. RaftMonitor is a standalone read-only debug server (separate from the cluster transport, loopback by default): GET /status = one-off snapshot, GET /events = SSE stream with snapshot-first contract (event zero is full status, then live events) — curl -N or browser EventSource.
      · HttpRaftTransport (`nisaba/raft-http`): the infrastructure-friendly sibling of raft-tcp — Raft is purely request/response and leader-initiated, so plain HTTP fits the transport contract with no push channel: one POST per call, binjson bodies as application/octet-stream (binary stays native). Same contract, pick per deployment: HTTP buys TLS/auth-header/firewall/observability compatibility at ~150–200 bytes of header overhead per call (mostly moot under quiescence) and a head-of-line risk on the keep-alive pool (bounded by maxSockets; Raft tolerates the reordering). Keep-alive is load-bearing — an explicit pooled Agent, with the server's keepAliveTimeout raised past the client's reuse window so quiesced groups don't churn ECONNRESETs on wake. Peers must be DIRECT addresses: a load balancer breaks node identity. Verified by the same suite shape as raft-tcp, including a real 3-node cluster over localhost HTTP.
 
+   - ✅ Phase 7c — where this code now LIVES. The Raft state machine moved
+     into C: `wasm/include/raft_node.h` (over raft_core.h's safety rules,
+     raft_msg.h's wire grammar and raft_drive.h's leader/candidate
+     bookkeeping) owns role, term transitions, the election timer and its
+     round, the heartbeat timer, the per-peer replication cursors, the
+     commit arithmetic, and the two hot RPC handlers. `await
+     transport.call(peer, msg)` — the single line that kept replication in
+     JavaScript, because it suspends a state machine on a promise and
+     there is no promise under WASI — is gone from that path: C queues
+     what it wants sent, the host delivers it however it likes (a promise,
+     a write(), a postMessage), and feeds each answer back with
+     rn_on_reply/rn_on_fail. A correlation id rather than a closure is the
+     whole difference; a closure needs a stack to live on and an integer
+     does not. src/raft.js is now the HOST half, and holds exactly what
+     needs host resources: the transport and every promise settled from
+     one, the apply pump and its waiters, the snapshot transfer's file
+     reads (the chunk walk itself is raft_drive.h's), membership
+     orchestration (join/leave, learner promotion, the one-change-at-a-time
+     gate, the restart CONFIG scan), the §3.10 transfer fence, and
+     observability — each reading its state through the C node rather than
+     keeping a second copy, which is what the old `_next`/`_match`/
+     `_inflight`/`_quiesced` maps were. Three small additions let the host
+     hand back what it still starts: rn_propose (append + sync + replicate
+     + the commit check, one synchronous call, because a single-voter
+     group has no reply coming to run it), rn_campaign (TimeoutNow), and
+     rn_observe_leader/rn_step_down for the terms carried by the one
+     message class the host still answers, InstallSnapshot. rn_set_log
+     exists because the node BORROWS its log and both compaction paths
+     swap it. The cutover found a bug no synchronous test could reach: a
+     pre-vote grant that arrives after its round has already won lands in
+     the REAL round that followed it, and since a pre-voter grants freely,
+     two candidates can both reach a quorum in one term — a split brain
+     arrived at through liveness code. Each round now owns the correlation
+     ids it issued and ignores everything else; falsified in both suites,
+     with a native regression test that delays the straggler the way a
+     network does. Also fixed in passing: a leader counted a peer it had
+     never heard from as "in contact" for the first check-quorum window,
+     and the leader's advisory commit index stopped being persisted when
+     that arithmetic moved. Native: 85 tests ASan/UBSan. Node: 430,
+     unchanged in count and in what they assert.
+
 6. Read semantics and change streams. Decide follower read policy (stale-ok vs. leader leases vs. readIndex). And change streams get a structural upgrade: db-plan.md:781 notes MongoDB's change streams tail the oplog and nisaba had "no analog" — the entry log is the analog now, giving resumable, gap-free streams.
 
 7. Testing, throughout. Deterministic simulation: in-memory transport with drop/delay/partition injection, plus crash-point tests that kill between append/sync/apply at every boundary (MemoryHandle makes that cheap, and the submodule's entrylog.durability-wasm.test.js is the model to copy).

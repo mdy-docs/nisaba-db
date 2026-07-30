@@ -26,8 +26,10 @@ export interface RaftStateMachine {
   appliedIndex(): number | Promise<number>;
 }
 
+/** The transport FRAMES, it does not interpret: messages cross as the
+ * bytes C produced (the grammar is raft_msg.h's). */
 export interface RaftTransport {
-  call(peerId: number, message: object): Promise<object>;
+  call(peerId: number, message: Uint8Array): Promise<Uint8Array>;
 }
 
 export interface RaftSnapshotManifest {
@@ -103,18 +105,38 @@ export declare class RaftNode {
   /** One JSON-able "what is true right now" snapshot (role, term, log
    * bounds, members, the leader's per-peer replication view). */
   status(): object;
-  leaderId: number;
-  commitIndex: number;
+  readonly leaderId: number;
+  readonly commitIndex: number;
   lastApplied: number;
   isRunning: boolean;
-  /** Peers that need an InstallSnapshot (roadmap 5b). */
+  /** Timers parked (see quiesce/wake). */
+  readonly quiesced: boolean;
+  /** The EntryLog. Assigning it repoints the C node too — it holds a
+   * borrowed pointer, and both compaction paths swap the log. */
+  log: any;
+  /** The leader's replication cursors for a peer (0 elsewhere). */
+  matchOf(peer: number): number;
+  nextOf(peer: number): number;
+  /** Peers that need an InstallSnapshot this node cannot serve (5b). */
   readonly peersNeedingSnapshot: number[];
+  /** Can this leader still prove it reaches a quorum? (check-quorum) */
+  hasQuorumContact(withinMs: number): boolean;
   start(now?: number): Promise<void>;
   stop(): Promise<void>;
+  /** Release the C node. Optional: a stopped node keeps answering
+   * status questions, which is why stop() does not do this. */
+  free(): void;
   tick(now: number): void;
+  quiesce(): void;
+  wake(now?: number): void;
+  /** Run `fn` with the node quiesced — nothing else touches its log. */
+  runExclusive<T>(fn: () => T | Promise<T>): Promise<T>;
   propose(payload: Uint8Array | string, type?: number): Promise<{ index: number; term: number }>;
   /** Propose a full-replacement member set (ids inherit known records,
    * so addresses can't be erased). One change in flight at a time. */
   changeMembership(members: Array<number | MemberRecord>): Promise<{ index: number; term: number }>;
-  handleMessage(message: object): object | Promise<object>;
+  /** Graceful leadership transfer (§3.10). Resolves once leadership has
+   * left this node; rejects (lifting the fence) on timeout. */
+  transferLeadership(targetId: number, options?: { timeoutMs?: number }): Promise<void>;
+  handleMessage(message: Uint8Array): Uint8Array | Promise<Uint8Array>;
 }

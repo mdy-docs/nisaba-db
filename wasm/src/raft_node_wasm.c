@@ -33,6 +33,7 @@ EMSCRIPTEN_KEEPALIVE raft_node *rnw_new(double self_id, elog *log) {
     return rn_new((uint64_t)self_id, log);
 }
 EMSCRIPTEN_KEEPALIVE void rnw_free(raft_node *n) { rn_free(n); }
+EMSCRIPTEN_KEEPALIVE void rnw_set_log(raft_node *n, elog *log) { rn_set_log(n, log); }
 
 EMSCRIPTEN_KEEPALIVE int rnw_set_members(raft_node *n, const uint8_t *members, int len) {
     if (len < 0) return BJ_ERR_RANGE;
@@ -65,15 +66,15 @@ EMSCRIPTEN_KEEPALIVE void rnw_wake(raft_node *n, double now, double random01) {
 /* ---- messages ----------------------------------------------------------- */
 
 EMSCRIPTEN_KEEPALIVE int rnw_handle(raft_node *n, double from, int corr,
-                                    const uint8_t *msg, int len) {
+                                    const uint8_t *msg, int len, double random01) {
     if (len < 0 || corr < 0) return BJ_ERR_RANGE;
-    return rn_handle(n, (uint64_t)from, (uint32_t)corr, msg, (uint32_t)len);
+    return rn_handle(n, (uint64_t)from, (uint32_t)corr, msg, (uint32_t)len, random01);
 }
 
 EMSCRIPTEN_KEEPALIVE int rnw_on_reply(raft_node *n, int corr,
-                                      const uint8_t *reply, int len) {
+                                      const uint8_t *reply, int len, double random01) {
     if (len < 0 || corr < 0) return BJ_ERR_RANGE;
-    return rn_on_reply(n, (uint32_t)corr, reply, (uint32_t)len);
+    return rn_on_reply(n, (uint32_t)corr, reply, (uint32_t)len, random01);
 }
 
 EMSCRIPTEN_KEEPALIVE int rnw_on_fail(raft_node *n, int corr) {
@@ -133,7 +134,11 @@ EMSCRIPTEN_KEEPALIVE double rnw_match(const raft_node *n, double peer) {
 EMSCRIPTEN_KEEPALIVE double rnw_next(const raft_node *n, double peer) {
     return (double)rn_next(n, (uint64_t)peer);
 }
+EMSCRIPTEN_KEEPALIVE int rnw_inflight(const raft_node *n, double peer) {
+    return (int)rn_inflight(n, (uint64_t)peer);
+}
 EMSCRIPTEN_KEEPALIVE int rnw_quorum(const raft_node *n) { return (int)rn_quorum(n); }
+EMSCRIPTEN_KEEPALIVE int rnw_is_quiesced(const raft_node *n) { return rn_is_quiesced(n); }
 EMSCRIPTEN_KEEPALIVE int rnw_has_quorum_contact(const raft_node *n, double within_ms) {
     return rn_has_quorum_contact(n, (int64_t)within_ms);
 }
@@ -142,4 +147,31 @@ EMSCRIPTEN_KEEPALIVE int rnw_replicate(raft_node *n, double peer) {
 }
 EMSCRIPTEN_KEEPALIVE int rnw_installed(raft_node *n, double peer, double boundary) {
     return rn_installed(n, (uint64_t)peer, (uint64_t)boundary);
+}
+
+/* ---- what the host still owns ------------------------------------------- */
+
+/* The index the entry landed at comes back through `out` (one f64 slot),
+ * because the return value is the error code. */
+EMSCRIPTEN_KEEPALIVE int rnw_propose(raft_node *n, int type, const uint8_t *payload,
+                                     int len, double *out) {
+    if (len < 0) return BJ_ERR_RANGE;
+    uint64_t at = 0;
+    int e = rn_propose(n, type, payload, (uint32_t)len, &at);
+    if (out) *out = (double)at;
+    return e;
+}
+
+EMSCRIPTEN_KEEPALIVE void rnw_seed_commit(raft_node *n, double index) {
+    rn_seed_commit(n, (uint64_t)index);
+}
+EMSCRIPTEN_KEEPALIVE int rnw_campaign(raft_node *n, double random01) {
+    return rn_campaign(n, random01);
+}
+EMSCRIPTEN_KEEPALIVE int rnw_observe_leader(raft_node *n, double term, double leader_id,
+                                            double random01) {
+    return rn_observe_leader(n, (uint64_t)term, (uint64_t)leader_id, random01);
+}
+EMSCRIPTEN_KEEPALIVE int rnw_step_down(raft_node *n, double term, double random01) {
+    return rn_step_down(n, (uint64_t)term, random01);
 }

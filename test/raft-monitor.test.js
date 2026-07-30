@@ -37,7 +37,12 @@ describe('raft observability: events and status', () => {
     const joined = rpc(leader().node, {
       kind: 'join', member: { id: 4, host: 'node4', port: 7004 }
     });
-    await until(sim, cluster, () => leader().node.members.includes(4));
+    // Wait for the adoption to REACH every member, not just for the
+    // leader to ack it: a follower learns the new commit index on the
+    // next heartbeat, so sampling at the leader's promise catches
+    // whoever happened to be mid-round.
+    await until(sim, cluster, () =>
+      [...cluster.values()].every((m) => m.node.members.includes(4)));
     await joined;
     const configs = events.filter((e) => e.type === 'config');
     expect(configs.length).toBeGreaterThanOrEqual(3); // each member adopted it

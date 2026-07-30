@@ -24,6 +24,11 @@
  *     rn_on_reply(n, corr, bytes)  -- ...and feeds each answer back
  *     rn_on_fail(n, corr)          -- ...or says it never came
  *
+ * Every entry point that can arm an election timer takes `random01`
+ * rather than drawing one: a node that reads its own random source is a
+ * node the simulator cannot replay, and test/raft-harness.js's
+ * determinism is the single biggest asset this port has.
+ *
  * A correlation id, not a closure, is what ties a reply to the request
  * that caused it. That is the whole difference: a closure needs a stack
  * to live on, an integer does not.
@@ -41,6 +46,14 @@
  * Those need host resources -- a state machine to apply into, files to
  * read, a promise to settle -- so they stay with the host and call in.
  * raft_drive.h already gives them their decisions.
+ *
+ * The host calling back IN is the "what the host still owns" section at
+ * the bottom: rn_propose for an entry it wants replicated, rn_campaign
+ * when a transferring leader tells this node to stand, rn_observe_leader
+ * for the one message class (InstallSnapshot) whose handler lives up
+ * there but whose term still deposes us. Each is the exact head or tail
+ * of a path C already owns -- none of them is a rule this file does not
+ * otherwise enforce.
  *
  * This does not replace raft_core.h or raft_msg.h; it drives them. Every
  * safety rule is still theirs, and this file contains no `if` that
@@ -84,6 +97,16 @@ raft_node *rn_new(uint64_t self_id, elog *log);
 void       rn_free(raft_node *n);
 
 /*
+ * Point the node at a different log. EntryLog cannot rebase in place, so
+ * both compaction paths -- a follower adopting an install, a leader
+ * snapshotting locally -- close the old log and open a fresh one based at
+ * the boundary. The node holds a BORROWED pointer, so it has to be told,
+ * and the host must have quiesced everything that could touch the old one
+ * before it closed it.
+ */
+void rn_set_log(raft_node *n, elog *log);
+
+/*
  * Adopt a member set: a binjson ARRAY of records ({ id, voting? }), the
  * same shape raft_core.h's members_adopt takes. This is the ONE funnel
  * -- bootstrap, a CONFIG entry applying, a snapshot install -- which is
@@ -97,10 +120,8 @@ int rn_set_members(raft_node *n, const uint8_t *members, uint32_t len);
 /*
  * Timing. `min_election` and `max_election` bound the randomised
  * election timeout; `heartbeat` is the leader's idle interval. The
- * random draw is passed IN to rn_tick rather than taken here, because a
- * node that reads its own random source is a node the simulator cannot
- * replay -- and test/raft-harness.js's determinism is the single biggest
- * asset this port has.
+ * random draw is passed IN to every call that can arm a timer, for the
+ * replayability reason at the top of this file.
  */
 void rn_set_timing(raft_node *n, int64_t min_election, int64_t max_election,
                    int64_t heartbeat);
@@ -134,16 +155,21 @@ void rn_wake(raft_node *n, int64_t now, double random01);
  * to `from` with the correlation id the sender used, so a host that
  * cannot distinguish a request from a reply on the wire does not have
  * to: it just sends what the outbox holds.
+ *
+ * Only the two hot kinds are answered here (RequestVote, AppendEntries);
+ * anything else is RAFT_ERR_MESSAGE, because answering it needs host
+ * resources -- see the note at the top.
  */
 int rn_handle(raft_node *n, uint64_t from, uint32_t corr,
-              const uint8_t *msg, uint32_t len);
+              const uint8_t *msg, uint32_t len, double random01);
 
 /*
  * A reply to something this node sent. `corr` is the id that went out
  * with it; a stale or unknown id is RAFT_ERR_PEER, which is not an error
  * the host needs to act on -- it means the round it belonged to is over.
  */
-int rn_on_reply(raft_node *n, uint32_t corr, const uint8_t *reply, uint32_t len);
+int rn_on_reply(raft_node *n, uint32_t corr, const uint8_t *reply, uint32_t len,
+                double random01);
 
 /* The request with this correlation id will never be answered. */
 int rn_on_fail(raft_node *n, uint32_t corr);
@@ -178,7 +204,8 @@ typedef enum {
     RN_EFFECT_NEEDS_SNAPSHOT= 2, /* peer is below our base; arg = peer   */
     RN_EFFECT_PROMOTE       = 3, /* learner is caught up; arg = peer     */
     RN_EFFECT_REACHABLE     = 4, /* peer reachability changed; arg = peer*/
-    RN_EFFECT_TRUNCATED     = 5  /* our log was cut back; arg = from     */
+    RN_EFFECT_TRUNCATED     = 5, /* our log was cut back; arg = from     */
+    RN_EFFECT_ELECTION      = 6  /* standing for `arg`; flag = pre-vote  */
 } rn_effect_kind;
 
 uint32_t rn_effect_count(const raft_node *n);
@@ -194,8 +221,14 @@ uint64_t rn_leader_id(const raft_node *n);
 uint64_t rn_commit_index(const raft_node *n);
 uint64_t rn_match(const raft_node *n, uint64_t peer);
 uint64_t rn_next(const raft_node *n, uint64_t peer);
+/* The correlation id outstanding at `peer`, or 0 -- the leader's own
+ * "is this one busy" bit, exposed for the host's status snapshot. */
+uint32_t rn_inflight(const raft_node *n, uint64_t peer);
 uint32_t rn_quorum(const raft_node *n);
-/* Has a quorum of voters answered within `within_ms` (check-quorum)? */
+int      rn_is_quiesced(const raft_node *n);
+/* Has a quorum of voters answered within `within_ms` (check-quorum)? A
+ * peer that has never answered this term counts for nothing, however
+ * recently the term began. */
 int      rn_has_quorum_contact(const raft_node *n, int64_t within_ms);
 
 /*
@@ -207,8 +240,58 @@ int      rn_has_quorum_contact(const raft_node *n, int64_t within_ms);
 int rn_replicate(raft_node *n, uint64_t peer);
 
 /* Tell the node an install finished at `boundary`, so the peer's
- * cursors move to it (raft_drive.h's raft_repl_installed). */
+ * cursors move to it (raft_drive.h's raft_repl_installed) and whatever
+ * that newly puts within reach of a quorum commits. */
 int rn_installed(raft_node *n, uint64_t peer, uint64_t boundary);
+
+/* ---- what the host still owns ------------------------------------------- */
+
+/*
+ * Append one entry at the current term, make it durable, and replicate
+ * it -- the leader's half of a proposal. The host owns the promise that
+ * settles when it applies; this owns everything up to that.
+ *
+ * The commit check runs here too, because a single-voter group reaches a
+ * quorum without sending anything: no reply will ever arrive to trigger
+ * it, and such a group would otherwise append forever and commit
+ * nothing. BJ_ERR_STATE if this node is not the leader -- the host
+ * refuses first with a routing error the caller can act on.
+ */
+int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
+               uint64_t *out_index);
+
+/*
+ * Seed the commit index at startup from the log's persisted (advisory)
+ * marker and the state machine's applied floor. Never lowers it. The
+ * host knows both numbers and the node knows neither.
+ */
+void rn_seed_commit(raft_node *n, uint64_t index);
+
+/*
+ * Stand for election NOW: a real round, skipping pre-vote, because the
+ * transferring leader that sent TimeoutNow (section 3.10) has certified
+ * this node is caught up and leader stickiness would otherwise make
+ * every peer refuse while that leader still lives. A leader, a stopped
+ * node and a non-voter all decline.
+ */
+int rn_campaign(raft_node *n, double random01);
+
+/*
+ * A message the HOST answered (InstallSnapshot) carrying a leader's
+ * term: adopt it the way an AppendEntries would -- step down if it is
+ * newer or we are not already following, record the leader, refresh the
+ * election timer. Returns 0 for a stale term, which is the caller's cue
+ * to refuse the message.
+ */
+int rn_observe_leader(raft_node *n, uint64_t term, uint64_t leader_id, double random01);
+
+/*
+ * A reply the HOST awaited (a snapshot chunk) carrying a higher term:
+ * step down. Unlike rn_observe_leader this records no leader and
+ * refreshes no contact -- the peer that deposed us is not thereby our
+ * leader. Returns 1 if it deposed us.
+ */
+int rn_step_down(raft_node *n, uint64_t term, double random01);
 
 #ifdef __cplusplus
 }

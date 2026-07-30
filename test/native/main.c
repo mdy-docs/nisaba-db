@@ -4751,8 +4751,8 @@ static void pump(rn_member *m, int count) {
 
             for (int j = 0; j < count; j++) {
                 if (m[j].id != to) continue;
-                if (is_reply) rn_on_reply(m[j].node, corr, copy, len);
-                else          rn_handle(m[j].node, m[i].id, corr, copy, len);
+                if (is_reply) rn_on_reply(m[j].node, corr, copy, len, 0.5);
+                else          rn_handle(m[j].node, m[i].id, corr, copy, len, 0.5);
                 break;
             }
             free(copy);
@@ -4806,6 +4806,94 @@ TEST(a_single_voter_group_commits_the_moment_it_elects_itself) {
     /* Nobody to talk to, so nothing was ever queued. */
     CHECK_I64(rn_out_count(n), 0);
 
+    bj_builder_free(members);
+    rn_free(n);
+    elog_free(log);
+    memfs_free(fs);
+}
+
+/* A vote reply as it comes off the wire. */
+static void vote_reply(bj_builder *b, int64_t term, int granted) {
+    bj_begin_object(b);
+    msg_kv_int(b, "term", term);
+    bj_put_key(b, (const uint8_t *)"voteGranted", 11);
+    bj_put_bool(b, granted);
+    bj_end_object(b);
+}
+
+TEST(a_stale_prevote_grant_cannot_elect_the_real_round) {
+    /*
+     * Regression, and the second one this port has taken from a host
+     * whose replies do not arrive in the order the pump above delivers
+     * them. A pre-vote round wins on its FIRST grant and immediately
+     * starts a real election. The second grant -- cast in a straw poll,
+     * where a peer grants freely because nothing is persisted and no
+     * term moves -- was then still in flight, and landed in the real
+     * round's tally.
+     *
+     * Both guards raft_drive.h documents pass it: the node is still a
+     * candidate, and still in the term it sought. So it counted, and a
+     * second node in the same term could reach a quorum on straw-poll
+     * votes: a split brain arrived at through liveness code. The
+     * three-node test above cannot see it, because its network is a
+     * for-loop that settles every pre-vote reply before the real round
+     * exists. test/raft.test.js saw it on the first run.
+     *
+     * Nothing but the correlation id can tell the two rounds apart --
+     * which is the whole argument for having one.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "raft.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(1, log);
+    CHECK_FATAL(n != NULL);
+
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    for (int i = 1; i <= 3; i++) {
+        bj_begin_object(members);
+        bj_put_key(members, (const uint8_t *)"id", 2);
+        bj_put_int(members, i);
+        bj_end_object(members);
+    }
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+    CHECK_OK(rn_set_members(n, mbuf, (uint32_t)mlen));
+    CHECK_I64(rn_quorum(n), 2);
+
+    /* Stand for the pre-vote round and take its two correlation ids. */
+    rn_start(n, 0, 0.0);
+    for (int64_t t = 0; t <= 1000 && rn_out_count(n) == 0; t += 10) rn_tick(n, t, 0.5);
+    CHECK_I64((long long)rn_out_count(n), 2);
+    uint32_t pre_a = rn_out_corr(n, 0), pre_b = rn_out_corr(n, 1);
+    rn_out_clear(n);
+    CHECK_I64(rn_role(n), RAFT_FOLLOWER);   /* a pre-voter is nothing yet */
+
+    /* One grant carries the straw poll, and the real round begins. */
+    bj_builder *grant = bj_builder_new();
+    vote_reply(grant, 0, 1);
+    size_t glen; const uint8_t *gbuf = bj_builder_data(grant, &glen);
+    CHECK_OK(rn_on_reply(n, pre_a, gbuf, (uint32_t)glen, 0.5));
+    CHECK_I64(rn_role(n), RAFT_CANDIDATE);
+    CHECK_I64((long long)elog_current_term(log), 1);
+    CHECK_I64((long long)rn_out_count(n), 2);   /* the real requests */
+    rn_out_clear(n);
+
+    /* The straggler. It is a grant, from a live peer, in the term the
+     * candidate is seeking -- and it must not count, because it was
+     * never cast for this round. */
+    CHECK_OK(rn_on_reply(n, pre_b, gbuf, (uint32_t)glen, 0.5));
+    CHECK_I64(rn_role(n), RAFT_CANDIDATE);
+    CHECK_I64((long long)rn_commit_index(n), 0);
+
+    /* A grant for THIS round elects it, so the tally still works. */
+    CHECK_OK(rn_on_reply(n, pre_b + 1, gbuf, (uint32_t)glen, 0.5));
+    CHECK_I64(rn_role(n), RAFT_LEADER);
+
+    bj_builder_free(grant);
     bj_builder_free(members);
     rn_free(n);
     elog_free(log);
@@ -4922,6 +5010,7 @@ int main(void) {
     RUN(snapshot_chunking_covers_every_byte_exactly_once);
     RUN(three_nodes_elect_a_leader_and_commit_without_a_host_language);
     RUN(a_single_voter_group_commits_the_moment_it_elects_itself);
+    RUN(a_stale_prevote_grant_cannot_elect_the_real_round);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);

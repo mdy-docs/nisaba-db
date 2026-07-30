@@ -61,6 +61,13 @@ struct raft_node {
 
     raft_round round;
     int        round_live;
+    /* The correlation ids this round's requests went out with. A vote
+     * reply is not tracked per peer (the round tallies them), so without
+     * this a straggling reply from the PRE-VOTE round lands in the real
+     * round that followed it -- and since a pre-voter grants freely, two
+     * candidates can both reach a quorum in one term. Corr ids are issued
+     * in order, so the round owns a contiguous range. */
+    uint32_t   round_corr_lo, round_corr_hi;
 
     uint32_t next_corr;
 
@@ -146,6 +153,10 @@ void rn_free(raft_node *n) {
     free(n);
 }
 
+void rn_set_log(raft_node *n, elog *log) {
+    if (log) n->log = log;
+}
+
 void rn_set_timing(raft_node *n, int64_t min_election, int64_t max_election,
                    int64_t heartbeat) {
     n->min_election = min_election;
@@ -204,6 +215,7 @@ int rn_set_members(raft_node *n, const uint8_t *members, uint32_t len) {
                 memset(p, 0, sizeof(*p));
                 p->id = (uint64_t)d;
                 p->reachable = -1;
+                p->ack_at = INT64_MIN;   /* never heard from; see check-quorum */
                 p->next = last + 1;
                 for (uint32_t j = 0; j < nold; j++) {
                     if (old[j].id != p->id) continue;
@@ -264,7 +276,8 @@ static int become_leader(raft_node *n) {
     for (uint32_t i = 0; i < n->npeers; i++) {
         n->peers[i].next = last + 1;
         n->peers[i].match = 0;
-        n->peers[i].ack_at = 0;
+        /* Acks from a previous term say nothing about this one. */
+        n->peers[i].ack_at = INT64_MIN;
         n->peers[i].inflight = 0;
     }
     set_role(n, RAFT_LEADER);
@@ -308,10 +321,12 @@ static int start_election(raft_node *n, int pre_vote, double random01) {
         set_role(n, RAFT_CANDIDATE);
     }
     arm_election(n, random01);
+    emit(n, RN_EFFECT_ELECTION, term, pre_vote);
 
     uint32_t quorum = rn_quorum(n);
     raft_round_begin(&n->round, term, quorum, pre_vote);
     n->round_live = 1;
+    n->round_corr_lo = n->round_corr_hi = 0;
 
     if (quorum <= 1) {
         n->round_live = 0;
@@ -324,7 +339,10 @@ static int start_election(raft_node *n, int pre_vote, double random01) {
     if (!e) {
         for (uint32_t i = 0; i < n->npeers && !e; i++) {
             if (!n->peers[i].voting) continue;
-            e = queue(n, n->peers[i].id, fresh_corr(n), 0, msg.data, msg.len);
+            uint32_t corr = fresh_corr(n);
+            if (!n->round_corr_lo) n->round_corr_lo = corr;
+            n->round_corr_hi = corr;
+            e = queue(n, n->peers[i].id, corr, 0, msg.data, msg.len);
         }
     }
     dbuf_free(&msg);
@@ -376,6 +394,8 @@ int rn_installed(raft_node *n, uint64_t peer, uint64_t boundary) {
     rn_peer *p = peer_of(n, peer);
     if (!p) return RAFT_ERR_PEER;
     raft_repl_installed(boundary, &p->match, &p->next);
+    /* The install may have carried this peer past what a quorum needed. */
+    advance_commit(n);
     return BJ_OK;
 }
 
@@ -398,6 +418,10 @@ static void advance_commit(raft_node *n) {
     if (!raft_may_commit(candidate, n->commit_index, base, term_at,
                          elog_current_term(n->log))) return;
     n->commit_index = candidate;
+    /* Advisory: it rides the next sync, and a restart re-derives what it
+     * cannot prove. Without it a rebooted node waits for a heartbeat
+     * before it may replay its own committed prefix. */
+    elog_set_commit_index(n->log, candidate);
     emit(n, RN_EFFECT_COMMIT, candidate, 0);
 }
 
@@ -467,7 +491,7 @@ static void adopt(raft_node *n, const raft_msg_effect *eff, double random01) {
 }
 
 int rn_handle(raft_node *n, uint64_t from, uint32_t corr,
-              const uint8_t *msg, uint32_t len) {
+              const uint8_t *msg, uint32_t len, double random01) {
     int kind = -1;
     int e = rmsg_kind(msg, len, &kind);
     if (e) return e;
@@ -490,7 +514,7 @@ int rn_handle(raft_node *n, uint64_t from, uint32_t corr,
         return RAFT_ERR_MESSAGE;
     }
     if (!e) {
-        adopt(n, &eff, 0.5);
+        adopt(n, &eff, random01);
         e = queue(n, from, corr, 1, reply.data, reply.len);
     }
     dbuf_free(&reply);
@@ -506,8 +530,13 @@ static rn_peer *peer_by_corr(raft_node *n, uint32_t corr) {
     return NULL;
 }
 
-static int on_vote_reply(raft_node *n, const uint8_t *reply, uint32_t len) {
+static int on_vote_reply(raft_node *n, uint32_t corr, const uint8_t *reply,
+                         uint32_t len, double random01) {
     if (!n->round_live) return BJ_OK;
+    /* From a round that is over -- most sharply, the pre-vote round this
+     * very campaign grew out of, whose grants would otherwise elect us
+     * on a straw poll. */
+    if (corr < n->round_corr_lo || corr > n->round_corr_hi) return BJ_OK;
 
     const uint8_t *v; size_t vlen; int found = 0;
     double term = 0;
@@ -530,12 +559,12 @@ static int on_vote_reply(raft_node *n, const uint8_t *reply, uint32_t len) {
     switch (action) {
         case RAFT_ROUND_STEP_DOWN:
             n->round_live = 0;
-            become_follower(n, step, 0, 0.5);
+            become_follower(n, step, 0, random01);
             return BJ_OK;
         case RAFT_ROUND_WON: {
             int pre = n->round.pre_vote;
             n->round_live = 0;
-            return pre ? start_election(n, 0, 0.5) : become_leader(n);
+            return pre ? start_election(n, 0, random01) : become_leader(n);
         }
         case RAFT_ROUND_IGNORE:
             n->round_live = 0;
@@ -545,7 +574,8 @@ static int on_vote_reply(raft_node *n, const uint8_t *reply, uint32_t len) {
     }
 }
 
-static int on_append_reply(raft_node *n, rn_peer *p, const uint8_t *reply, uint32_t len) {
+static int on_append_reply(raft_node *n, rn_peer *p, const uint8_t *reply, uint32_t len,
+                           double random01) {
     uint64_t term = elog_current_term(n->log);
     const uint8_t *v; size_t vlen; int found = 0;
     double rterm = 0, match = 0, hint = 0;
@@ -569,7 +599,7 @@ static int on_append_reply(raft_node *n, rn_peer *p, const uint8_t *reply, uint3
     }
 
     if (n->role != RAFT_LEADER) return BJ_OK;
-    if ((uint64_t)rterm > term) { become_follower(n, (uint64_t)rterm, 0, 0.5); return BJ_OK; }
+    if ((uint64_t)rterm > term) { become_follower(n, (uint64_t)rterm, 0, random01); return BJ_OK; }
 
     /* Any reply that did not depose us proves the peer is alive and still
      * accepts our leadership -- a log-conflict rejection counts as much
@@ -596,15 +626,17 @@ static int on_append_reply(raft_node *n, rn_peer *p, const uint8_t *reply, uint3
     return replicate_to(n, p);
 }
 
-int rn_on_reply(raft_node *n, uint32_t corr, const uint8_t *reply, uint32_t len) {
+int rn_on_reply(raft_node *n, uint32_t corr, const uint8_t *reply, uint32_t len,
+                double random01) {
     rn_peer *p = peer_by_corr(n, corr);
     if (p) {
         p->inflight = 0;
-        return on_append_reply(n, p, reply, len);
+        return on_append_reply(n, p, reply, len, random01);
     }
     /* Not an append: the only other thing we send is a vote request, and
-     * those are not tracked per peer because the round tallies them. */
-    return on_vote_reply(n, reply, len);
+     * those are not tracked per peer because the round tallies them --
+     * it checks the correlation id against its own range instead. */
+    return on_vote_reply(n, corr, reply, len, random01);
 }
 
 int rn_on_fail(raft_node *n, uint32_t corr) {
@@ -653,12 +685,72 @@ uint64_t rn_next(const raft_node *n, uint64_t peer) {
     const rn_peer *p = peer_of((raft_node *)n, peer);
     return p ? p->next : 0;
 }
+uint32_t rn_inflight(const raft_node *n, uint64_t peer) {
+    const rn_peer *p = peer_of((raft_node *)n, peer);
+    return p ? p->inflight : 0;
+}
+
+int rn_is_quiesced(const raft_node *n) { return n->quiesced; }
+
+/* ---- what the host still owns ------------------------------------------- */
+
+int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
+               uint64_t *out_index) {
+    if (n->role != RAFT_LEADER) return BJ_ERR_STATE;
+
+    uint64_t at = 0;
+    int e = elog_append(n->log, elog_current_term(n->log), type, payload, len, &at);
+    if (e) return e;
+    /* Durable before it counts toward anything: the leader counting
+     * itself is the same ack a follower gives, and it must mean the same
+     * thing. */
+    e = elog_sync(n->log);
+    if (e) return e;
+    if (out_index) *out_index = at;
+
+    for (uint32_t i = 0; i < n->npeers; i++) replicate_to(n, &n->peers[i]);
+    advance_commit(n);   /* single-voter groups: see become_leader */
+    return BJ_OK;
+}
+
+void rn_seed_commit(raft_node *n, uint64_t index) {
+    if (index > n->commit_index) n->commit_index = index;
+}
+
+int rn_campaign(raft_node *n, double random01) {
+    if (!n->running || n->role == RAFT_LEADER || !n->self_voting) return BJ_OK;
+    n->quiesced = 0;
+    return start_election(n, 0, random01);
+}
+
+int rn_observe_leader(raft_node *n, uint64_t term, uint64_t leader_id, double random01) {
+    uint64_t current = elog_current_term(n->log);
+    if (term < current) return 0;
+    if (term > current || n->role != RAFT_FOLLOWER) {
+        become_follower(n, term, leader_id, random01);
+    }
+    n->leader_id = leader_id;
+    n->last_leader_contact = n->now;
+    arm_election(n, random01);
+    return 1;
+}
+
+int rn_step_down(raft_node *n, uint64_t term, double random01) {
+    if (term < elog_current_term(n->log)) return 0;
+    if (term == elog_current_term(n->log) && n->role == RAFT_FOLLOWER) return 0;
+    become_follower(n, term, 0, random01);
+    return 1;
+}
 
 int rn_has_quorum_contact(const raft_node *n, int64_t within_ms) {
     if (n->role != RAFT_LEADER) return 1;
     uint32_t live = n->self_voting ? 1 : 0;
     for (uint32_t i = 0; i < n->npeers; i++) {
         if (!n->peers[i].voting) continue;
+        /* Never answered us this term: silence is not contact, however
+         * recently the term began (the arithmetic would overflow here
+         * anyway). */
+        if (n->peers[i].ack_at == INT64_MIN) continue;
         if (n->now - n->peers[i].ack_at <= within_ms) live++;
     }
     return live >= rn_quorum(n);

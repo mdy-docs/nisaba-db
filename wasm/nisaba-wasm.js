@@ -1309,7 +1309,8 @@ const raftDrive = {
  */
 const RAFT_ROLE = Object.freeze({ FOLLOWER: 0, CANDIDATE: 1, LEADER: 2 });
 const RN_EFFECT = Object.freeze({
-  ROLE: 0, COMMIT: 1, NEEDS_SNAPSHOT: 2, PROMOTE: 3, REACHABLE: 4, TRUNCATED: 5
+  ROLE: 0, COMMIT: 1, NEEDS_SNAPSHOT: 2, PROMOTE: 3, REACHABLE: 4, TRUNCATED: 5,
+  ELECTION: 6
 });
 
 class RaftCore {
@@ -1326,6 +1327,10 @@ class RaftCore {
   free() {
     if (this._ptr) { requireModule()._rnw_free(this._ptr); this._ptr = 0; }
   }
+
+  /** Point the node at a different log (EntryLog cannot rebase in place,
+   * so both compaction paths swap it). The old log must already be quiet. */
+  setLog(log) { requireModule()._rnw_set_log(this._ptr, log.ctx); }
 
   setMembers(records) {
     const M = requireModule();
@@ -1348,23 +1353,25 @@ class RaftCore {
   wake(now, random01) { requireModule()._rnw_wake(this._ptr, now, random01); }
 
   /** An incoming request. Its reply lands in the outbox addressed back
-   * to `from` with the same correlation id. */
-  handle(from, corr, bytes) {
+   * to `from` with the same correlation id. `random01` seeds any election
+   * timer the message re-arms — passed in, never drawn, so a simulated
+   * cluster replays exactly. */
+  handle(from, corr, bytes, random01 = 0.5) {
     const M = requireModule();
     const p = M._malloc(bytes.length || 1);
     try {
       if (bytes.length) M.HEAPU8.set(bytes, p);
-      return M._rnw_handle(this._ptr, from, corr, p, bytes.length);
+      return M._rnw_handle(this._ptr, from, corr, p, bytes.length, random01);
     } finally { M._free(p); }
   }
 
   /** A reply to something this node sent. */
-  onReply(corr, bytes) {
+  onReply(corr, bytes, random01 = 0.5) {
     const M = requireModule();
     const p = M._malloc(bytes.length || 1);
     try {
       if (bytes.length) M.HEAPU8.set(bytes, p);
-      return M._rnw_on_reply(this._ptr, corr, p, bytes.length);
+      return M._rnw_on_reply(this._ptr, corr, p, bytes.length, random01);
     } finally { M._free(p); }
   }
 
@@ -1415,14 +1422,54 @@ class RaftCore {
   get leaderId() { return requireModule()._rnw_leader_id(this._ptr); }
   get commitIndex() { return requireModule()._rnw_commit_index(this._ptr); }
   get quorum() { return requireModule()._rnw_quorum(this._ptr); }
+  get quiesced() { return requireModule()._rnw_is_quiesced(this._ptr) === 1; }
   matchOf(peer) { return requireModule()._rnw_match(this._ptr, peer); }
   nextOf(peer) { return requireModule()._rnw_next(this._ptr, peer); }
+  /** The correlation id outstanding at `peer`, or 0. */
+  inflightOf(peer) { return requireModule()._rnw_inflight(this._ptr, peer); }
   hasQuorumContact(withinMs) {
     return requireModule()._rnw_has_quorum_contact(this._ptr, withinMs) === 1;
   }
   replicate(peer) { return requireModule()._rnw_replicate(this._ptr, peer); }
   installed(peer, boundary) {
     return requireModule()._rnw_installed(this._ptr, peer, boundary);
+  }
+
+  /**
+   * Append one entry at the current term, sync it, replicate it, and run
+   * the commit check (a single-voter group has no reply coming to run it
+   * for them). Returns the index it landed at.
+   */
+  propose(type, payload) {
+    const M = requireModule();
+    const p = M._malloc(payload.length || 1);
+    const out = M._malloc(8);
+    try {
+      if (payload.length) M.HEAPU8.set(payload, p);
+      const rc = M._rnw_propose(this._ptr, type, p, payload.length, out);
+      if (rc !== 0) throw codeError(rc, 'propose');
+      return readF64(M, out);
+    } finally { M._free(out); M._free(p); }
+  }
+
+  /** Seed the commit index at startup (never lowers it). */
+  seedCommit(index) { requireModule()._rnw_seed_commit(this._ptr, index); }
+
+  /** Stand for election now, skipping pre-vote (TimeoutNow, §3.10). */
+  campaign(random01 = 0.5) {
+    const rc = requireModule()._rnw_campaign(this._ptr, random01);
+    if (rc !== 0) throw codeError(rc, 'campaign');
+  }
+
+  /** A leader's term on a message the HOST answered (InstallSnapshot):
+   * adopt it as an AppendEntries would. False means it was stale. */
+  observeLeader(term, leaderId, random01 = 0.5) {
+    return requireModule()._rnw_observe_leader(this._ptr, term, leaderId, random01) === 1;
+  }
+
+  /** A higher term on a reply the HOST awaited: step down. */
+  stepDown(term, random01 = 0.5) {
+    return requireModule()._rnw_step_down(this._ptr, term, random01) === 1;
   }
 }
 

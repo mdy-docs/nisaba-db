@@ -185,6 +185,7 @@ _rdw_chunk_next
 # The replication state machine and its outbox (raft_node.h)
 _rnw_new
 _rnw_free
+_rnw_set_log
 _rnw_set_members
 _rnw_set_timing
 _rnw_set_limits
@@ -213,7 +214,14 @@ _rnw_leader_id
 _rnw_commit_index
 _rnw_match
 _rnw_next
+_rnw_inflight
 _rnw_quorum
+_rnw_is_quiesced
 _rnw_has_quorum_contact
 _rnw_replicate
 _rnw_installed
+_rnw_propose
+_rnw_seed_commit
+_rnw_campaign
+_rnw_observe_leader
+_rnw_step_down

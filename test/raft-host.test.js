@@ -108,7 +108,7 @@ describe('raft host: multi-group', () => {
     const before = calls;
     await sim.advance(5000, tickables);
     expect(calls).toBe(before); // ZERO messages while quiesced
-    expect(leader.node._quiesced).toBe(true);
+    expect(leader.node.quiesced).toBe(true);
 
     // Local use wakes the group; replication resumes and converges.
     const hostOfLeader = [...hosts.values()].find((h) => h.group('g') === leader.node);

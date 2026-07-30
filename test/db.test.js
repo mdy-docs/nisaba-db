@@ -2316,6 +2316,100 @@ describe('db: CRUD completeness (milestone 8)', () => {
       await db.close();
     });
   });
+
+  describe('upsert _id', () => {
+    // An upsert whose filter says {_id: X} must create X. It used to
+    // create a generated id instead -- the filter's _id was seeded into
+    // the new document and then overwritten -- so the document landed
+    // under a key nobody had asked for, and `upsertedId` reported that
+    // key rather than the one a caller could later look up.
+
+    it('updateOne upserts under the _id the filter pinned', async () => {
+      const db = await openDb();
+      const users = await db.collection('users');
+      const pinned = new ObjectId();
+
+      const result = await users.updateOne(
+        { _id: pinned, team: 'core' }, { $set: { seen: true } }, { upsert: true }
+      );
+      expect(result.upsertedId.equals(pinned)).toBe(true);
+      expect(await users.findOne({ _id: pinned })).toEqual({
+        _id: pinned, team: 'core', seen: true
+      });
+      // Exactly one document exists: nothing was created under a second id.
+      expect(await users.countDocuments({})).toBe(1);
+
+      // Re-running the same upsert now matches it rather than creating
+      // another -- which is the property the pinned id actually buys.
+      const again = await users.updateOne(
+        { _id: pinned, team: 'core' }, { $set: { seen: false } }, { upsert: true }
+      );
+      expect(again.matchedCount).toBe(1);
+      expect(again.upsertedId).toBeNull();
+      expect(await users.countDocuments({})).toBe(1);
+      await db.close();
+    });
+
+    it('updateMany and replaceOne pin it the same way', async () => {
+      const db = await openDb();
+      const users = await db.collection('users');
+
+      const a = new ObjectId();
+      const many = await users.updateMany({ _id: a }, { $set: { n: 1 } }, { upsert: true });
+      expect(many.upsertedId.equals(a)).toBe(true);
+      expect((await users.findOne({ _id: a })).n).toBe(1);
+
+      // replaceOne: the replacement names no _id, so the filter's wins.
+      const b = new ObjectId();
+      const repl = await users.replaceOne({ _id: b }, { name: 'Fresh' }, { upsert: true });
+      expect(repl.upsertedId.equals(b)).toBe(true);
+      expect(await users.findOne({ _id: b })).toEqual({ _id: b, name: 'Fresh' });
+
+      // A replacement that names its own _id still wins over the filter's:
+      // it is the more specific statement of intent.
+      const filterId = new ObjectId();
+      const docId = new ObjectId();
+      const own = await users.replaceOne(
+        { _id: filterId }, { _id: docId, name: 'Explicit' }, { upsert: true }
+      );
+      expect(own.upsertedId.equals(docId)).toBe(true);
+      expect(await users.findOne({ _id: filterId })).toBeNull();
+      await db.close();
+    });
+
+    it('a filter that pins no single _id still generates one', async () => {
+      const db = await openDb();
+      const users = await db.collection('users');
+
+      // No _id at all.
+      const plain = await users.updateOne({ team: 'ghosts' }, { $set: { n: 1 } }, { upsert: true });
+      expect(plain.upsertedId).toBeInstanceOf(ObjectId);
+
+      // An _id inside an operator expression pins nothing -- the same
+      // rule that already applies to every other field when seeding.
+      const other = new ObjectId();
+      const expr = await users.updateOne(
+        { _id: { $ne: other }, team: 'phantom' }, { $set: { n: 1 } }, { upsert: true }
+      );
+      expect(expr.upsertedId.equals(other)).toBe(false);
+      expect((await users.findOne({ _id: expr.upsertedId })).team).toBe('phantom');
+      await db.close();
+    });
+
+    it('refuses an _id this format cannot store rather than substituting one', async () => {
+      // Filters skip the toObjectId gate that insertOne's documents pass
+      // through, so this is the first place such an _id can be caught --
+      // and quietly storing the document under a generated id instead is
+      // the behavior being fixed, not an acceptable fallback.
+      const db = await openDb();
+      const users = await db.collection('users');
+      await expect(
+        users.updateOne({ _id: 'not-an-objectid' }, { $set: { n: 1 } }, { upsert: true })
+      ).rejects.toThrow(/ObjectId/);
+      expect(await users.countDocuments({})).toBe(0);
+      await db.close();
+    });
+  });
 });
 
 describe('db: index options (milestone 9)', () => {

@@ -257,7 +257,7 @@ TEST(update_and_delete) {
     mk_oid(default_id, 99);
     int64_t matched = 0; int upserted = 0;
     CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen,
-                            default_id, 0, &matched, &upserted, NULL, NULL));
+                            default_id, 0, &matched, &upserted, NULL, NULL, NULL));
     CHECK_I64(matched, 2);
     CHECK_I64(upserted, 0);
 
@@ -305,7 +305,7 @@ TEST(upsert_seeds_from_filter) {
     uint8_t default_id[12];
     mk_oid(default_id, 7);
     int result = -1;
-    CHECK_OK(dc_update_one(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 1, &result));
+    CHECK_OK(dc_update_one(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 1, &result, NULL));
     CHECK_I64(result, 2);   /* 2 == upserted */
 
     /* The upserted document must carry BOTH the filter's equality seed and
@@ -734,6 +734,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         BJ_ERR_RANGE,
         DC_ERR_DUPLICATE, DC_ERR_ID_MISMATCH, DC_ERR_DUPLICATE_KEY,
         DC_ERR_MISSING_INDEXED_FIELD, DC_ERR_UNINDEXABLE_VALUE,
+        DC_ERR_UNSUPPORTED_ID,
         DC_ERR_INVALID_COLLECTION_NAME, DC_ERR_INVALID_DB_NAME,
         DC_ERR_RESERVED_NAME, DC_ERR_EMPTY_KEY_SPEC, DC_ERR_NON_ASCENDING_KEY,
         DC_ERR_BULK_EMPTY, DC_ERR_BULK_UNKNOWN_OP, DC_ERR_BULK_MISSING_FIELD,
@@ -2405,7 +2406,7 @@ TEST(update_many_hands_back_post_images_when_asked) {
     int64_t matched = 0; int upserted = 0;
     uint8_t *images = NULL; size_t images_len = 0;
     CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 0,
-                            &matched, &upserted, &images, &images_len));
+                            &matched, &upserted, NULL, &images, &images_len));
     CHECK_I64(matched, 2);
     CHECK_I64(arr_count(images, images_len), 2);
     /* POST-images: the $set is already applied in what comes back. */
@@ -2415,7 +2416,7 @@ TEST(update_many_hands_back_post_images_when_asked) {
     /* Not asking costs nothing and returns nothing. */
     images = NULL; images_len = 0;
     CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 0,
-                            &matched, &upserted, NULL, NULL));
+                            &matched, &upserted, NULL, NULL, NULL));
     CHECK(images == NULL);
 
     /* An upsert's post-image is the inserted document. */
@@ -2424,7 +2425,7 @@ TEST(update_many_hands_back_post_images_when_asked) {
     uint32_t q2len; const uint8_t *q2buf = doc_done(q2, &q2len);
     images = NULL; images_len = 0;
     CHECK_OK(dc_update_many(fx.coll, q2buf, q2len, ubuf, ulen, default_id, 1,
-                            &matched, &upserted, &images, &images_len));
+                            &matched, &upserted, NULL, &images, &images_len));
     CHECK_I64(upserted, 1);
     CHECK_I64(arr_count(images, images_len), 1);
     CHECK(find_bytes(images, images_len, "brand-new", 9) != NULL);
@@ -2647,6 +2648,110 @@ TEST(wal_plan_resolves_every_command_to_one_id_and_no_filter) {
     fx_close(&fx);
 }
 
+TEST(upsert_uses_the_id_the_filter_pinned) {
+    /*
+     * An upsert whose filter says {_id: X} must insert X. It used to
+     * insert a generated id instead -- splice_id overwrote whatever the
+     * seed carried -- so the document landed under a key the caller never
+     * named, and the reported upsertedId was that key rather than the one
+     * actually stored. Both halves are checked here.
+     */
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-people.bj") == 0);
+
+    uint8_t pinned[12]; mk_oid(pinned, 42);
+    uint8_t generated[12]; mk_oid(generated, 99);
+
+    doc *q = doc_new();
+    doc_oid(q, "_id", pinned);
+    doc_str(q, "team", "core");
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+    doc *u = set_seen();
+    uint32_t ulen; const uint8_t *ubuf = doc_done(u, &ulen);
+
+    int result = -1;
+    uint8_t reported[12];
+    memset(reported, 0, sizeof(reported));
+    CHECK_OK(dc_update_one(fx.coll, qbuf, qlen, ubuf, ulen, generated, 1, &result, reported));
+    CHECK_I64(result, 2);
+    CHECK(memcmp(reported, pinned, 12) == 0);
+
+    /* Findable by the id that was asked for, not by the generated one. */
+    doc *byPinned = doc_new(); doc_oid(byPinned, "_id", pinned);
+    uint32_t bplen; const uint8_t *bpbuf = doc_done(byPinned, &bplen);
+    int found = 0; uint8_t *out = NULL; size_t out_len = 0;
+    CHECK_OK(dc_find_one(fx.coll, bpbuf, bplen, NULL, 0, &found, &out, &out_len));
+    CHECK_I64(found, 1);
+    if (found) {
+        char team[32];
+        CHECK(doc_get_str(out, out_len, "team", team, sizeof(team)));
+        CHECK_STR(team, "core");            /* the filter's other conditions still seed */
+    }
+    free(out);
+
+    /* updateMany takes the same path. */
+    uint8_t pinned2[12]; mk_oid(pinned2, 43);
+    doc *q2 = doc_new(); doc_oid(q2, "_id", pinned2);
+    uint32_t q2len; const uint8_t *q2buf = doc_done(q2, &q2len);
+    int64_t matched = 0; int upserted = 0;
+    memset(reported, 0, sizeof(reported));
+    CHECK_OK(dc_update_many(fx.coll, q2buf, q2len, ubuf, ulen, generated, 1,
+                            &matched, &upserted, reported, NULL, NULL));
+    CHECK_I64(upserted, 1);
+    CHECK(memcmp(reported, pinned2, 12) == 0);
+
+    /* replaceOne, whose replacement names no _id, likewise takes the
+     * filter's -- the same bug wearing a different hat. */
+    uint8_t pinned3[12]; mk_oid(pinned3, 44);
+    doc *q3 = doc_new(); doc_oid(q3, "_id", pinned3);
+    uint32_t q3len; const uint8_t *q3buf = doc_done(q3, &q3len);
+    doc *repl = doc_new(); doc_str(repl, "name", "Replaced");
+    uint32_t rlen; const uint8_t *rbuf = doc_done(repl, &rlen);
+    result = -1;
+    memset(reported, 0, sizeof(reported));
+    CHECK_OK(dc_replace_one(fx.coll, q3buf, q3len, rbuf, rlen, generated, 1, &result, reported));
+    CHECK_I64(result, 2);
+    CHECK(memcmp(reported, pinned3, 12) == 0);
+
+    /* No pinned id: the generated one, as before. */
+    doc *q4 = doc_new(); doc_str(q4, "team", "ghosts");
+    uint32_t q4len; const uint8_t *q4buf = doc_done(q4, &q4len);
+    result = -1;
+    memset(reported, 0, sizeof(reported));
+    CHECK_OK(dc_update_one(fx.coll, q4buf, q4len, ubuf, ulen, generated, 1, &result, reported));
+    CHECK_I64(result, 2);
+    CHECK(memcmp(reported, generated, 12) == 0);
+
+    /* An _id inside an operator expression pins nothing -- the same rule
+     * build_upsert_seed applies to every other field. */
+    doc *q5 = doc_new();
+    doc_begin_obj(q5, "_id");
+    doc_key(q5, "$ne");
+    bj_put_oid(q5->b, pinned);
+    doc_end_obj(q5);
+    doc_str(q5, "team", "phantom");   /* so the filter matches nothing */
+    uint32_t q5len; const uint8_t *q5buf = doc_done(q5, &q5len);
+    uint8_t generated2[12]; mk_oid(generated2, 100);
+    result = -1;
+    memset(reported, 0, sizeof(reported));
+    CHECK_OK(dc_update_one(fx.coll, q5buf, q5len, ubuf, ulen, generated2, 1, &result, reported));
+    CHECK_I64(result, 2);
+    CHECK(memcmp(reported, generated2, 12) == 0);
+
+    /* A pinned _id this format cannot store is refused, not quietly
+     * swapped for a generated one. */
+    doc *q6 = doc_new(); doc_str(q6, "_id", "not-an-objectid");
+    uint32_t q6len; const uint8_t *q6buf = doc_done(q6, &q6len);
+    result = -1;
+    CHECK_RC(dc_update_one(fx.coll, q6buf, q6len, ubuf, ulen, generated, 1, &result, NULL),
+             DC_ERR_UNSUPPORTED_ID);
+    CHECK_I64(result, 0);
+
+    doc_free(q6); doc_free(q5); doc_free(q4); doc_free(repl); doc_free(q3);
+    doc_free(q2); doc_free(byPinned); doc_free(u); doc_free(q);
+    fx_close(&fx);
+}
+
 TEST(wal_plan_and_direct_upsert_insert_the_same_document) {
     /*
      * The whole point of routing the planner through dc_upsert_document:
@@ -2681,7 +2786,7 @@ TEST(wal_plan_and_direct_upsert_insert_the_same_document) {
     if (found) CHECK_OK(dc_insert_one(planned.coll, dp, (uint32_t)dlen));
 
     int result = -1;
-    CHECK_OK(dc_update_one(direct.coll, qbuf, qlen, ubuf, ulen, did, 1, &result));
+    CHECK_OK(dc_update_one(direct.coll, qbuf, qlen, ubuf, ulen, did, 1, &result, NULL));
     CHECK_I64(result, 2);
 
     doc *all = doc_new();
@@ -2819,6 +2924,7 @@ int main(void) {
     RUN(wal_grammar_round_trips_every_op_it_can_emit);
     RUN(wal_grammar_refuses_what_it_cannot_replay);
     RUN(wal_plan_resolves_every_command_to_one_id_and_no_filter);
+    RUN(upsert_uses_the_id_the_filter_pinned);
     RUN(wal_plan_and_direct_upsert_insert_the_same_document);
     RUN(wal_plan_returns_the_preimage_the_host_would_have_queried_for);
     RUN(wal_plan_rejects_before_it_logs_rather_than_after);

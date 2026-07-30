@@ -269,7 +269,7 @@ static int plan_update_like(dc_wal_plan *p, dc_collection *c,
     uint8_t *ins = NULL; size_t ins_len = 0;
     int e = is_update
         ? dc_upsert_document(filter, filter_len, arg, arg_len, default_id, &ins, &ins_len)
-        : dc_replace_document(arg, arg_len, default_id, &ins, &ins_len);
+        : dc_replace_document(arg, arg_len, filter, filter_len, default_id, &ins, &ins_len);
     if (e) return e;
     e = dc_document_id(ins, (uint32_t)ins_len, p->target);
     if (!e) {

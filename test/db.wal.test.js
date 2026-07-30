@@ -361,6 +361,33 @@ describe('WAL: crash recovery', () => {
     await db2.close();
   });
 
+  it('an upsert pinning its _id logs that _id, on the WAL path too', async () => {
+    // The planner builds the upserted document through the same
+    // dc_upsert_document the direct path uses, so a filter-pinned _id
+    // reaches the log rather than being replaced by a generated one --
+    // and a replica replaying the entry stores it under the id the
+    // caller named. Were the two to diverge, the WAL and non-WAL
+    // databases would disagree about where a document lives.
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider);
+    const users = await db.collection('users');
+    const pinned = oid(0xfeed);
+
+    const { upsertedId } = await users.updateOne(
+      { _id: pinned, team: 'core' }, { $set: { seen: true } }, { upsert: true }
+    );
+    expect(upsertedId.equals(pinned)).toBe(true);
+
+    const cmd = decode(db.log.getBatch(db.log.lastIndex)[0].payload);
+    expect(cmd.op).toBe('i');
+    expect(cmd.doc._id.equals(pinned)).toBe(true);
+    await db.close();
+
+    const db2 = await connectWal(provider);
+    expect((await (await db2.collection('users')).findOne({ _id: pinned })).seen).toBe(true);
+    await db2.close();
+  });
+
   it('an entry naming an op this build cannot execute is refused, not skipped', async () => {
     // A follower that silently ignores what it does not understand has
     // diverged from one that does. The grammar (db_wal.h) rejects it, and

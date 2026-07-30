@@ -123,6 +123,13 @@ extern "C" {
  * (keyenc.h: number/string/Date only; no NaN, no strings containing
  * U+0000). Same rationale as DC_ERR_MISSING_INDEXED_FIELD. */
 #define DC_ERR_UNINDEXABLE_VALUE (-14)
+/* An upsert's filter pins an `_id` that this format cannot store as one
+ * (only ObjectIds are storable keys -- see the InvalidIdError text in
+ * wasm/nisaba-wasm.js for the full rationale). Distinct from the generic
+ * BJ_ERR_STATE the other _id checks return, because this one is reached
+ * through a *filter* rather than a document, where JS's toObjectId gate
+ * never runs and the caller therefore gets no earlier warning. */
+#define DC_ERR_UNSUPPORTED_ID (-35)
 
 typedef struct dc_collection dc_collection;
 
@@ -291,8 +298,15 @@ int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12],
  * The document an upsert WOULD insert, without inserting it: for an
  * update, `filter`'s bare top-level equality conditions seeded through
  * `update`'s operators (see build_upsert_seed in db.c); for a replace,
- * `replacement` itself. Both then carry an `_id` -- `default_id` for the
- * update form, `replacement`'s own if it has one for the replace form.
+ * `replacement` itself (`filter` may be NULL there; it is consulted only
+ * for an `_id`).
+ *
+ * Both then carry an `_id`: the one the replacement pinned, else the one
+ * the filter pinned as a bare equality, else `default_id` -- matching
+ * real MongoDB, which seeds an upsert's id from the query. A pinned `_id`
+ * that is not an ObjectId is DC_ERR_UNSUPPORTED_ID: this format stores no
+ * other kind of key, and quietly substituting a generated id would store
+ * the document somewhere the caller never asked for.
  * Writes a freshly malloc'd OBJECT through *out / *out_len (caller frees).
  *
  * dc_update_one/dc_update_many/dc_replace_one build their upserted
@@ -307,6 +321,7 @@ int dc_upsert_document(const uint8_t *filter, uint32_t filter_len,
                        const uint8_t default_id[12],
                        uint8_t **out, size_t *out_len);
 int dc_replace_document(const uint8_t *replacement, uint32_t replacement_len,
+                        const uint8_t *filter, uint32_t filter_len,
                         const uint8_t default_id[12],
                         uint8_t **out, size_t *out_len);
 
@@ -455,10 +470,18 @@ int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t fil
  *
  * *result is written to 0 (no match, no upsert), 1 (matched and replaced),
  * or 2 (upserted).
+ *
+ * `upserted_id` (may be NULL) receives the 12 id bytes of the document an
+ * upsert actually inserted -- which is NOT always `default_id`: a filter
+ * or a replacement that pins an `_id` gets that one (dc_upsert_document /
+ * dc_replace_document). The host reports it as `upsertedId`, and has to
+ * be told rather than deduce it, or the rule ends up written twice.
+ * Untouched unless *result is 2.
  */
 int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *replacement, uint32_t replacement_len,
-                   const uint8_t default_id[12], int upsert, int *result);
+                   const uint8_t default_id[12], int upsert, int *result,
+                   uint8_t upserted_id[12]);
 
 /*
  * Atomically find the first document matching `filter` and replace it with
@@ -488,7 +511,8 @@ int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t fi
  */
 int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                   const uint8_t *update, uint32_t update_len,
-                  const uint8_t default_id[12], int upsert, int *result);
+                  const uint8_t default_id[12], int upsert, int *result,
+                  uint8_t upserted_id[12]);
 
 /*
  * Atomically find the first document matching `filter` and apply `update`
@@ -525,6 +549,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *update, uint32_t update_len,
                    const uint8_t default_id[12], int upsert,
                    int64_t *matched_count, int *upserted,
+                   uint8_t upserted_id[12],
                    uint8_t **images, size_t *images_len);
 
 /* Count of documents matching `filter` ({} is bpt_size of the primary tree,

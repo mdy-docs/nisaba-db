@@ -175,6 +175,20 @@ a plain field is rejected — use `replaceOne` for a full replacement.
 `updateMany` does not detect no-op updates: `modifiedCount` always mirrors
 `matchedCount`.
 
+An upsert takes its `_id` from the write itself where the write says one:
+a `replaceOne` replacement's own `_id` first, then an `_id` the filter
+pins as a bare equality (`{ _id: x }` — not `{ _id: { $ne: y } }`, which
+pins nothing, the same rule that governs which filter conditions seed the
+new document). Only when neither says anything is an id generated. So
+
+```js
+await users.updateOne({ _id: x, team: 'core' }, { $set: { seen: true } }, { upsert: true });
+```
+
+creates `x`, and running it again matches rather than creating a second
+document. A pinned `_id` that is not an ObjectId is rejected — the
+on-disk format has no other kind of key.
+
 ### Find-and-modify
 
 ```js

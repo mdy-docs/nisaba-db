@@ -158,7 +158,11 @@ const ERR_CLASS = {
   [-16]: InvalidNameError,
   [-17]: InvalidNameError,
   [-18]: InvalidIndexSpecError,
-  [-19]: InvalidIndexSpecError
+  [-19]: InvalidIndexSpecError,
+  // db.h's DC_ERR_UNSUPPORTED_ID: an upsert filter pinning a non-ObjectId
+  // _id is the same complaint toObjectId makes about a document's, so it
+  // arrives as the same error class.
+  [-35]: InvalidIdError
 };
 
 function codeError(code, context) {
@@ -2329,12 +2333,20 @@ class Collection {
   }
 
   /**
-   * Malloc `a`/`b` (encoded) plus a fresh ObjectId's 12 bytes, call
-   * fn(M, aPtr, aLen, bPtr, bLen, idPtr), free everything, and return
-   * { rc, defaultId }. Shared by replaceOne/updateOne/updateMany, which all
-   * pass a filter + a second document and may need a fresh id for an
-   * upsert (see the Db/Collection section's top comment for why JS always
-   * generates one rather than C inventing it).
+   * Malloc `a`/`b` (encoded) plus 24 bytes of id space, call
+   * fn(M, aPtr, aLen, bPtr, bLen, idPtr, outIdPtr), free everything, and
+   * return { rc, upsertedId }. Shared by replaceOne/updateOne/updateMany,
+   * which all pass a filter + a second document and may need a fresh id
+   * for an upsert (see the Db/Collection section's top comment for why JS
+   * always generates one rather than C inventing it).
+   *
+   * `upsertedId` is what C says it used, NOT the id passed in. Those
+   * differ whenever the filter or the replacement pinned an `_id`: the
+   * upserted document takes that one. This side used to work the answer
+   * out for itself (`replacement._id !== undefined ? ... : defaultId`),
+   * which is the rule written twice -- and the update form's copy was
+   * simply wrong, reporting a generated id for a document stored under
+   * the filter's.
    *
    * The id used to be overridable, so the WAL layer could pin the one a
    * logged upsert command had resolved at proposal time. It no longer
@@ -2342,21 +2354,23 @@ class Collection {
    * logging (db_wal.h), so no logged command reaches these methods with
    * an upsert to perform.
    */
-  _marshalTriple(a, b, fn, defaultId = new ObjectId()) {
+  _marshalTriple(a, b, fn) {
     const M = requireModule();
     const aBytes = encode(a);
     const bBytes = encode(b);
-    const idBytes = defaultId.toBytes();
 
     const ap = aBytes.length ? M._malloc(aBytes.length) : 0;
     const bp = bBytes.length ? M._malloc(bBytes.length) : 0;
-    const dp = M._malloc(12);
+    const dp = M._malloc(24);          // [0,12) the default id, [12,24) C's answer
     if (aBytes.length) M.HEAPU8.set(aBytes, ap);
     if (bBytes.length) M.HEAPU8.set(bBytes, bp);
-    M.HEAPU8.set(idBytes, dp);
+    M.HEAPU8.set(new ObjectId().toBytes(), dp);
 
     try {
-      return { rc: fn(M, ap, aBytes.length, bp, bBytes.length, dp), defaultId };
+      const rc = fn(M, ap, aBytes.length, bp, bBytes.length, dp, dp + 12);
+      // Only meaningful when C reports an upsert (rc === 2); read
+      // unconditionally so the caller has one thing to look at.
+      return { rc, upsertedId: new ObjectId(M.HEAPU8.slice(dp + 12, dp + 24)) };
     } finally {
       if (ap) M._free(ap);
       if (bp) M._free(bp);
@@ -2370,13 +2384,12 @@ class Collection {
     }
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
-    const { rc, defaultId } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp) =>
-      M._dcw_replace_one(this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0));
+    const { rc, upsertedId } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp, op) =>
+      M._dcw_replace_one(this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0, op));
     if (rc < 0) throw codeError(rc, 'replaceOne');
 
     if (rc === 0) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
     if (rc === 2) {
-      const upsertedId = replacement._id !== undefined ? toObjectId(replacement._id) : defaultId;
       if (watching) {
         this._emitChange({ operationType: 'insert', documentKey: { _id: upsertedId }, fullDocument: { ...replacement, _id: upsertedId } });
       }
@@ -2402,6 +2415,8 @@ class Collection {
     const returnNew = returnDocument === 'after';
     const { rc } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp) =>
       M._dcw_find_one_and_replace(this._outCtx, this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0, returnNew ? 1 : 0));
+    // No upserted-id out-param: these return the document itself, which
+    // carries the id whatever it turned out to be.
     if (rc < 0) throw codeError(rc, 'findOneAndReplace');
     if (!rc) return null;
     const doc = this._readOut(requireModule());
@@ -2429,16 +2444,16 @@ class Collection {
     update = resolveCurrentDate(update);
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
-    const { rc, defaultId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_update_one(this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0));
+    const { rc, upsertedId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp, op) =>
+      M._dcw_update_one(this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0, op));
     if (rc < 0) throw codeError(rc, 'updateOne');
 
     if (rc === 0) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
     if (rc === 2) {
       if (watching) {
-        this._emitChange({ operationType: 'insert', documentKey: { _id: defaultId }, fullDocument: await this.findOne({ _id: defaultId }) });
+        this._emitChange({ operationType: 'insert', documentKey: { _id: upsertedId }, fullDocument: await this.findOne({ _id: upsertedId }) });
       }
-      return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: defaultId };
+      return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId };
     }
     if (watching && preId) {
       this._emitChange({ operationType: 'update', documentKey: { _id: preId }, fullDocument: await this.findOne({ _id: preId }) });
@@ -2488,7 +2503,7 @@ class Collection {
     // so collecting them costs nothing -- where this side previously ran
     // one find() for the ids and then one findOne() per matched document,
     // which its own comment called "O(matched) extra round trips".
-    const { rc, defaultId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
+    const { rc } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
       M._dcw_update_many(this._outCtx, this._collCtx, fp, fn, up, un, dp,
                          upsert ? 1 : 0, watching ? 1 : 0));
     if (rc !== 0) throw codeError(rc, 'updateMany');
@@ -2499,7 +2514,7 @@ class Collection {
       if (result.upserted) {
         this._emitChange({
           operationType: 'insert',
-          documentKey: { _id: defaultId },
+          documentKey: { _id: result.upsertedId },
           fullDocument: images[0] ?? null
         });
       } else {
@@ -2516,7 +2531,9 @@ class Collection {
       acknowledged: true,
       matchedCount: result.matchedCount,
       modifiedCount: result.matchedCount,
-      upsertedId: result.upserted ? defaultId : null
+      // C's own answer (dcw_update_many's `upsertedId`), not the id this
+      // side generated: a filter that pinned an _id gets that one.
+      upsertedId: result.upserted ? result.upsertedId : null
     };
   }
 

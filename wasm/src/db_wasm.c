@@ -246,14 +246,17 @@ EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_delete(dcw_out *o, dc_collection *c,
 
 /* Returns 0 (no match, no upsert), 1 (matched and replaced), 2 (upserted),
  * or a negative error. */
+/* `upserted_id_out` (12 writable bytes) receives the id an upsert
+ * actually used, which is not always `default_id` -- see dc_replace_one.
+ * The host reads it only when the return value is 2. */
 EMSCRIPTEN_KEEPALIVE int dcw_replace_one(dc_collection *c,
         const uint8_t *filter, int filter_len,
         const uint8_t *replacement, int replacement_len,
-        const uint8_t *default_id, int upsert) {
+        const uint8_t *default_id, int upsert, uint8_t *upserted_id_out) {
     int result = 0;
     int e = dc_replace_one(c, filter, (uint32_t)filter_len,
                            replacement, (uint32_t)replacement_len,
-                           default_id, upsert, &result);
+                           default_id, upsert, &result, upserted_id_out);
     if (e) return e;
     return result;
 }
@@ -276,14 +279,15 @@ EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_replace(dcw_out *o, dc_collection *c,
 
 /* Returns 0 (no match, no upsert), 1 (matched and updated), 2 (upserted),
  * or a negative error. */
+/* `upserted_id_out`: see dcw_replace_one. */
 EMSCRIPTEN_KEEPALIVE int dcw_update_one(dc_collection *c,
         const uint8_t *filter, int filter_len,
         const uint8_t *update, int update_len,
-        const uint8_t *default_id, int upsert) {
+        const uint8_t *default_id, int upsert, uint8_t *upserted_id_out) {
     int result = 0;
     int e = dc_update_one(c, filter, (uint32_t)filter_len,
                           update, (uint32_t)update_len,
-                          default_id, upsert, &result);
+                          default_id, upsert, &result, upserted_id_out);
     if (e) return e;
     return result;
 }
@@ -316,10 +320,11 @@ EMSCRIPTEN_KEEPALIVE int dcw_update_many(dcw_out *o, dc_collection *c,
         const uint8_t *default_id, int upsert, int want_images) {
     reset_out(o);
     int64_t matched = 0; int upserted = 0;
+    uint8_t upserted_id[12];
     uint8_t *images = NULL; size_t images_len = 0;
     int e = dc_update_many(c, filter, (uint32_t)filter_len,
                            update, (uint32_t)update_len,
-                           default_id, upsert, &matched, &upserted,
+                           default_id, upsert, &matched, &upserted, upserted_id,
                            want_images ? &images : NULL,
                            want_images ? &images_len : NULL);
     if (e) { free(images); return e; }
@@ -331,6 +336,13 @@ EMSCRIPTEN_KEEPALIVE int dcw_update_many(dcw_out *o, dc_collection *c,
     if (!e) e = bj_put_int(b, matched);
     if (!e) e = bj_put_key(b, (const uint8_t *)"upserted", 8);
     if (!e) e = bj_put_bool(b, upserted);
+    /* The id the upsert actually used -- rides in the result object this
+     * call already builds, rather than through an out-pointer the way the
+     * single-document forms need. */
+    if (!e && upserted) {
+        e = bj_put_key(b, (const uint8_t *)"upsertedId", 10);
+        if (!e) e = bj_put_oid(b, upserted_id);
+    }
     if (!e && images) {
         e = bj_put_key(b, (const uint8_t *)"documents", 9);
         if (!e) e = bj_put_raw(b, images, (uint32_t)images_len);

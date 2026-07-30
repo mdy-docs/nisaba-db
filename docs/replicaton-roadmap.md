@@ -121,7 +121,8 @@ Now the replication roadmap. Having read the new primitives' contracts, here's t
      and the quorum count are one copy with one owner rather than two
      that agree by convention. InstallSnapshot stays refused, and stays
      honestly so: it writes FILES, and this layer has no namespace to
-     write them through -- that is the file-seam piece, not this one.
+     write them through -- that is the file-seam piece, not this one, and
+     it is specified in docs/steps/install-snapshot-in-c.md.
 
 6. Read semantics and change streams. Decide follower read policy (stale-ok vs. leader leases vs. readIndex). And change streams get a structural upgrade: db-plan.md:781 notes MongoDB's change streams tail the oplog and nisaba had "no analog" — the entry log is the analog now, giving resumable, gap-free streams.
 

@@ -480,3 +480,38 @@ describe('raft: leadership transfer (TimeoutNow, §3.10)', () => {
     expect(w.error).toBeUndefined();      // ...and the fence is gone
   });
 });
+
+describe('raft: check-quorum (hasQuorumContact)', () => {
+  it('true for a reachable leader, false once it cannot reach a quorum, and always true where it is meaningless', async () => {
+    const { sim, net, cluster, leader } = await electedCluster(61);
+    const L = leader();
+    await settle(sim, cluster, L.node.propose(kvSet('a', 1)));
+    expect(L.node.hasQuorumContact(1_000)).toBe(true);
+
+    // A follower has nothing to vouch for: never gates its caller.
+    const F = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    expect(F.node.hasQuorumContact(1)).toBe(true);
+
+    // Isolate the leader. It never learns a higher term, so it keeps
+    // claiming leadership -- but it can no longer prove it.
+    const others = [...cluster.keys()].filter((id) => id !== L.node.id);
+    net.partition(others, [L.node.id]);
+    await sim.advance(2_000, [...cluster.values()].map((m) => m.node));
+    expect(L.node.role).toBe('leader');              // still believes it leads
+    expect(L.node.hasQuorumContact(500)).toBe(false); // but cannot show it
+
+    // Healing restores contact on the next heartbeat round.
+    net.heal();
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    const settledLeader = leaders(cluster)[0];
+    expect(settledLeader.node.hasQuorumContact(1_000)).toBe(true);
+  });
+
+  it('a single-voter group can always prove leadership (nobody to hear from)', async () => {
+    const { sim, cluster, leader } = await electedCluster(62, 1);
+    const solo = leader();
+    await sim.advance(5_000, [solo.node]);
+    expect(solo.node.role).toBe('leader');
+    expect(solo.node.hasQuorumContact(1)).toBe(true);
+  });
+});

@@ -232,6 +232,13 @@ export class RaftNode {
     this._quiesced = false;       // timers parked (see quiesce/wake)
     this._configInFlight = false; // one membership change at a time
     this._transfer = null;        // in-flight leadership transfer: {targetId, deadline, sent, resolve, reject}
+    /** Leader bookkeeping for check-quorum (see hasQuorumContact): when
+     * each peer last answered us without deposing us, and when we became
+     * leader. `_reachable` cannot serve this purpose — it is edge-
+     * triggered on a FAILED call, so a leader that simply hasn't tried
+     * recently still reads reachable. */
+    this._ackAt = new Map();      // peer -> this._now of its last non-deposing reply
+    this._leaderAt = 0;           // this._now when we became leader
   }
 
   /**
@@ -930,6 +937,8 @@ export class RaftNode {
   _becomeLeader() {
     this.role = ROLE.LEADER;
     this.leaderId = this.id;
+    this._ackAt.clear();       // acks from a previous term say nothing about this one
+    this._leaderAt = this._now;
     this._emit('role', { role: this.role });
     this._heartbeatDue = this._now; // heartbeat on the next tick
     for (const p of this.peers) {
@@ -980,6 +989,10 @@ export class RaftNode {
         this._emit('peer', { id: peer, reachable: true });
       }
       if (reply.term > term) return this._becomeFollower(reply.term, 0);
+      // Any reply that did not depose us proves this peer is alive and
+      // still accepts our leadership — a rejected-for-log-conflict reply
+      // counts exactly as much as a successful one for check-quorum.
+      this._ackAt.set(peer, this._now);
       if (reply.success) {
         if (reply.matchIndex > this._match.get(peer)) {
           this._match.set(peer, reply.matchIndex);
@@ -1119,6 +1132,36 @@ export class RaftNode {
 
   /** Majority of VOTERS — learners add capacity, not quorum weight. */
   _quorum() { return Math.floor(this.voters.length / 2) + 1; }
+
+  /**
+   * Check-quorum: has a quorum of voters (this node included) answered
+   * this leader within `withinMs`? Raft's safety argument never required
+   * this — a partitioned leader cannot COMMIT anything — but a caller
+   * that reads the leader's local state without committing gets a stale
+   * answer presented as authoritative, so anything serving reads off
+   * `role === 'leader'` needs to ask this too. Writes benefit as well:
+   * refusing early beats a propose() that can never resolve.
+   *
+   * Always true for a non-leader (nothing to vouch for) and for a
+   * single-voter group (there is nobody to hear from). `false` does NOT
+   * mean deposed — it means "cannot currently prove leadership", which
+   * for a freshly woken quiesced group is a transient state the caller
+   * should give heartbeats a moment to clear.
+   */
+  hasQuorumContact(withinMs) {
+    if (this.role !== ROLE.LEADER) return true;
+    let live = this.voters.includes(this.id) ? 1 : 0;
+    for (const p of this.peers) {
+      if (!this.voters.includes(p)) continue;
+      if (this._now - (this._ackAt.get(p) ?? -Infinity) <= withinMs) live++;
+    }
+    return live >= this._quorum();
+  }
+
+  /** How long this node has been leader, in its own clock (0 if not leader). */
+  get leaderForMs() {
+    return this.role === ROLE.LEADER ? this._now - this._leaderAt : 0;
+  }
 
   _advanceCommit() {
     if (this.role !== ROLE.LEADER) return;

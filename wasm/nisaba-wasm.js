@@ -968,6 +968,110 @@ async function runBulkWrite(target, operations, ordered) {
   return result;
 }
 
+/**
+ * WAL command opcodes, as db_wal.h numbers them. The wire spellings ("i",
+ * "u", "createIndex", ...) exist only in wasm/src/db_wal.c -- this side
+ * dispatches on numbers it cannot mistype.
+ */
+const WAL_OP = Object.freeze({
+  INSERT: 0, UPDATE: 1, REPLACE: 2, DELETE: 3,
+  CREATE_INDEX: 4, DROP_INDEX: 5, DROP_COLLECTION: 6
+});
+
+/** What the host asks for, before the planner resolves it (dc_wal_req). */
+const WAL_REQ = Object.freeze({
+  INSERT_ONE: 0, INSERT_MANY: 1, UPDATE_ONE: 2, UPDATE_MANY: 3,
+  REPLACE_ONE: 4, DELETE_ONE: 5, DELETE_MANY: 6,
+  CREATE_INDEX: 7, DROP_INDEX: 8, DROP_COLLECTION: 9
+});
+
+/** dc_wal_plan_outcome. NOTHING = the request logs nothing at all. */
+const WAL_PLAN = Object.freeze({ NOTHING: 0, MATCHED: 1, UPSERT: 2 });
+
+/**
+ * Resolve a write request into the exact commands to append to the log.
+ *
+ * This is the whole of Phase 6's marshalling: one call replaces the
+ * findOne (or projected find) the WAL layer used to run to pin its target
+ * before logging, AND the filter that used to travel into the log for an
+ * upsert to re-evaluate at apply time. See db_wal.h for both.
+ *
+ * `collection` is the inner Collection whose documents are being planned
+ * against, or null for a request that touches none (the DDL three, and
+ * the insert forms, whose ids this side already assigned).
+ *
+ * Returns { outcome, commands, targetId, preimage }:
+ *   commands  one Uint8Array per log entry, in append order
+ *   targetId  the matched or upserted _id, or null
+ *   preimage  the matched document as it was before, or null -- what
+ *             findOneAnd*'s `returnDocument: 'before'` returns, free,
+ *             because resolving the target already read it
+ */
+function walPlan(collection, collName, req, a, b, { upsert = false, defaultId } = {}) {
+  const M = requireModule();
+  const oid = defaultId ?? new ObjectId();
+  // DROP_INDEX's `a` is an index name, not a document; everything else
+  // crosses as binjson (db_wal.h's request table).
+  const enc = (v, raw) => v === undefined || v === null
+    ? new Uint8Array(0)
+    : (raw ? textEncoder.encode(v) : encode(v));
+  const aBytes = enc(a, req === WAL_REQ.DROP_INDEX);
+  const bBytes = enc(b, false);
+
+  const n = allocStr(M, collName);
+  const ap = M._malloc(aBytes.length || 1);
+  const bp = M._malloc(bBytes.length || 1);
+  const dp = M._malloc(12);
+  const rp = M._malloc(4);
+  let plan = 0;
+  try {
+    if (aBytes.length) M.HEAPU8.set(aBytes, ap);
+    if (bBytes.length) M.HEAPU8.set(bBytes, bp);
+    M.HEAPU8.set(oid.toBytes(), dp);
+    plan = M._walw_plan(collection ? collection._collCtx : 0, n.ptr, n.len, req,
+                        ap, aBytes.length, bp, bBytes.length,
+                        upsert ? 1 : 0, dp, rp);
+    const rc = readI32(M, rp);
+    if (rc !== 0) throw codeError(rc, collName);
+
+    // Heap growth during the call may have swapped the ArrayBuffer, so
+    // every read below goes through a freshly-read M.HEAPU8.
+    const commands = [];
+    for (let i = 0, count = M._walw_count(plan); i < count; i++) {
+      const p = M._walw_cmd_ptr(plan, i);
+      const len = M._walw_cmd_len(plan, i);
+      commands.push(M.HEAPU8.slice(p, p + len));
+    }
+    const prePtr = M._walw_preimage_ptr(plan);
+    const preLen = M._walw_preimage_len(plan);
+    const tid = M._walw_target_id(plan);
+    return {
+      outcome: M._walw_outcome(plan),
+      commands,
+      preimage: prePtr ? decode(M.HEAPU8.slice(prePtr, prePtr + preLen)) : null,
+      targetId: tid ? new ObjectId(M.HEAPU8.slice(tid, tid + 12)) : null
+    };
+  } finally {
+    if (plan) M._walw_plan_free(plan);
+    M._free(rp); M._free(dp); M._free(bp); M._free(ap); n.free();
+  }
+}
+
+/**
+ * The opcode of a logged command, having validated that every field that
+ * opcode requires is present and correctly typed.
+ *
+ * Applied to every entry before it is replayed, so an entry this version
+ * cannot execute is refused rather than skipped: a follower that ignores
+ * what it does not understand has silently diverged from one that does.
+ */
+function walParse(payload) {
+  const M = requireModule();
+  const op = withBytes(M, payload, (p, n) => M._walw_parse(p, n));
+  if (op < 0) throw codeError(op, 'WAL command');
+  return op;
+}
+
 let ttlCtx = 0;
 
 /**
@@ -2230,10 +2334,13 @@ class Collection {
    * { rc, defaultId }. Shared by replaceOne/updateOne/updateMany, which all
    * pass a filter + a second document and may need a fresh id for an
    * upsert (see the Db/Collection section's top comment for why JS always
-   * generates one rather than C inventing it). `defaultId` may be supplied
-   * by the caller -- the WAL layer (src/db-wal.js) pins the id a logged
-   * upsert command resolved at proposal time, so replaying the command
-   * upserts the identical document.
+   * generates one rather than C inventing it).
+   *
+   * The id used to be overridable, so the WAL layer could pin the one a
+   * logged upsert command had resolved at proposal time. It no longer
+   * needs to: the WAL resolves an upsert into a plain insert before
+   * logging (db_wal.h), so no logged command reaches these methods with
+   * an upsert to perform.
    */
   _marshalTriple(a, b, fn, defaultId = new ObjectId()) {
     const M = requireModule();
@@ -2257,14 +2364,14 @@ class Collection {
     }
   }
 
-  async replaceOne(filter, replacement, { upsert = false, _defaultId } = {}) {
+  async replaceOne(filter, replacement, { upsert = false } = {}) {
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('replaceOne requires a replacement document object');
     }
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
     const { rc, defaultId } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp) =>
-      M._dcw_replace_one(this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0), _defaultId);
+      M._dcw_replace_one(this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0));
     if (rc < 0) throw codeError(rc, 'replaceOne');
 
     if (rc === 0) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
@@ -2288,13 +2395,13 @@ class Collection {
    * happened (or `returnDocument: 'before'` with an upsert: no prior state
    * to return, matching real MongoDB).
    */
-  async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before', _defaultId } = {}) {
+  async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before' } = {}) {
     if (replacement === null || typeof replacement !== 'object' || Array.isArray(replacement)) {
       throw new Error('findOneAndReplace requires a replacement document object');
     }
     const returnNew = returnDocument === 'after';
     const { rc } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp) =>
-      M._dcw_find_one_and_replace(this._outCtx, this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0, returnNew ? 1 : 0), _defaultId);
+      M._dcw_find_one_and_replace(this._outCtx, this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0, returnNew ? 1 : 0));
     if (rc < 0) throw codeError(rc, 'findOneAndReplace');
     if (!rc) return null;
     const doc = this._readOut(requireModule());
@@ -2315,7 +2422,7 @@ class Collection {
    * must be entirely $-prefixed operators; for a full replacement document
    * use replaceOne instead.
    */
-  async updateOne(filter, update, { upsert = false, _defaultId } = {}) {
+  async updateOne(filter, update, { upsert = false } = {}) {
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateOne requires an update document object');
     }
@@ -2323,7 +2430,7 @@ class Collection {
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
     const { rc, defaultId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_update_one(this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0), _defaultId);
+      M._dcw_update_one(this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0));
     if (rc < 0) throw codeError(rc, 'updateOne');
 
     if (rc === 0) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
@@ -2345,14 +2452,14 @@ class Collection {
    * the default) or the post-image (`'after'`) — or null, following
    * findOneAndReplace's exact convention for "nothing to return".
    */
-  async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before', _defaultId } = {}) {
+  async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before' } = {}) {
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('findOneAndUpdate requires an update document object');
     }
     update = resolveCurrentDate(update);
     const returnNew = returnDocument === 'after';
     const { rc } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_find_one_and_update(this._outCtx, this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0, returnNew ? 1 : 0), _defaultId);
+      M._dcw_find_one_and_update(this._outCtx, this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0, returnNew ? 1 : 0));
     if (rc < 0) throw codeError(rc, 'findOneAndUpdate');
     if (!rc) return null;
     const doc = this._readOut(requireModule());
@@ -2370,7 +2477,7 @@ class Collection {
    * detect no-op updates (e.g. $set to a field's current value already
    * matching) — modifiedCount always mirrors matchedCount.
    */
-  async updateMany(filter, update, { upsert = false, _defaultId } = {}) {
+  async updateMany(filter, update, { upsert = false } = {}) {
     if (update === null || typeof update !== 'object' || Array.isArray(update)) {
       throw new Error('updateMany requires an update document object');
     }
@@ -2383,7 +2490,7 @@ class Collection {
     // which its own comment called "O(matched) extra round trips".
     const { rc, defaultId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
       M._dcw_update_many(this._outCtx, this._collCtx, fp, fn, up, un, dp,
-                         upsert ? 1 : 0, watching ? 1 : 0), _defaultId);
+                         upsert ? 1 : 0, watching ? 1 : 0));
     if (rc !== 0) throw codeError(rc, 'updateMany');
 
     const result = this._readOut(requireModule());
@@ -3076,6 +3183,14 @@ export {
   resolveCurrentDate,
   runBulkWrite,
   ttlFilters,
+  // The WAL command grammar (db_wal.h). src/db-wal.js plans through
+  // walPlan and dispatches on WAL_OP, so the opcode spellings live in C
+  // and nowhere else.
+  walPlan,
+  walParse,
+  WAL_OP,
+  WAL_REQ,
+  WAL_PLAN,
   // File naming and the format stamp (db_names.h). Exported so no other
   // layer has to restate the convention -- src/db-wal.js carried its own
   // copy of the catalog name and the orphan-sweep pattern, with a comment

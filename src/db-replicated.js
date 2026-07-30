@@ -47,7 +47,7 @@
  * the RaftNode owns replay, applying exactly the committed prefix — an
  * uncommitted local suffix stays unapplied until a leader settles it.
  */
-import { connect, EntryLog, encode, decode, crc32 } from '../wasm/nisaba-wasm.js';
+import { connect, EntryLog, crc32 } from '../wasm/nisaba-wasm.js';
 import { RaftNode, NotLeaderError } from './raft.js';
 import {
   WalDb, WAL_FILE, SNAP_PREFIX,
@@ -75,10 +75,9 @@ export class DbStateMachine {
   }
 
   async apply(entry) {
-    const cmd = this._rdb._decodeCommand(entry.payload);
     let outcome;
     try {
-      outcome = { value: await this._rdb._applyCommand(entry.index, cmd) };
+      outcome = { value: await this._rdb._applyCommand(entry.index, entry.payload) };
     } catch (err) {
       // A deterministic command failure (duplicate key, missing indexed
       // field, ...) is a normal result — every replica computes the same
@@ -149,7 +148,7 @@ export class ReplicatedDb extends WalDb {
     for (let i = 0; i < cmds.length; i++) {
       let outcome;
       try {
-        const { index } = await this._raft.propose(encode(cmds[i]));
+        const { index } = await this._raft.propose(cmds[i]);
         outcome = this._machine.takeResult(index);
       } catch (err) {
         if (err instanceof NotLeaderError) throw err;
@@ -279,11 +278,6 @@ export class ReplicatedDb extends WalDb {
       try { await this._provider.deleteFile(WAL_FILE); } catch { /* best-effort */ }
       return log;
     };
-  }
-
-  _decodeCommand(payload) {
-    // A method so the service layer can interpose (e.g. metrics).
-    return decode(payload);
   }
 }
 

@@ -12,15 +12,24 @@
  *
  * Determinism: a command must replay to the identical state on any
  * replica, so ALL nondeterminism resolves at proposal time, before the
- * command is logged:
+ * command is logged. The resolving itself is C's — wasm/include/db_wal.h
+ * owns the command grammar and the planner that produces it — and what
+ * it guarantees is stronger than a list of rules:
+ *
+ *   EVERY LOGGED DOCUMENT COMMAND NAMES EXACTLY ONE _id.
+ *
+ * So apply never runs a query, and never depends on the state replay
+ * happens to be partway through reproducing. Concretely:
  *   - documents are logged with their _id already assigned;
  *   - $currentDate resolves to concrete Dates (resolveCurrentDate — the
  *     same helper the inner collection uses at apply time, which is a
  *     no-op on an already-resolved update);
  *   - matched updates/replaces/deletes are resolved to their target _id
  *     (a no-match non-upsert write is not logged at all);
- *   - an upsert that found no match pins the id the inserted document
- *     will get (`did`), threaded to the engine as _defaultId;
+ *   - an upsert that found no match is resolved the whole way: the
+ *     planner builds the document the upsert would have inserted, and
+ *     logs a plain insert. The `uu`/`ru` commands that used to carry a
+ *     filter into the log, for apply to re-evaluate, are gone;
  *   - pruneExpired's TTL cutoffs become concrete Dates inside ordinary
  *     logged deletes.
  *
@@ -71,11 +80,15 @@ import {
   EntryLog,
   SnapshotStore,
   ObjectId,
-  encode,
   decode,
   resolveCurrentDate,
   runBulkWrite,
   ttlFilters,
+  walPlan,
+  walParse,
+  WAL_OP,
+  WAL_REQ,
+  WAL_PLAN,
   dbCatalogFile,
   isDbFile
 } from '../wasm/nisaba-wasm.js';
@@ -98,19 +111,27 @@ function providerDirectory(provider) {
   };
 }
 
-/** One entry ~= one collection commit. Command shapes ('c' = collection):
- *   { c, op: 'i',  doc }                  insert (doc._id resolved)
- *   { c, op: 'u',  id, update }           update the document `id`
- *   { c, op: 'uu', filter, update, did }  upsert-update (no match at
- *                                         proposal; did = pinned _id)
- *   { c, op: 'r',  id, doc }              replace the document `id`
- *   { c, op: 'ru', filter, doc, did }     upsert-replace
- *   { c, op: 'd',  id }                   delete the document `id`
- *   { c, op: 'createIndex', keys, options }   DDL — logged so replicas
- *   { c, op: 'dropIndex', name }              and crash replay perform
- *   { c, op: 'dropCollection' }               it too (step-4 decision);
- *                                             apply is idempotent, not
- *                                             appliedIndex-guarded
+/**
+ * One entry ~= one collection commit. The command grammar itself lives in
+ * wasm/include/db_wal.h — which opcodes exist, what each requires, and
+ * what a request resolves to. This file plans through walPlan and
+ * dispatches on WAL_OP, so no opcode spelling appears in JavaScript.
+ *
+ * Two things about that grammar are worth restating here, because they
+ * changed what this file does:
+ *
+ * Every logged document command names exactly one _id. The old grammar
+ * had `uu`/`ru` commands that carried a FILTER, which apply re-evaluated
+ * against the state replay was in the middle of reproducing. The planner
+ * now resolves an upsert the whole way — no match means it builds the
+ * document the upsert would have inserted and logs a plain insert — so
+ * apply never runs a query.
+ *
+ * The planner returns what the proposer used to query for. Resolving the
+ * target already read the matched document, so its _id, and the
+ * pre-image findOneAndUpdate/Replace/Delete return, come back for free.
+ * Every findOne and projected find that used to precede a logged write is
+ * gone.
  */
 class WalDb {
   constructor(db, log, { provider, store }) {
@@ -156,7 +177,8 @@ class WalDb {
    * log compaction removes the churn entirely. */
   async dropCollection(name) {
     return this._serialize(async () => {
-      const { results, firstError } = await this._commit([{ c: name, op: 'dropCollection' }]);
+      const { commands } = walPlan(null, name, WAL_REQ.DROP_COLLECTION);
+      const { results, firstError } = await this._commit(commands);
       if (firstError) throw firstError.error;
       return results[0];
     });
@@ -260,15 +282,21 @@ class WalDb {
   }
 
   /** Append every command (one entry each), then one durable sync().
-   * Returns the first entry's index; the rest are contiguous. */
+   * Returns the first entry's index; the rest are contiguous.
+   *
+   * `cmds` are already-encoded payloads straight from the planner, not
+   * objects: the live path and the replay path now take the identical
+   * input, which is the point — a command this side could build but not
+   * parse, or parse but not build, would be a divergence with nothing to
+   * catch it. */
   _propose(cmds) {
     if (this._broken) {
       throw new Error(`WAL is poisoned by an earlier sync failure: ${this._broken.message}`, { cause: this._broken });
     }
     const term = this._log.currentTerm;
     let first = 0;
-    for (const cmd of cmds) {
-      const index = this._log.append(term, encode(cmd));
+    for (const payload of cmds) {
+      const index = this._log.append(term, payload);
       if (!first) first = index;
     }
     try {
@@ -329,27 +357,36 @@ class WalDb {
    * primary tree, so a staged value wouldn't persist anyway); their
    * replay is idempotent instead — a re-run createIndex resolves to the
    * existing index, a re-run drop of a missing target reports "nothing
-   * to do" — bounded by the next snapshot's log compaction. */
-  async _applyCommand(index, cmd) {
-    if (cmd.op === 'dropCollection') {
+   * to do" — bounded by the next snapshot's log compaction.
+   *
+   * Takes the raw payload, not a decoded command: walParse validates it
+   * against the grammar first, so an entry naming an op this build cannot
+   * execute is REFUSED rather than skipped. That distinction is the
+   * difference between a node that stops and a node that has quietly
+   * diverged from its peers.
+   *
+   * Every document command names one _id, so nothing here runs a query
+   * (db_wal.h) — {_id: ...} is a point lookup on the primary tree. */
+  async _applyCommand(index, payload) {
+    const op = walParse(payload);
+    const cmd = decode(payload);
+    if (op === WAL_OP.DROP_COLLECTION) {
       const dropped = await this._db.dropCollection(cmd.c);
       this._collections.delete(cmd.c);
       return dropped;
     }
     const col = await this._db.collection(cmd.c);
-    switch (cmd.op) {
-      case 'createIndex': return col.createIndex(cmd.keys, cmd.options);
-      case 'dropIndex': return col.dropIndex(cmd.name);
-    }
+    if (op === WAL_OP.CREATE_INDEX) return col.createIndex(cmd.keys, cmd.options);
+    if (op === WAL_OP.DROP_INDEX) return col.dropIndex(cmd.name);
+
     await col.setAppliedIndex(index);
-    switch (cmd.op) {
-      case 'i': return col.insertOne(cmd.doc);
-      case 'u': return col.updateOne({ _id: cmd.id }, cmd.update);
-      case 'uu': return col.updateOne(cmd.filter, cmd.update, { upsert: true, _defaultId: cmd.did });
-      case 'r': return col.replaceOne({ _id: cmd.id }, cmd.doc);
-      case 'ru': return col.replaceOne(cmd.filter, cmd.doc, { upsert: true, _defaultId: cmd.did });
-      case 'd': return col.deleteOne({ _id: cmd.id });
-      default: throw new Error(`WAL: unknown command op "${cmd.op}"`);
+    switch (op) {
+      case WAL_OP.INSERT: return col.insertOne(cmd.doc);
+      case WAL_OP.UPDATE: return col.updateOne({ _id: cmd.id }, cmd.update);
+      case WAL_OP.REPLACE: return col.replaceOne({ _id: cmd.id }, cmd.doc);
+      // No default: walParse already rejected anything else, which is
+      // why this switch has no "unknown op" arm to keep in step with C's.
+      default: return col.deleteOne({ _id: cmd.id });
     }
   }
 
@@ -369,7 +406,7 @@ class WalDb {
         const col = await this._db.collection(cmd.c);
         if (entry.index <= await col.appliedIndex()) continue;
         try {
-          await this._applyCommand(entry.index, cmd);
+          await this._applyCommand(entry.index, entry.payload);
         } catch { /* deterministic re-failure; see doc comment */ }
       }
       from = batch[batch.length - 1].index + 1;
@@ -412,22 +449,57 @@ class WalCollection {
 
   // ---- logged writes ------------------------------------------------------
 
-  /** One logged command through the commit engine; throws its error or
-   * returns its result. */
-  async _one(cmd) {
-    const { results, firstError } = await this._wal._commit([cmd]);
-    if (firstError) throw firstError.error;
-    return results[0];
+  /**
+   * Plan → log → apply: the one write path, and the whole of this class's
+   * logged half.
+   *
+   * The planner (db_wal.h) resolves the request into id-targeted commands
+   * — running at most one query to do it — and hands back the matched or
+   * upserted _id and the matched document's pre-image alongside them.
+   * Every findOne and projected find this class used to run before
+   * logging is inside that single call now.
+   *
+   * Returns the plan, so callers can shape their driver-facing result
+   * from what was PLANNED rather than from what apply happened to return:
+   * an upsert is logged as a plain insert, and only the plan still knows
+   * it was an upsert.
+   */
+  async _writeCollecting(req, a, b, { upsert = false, ordered = true } = {}) {
+    const plan = walPlan(this._inner, this.name, req, a, b, { upsert });
+    if (plan.commands.length === 0) return { plan, results: [], firstError: null };
+    const { results, firstError } = await this._wal._commit(plan.commands, { ordered });
+    return { plan, results, firstError };
+  }
+
+  /** _writeCollecting, throwing the first apply error — what every caller
+   * but insertMany wants, since a single-document write has exactly one
+   * error to report and no partial result to carry it. */
+  async _write(req, a, b, opts) {
+    const out = await this._writeCollecting(req, a, b, opts);
+    if (out.firstError) throw out.firstError.error;
+    return out;
+  }
+
+  /** The driver's result shape for the update/replace family, read off
+   * the plan: matched-and-written, upserted, or neither. */
+  static _writeResult(plan) {
+    if (plan.outcome === WAL_PLAN.UPSERT) {
+      return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: plan.targetId };
+    }
+    const n = plan.commands.length;
+    return { acknowledged: true, matchedCount: n, modifiedCount: n, upsertedId: null };
   }
 
   /** Index DDL is logged (step-4 decision: replicas and crash replay must
    * perform it too); see _applyCommand for the idempotent-replay story. */
   async createIndex(keys, options = {}) {
-    return this._wal._serialize(() => this._one({ c: this.name, op: 'createIndex', keys, options }));
+    return this._wal._serialize(async () =>
+      (await this._write(WAL_REQ.CREATE_INDEX, keys, options)).results[0]);
   }
 
   async dropIndex(name) {
-    return this._wal._serialize(() => this._one({ c: this.name, op: 'dropIndex', name }));
+    return this._wal._serialize(async () =>
+      (await this._write(WAL_REQ.DROP_INDEX, name)).results[0]);
   }
 
   async insertOne(doc) {
@@ -435,7 +507,8 @@ class WalCollection {
       throw new Error('insertOne requires a document object');
     }
     const _id = doc._id !== undefined ? doc._id : new ObjectId();
-    return this._wal._serialize(() => this._one({ c: this.name, op: 'i', doc: { ...doc, _id } }));
+    return this._wal._serialize(async () =>
+      (await this._write(WAL_REQ.INSERT_ONE, { ...doc, _id })).results[0]);
   }
 
   async insertMany(docs, { ordered = true } = {}) {
@@ -444,8 +517,10 @@ class WalCollection {
     }
     const withIds = docs.map((doc) => ({ ...doc, _id: doc._id !== undefined ? doc._id : new ObjectId() }));
     return this._wal._serialize(async () => {
-      const cmds = withIds.map((doc) => ({ c: this.name, op: 'i', doc }));
-      const { results } = await this._wal._commit(cmds, { ordered });
+      // The one caller that collects rather than throws: insertMany's
+      // contract is to report a partial result on the failing document,
+      // which the scan below builds.
+      const { results } = await this._writeCollecting(WAL_REQ.INSERT_MANY, withIds, null, { ordered });
       // Mirror the inner insertMany's result/throw contract: scan in doc
       // order, throw at the first failed document with the partial result.
       const insertedIds = {};
@@ -466,128 +541,70 @@ class WalCollection {
 
   async deleteOne(filter = {}) {
     return this._wal._serialize(async () => {
-      const target = await this._inner.findOne(filter, { projection: { _id: 1 } });
-      if (!target) return { acknowledged: true, deletedCount: 0 };
-      return this._one({ c: this.name, op: 'd', id: target._id });
+      const { results } = await this._write(WAL_REQ.DELETE_ONE, filter);
+      return { acknowledged: true, deletedCount: results[0]?.deletedCount ?? 0 };
     });
   }
 
   async deleteMany(filter = {}) {
     return this._wal._serialize(async () => {
-      const ids = (await this._inner.find(filter, { projection: { _id: 1 } }).toArray()).map((d) => d._id);
-      if (ids.length === 0) return { acknowledged: true, deletedCount: 0 };
-      const cmds = ids.map((id) => ({ c: this.name, op: 'd', id }));
-      const { results, firstError } = await this._wal._commit(cmds);
-      if (firstError) throw firstError.error;
+      // Summed rather than counted: a planned delete of a known _id that
+      // reports 0 means the log holds a delete for a document that was
+      // not there, and reporting 1 would hide it.
+      const { results } = await this._write(WAL_REQ.DELETE_MANY, filter);
       return { acknowledged: true, deletedCount: results.reduce((n, r) => n + r.deletedCount, 0) };
     });
   }
 
   async findOneAndDelete(filter = {}) {
     return this._wal._serialize(async () => {
-      const doc = await this._inner.findOne(filter);
-      if (!doc) return null;
-      await this._one({ c: this.name, op: 'd', id: doc._id });
-      return doc;
-    });
-  }
-
-  /**
-   * Shared shape for updateOne/replaceOne/findOneAndUpdate/
-   * findOneAndReplace: resolve the target document (matched) or pin the
-   * upsert id at proposal time, log the one command, and let the commit
-   * engine apply it generically — identical on the local path, on crash
-   * replay, and on every replica. `finish(result, target, did)` shapes
-   * the caller-facing return from the generic result plus the pre-image
-   * resolved here (writes are serialized, so nothing intervenes between
-   * the resolve, the apply, and any post-apply read in finish).
-   */
-  async _updateLike(filter, matchedCmd, upsertCmd, { upsert, noMatch, finish }) {
-    return this._wal._serialize(async () => {
-      const target = await this._inner.findOne(filter);
-      if (!target && !upsert) return noMatch;
-      const did = target ? null : new ObjectId();
-      const result = await this._one(target ? matchedCmd(target._id) : upsertCmd(did));
-      return finish(result, target, did);
+      // The pre-image is the planner's, not a second query's.
+      const { plan } = await this._write(WAL_REQ.DELETE_ONE, filter);
+      return plan.preimage;
     });
   }
 
   async updateOne(filter, update, { upsert = false } = {}) {
-    update = resolveCurrentDate(update);
-    return this._updateLike(
-      filter,
-      (id) => ({ c: this.name, op: 'u', id, update }),
-      (did) => ({ c: this.name, op: 'uu', filter, update, did }),
-      {
-        upsert,
-        noMatch: { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null },
-        finish: (result) => result
-      }
-    );
+    return this._wal._serialize(async () => {
+      const { plan } = await this._write(WAL_REQ.UPDATE_ONE, filter, resolveCurrentDate(update), { upsert });
+      return WalCollection._writeResult(plan);
+    });
   }
 
   async replaceOne(filter, replacement, { upsert = false } = {}) {
-    return this._updateLike(
-      filter,
-      (id) => ({ c: this.name, op: 'r', id, doc: replacement }),
-      (did) => ({ c: this.name, op: 'ru', filter, doc: replacement, did }),
-      {
-        upsert,
-        noMatch: { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null },
-        finish: (result) => result
-      }
-    );
-  }
-
-  async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before' } = {}) {
-    update = resolveCurrentDate(update);
-    return this._updateLike(
-      filter,
-      (id) => ({ c: this.name, op: 'u', id, update }),
-      (did) => ({ c: this.name, op: 'uu', filter, update, did }),
-      {
-        upsert,
-        noMatch: null,
-        // 'before': the pre-image resolved at proposal (null for an
-        // upsert-insert, matching the driver); 'after': read back the
-        // known target id post-apply.
-        finish: (result, target, did) => returnDocument === 'after'
-          ? this._inner.findOne({ _id: target ? target._id : did })
-          : (target || null)
-      }
-    );
-  }
-
-  async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before' } = {}) {
-    return this._updateLike(
-      filter,
-      (id) => ({ c: this.name, op: 'r', id, doc: replacement }),
-      (did) => ({ c: this.name, op: 'ru', filter, doc: replacement, did }),
-      {
-        upsert,
-        noMatch: null,
-        finish: (result, target, did) => returnDocument === 'after'
-          ? this._inner.findOne({ _id: target ? target._id : did })
-          : (target || null)
-      }
-    );
+    return this._wal._serialize(async () => {
+      const { plan } = await this._write(WAL_REQ.REPLACE_ONE, filter, replacement, { upsert });
+      return WalCollection._writeResult(plan);
+    });
   }
 
   async updateMany(filter, update, { upsert = false } = {}) {
-    update = resolveCurrentDate(update);
     return this._wal._serialize(async () => {
-      const ids = (await this._inner.find(filter, { projection: { _id: 1 } }).toArray()).map((d) => d._id);
-      if (ids.length === 0) {
-        if (!upsert) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
-        const did = new ObjectId();
-        const result = await this._one({ c: this.name, op: 'uu', filter, update, did });
-        return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: result.upsertedId };
-      }
-      const cmds = ids.map((id) => ({ c: this.name, op: 'u', id, update }));
-      const { firstError } = await this._wal._commit(cmds); // ordered: mirror the engine's stop-at-first-error
-      if (firstError) throw firstError.error;
-      return { acknowledged: true, matchedCount: ids.length, modifiedCount: ids.length, upsertedId: null };
+      // ordered: mirror the engine's stop-at-first-error.
+      const { plan } = await this._write(WAL_REQ.UPDATE_MANY, filter, resolveCurrentDate(update), { upsert });
+      return WalCollection._writeResult(plan);
     });
+  }
+
+  /** 'before' is the planner's pre-image — null for an upsert, matching
+   * the driver (there was no prior state). 'after' reads back the _id the
+   * plan resolved; writes are serialized, so nothing intervenes. */
+  async _findOneAndWrite(req, filter, arg, upsert, returnDocument) {
+    return this._wal._serialize(async () => {
+      const { plan } = await this._write(req, filter, arg, { upsert });
+      if (plan.outcome === WAL_PLAN.NOTHING) return null;
+      return returnDocument === 'after'
+        ? this._inner.findOne({ _id: plan.targetId })
+        : plan.preimage;
+    });
+  }
+
+  async findOneAndUpdate(filter, update, { upsert = false, returnDocument = 'before' } = {}) {
+    return this._findOneAndWrite(WAL_REQ.UPDATE_ONE, filter, resolveCurrentDate(update), upsert, returnDocument);
+  }
+
+  async findOneAndReplace(filter, replacement, { upsert = false, returnDocument = 'before' } = {}) {
+    return this._findOneAndWrite(WAL_REQ.REPLACE_ONE, filter, replacement, upsert, returnDocument);
   }
 
   /** Same loop as the inner bulkWrite (wasm/nisaba-wasm.js), dispatching

@@ -26,6 +26,7 @@
 #include "db_bulk.h"
 #include "db_agg.h"
 #include "db_catalog.h"
+#include "db_wal.h"
 #include "bjcursor.h"
 #include "db_update.h"
 #include "dbuf.h"
@@ -736,6 +737,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_INVALID_COLLECTION_NAME, DC_ERR_INVALID_DB_NAME,
         DC_ERR_RESERVED_NAME, DC_ERR_EMPTY_KEY_SPEC, DC_ERR_NON_ASCENDING_KEY,
         DC_ERR_BULK_EMPTY, DC_ERR_BULK_UNKNOWN_OP, DC_ERR_BULK_MISSING_FIELD,
+        DC_ERR_WAL_UNKNOWN_OP, DC_ERR_WAL_MISSING_FIELD, DC_ERR_WAL_BAD_REQUEST,
     };
     for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
         const char *s = dc_strerror(codes[i]);
@@ -2432,7 +2434,394 @@ TEST(update_many_hands_back_post_images_when_asked) {
     fx_close(&fx);
 }
 
+/* ---- WAL command grammar and planner (db_wal.h) ----------------------- */
+
+/* Has `cmd` a top-level field called `name`? The invariant tests below are
+ * all of the form "this field must (not) be there". */
+static int cmd_has(const uint8_t *cmd, uint32_t len, const char *name) {
+    const uint8_t *vp; size_t vlen; int found = 0;
+    if (obj_get_field(cmd, len, (const uint8_t *)name, (uint32_t)strlen(name),
+                      &vp, &vlen, &found) != BJ_OK) return -1;
+    return found;
+}
+
+/* The 12 id bytes of `cmd`'s top-level `id` field, or 0. */
+static const uint8_t *cmd_id(const uint8_t *cmd, uint32_t len) {
+    const uint8_t *vp; size_t vlen; int found = 0;
+    if (obj_get_field(cmd, len, (const uint8_t *)"id", 2, &vp, &vlen, &found) != BJ_OK) return NULL;
+    if (!found || vlen != 13 || vp[0] != BJ_TYPE_OID) return NULL;
+    return vp + 1;
+}
+
+/* {$set: {seen: true}} */
+static doc *set_seen(void) {
+    doc *u = doc_new();
+    doc_begin_obj(u, "$set");
+    doc_key(u, "seen");
+    bj_put_bool(u->b, 1);
+    doc_end_obj(u);
+    return u;
+}
+
+TEST(wal_grammar_round_trips_every_op_it_can_emit) {
+    /* Whatever the planner emits, the parser must accept and identify --
+     * otherwise a command can be written to the log that no replica can
+     * replay, which is the one failure this layer exists to prevent. */
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-people.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+
+    uint8_t did[12]; mk_oid(did, 90);
+    doc *idq = doc_new(); { uint8_t id[12]; mk_oid(id, 1); doc_oid(idq, "_id", id); }
+    uint32_t idqlen; const uint8_t *idqbuf = doc_done(idq, &idqlen);
+    doc *u = set_seen();
+    uint32_t ulen; const uint8_t *ubuf = doc_done(u, &ulen);
+    doc *empty = doc_new();
+    uint32_t elen; const uint8_t *ebuf = doc_done(empty, &elen);
+    doc *nomatch = doc_new(); doc_str(nomatch, "team", "ghosts");
+    uint32_t nlen; const uint8_t *nbuf = doc_done(nomatch, &nlen);
+
+    /* One request per opcode the grammar has, and the opcode each must
+     * produce. INSERT appears twice on purpose: once asked for directly,
+     * once as what an upsert resolves to. */
+    struct { int req; const uint8_t *a; uint32_t a_len;
+             const uint8_t *b; uint32_t b_len; int upsert; int want_op; } cases[] = {
+        { DC_WREQ_UPDATE_ONE,      idqbuf, idqlen, ubuf, ulen, 0, DC_WAL_UPDATE },
+        { DC_WREQ_REPLACE_ONE,     idqbuf, idqlen, ebuf, elen, 0, DC_WAL_REPLACE },
+        { DC_WREQ_DELETE_ONE,      idqbuf, idqlen, NULL, 0,    0, DC_WAL_DELETE },
+        { DC_WREQ_CREATE_INDEX,    ebuf,   elen,   ebuf, elen, 0, DC_WAL_CREATE_INDEX },
+        { DC_WREQ_DROP_INDEX,      (const uint8_t *)"ix_a", 4, NULL, 0, 0, DC_WAL_DROP_INDEX },
+        { DC_WREQ_DROP_COLLECTION, NULL,   0,      NULL, 0,    0, DC_WAL_DROP_COLLECTION },
+        /* No match + upsert: the upsert opcodes are gone, so this is an
+         * ordinary insert by the time it reaches the log. */
+        { DC_WREQ_UPDATE_ONE,      nbuf,   nlen,   ubuf, ulen, 1, DC_WAL_INSERT },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        dc_wal_plan *p = NULL;
+        int rc = dc_wal_plan_build(fx.coll, "people", 6, cases[i].req,
+                                   cases[i].a, cases[i].a_len,
+                                   cases[i].b, cases[i].b_len,
+                                   cases[i].upsert, did, &p);
+        if (rc != BJ_OK) { TAP_FAIL("case %zu: plan failed rc=%d", i, rc); continue; }
+        CHECK_I64((long long)dc_wal_plan_count(p), 1);
+        uint32_t len; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &len);
+        if (cmd) {
+            int op = -1; const uint8_t *coll; uint32_t coll_len;
+            CHECK_OK(dc_wal_parse(cmd, len, &op, &coll, &coll_len));
+            CHECK_I64(op, cases[i].want_op);
+            CHECK_I64(coll_len, 6);
+            CHECK(coll && memcmp(coll, "people", 6) == 0);
+        }
+        dc_wal_plan_free(p);
+    }
+
+    doc_free(nomatch); doc_free(empty); doc_free(u); doc_free(idq);
+    fx_close(&fx);
+}
+
+TEST(wal_grammar_refuses_what_it_cannot_replay) {
+    int op = -1; const uint8_t *coll; uint32_t coll_len;
+
+    /* An op this version does not know. Rejected rather than ignored: a
+     * follower that skips an entry it does not understand has silently
+     * diverged from one that does. */
+    doc *unknown = doc_new();
+    doc_str(unknown, "c", "people");
+    doc_str(unknown, "op", "teleport");
+    uint32_t ulen; const uint8_t *ubuf = doc_done(unknown, &ulen);
+    CHECK_RC(dc_wal_parse(ubuf, ulen, &op, &coll, &coll_len), DC_ERR_WAL_UNKNOWN_OP);
+
+    /* The old upsert opcodes are among the ops this version does not
+     * know -- they carried a filter into the log, which the grammar no
+     * longer permits (db_wal.h). */
+    doc *old = doc_new();
+    doc_str(old, "c", "people");
+    doc_str(old, "op", "uu");
+    uint32_t olen; const uint8_t *obuf = doc_done(old, &olen);
+    CHECK_RC(dc_wal_parse(obuf, olen, &op, &coll, &coll_len), DC_ERR_WAL_UNKNOWN_OP);
+
+    /* A known op missing the field it needs. */
+    doc *torn = doc_new();
+    doc_str(torn, "c", "people");
+    doc_str(torn, "op", "d");        /* DELETE, but no id */
+    uint32_t tlen; const uint8_t *tbuf = doc_done(torn, &tlen);
+    CHECK_RC(dc_wal_parse(tbuf, tlen, &op, &coll, &coll_len), DC_ERR_WAL_MISSING_FIELD);
+
+    /* An id of the wrong type is missing as far as the grammar cares. */
+    doc *wrong = doc_new();
+    doc_str(wrong, "c", "people");
+    doc_str(wrong, "op", "d");
+    doc_str(wrong, "id", "not-an-oid");
+    uint32_t wlen; const uint8_t *wbuf = doc_done(wrong, &wlen);
+    CHECK_RC(dc_wal_parse(wbuf, wlen, &op, &coll, &coll_len), DC_ERR_WAL_MISSING_FIELD);
+
+    /* No collection at all: the applier would have nowhere to send it. */
+    doc *nc = doc_new();
+    doc_str(nc, "op", "dropCollection");
+    uint32_t nlen; const uint8_t *nbuf = doc_done(nc, &nlen);
+    CHECK_RC(dc_wal_parse(nbuf, nlen, &op, &coll, &coll_len), DC_ERR_WAL_MISSING_FIELD);
+
+    /* A rejected command reports no opcode -- a caller that ignores the
+     * return value must not find a plausible one sitting in `op`. */
+    CHECK_I64(op, -1);
+
+    doc_free(nc); doc_free(wrong); doc_free(torn); doc_free(old); doc_free(unknown);
+}
+
+TEST(wal_plan_resolves_every_command_to_one_id_and_no_filter) {
+    /*
+     * The invariant db_wal.h exists for: no logged document command
+     * carries a filter, so applying one never runs a query and never
+     * depends on the state replay happens to be in.
+     */
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-people.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+    CHECK_OK(insert_person(fx.coll, 2, "Grace", "core", 45));
+    CHECK_OK(insert_person(fx.coll, 3, "Alan", "research", 41));
+
+    uint8_t did[12]; mk_oid(did, 90);
+    doc *q = doc_new(); doc_str(q, "team", "core");
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+    doc *u = set_seen();
+    uint32_t ulen; const uint8_t *ubuf = doc_done(u, &ulen);
+    doc *nomatch = doc_new(); doc_str(nomatch, "team", "ghosts");
+    uint32_t nlen; const uint8_t *nbuf = doc_done(nomatch, &nlen);
+
+    struct { const char *what; int req; const uint8_t *a; uint32_t a_len;
+             const uint8_t *b; uint32_t b_len; int upsert; uint32_t want_count; } cases[] = {
+        { "updateOne",    DC_WREQ_UPDATE_ONE,  qbuf, qlen, ubuf, ulen, 0, 1 },
+        { "updateMany",   DC_WREQ_UPDATE_MANY, qbuf, qlen, ubuf, ulen, 0, 2 },
+        { "deleteOne",    DC_WREQ_DELETE_ONE,  qbuf, qlen, NULL, 0,    0, 1 },
+        { "deleteMany",   DC_WREQ_DELETE_MANY, qbuf, qlen, NULL, 0,    0, 2 },
+        { "upsertOne",    DC_WREQ_UPDATE_ONE,  nbuf, nlen, ubuf, ulen, 1, 1 },
+        { "upsertMany",   DC_WREQ_UPDATE_MANY, nbuf, nlen, ubuf, ulen, 1, 1 },
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        dc_wal_plan *p = NULL;
+        int rc = dc_wal_plan_build(fx.coll, "people", 6, cases[i].req,
+                                   cases[i].a, cases[i].a_len,
+                                   cases[i].b, cases[i].b_len,
+                                   cases[i].upsert, did, &p);
+        if (rc != BJ_OK) { TAP_FAIL("%s: plan failed rc=%d", cases[i].what, rc); continue; }
+        if (dc_wal_plan_count(p) != cases[i].want_count) {
+            TAP_FAIL("%s: planned %u commands, want %u",
+                     cases[i].what, dc_wal_plan_count(p), cases[i].want_count);
+        }
+        for (uint32_t k = 0; k < dc_wal_plan_count(p); k++) {
+            uint32_t len; const uint8_t *cmd = dc_wal_plan_cmd(p, k, &len);
+            if (cmd_has(cmd, len, "filter") != 0)
+                TAP_FAIL("%s: command %u carries a filter", cases[i].what, k);
+            /* An INSERT names its document's _id instead of an `id`
+             * field; every other document command names an id. */
+            int op = -1; const uint8_t *coll; uint32_t coll_len;
+            CHECK_OK(dc_wal_parse(cmd, len, &op, &coll, &coll_len));
+            if (op != DC_WAL_INSERT && cmd_id(cmd, len) == NULL)
+                TAP_FAIL("%s: command %u names no id", cases[i].what, k);
+        }
+        dc_wal_plan_free(p);
+    }
+
+    /* A non-upsert write that matches nothing produces no commands at
+     * all: an entry that does nothing is still an entry every replica
+     * stores, ships and replays. */
+    dc_wal_plan *p = NULL;
+    CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_ONE,
+                               nbuf, nlen, ubuf, ulen, 0, did, &p));
+    CHECK_I64(dc_wal_plan_outcome(p), DC_PLAN_NOTHING);
+    CHECK_I64((long long)dc_wal_plan_count(p), 0);
+    CHECK(dc_wal_plan_target_id(p) == NULL);
+    dc_wal_plan_free(p);
+
+    /* deleteMany matching nothing, likewise. */
+    p = NULL;
+    CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_DELETE_MANY,
+                               nbuf, nlen, NULL, 0, 0, did, &p));
+    CHECK_I64(dc_wal_plan_outcome(p), DC_PLAN_NOTHING);
+    CHECK_I64((long long)dc_wal_plan_count(p), 0);
+    dc_wal_plan_free(p);
+
+    doc_free(nomatch); doc_free(u); doc_free(q);
+    fx_close(&fx);
+}
+
+TEST(wal_plan_and_direct_upsert_insert_the_same_document) {
+    /*
+     * The whole point of routing the planner through dc_upsert_document:
+     * what the WAL logs and what a non-WAL collection would have done
+     * must be the same document, byte for byte. Two collections, the same
+     * request, one via the plan and one direct.
+     */
+    fixture planned, direct;
+    CHECK_FATAL(fx_open(&planned, "coll-a.bj") == 0);
+    CHECK_FATAL(fx_open(&direct, "coll-b.bj") == 0);
+
+    uint8_t did[12]; mk_oid(did, 90);
+    doc *q = doc_new();
+    doc_str(q, "team", "ghosts");
+    doc_int(q, "age", 100);
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+    doc *u = set_seen();
+    uint32_t ulen; const uint8_t *ubuf = doc_done(u, &ulen);
+
+    dc_wal_plan *p = NULL;
+    CHECK_OK(dc_wal_plan_build(planned.coll, "people", 6, DC_WREQ_UPDATE_ONE,
+                               qbuf, qlen, ubuf, ulen, 1, did, &p));
+    CHECK_I64(dc_wal_plan_outcome(p), DC_PLAN_UPSERT);
+    CHECK_I64((long long)dc_wal_plan_count(p), 1);
+
+    /* Apply the planned INSERT the way the host's apply path would: pull
+     * `doc` straight out of the command. */
+    uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+    const uint8_t *dp; size_t dlen; int found = 0;
+    CHECK_OK(obj_get_field(cmd, clen, (const uint8_t *)"doc", 3, &dp, &dlen, &found));
+    CHECK_I64(found, 1);
+    if (found) CHECK_OK(dc_insert_one(planned.coll, dp, (uint32_t)dlen));
+
+    int result = -1;
+    CHECK_OK(dc_update_one(direct.coll, qbuf, qlen, ubuf, ulen, did, 1, &result));
+    CHECK_I64(result, 2);
+
+    doc *all = doc_new();
+    uint32_t alen; const uint8_t *abuf = doc_done(all, &alen);
+    int f1 = 0, f2 = 0; uint8_t *d1 = NULL, *d2 = NULL; size_t l1 = 0, l2 = 0;
+    CHECK_OK(dc_find_one(planned.coll, abuf, alen, NULL, 0, &f1, &d1, &l1));
+    CHECK_OK(dc_find_one(direct.coll, abuf, alen, NULL, 0, &f2, &d2, &l2));
+    CHECK_I64(f1, 1); CHECK_I64(f2, 1);
+    CHECK_I64((long long)l1, (long long)l2);
+    if (l1 == l2) CHECK(memcmp(d1, d2, l1) == 0);
+
+    /* And the id the plan reports is the id it actually inserted. */
+    const uint8_t *target = dc_wal_plan_target_id(p);
+    CHECK(target != NULL);
+    if (target && f1) {
+        uint8_t actual[12];
+        CHECK_OK(dc_document_id(d1, (uint32_t)l1, actual));
+        CHECK(memcmp(target, actual, 12) == 0);
+    }
+
+    free(d1); free(d2);
+    dc_wal_plan_free(p);
+    doc_free(all); doc_free(u); doc_free(q);
+    fx_close(&direct); fx_close(&planned);
+}
+
+TEST(wal_plan_returns_the_preimage_the_host_would_have_queried_for) {
+    /* findOneAndUpdate's `returnDocument: 'before'` used to cost a
+     * findOne of its own. The planner already had the matched document
+     * in hand -- it is how the target id was resolved. */
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-people.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+
+    uint8_t did[12]; mk_oid(did, 90);
+    doc *q = doc_new(); doc_str(q, "name", "Ada");
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+    doc *u = set_seen();
+    uint32_t ulen; const uint8_t *ubuf = doc_done(u, &ulen);
+
+    dc_wal_plan *p = NULL;
+    CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_ONE,
+                               qbuf, qlen, ubuf, ulen, 0, did, &p));
+    uint32_t plen; const uint8_t *pre = dc_wal_plan_preimage(p, &plen);
+    CHECK(pre != NULL);
+    if (pre) {
+        char team[32];
+        CHECK(doc_get_str(pre, plen, "team", team, sizeof(team)));
+        CHECK_STR(team, "core");
+        /* PRE-image: the update is not in it. */
+        CHECK_I64(cmd_has(pre, plen, "seen"), 0);
+    }
+    dc_wal_plan_free(p);
+
+    /* An upsert has no pre-image -- there was no prior state, which is
+     * exactly what the driver returns null for. */
+    doc *nomatch = doc_new(); doc_str(nomatch, "name", "Nobody");
+    uint32_t nlen; const uint8_t *nbuf = doc_done(nomatch, &nlen);
+    p = NULL;
+    CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_ONE,
+                               nbuf, nlen, ubuf, ulen, 1, did, &p));
+    CHECK_I64(dc_wal_plan_outcome(p), DC_PLAN_UPSERT);
+    CHECK(dc_wal_plan_preimage(p, &plen) == NULL);
+    dc_wal_plan_free(p);
+
+    doc_free(nomatch); doc_free(u); doc_free(q);
+    fx_close(&fx);
+}
+
+TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
+    /* A command certain to fail must never reach the log. The proposer
+     * still has a caller to hand the error to; the applier does not, and
+     * on a replica there is nobody to tell at all. */
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-people.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+
+    uint8_t did[12]; mk_oid(did, 90);
+    doc *q = doc_new(); doc_str(q, "name", "Ada");
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+
+    /* replaceOne may not move a document to a different _id. */
+    doc *moved = doc_new();
+    { uint8_t other[12]; mk_oid(other, 77); doc_oid(moved, "_id", other); }
+    doc_str(moved, "name", "Ada");
+    uint32_t mlen; const uint8_t *mbuf = doc_done(moved, &mlen);
+    dc_wal_plan *p = NULL;
+    CHECK_RC(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_REPLACE_ONE,
+                               qbuf, qlen, mbuf, mlen, 0, did, &p),
+             DC_ERR_ID_MISMATCH);
+    CHECK(p == NULL);
+
+    /* A malformed update is rejected before a single command is emitted,
+     * so an unordered batch can still attempt everything else -- the
+     * reasoning db_bulk.h documents for its own up-front validation. */
+    doc *bad = doc_new();
+    doc_str(bad, "seen", "no-operator-here");
+    uint32_t blen; const uint8_t *bbuf = doc_done(bad, &blen);
+    p = NULL;
+    CHECK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_MANY,
+                            qbuf, qlen, bbuf, blen, 0, did, &p) != BJ_OK);
+    CHECK(p == NULL);
+
+    /* An insert with no _id: the host assigns ids, and one that forgot
+     * would otherwise log an entry that fails on every replica. */
+    doc *anon = doc_new();
+    doc_str(anon, "name", "Anonymous");
+    uint32_t anlen; const uint8_t *anbuf = doc_done(anon, &anlen);
+    p = NULL;
+    CHECK(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
+                            anbuf, anlen, NULL, 0, 0, did, &p) != BJ_OK);
+    CHECK(p == NULL);
+
+    /* An empty insertMany. */
+    doc *empty_arr = doc_new();
+    uint32_t ealen; const uint8_t *eabuf;
+    { /* a bare ARRAY, not an object -- built directly */
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b); bj_end_array(b);
+        size_t n; const uint8_t *d = bj_builder_data(b, &n);
+        p = NULL;
+        CHECK_RC(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_MANY,
+                                   d, (uint32_t)n, NULL, 0, 0, did, &p),
+                 DC_ERR_WAL_BAD_REQUEST);
+        CHECK(p == NULL);
+        bj_builder_free(b);
+    }
+    (void)ealen; (void)eabuf;
+
+    doc_free(empty_arr); doc_free(anon); doc_free(bad); doc_free(moved); doc_free(q);
+    fx_close(&fx);
+}
+
 int main(void) {
+    RUN(wal_grammar_round_trips_every_op_it_can_emit);
+    RUN(wal_grammar_refuses_what_it_cannot_replay);
+    RUN(wal_plan_resolves_every_command_to_one_id_and_no_filter);
+    RUN(wal_plan_and_direct_upsert_insert_the_same_document);
+    RUN(wal_plan_returns_the_preimage_the_host_would_have_queried_for);
+    RUN(wal_plan_rejects_before_it_logs_rather_than_after);
     RUN(update_many_hands_back_post_images_when_asked);
     RUN(compact_execute_builds_and_flips_over_real_files);
     RUN(sweep_execute_drives_a_real_namespace);

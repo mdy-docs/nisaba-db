@@ -129,3 +129,15 @@ _dcw_out_new
 _dcw_out_free
 _dcw_out_ptr
 _dcw_out_len
+
+# WAL command grammar and planner (db_wal.h)
+_walw_plan
+_walw_plan_free
+_walw_outcome
+_walw_count
+_walw_cmd_ptr
+_walw_cmd_len
+_walw_preimage_ptr
+_walw_preimage_len
+_walw_target_id
+_walw_parse

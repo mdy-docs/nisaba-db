@@ -7,6 +7,7 @@
 #include "db_agg.h"
 #include "db_update.h"
 #include "db_catalog.h"
+#include "db_wal.h"
 #include "db.h"
 #include "bjcursor.h"
 
@@ -86,6 +87,14 @@ const char *dc_strerror(int code) {
         case DC_ERR_BULK_MISSING_FIELD:
             return "bulkWrite: operation is missing a required field "
                    "(document / filter / update / replacement)";
+        /* db_wal.h */
+        case DC_ERR_WAL_UNKNOWN_OP:
+            return "WAL: log entry names an unknown command op";
+        case DC_ERR_WAL_MISSING_FIELD:
+            return "WAL: log entry is missing a field its command op requires";
+        case DC_ERR_WAL_BAD_REQUEST:
+            return "WAL: malformed write request (empty batch, or a document "
+                   "request with no collection)";
         default:                    return "unknown error";
     }
 }

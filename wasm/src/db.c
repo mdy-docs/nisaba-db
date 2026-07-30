@@ -554,14 +554,24 @@ static void oid_key(const uint8_t id[12], bpt_key *k) {
 }
 
 /* `doc`'s top-level _id, which must be an OID (13 encoded bytes: type + 12
- * raw). BJ_ERR_STATE if absent or any other type. */
-static int dc_get_id(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12]) {
+ * raw) if present. *has reports presence; a present value of any other
+ * type is BJ_ERR_STATE either way. */
+int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12], int *has) {
     const uint8_t *vp; size_t vlen; int found;
     int e = obj_get_field(doc, doc_len, (const uint8_t *)"_id", 3, &vp, &vlen, &found);
     if (e) return e;
-    if (!found || vlen != 13 || vp[0] != BJ_TYPE_OID) return BJ_ERR_STATE;
+    *has = found;
+    if (!found) return BJ_OK;
+    if (vlen != 13 || vp[0] != BJ_TYPE_OID) return BJ_ERR_STATE;
     memcpy(id_out, vp + 1, 12);
     return BJ_OK;
+}
+
+int dc_document_id(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12]) {
+    int has = 0;
+    int e = dc_document_id_opt(doc, doc_len, id_out, &has);
+    if (e) return e;
+    return has ? BJ_OK : BJ_ERR_STATE;
 }
 
 /* True (via *is_id_filter) iff `filter` is exactly {_id: <OID>}; when true,
@@ -1696,7 +1706,7 @@ static int gather_matches(dc_collection *c, const uint8_t *filter, uint32_t filt
 
 int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len) {
     uint8_t id[12];
-    int e = dc_get_id(doc, doc_len, id);
+    int e = dc_document_id(doc, doc_len, id);
     if (e) return e;
     bpt_key key; oid_key(id, &key);
     int found = 0;
@@ -2096,7 +2106,7 @@ int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, 
     if (!found) { free(doc); return BJ_OK; }
 
     uint8_t id[12];
-    e = dc_get_id(doc, (uint32_t)doc_len, id);
+    e = dc_document_id(doc, (uint32_t)doc_len, id);
     if (e) { free(doc); return e; }
     uint64_t *undo;
     e = mut_begin(c, &undo);
@@ -2132,7 +2142,7 @@ int dc_delete_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
 
     for (size_t i = 0; !e && i < match_count; i++) {
         uint8_t id[12];
-        e = dc_get_id(matches[i].ptr, (uint32_t)matches[i].len, id);
+        e = dc_document_id(matches[i].ptr, (uint32_t)matches[i].len, id);
         if (e) break;
         uint64_t *undo;
         e = mut_begin(c, &undo);
@@ -2178,7 +2188,7 @@ int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t fil
     if (!f) { free(doc); return BJ_OK; }
 
     uint8_t id[12];
-    e = dc_get_id(doc, (uint32_t)doc_len, id);
+    e = dc_document_id(doc, (uint32_t)doc_len, id);
     if (e) { free(doc); return e; }
     uint8_t *idfilter = NULL; size_t idfilter_len = 0;
     e = build_id_filter(id, &idfilter, &idfilter_len);
@@ -2228,34 +2238,34 @@ static int splice_id(const uint8_t *replacement, size_t replacement_len,
     return e;
 }
 
+int dc_replace_document(const uint8_t *replacement, uint32_t replacement_len,
+                        const uint8_t default_id[12],
+                        uint8_t **out, size_t *out_len) {
+    uint8_t repl_id[12]; int repl_has_id = 0;
+    int e = dc_document_id_opt(replacement, replacement_len, repl_id, &repl_has_id);
+    if (e) return e;
+    return splice_id(replacement, replacement_len,
+                     repl_has_id ? repl_id : default_id, out, out_len);
+}
+
 int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *replacement, uint32_t replacement_len,
                    const uint8_t default_id[12], int upsert, int *result) {
     *result = 0;
 
     uint8_t repl_id[12]; int repl_has_id;
-    {
-        const uint8_t *vp; size_t vlen; int found;
-        int e = obj_get_field(replacement, replacement_len,
-                              (const uint8_t *)"_id", 3, &vp, &vlen, &found);
-        if (e) return e;
-        if (found) {
-            if (vlen != 13 || vp[0] != BJ_TYPE_OID) return BJ_ERR_STATE;
-            memcpy(repl_id, vp + 1, 12);
-        }
-        repl_has_id = found;
-    }
+    int e = dc_document_id_opt(replacement, replacement_len, repl_id, &repl_has_id);
+    if (e) return e;
 
     int found = 0; uint8_t *doc = NULL; size_t doc_len = 0;
-    int e = dc_find_one(c, filter, filter_len, NULL, 0, &found, &doc, &doc_len);
+    e = dc_find_one(c, filter, filter_len, NULL, 0, &found, &doc, &doc_len);
     if (e) { free(doc); return e; }
 
     if (!found) {
         free(doc);
         if (!upsert) return BJ_OK;
-        const uint8_t *use_id = repl_has_id ? repl_id : default_id;
         uint8_t *spliced; size_t spliced_len;
-        e = splice_id(replacement, replacement_len, use_id, &spliced, &spliced_len);
+        e = dc_replace_document(replacement, replacement_len, default_id, &spliced, &spliced_len);
         if (e) return e;
         e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
         free(spliced);
@@ -2265,7 +2275,7 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     }
 
     uint8_t existing_id[12];
-    e = dc_get_id(doc, (uint32_t)doc_len, existing_id);
+    e = dc_document_id(doc, (uint32_t)doc_len, existing_id);
     if (e) { free(doc); return e; }
 
     if (repl_has_id && memcmp(repl_id, existing_id, 12) != 0) {
@@ -2317,7 +2327,7 @@ int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t fi
     int result = 0;
     uint8_t target_id[12];
     if (before_found) {
-        e = dc_get_id(before, (uint32_t)before_len, target_id);
+        e = dc_document_id(before, (uint32_t)before_len, target_id);
         uint8_t *idfilter = NULL; size_t idfilter_len = 0;
         if (!e) e = build_id_filter(target_id, &idfilter, &idfilter_len);
         if (!e) e = dc_replace_one(c, idfilter, (uint32_t)idfilter_len, replacement, replacement_len, default_id, 0, &result);
@@ -2385,6 +2395,29 @@ static int build_upsert_seed(const uint8_t *filter, size_t filter_len, uint8_t *
     return e;
 }
 
+/*
+ * Note that the _id is always `default_id`, even when `filter` pins one:
+ * splice_id overwrites whatever the seed carried. Real MongoDB would
+ * insert the filter's _id. Preserved deliberately rather than fixed in
+ * passing -- it is a semantics change with its own tests to write, and
+ * folding it into a refactor whose whole point is that plan and apply
+ * agree would be exactly the wrong place to change what they agree on.
+ */
+int dc_upsert_document(const uint8_t *filter, uint32_t filter_len,
+                       const uint8_t *update, uint32_t update_len,
+                       const uint8_t default_id[12],
+                       uint8_t **out, size_t *out_len) {
+    uint8_t *seed = NULL; size_t seed_len = 0;
+    int e = build_upsert_seed(filter, filter_len, &seed, &seed_len);
+    uint8_t *updated = NULL; size_t updated_len = 0;
+    if (!e) e = upd_apply(seed, seed_len, update, update_len, 1, &updated, &updated_len);
+    free(seed);
+    if (e) { free(updated); return e; }
+    e = splice_id(updated, updated_len, default_id, out, out_len);
+    free(updated);
+    return e;
+}
+
 int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                   const uint8_t *update, uint32_t update_len,
                   const uint8_t default_id[12], int upsert, int *result) {
@@ -2400,15 +2433,9 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     if (!found) {
         free(doc);
         if (!upsert) return BJ_OK;
-        uint8_t *seed = NULL; size_t seed_len = 0;
-        e = build_upsert_seed(filter, filter_len, &seed, &seed_len);
-        uint8_t *updated = NULL; size_t updated_len = 0;
-        if (!e) e = upd_apply(seed, seed_len, update, update_len, 1, &updated, &updated_len);
-        free(seed);
-        if (e) { free(updated); return e; }
         uint8_t *spliced = NULL; size_t spliced_len = 0;
-        e = splice_id(updated, updated_len, default_id, &spliced, &spliced_len);
-        free(updated);
+        e = dc_upsert_document(filter, filter_len, update, update_len,
+                               default_id, &spliced, &spliced_len);
         if (e) return e;
         e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
         free(spliced);
@@ -2418,7 +2445,7 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     }
 
     uint8_t id[12];
-    e = dc_get_id(doc, (uint32_t)doc_len, id);
+    e = dc_document_id(doc, (uint32_t)doc_len, id);
     if (e) { free(doc); return e; }
 
     uint8_t *updated = NULL; size_t updated_len = 0;
@@ -2467,7 +2494,7 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
     if (before_found) {
         /* Re-target the exact matched document by _id so dc_update_one's
          * own internal re-scan can never land on a different document. */
-        e = dc_get_id(before, (uint32_t)before_len, target_id);
+        e = dc_document_id(before, (uint32_t)before_len, target_id);
         uint8_t *idfilter = NULL; size_t idfilter_len = 0;
         if (!e) e = build_id_filter(target_id, &idfilter, &idfilter_len);
         if (!e) e = dc_update_one(c, idfilter, (uint32_t)idfilter_len, update, update_len, default_id, 0, &result);
@@ -2519,14 +2546,9 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
 
     if (match_count == 0) {
         if (upsert) {
-            uint8_t *seed = NULL; size_t seed_len = 0;
-            e = build_upsert_seed(filter, filter_len, &seed, &seed_len);
-            uint8_t *updated = NULL; size_t updated_len = 0;
-            if (!e) e = upd_apply(seed, seed_len, update, update_len, 1, &updated, &updated_len);
-            free(seed);
             uint8_t *spliced = NULL; size_t spliced_len = 0;
-            if (!e) e = splice_id(updated, updated_len, default_id, &spliced, &spliced_len);
-            free(updated);
+            e = dc_upsert_document(filter, filter_len, update, update_len,
+                                   default_id, &spliced, &spliced_len);
             if (!e) e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
             /* The inserted document is the upsert's post-image. */
             if (!e && img) bj_put_raw(img, spliced, (uint32_t)spliced_len);
@@ -2537,7 +2559,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         *matched_count = (int64_t)match_count;
         for (size_t i = 0; !e && i < match_count; i++) {
             uint8_t id[12];
-            e = dc_get_id(matches[i].ptr, (uint32_t)matches[i].len, id);
+            e = dc_document_id(matches[i].ptr, (uint32_t)matches[i].len, id);
             if (e) break;
             uint8_t *updated = NULL; size_t updated_len = 0;
             e = upd_apply(matches[i].ptr, matches[i].len, update, update_len, 0, &updated, &updated_len);

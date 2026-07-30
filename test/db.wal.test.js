@@ -192,6 +192,45 @@ describe('WAL: what gets logged', () => {
     await db.close();
   });
 
+  it('no logged command carries a filter: every one names a single _id', async () => {
+    // The invariant the C grammar exists to hold (wasm/include/db_wal.h).
+    // A command carrying a filter would have apply re-run a query against
+    // the very state replay is in the middle of reproducing -- which is
+    // how the retired `uu`/`ru` opcodes worked, and why they are gone.
+    // Checked over every write shape at once, because the failure mode is
+    // one method quietly reintroducing it.
+    const db = await connectWal(new MemoryStorageProvider());
+    const users = await db.collection('users');
+    await users.insertOne({ _id: oid(1), team: 'core' });
+    await users.insertMany([{ _id: oid(2), team: 'core' }, { _id: oid(3), team: 'research' }]);
+    await users.updateOne({ team: 'core' }, { $set: { a: 1 } });
+    await users.updateMany({ team: 'core' }, { $set: { b: 1 } });
+    await users.updateOne({ team: 'ghosts' }, { $set: { c: 1 } }, { upsert: true });
+    await users.updateMany({ team: 'spectres' }, { $set: { d: 1 } }, { upsert: true });
+    await users.replaceOne({ team: 'research' }, { team: 'research', replaced: true });
+    await users.replaceOne({ team: 'nobody' }, { team: 'nobody' }, { upsert: true });
+    await users.findOneAndUpdate({ team: 'core' }, { $set: { e: 1 } });
+    await users.findOneAndReplace({ team: 'ghosts' }, { team: 'ghosts' });
+    await users.findOneAndDelete({ team: 'spectres' });
+    await users.deleteOne({ team: 'nobody' });
+    await users.deleteMany({ team: 'core' });
+    await users.createIndex({ team: 1 });
+    await users.dropIndex('team_1');
+
+    const entries = db.log.getBatch(1, 1 << 20);
+    expect(entries.length).toBeGreaterThan(14);   // every write above logged
+    const documentOps = new Set(['i', 'u', 'r', 'd']);
+    for (const entry of entries) {
+      const cmd = decode(entry.payload);
+      expect(cmd.filter).toBeUndefined();
+      if (!documentOps.has(cmd.op)) continue;
+      // An insert names its _id inside the document; the rest name an id.
+      const id = cmd.op === 'i' ? cmd.doc._id : cmd.id;
+      expect(id).toBeInstanceOf(ObjectId);
+    }
+    await db.close();
+  });
+
   it('$currentDate is resolved to a concrete Date before logging', async () => {
     const db = await connectWal(new MemoryStorageProvider());
     const users = await db.collection('users');
@@ -286,22 +325,63 @@ describe('WAL: crash recovery', () => {
     await db2.close();
   });
 
-  it('an upsert command replays to the identical pinned _id', async () => {
+  it('an upsert is logged as a plain insert, and replays to the identical _id', async () => {
+    // The upsert opcodes that carried a filter into the log are gone: the
+    // planner resolves an upsert the whole way and logs the document it
+    // would have inserted (wasm/include/db_wal.h). So what survives a
+    // crash between sync and apply is not "re-run this filter and see" --
+    // it is one document with one _id, which is why replay is exact.
     const provider = new MemoryStorageProvider();
     const db1 = await connectWal(provider);
-    await (await db1.collection('users')).insertOne({ _id: oid(1) }); // creates the collection
+    const users1 = await db1.collection('users');
+    await users1.insertOne({ _id: oid(1) });
+
+    const { upsertedId } = await users1.updateOne({ tag: 'x' }, { $set: { n: 7 } }, { upsert: true });
+    const cmd = decode(db1.log.getBatch(db1.log.lastIndex)[0].payload);
+    expect(cmd.op).toBe('i');                       // not an upsert command
+    expect(cmd.filter).toBeUndefined();             // and it carries no filter
+    expect(cmd.doc._id.equals(upsertedId)).toBe(true);
+    expect(cmd.doc).toEqual({ _id: upsertedId, tag: 'x', n: 7 });
     await db1.close();
 
-    const did = oid(0xbeef);
+    // Replay that exact entry into a database that has never seen it.
+    const fresh = new MemoryStorageProvider();
+    const seed = await connectWal(fresh);
+    await (await seed.collection('users')).insertOne({ _id: oid(1) });
+    await seed.close();
+    const log = await rawLog(fresh);
+    log.append(log.currentTerm, encode(cmd));
+    log.sync();
+    await log.close();
+
+    const db2 = await connectWal(fresh);
+    const doc = await (await db2.collection('users')).findOne({ tag: 'x' });
+    expect(doc._id.equals(upsertedId)).toBe(true);
+    expect(doc.n).toBe(7);
+    await db2.close();
+  });
+
+  it('an entry naming an op this build cannot execute is refused, not skipped', async () => {
+    // A follower that silently ignores what it does not understand has
+    // diverged from one that does. The grammar (db_wal.h) rejects it, and
+    // recovery's swallow-deterministic-errors arm leaves the state
+    // untouched rather than half-applying a log it cannot read.
+    const provider = new MemoryStorageProvider();
+    const db1 = await connectWal(provider);
+    await (await db1.collection('users')).insertOne({ _id: oid(1), n: 1 });
+    await db1.close();
+
     const log = await rawLog(provider);
-    log.append(log.currentTerm, encode({ c: 'users', op: 'uu', filter: { tag: 'x' }, update: { $set: { n: 7 } }, did }));
+    log.append(log.currentTerm, encode({ c: 'users', op: 'teleport', doc: { _id: oid(2) } }));
+    // The retired upsert opcode is now exactly such an entry.
+    log.append(log.currentTerm, encode({ c: 'users', op: 'uu', filter: { tag: 'x' }, update: {}, did: oid(3) }));
     log.sync();
     await log.close();
 
     const db2 = await connectWal(provider);
-    const doc = await (await db2.collection('users')).findOne({ tag: 'x' });
-    expect(doc._id.equals(did)).toBe(true);
-    expect(doc.n).toBe(7);
+    const users = await db2.collection('users');
+    expect(await users.countDocuments({})).toBe(1);   // neither was applied
+    expect((await users.findOne({ _id: oid(1) })).n).toBe(1);
     await db2.close();
   });
 

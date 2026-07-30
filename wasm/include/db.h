@@ -278,6 +278,39 @@ int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len
                                 uint8_t **out, size_t *out_len);
 
 /*
+ * The 12-byte `_id` of a document. BJ_ERR_STATE if the top-level `_id` is
+ * missing or is not an OID. `dc_document_id_opt` instead reports absence
+ * through *has (0/1) and only errors on a present-but-wrong-typed one --
+ * the distinction replaceOne needs, where an absent _id is legal and a
+ * string one is not.
+ */
+int dc_document_id(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12]);
+int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12], int *has);
+
+/*
+ * The document an upsert WOULD insert, without inserting it: for an
+ * update, `filter`'s bare top-level equality conditions seeded through
+ * `update`'s operators (see build_upsert_seed in db.c); for a replace,
+ * `replacement` itself. Both then carry an `_id` -- `default_id` for the
+ * update form, `replacement`'s own if it has one for the replace form.
+ * Writes a freshly malloc'd OBJECT through *out / *out_len (caller frees).
+ *
+ * dc_update_one/dc_update_many/dc_replace_one build their upserted
+ * document by calling these, so there is exactly one definition of what
+ * an upsert inserts. That matters because db_wal.h's planner calls them
+ * too, at proposal time, to turn an upsert into a plain insert command
+ * (db_wal.h explains why) -- and plan and apply agreeing is not a
+ * property to test for, it is one to make unrepresentable.
+ */
+int dc_upsert_document(const uint8_t *filter, uint32_t filter_len,
+                       const uint8_t *update, uint32_t update_len,
+                       const uint8_t default_id[12],
+                       uint8_t **out, size_t *out_len);
+int dc_replace_document(const uint8_t *replacement, uint32_t replacement_len,
+                        const uint8_t default_id[12],
+                        uint8_t **out, size_t *out_len);
+
+/*
  * Insert `doc` (a binjson OBJECT whose top-level `_id` is an OID — BJ_ERR_
  * STATE if missing or not an OID) into `c`'s primary tree and every
  * attached index. DC_ERR_DUPLICATE if that id already exists.

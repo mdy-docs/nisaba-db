@@ -213,13 +213,15 @@ export class ReplicatedDb extends WalDb {
           },
           async commit() {
             // Validate the staged bytes against the LEADER's manifest
-            // before anything becomes adoptable.
-            for (const want of manifest.files) {
-              const f = open.get(want.role) || { written: 0, crc: 0 };
-              if (f.written !== want.size || f.crc !== want.crc) {
-                throw new Error(`snapshot file ${want.role} failed validation`);
-              }
-            }
+            // before anything becomes adoptable -- through the store's
+            // own check, which is C's (snapstore.h). This used to be a
+            // hand-written loop here, one of three copies of the rule; a
+            // follower deciding whether transferred bytes really are the
+            // leader's snapshot is not a place for three opinions.
+            store.checkFiles(
+              [...open].map(([role, f]) => ({ role, size: f.written, crc: f.crc })),
+              manifest.files
+            );
             for (const f of open.values()) {
               f.handle.flush();
               await f.handle.close();

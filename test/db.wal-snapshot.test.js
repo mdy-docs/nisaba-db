@@ -231,6 +231,85 @@ describe('WAL snapshots: crash windows', () => {
     await db2.close();
   });
 
+  it('a torn manifest is not a snapshot: the generation is refused and swept', async () => {
+    // The manifest is written LAST and its validity IS the commit, so a
+    // generation whose manifest lost its tail must read as one that never
+    // happened -- and its files must be swept rather than left to
+    // accumulate. Nothing tested this before, which meant the CRC that
+    // makes the whole protocol work was never observed to do anything.
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider);
+    const users = await db.collection('users');
+    for (let i = 1; i <= 3; i++) await users.insertOne({ _id: oid(i), i });
+    await db.snapshot();
+    await db.close();
+
+    const manifest = '__snap-1.manifest.bj';
+    const h = await provider.openFile(manifest, { create: false });
+    h.truncate(h.getSize() - 1);      // lose one byte of the CRC
+    h.flush();
+    await h.close();
+
+    const db2 = await connectWal(provider);
+    expect(db2.snapshots.latest).toBeNull();
+    // Swept: the refused generation leaves nothing behind for the next
+    // open to reconsider.
+    const left = await provider.listFiles();
+    expect(left.filter((n) => n.startsWith('__snap-1.') || n.startsWith('__snap-1-'))).toEqual([]);
+    // The data itself is untouched -- a snapshot is derived state.
+    expect(await (await db2.collection('users')).countDocuments({})).toBe(3);
+    await db2.close();
+  });
+
+  it('a generation missing a data file is refused, not adopted with a hole', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider);
+    const users = await db.collection('users');
+    await users.insertOne({ _id: oid(1), i: 1 });
+    await db.snapshot();                       // generation 1
+    await users.insertOne({ _id: oid(2), i: 2 });
+    await db.snapshot();                       // generation 2 supersedes it
+    await db.close();
+
+    // Generation 2's manifest validates, but one of its files is gone.
+    // Presence at the recorded size is part of adoption, not something
+    // discovered later when a restore reads a hole.
+    const gone = (await provider.listFiles()).find((n) => n.startsWith('__snap-2-'));
+    expect(gone).toBeTruthy();
+    await provider.deleteFile(gone);
+
+    const db2 = await connectWal(provider);
+    expect(db2.snapshots.latest).toBeNull();   // 1 was already swept by 2
+    expect(await (await db2.collection('users')).countDocuments({})).toBe(2);
+    await db2.close();
+  });
+
+  it('verify() catches a corrupted generation file that is the right length', async () => {
+    // Length alone cannot see this, which is the entire reason a CRC is
+    // carried per file. Same check the replicated install path runs
+    // against a leader's manifest (snapstore.h's sst_check_files).
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider);
+    const users = await db.collection('users');
+    for (let i = 1; i <= 3; i++) await users.insertOne({ _id: oid(i), i });
+    const snap = await db.snapshot();
+    expect(await db.snapshots.verify()).toBe(true);
+
+    const victim = snap.files[0];
+    const h = await provider.openFile(victim.name, { create: false });
+    const buf = new Uint8Array(8);
+    h.read(buf, { at: 0 });
+    buf[0] ^= 0xff;                     // same length, different bytes
+    h.write(buf, { at: 0 });
+    h.flush();
+    await h.close();
+
+    await expect(db.snapshots.verify()).rejects.toThrow(
+      new RegExp(`Snapshot file ${victim.role} failed its checksum`)
+    );
+    await db.close();
+  });
+
   it('entries beyond the boundary that never applied replay after reopen', async () => {
     const provider = new MemoryStorageProvider();
     const db = await connectWal(provider);

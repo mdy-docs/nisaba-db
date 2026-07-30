@@ -588,7 +588,7 @@ function readI32(M, addr) {
 const {
   orderedKey, compositeKey, compositeUpperBound, BPlusTree,
   haversineDistance, RTree, TextLog, TiledTextLog, ENTRY_TYPE,
-  EntryLog, ENTRYLOG_TYPE, SnapshotStore, crc32, TextIndex,
+  EntryLog, ENTRYLOG_TYPE, SnapshotStore, crc32, snapshotCheckFiles, TextIndex,
   stemmer, createPatch, unifiedDiff, applyPatch, createDelta, applyDelta
 } = bindStructures({
   ready, requireModule, codeError, check,
@@ -3188,6 +3188,7 @@ export {
   ENTRYLOG_TYPE,
   SnapshotStore,
   crc32,
+  snapshotCheckFiles,
   TextIndex,
   stemmer,
   createPatch,

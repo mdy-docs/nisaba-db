@@ -27,6 +27,7 @@
 #include "db_agg.h"
 #include "db_catalog.h"
 #include "db_wal.h"
+#include "snapstore.h"
 #include "bjcursor.h"
 #include "db_update.h"
 #include "dbuf.h"
@@ -2435,6 +2436,481 @@ TEST(update_many_hands_back_post_images_when_asked) {
     fx_close(&fx);
 }
 
+/* ---- snapshot store policy (snapstore.h) ------------------------------ */
+
+/* A NUL-separated listing, and a parallel size array, built by hand
+ * because that is exactly the shape a host passes in. */
+typedef struct { dbuf names; const char *n_at[64]; double sizes[64]; uint32_t n; } dirlist;
+
+static void dirlist_add(dirlist *l, const char *name, double size) {
+    dbuf_put(&l->names, (const uint8_t *)name, strlen(name));
+    dbuf_put(&l->names, (const uint8_t *)"", 1);
+    l->n_at[l->n] = name;
+    l->sizes[l->n++] = size;
+}
+
+/* Play the host's half of the two-beat open: read the manifest the store
+ * asks for, size the files it then names, and report which candidate (if
+ * any) was adopted. `manifests` maps candidate manifest name -> bytes. */
+static int dirlist_size_of(const dirlist *l, const char *name, uint32_t len) {
+    for (uint32_t i = 0; i < l->n; i++) {
+        if (strlen(l->n_at[i]) == len && memcmp(l->n_at[i], name, len) == 0) return i;
+    }
+    return -1;
+}
+
+typedef struct { const char *name; const dbuf *bytes; } manifest_src;
+
+static int run_open(sst *s, const dirlist *l, const manifest_src *srcs, uint32_t n_srcs) {
+    for (uint32_t i = 0; i < sst_candidate_count(s); i++) {
+        uint32_t nlen; const char *name = sst_candidate_manifest(s, i, &nlen);
+        const dbuf *bytes = NULL;
+        for (uint32_t k = 0; k < n_srcs; k++) {
+            if (strlen(srcs[k].name) == nlen && memcmp(srcs[k].name, name, nlen) == 0) {
+                bytes = srcs[k].bytes; break;
+            }
+        }
+        if (!bytes) continue;
+        if (sst_try_manifest(s, i, bytes->data, (uint32_t)bytes->len) != BJ_OK) continue;
+
+        double sizes[64];
+        uint32_t pc = sst_pending_count(s);
+        for (uint32_t k = 0; k < pc && k < 64; k++) {
+            uint32_t plen; const char *pn = sst_pending_name(s, k, &plen);
+            int at = dirlist_size_of(l, pn, plen);
+            sizes[k] = at < 0 ? -1 : l->sizes[at];
+        }
+        if (sst_confirm(s, sizes, pc) == BJ_OK) return (int)i;
+    }
+    return -1;
+}
+static void dirlist_free(dirlist *l) { dbuf_free(&l->names); }
+
+/* Is `name` one of the NUL-separated names in `buf`? */
+static int dirlist_has(const dbuf *buf, const char *name) {
+    size_t want = strlen(name), at = 0;
+    while (at < buf->len) {
+        size_t end = at;
+        while (end < buf->len && buf->data[end] != '\0') end++;
+        if (end - at == want && memcmp(buf->data + at, name, want) == 0) return 1;
+        at = end + 1;
+    }
+    return 0;
+}
+static uint32_t dirlist_count(const dbuf *buf) {
+    uint32_t n = 0;
+    for (size_t at = 0; at < buf->len; at++) if (buf->data[at] == '\0') n++;
+    return n;
+}
+static const char *dirlist_at(const dbuf *buf, uint32_t i) {
+    uint32_t seen = 0;
+    size_t at = 0;
+    while (at < buf->len) {
+        if (seen == i) return (const char *)buf->data + at;
+        while (at < buf->len && buf->data[at] != '\0') at++;
+        at++;
+        seen++;
+    }
+    return NULL;
+}
+
+/* {files: [{role, name, size, crc}, ...]} for one role -- what a host
+ * accumulates as it writes and checksums each generation file. */
+static void files_entry(bj_builder *b, const char *role, const char *name,
+                        int64_t size, int64_t crc) {
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"role", 4);
+    bj_put_string(b, (const uint8_t *)role, (uint32_t)strlen(role));
+    if (name) {
+        bj_put_key(b, (const uint8_t *)"name", 4);
+        bj_put_string(b, (const uint8_t *)name, (uint32_t)strlen(name));
+    }
+    bj_put_key(b, (const uint8_t *)"size", 4);
+    bj_put_int(b, size);
+    bj_put_key(b, (const uint8_t *)"crc", 3);
+    bj_put_int(b, crc);
+    bj_end_object(b);
+}
+
+TEST(snapshot_names_round_trip_through_the_scanner) {
+    /* Whatever the store names, the store must recognize -- a generation
+     * whose files it writes and then cannot classify is one it sweeps at
+     * the next open, silently losing a snapshot it just took. */
+    sst *s = sst_new("snap", 4);
+    CHECK_FATAL(s != NULL);
+
+    dbuf m = {0}, d = {0}, lg = {0};
+    CHECK_OK(sst_manifest_name(s, 7, &m));
+    CHECK_OK(sst_data_name(s, 7, "f0", 2, &d));
+    CHECK_OK(sst_log_name(s, 7, &lg));
+    CHECK(m.len == strlen("snap-7.manifest.bj") && memcmp(m.data, "snap-7.manifest.bj", m.len) == 0);
+    CHECK(d.len == strlen("snap-7-f0.bj") && memcmp(d.data, "snap-7-f0.bj", d.len) == 0);
+    CHECK(lg.len == strlen("snap-log-7.bj") && memcmp(lg.data, "snap-log-7.bj", lg.len) == 0);
+
+    dirlist l;
+    memset(&l, 0, sizeof(l));
+    dirlist_add(&l, "snap-7.manifest.bj", 100);
+    dirlist_add(&l, "snap-7-f0.bj", 200);
+    dirlist_add(&l, "snap-log-7.bj", 300);
+    /* Files this store does not own must be left entirely alone: the
+     * snapshot directory is the database's directory. */
+    dirlist_add(&l, "catalog.bj", 10);
+    dirlist_add(&l, "coll-users.bj", 20);
+    dirlist_add(&l, "othersnap-3.manifest.bj", 30);
+    dirlist_add(&l, "snap-01-f0.bj", 40);      /* leading zero: not ours */
+    CHECK_OK(sst_scan(s, l.names.data, (uint32_t)l.names.len));
+
+    /* The paired log's generation counts toward next_gen even though the
+     * log has its own lifecycle -- reusing 7 would put a fresh snapshot
+     * behind a stale log. */
+    CHECK_I64((long long)sst_next_gen(s), 8);
+    CHECK_I64((long long)sst_candidate_count(s), 1);
+    uint32_t clen; const char *cand = sst_candidate_manifest(s, 0, &clen);
+    CHECK(cand && clen == m.len && memcmp(cand, m.data, clen) == 0);
+
+    /* Nothing adopted yet, so the sweep would take generation 7 -- but
+     * never the foreign files. */
+    dbuf sweep = {0};
+    CHECK_OK(sst_sweep_plan(s, &sweep));
+    CHECK(dirlist_has(&sweep, "snap-7.manifest.bj"));
+    CHECK(dirlist_has(&sweep, "snap-7-f0.bj"));
+    CHECK(!dirlist_has(&sweep, "catalog.bj"));
+    CHECK(!dirlist_has(&sweep, "coll-users.bj"));
+    CHECK(!dirlist_has(&sweep, "othersnap-3.manifest.bj"));
+    CHECK(!dirlist_has(&sweep, "snap-01-f0.bj"));
+    CHECK(!dirlist_has(&sweep, "snap-log-7.bj"));   /* logs are pruned separately */
+
+    /* A role that cannot be a filename is refused at naming time. */
+    dbuf bad = {0};
+    CHECK_RC(sst_data_name(s, 7, "has/slash", 9, &bad), SST_ERR_ROLE);
+    CHECK_RC(sst_data_name(s, 7, "", 0, &bad), SST_ERR_ROLE);
+    dbuf_free(&bad);
+
+    dbuf_free(&sweep); dbuf_free(&lg); dbuf_free(&d); dbuf_free(&m);
+    dirlist_free(&l);
+    sst_free(s);
+}
+
+TEST(snapshot_adopts_the_newest_generation_that_committed) {
+    /*
+     * The commit protocol: the manifest is written LAST and its validity
+     * IS the commit. So a crashed attempt (data files, no manifest) and a
+     * torn manifest must both fail to adopt, and adoption must fall back
+     * to the older generation rather than to nothing.
+     */
+    sst *s = sst_new("snap", 4);
+    CHECK_FATAL(s != NULL);
+
+    /* Generation 1: complete. */
+    bj_builder *fb = bj_builder_new();
+    bj_begin_array(fb);
+    files_entry(fb, "f0", "snap-1-f0.bj", 200, 0xabcd);
+    bj_end_array(fb);
+    size_t flen; const uint8_t *fbuf = bj_builder_data(fb, &flen);
+    dbuf man1 = {0};
+    CHECK_OK(sst_manifest_encode(10, 3, NULL, 0, fbuf, (uint32_t)flen, &man1));
+
+    /* Generation 2: a manifest whose last byte was lost. */
+    bj_builder *fb2 = bj_builder_new();
+    bj_begin_array(fb2);
+    files_entry(fb2, "f0", "snap-2-f0.bj", 400, 0x1234);
+    bj_end_array(fb2);
+    size_t f2len; const uint8_t *f2buf = bj_builder_data(fb2, &f2len);
+    dbuf man2 = {0};
+    CHECK_OK(sst_manifest_encode(20, 4, NULL, 0, f2buf, (uint32_t)f2len, &man2));
+    dbuf torn = {0};
+    dbuf_put(&torn, man2.data, man2.len - 1);
+
+    dirlist l;
+    memset(&l, 0, sizeof(l));
+    dirlist_add(&l, "snap-1.manifest.bj", (double)man1.len);
+    dirlist_add(&l, "snap-1-f0.bj", 200);
+    dirlist_add(&l, "snap-2.manifest.bj", (double)torn.len);
+    dirlist_add(&l, "snap-2-f0.bj", 400);
+    /* Generation 3 crashed before writing its manifest at all. */
+    dirlist_add(&l, "snap-3-f0.bj", 999);
+    CHECK_OK(sst_scan(s, l.names.data, (uint32_t)l.names.len));
+
+    /* Candidates are manifest-bearing generations, newest first; the
+     * crashed generation 3 is not among them. */
+    CHECK_I64((long long)sst_candidate_count(s), 2);
+    CHECK_I64((long long)sst_next_gen(s), 4);
+
+    manifest_src srcs[] = {
+        { "snap-1.manifest.bj", &man1 },
+        { "snap-2.manifest.bj", &torn }
+    };
+    int adopted = run_open(s, &l, srcs, 2);
+    CHECK_I64(adopted, 1);            /* generation 2 refused, 1 adopted */
+    CHECK_I64((long long)sst_latest_gen(s), 1);
+    CHECK_I64(sst_has_latest(s), 1);
+
+    /* The sweep takes everything but the adopted generation: the torn
+     * attempt AND the manifest-less one. */
+    dbuf sweep = {0};
+    CHECK_OK(sst_sweep_plan(s, &sweep));
+    CHECK(!dirlist_has(&sweep, "snap-1.manifest.bj"));
+    CHECK(!dirlist_has(&sweep, "snap-1-f0.bj"));
+    CHECK(dirlist_has(&sweep, "snap-2.manifest.bj"));
+    CHECK(dirlist_has(&sweep, "snap-2-f0.bj"));
+    CHECK(dirlist_has(&sweep, "snap-3-f0.bj"));
+
+    /* What the host gets back: the manifest plus the generation number,
+     * which lives in the filenames rather than inside the record. */
+    dbuf latest = {0};
+    int has = 0;
+    CHECK_OK(sst_latest(s, &latest, &has));
+    CHECK_I64(has, 1);
+    {
+        const uint8_t *v; size_t vlen; int found = 0;
+        CHECK_OK(obj_get_field(latest.data, latest.len, (const uint8_t *)"gen", 3, &v, &vlen, &found));
+        CHECK_I64(found, 1);
+        CHECK_OK(obj_get_field(latest.data, latest.len,
+                               (const uint8_t *)"lastIncludedIndex", 17, &v, &vlen, &found));
+        CHECK_I64(found, 1);
+    }
+    dbuf_free(&latest);
+
+    dbuf_free(&sweep); dbuf_free(&torn); dbuf_free(&man2); dbuf_free(&man1);
+    bj_builder_free(fb2); bj_builder_free(fb);
+    dirlist_free(&l);
+    sst_free(s);
+}
+
+TEST(snapshot_refuses_a_manifest_whose_files_are_not_there) {
+    /* A manifest validating is necessary but not sufficient: every file
+     * it names must be present at its recorded length. A generation that
+     * lost a data file must fall back, not adopt and fail later. */
+    sst *s = sst_new("snap", 4);
+    CHECK_FATAL(s != NULL);
+
+    bj_builder *fb = bj_builder_new();
+    bj_begin_array(fb);
+    files_entry(fb, "f0", "snap-1-f0.bj", 200, 0xabcd);
+    files_entry(fb, "f1", "snap-1-f1.bj", 300, 0xbeef);
+    bj_end_array(fb);
+    size_t flen; const uint8_t *fbuf = bj_builder_data(fb, &flen);
+    dbuf man = {0};
+    CHECK_OK(sst_manifest_encode(10, 3, NULL, 0, fbuf, (uint32_t)flen, &man));
+
+    /* f1 is missing entirely. */
+    dirlist a;
+    memset(&a, 0, sizeof(a));
+    dirlist_add(&a, "snap-1.manifest.bj", (double)man.len);
+    dirlist_add(&a, "snap-1-f0.bj", 200);
+    CHECK_OK(sst_scan(s, a.names.data, (uint32_t)a.names.len));
+    manifest_src src[] = { { "snap-1.manifest.bj", &man } };
+    CHECK_I64(run_open(s, &a, src, 1), -1);
+    CHECK_I64(sst_has_latest(s), 0);
+    dirlist_free(&a);
+
+    /* f1 is present but the wrong length -- a truncated write. */
+    dirlist b;
+    memset(&b, 0, sizeof(b));
+    dirlist_add(&b, "snap-1.manifest.bj", (double)man.len);
+    dirlist_add(&b, "snap-1-f0.bj", 200);
+    dirlist_add(&b, "snap-1-f1.bj", 299);
+    CHECK_OK(sst_scan(s, b.names.data, (uint32_t)b.names.len));
+    CHECK_I64(run_open(s, &b, src, 1), -1);
+    CHECK_I64(sst_has_latest(s), 0);
+    dirlist_free(&b);
+
+    /* Both present and correct: adopted. */
+    dirlist c;
+    memset(&c, 0, sizeof(c));
+    dirlist_add(&c, "snap-1.manifest.bj", (double)man.len);
+    dirlist_add(&c, "snap-1-f0.bj", 200);
+    dirlist_add(&c, "snap-1-f1.bj", 300);
+    CHECK_OK(sst_scan(s, c.names.data, (uint32_t)c.names.len));
+    CHECK_I64(run_open(s, &c, src, 1), 0);
+    CHECK_I64(sst_has_latest(s), 1);
+    dirlist_free(&c);
+
+    dbuf_free(&man);
+    bj_builder_free(fb);
+    sst_free(s);
+}
+
+TEST(snapshot_validates_transferred_files_against_the_leaders_manifest) {
+    /*
+     * The rule that was written three times: the JS store's verify(), the
+     * replicated install path and the Raft harness each had their own
+     * copy. A follower deciding whether a transferred snapshot is intact
+     * is not a place for three opinions -- one of them being subtly
+     * wrong means adopting corrupt state and diverging silently.
+     *
+     * A leader's manifest names roles, not the follower's filenames, so
+     * `name` is optional throughout.
+     */
+    bj_builder *want = bj_builder_new();
+    bj_begin_array(want);
+    files_entry(want, "f0", NULL, 200, 0xabcd);
+    files_entry(want, "f1", NULL, 300, 0xbeef);
+    bj_end_array(want);
+    size_t wlen; const uint8_t *wbuf = bj_builder_data(want, &wlen);
+    dbuf man = {0};
+    CHECK_OK(sst_manifest_encode(10, 3, NULL, 0, wbuf, (uint32_t)wlen, &man));
+    /* Validation reads the record, not the CRC-tailed file. */
+    const uint8_t *body = man.data;
+    uint32_t body_len = (uint32_t)man.len - 4;
+
+    const uint8_t *bad; uint32_t bad_len;
+
+    /* Exactly what was promised. Order need not match: chunks arrive in
+     * whatever order the transfer produced them. */
+    bj_builder *ok = bj_builder_new();
+    bj_begin_array(ok);
+    files_entry(ok, "f1", NULL, 300, 0xbeef);
+    files_entry(ok, "f0", NULL, 200, 0xabcd);
+    bj_end_array(ok);
+    size_t olen; const uint8_t *obuf = bj_builder_data(ok, &olen);
+    CHECK_OK(sst_check_files(body, body_len, obuf, (uint32_t)olen, &bad, &bad_len));
+
+    /* Right length, wrong bytes: the case a size check alone would miss,
+     * and the reason a CRC is carried at all. */
+    bj_builder *corrupt = bj_builder_new();
+    bj_begin_array(corrupt);
+    files_entry(corrupt, "f0", NULL, 200, 0xabcd);
+    files_entry(corrupt, "f1", NULL, 300, 0x9999);
+    bj_end_array(corrupt);
+    size_t clen; const uint8_t *cbuf = bj_builder_data(corrupt, &clen);
+    CHECK_RC(sst_check_files(body, body_len, cbuf, (uint32_t)clen, &bad, &bad_len), SST_ERR_CHECKSUM);
+    CHECK(bad && bad_len == 2 && memcmp(bad, "f1", 2) == 0);
+
+    /* A file that never arrived is a failure, not an omission: an install
+     * missing a structure has not received the snapshot. */
+    bj_builder *partial = bj_builder_new();
+    bj_begin_array(partial);
+    files_entry(partial, "f0", NULL, 200, 0xabcd);
+    bj_end_array(partial);
+    size_t plen; const uint8_t *pbuf = bj_builder_data(partial, &plen);
+    CHECK_RC(sst_check_files(body, body_len, pbuf, (uint32_t)plen, &bad, &bad_len), SST_ERR_CHECKSUM);
+    CHECK(bad && bad_len == 2 && memcmp(bad, "f1", 2) == 0);
+
+    /* A prefix-less store: what the standalone validator in
+     * structures-core.js creates, since checking bytes against a
+     * manifest needs no filenames at all. */
+    sst *bare = sst_new("", 0);
+    CHECK_FATAL(bare != NULL);
+    CHECK_OK(sst_check_files(body, body_len, obuf, (uint32_t)olen, &bad, &bad_len));
+    sst_free(bare);
+
+    bj_builder_free(partial); bj_builder_free(corrupt); bj_builder_free(ok);
+    dbuf_free(&man);
+    bj_builder_free(want);
+}
+
+TEST(snapshot_commit_supersedes_the_previous_generation) {
+    sst *s = sst_new("snap", 4);
+    CHECK_FATAL(s != NULL);
+
+    bj_builder *f1 = bj_builder_new();
+    bj_begin_array(f1);
+    files_entry(f1, "f0", "snap-1-f0.bj", 200, 0xabcd);
+    bj_end_array(f1);
+    size_t l1; const uint8_t *b1 = bj_builder_data(f1, &l1);
+    dbuf man1 = {0};
+    CHECK_OK(sst_manifest_encode(10, 3, NULL, 0, b1, (uint32_t)l1, &man1));
+
+    dirlist l;
+    memset(&l, 0, sizeof(l));
+    dirlist_add(&l, "snap-1.manifest.bj", (double)man1.len);
+    dirlist_add(&l, "snap-1-f0.bj", 200);
+    CHECK_OK(sst_scan(s, l.names.data, (uint32_t)l.names.len));
+    manifest_src srcs[] = { { "snap-1.manifest.bj", &man1 } };
+    CHECK_I64(run_open(s, &l, srcs, 1), 0);
+    CHECK_I64((long long)sst_next_gen(s), 2);
+
+    /* Commit generation 2. The predecessor's files come back to delete --
+     * and only AFTER the new manifest is durable, which is what makes a
+     * crash in this window leave an openable snapshot behind. */
+    bj_builder *f2 = bj_builder_new();
+    bj_begin_array(f2);
+    files_entry(f2, "f0", "snap-2-f0.bj", 400, 0x1234);
+    files_entry(f2, "f1", "snap-2-f1.bj", 500, 0x5678);
+    bj_end_array(f2);
+    size_t l2; const uint8_t *b2 = bj_builder_data(f2, &l2);
+    dbuf man2 = {0};
+    CHECK_OK(sst_manifest_encode(20, 4, NULL, 0, b2, (uint32_t)l2, &man2));
+
+    dbuf sweep = {0};
+    CHECK_OK(sst_adopt_committed(s, 2, man2.data, (uint32_t)man2.len, &sweep));
+    CHECK_I64((long long)sst_latest_gen(s), 2);
+    CHECK_I64((long long)sst_next_gen(s), 3);
+    CHECK_I64((long long)dirlist_count(&sweep), 2);
+    CHECK(dirlist_has(&sweep, "snap-1.manifest.bj"));
+    CHECK(dirlist_has(&sweep, "snap-1-f0.bj"));
+    CHECK(!dirlist_has(&sweep, "snap-2-f0.bj"));
+
+    /* A duplicated role would produce two generations' worth of one file
+     * name; caught at encode, not at the next open. */
+    bj_builder *dup = bj_builder_new();
+    bj_begin_array(dup);
+    files_entry(dup, "f0", NULL, 1, 1);
+    files_entry(dup, "f0", NULL, 2, 2);
+    bj_end_array(dup);
+    size_t dlen; const uint8_t *dbufp = bj_builder_data(dup, &dlen);
+    dbuf out = {0};
+    CHECK_RC(sst_manifest_encode(1, 1, NULL, 0, dbufp, (uint32_t)dlen, &out), SST_ERR_ROLE);
+    dbuf_free(&out);
+
+    bj_builder *badrole = bj_builder_new();
+    bj_begin_array(badrole);
+    files_entry(badrole, "f/0", NULL, 1, 1);
+    bj_end_array(badrole);
+    const uint8_t *brbuf = bj_builder_data(badrole, &dlen);
+    dbuf out2 = {0};
+    CHECK_RC(sst_manifest_encode(1, 1, NULL, 0, brbuf, (uint32_t)dlen, &out2), SST_ERR_ROLE);
+    dbuf_free(&out2);
+
+    bj_builder_free(badrole); bj_builder_free(dup);
+    dbuf_free(&sweep); dbuf_free(&man2); dbuf_free(&man1);
+    bj_builder_free(f2); bj_builder_free(f1);
+    dirlist_free(&l);
+    sst_free(s);
+}
+
+TEST(snapshot_log_candidates_are_newest_first) {
+    /* A crash mid-compaction leaves a torn newest log. The host tries
+     * each candidate with elog_open and takes the first that works, so
+     * the ORDER is the fallback policy -- getting it backwards would
+     * adopt an obsolete log and replay from too far back. */
+    sst *s = sst_new("snap", 4);
+    CHECK_FATAL(s != NULL);
+
+    dirlist l;
+    memset(&l, 0, sizeof(l));
+    dirlist_add(&l, "snap-log-2.bj", 10);
+    dirlist_add(&l, "snap-log-11.bj", 10);   /* lexically before "-2", numerically after */
+    dirlist_add(&l, "snap-log-7.bj", 10);
+    dirlist_add(&l, "snap-3-f0.bj", 10);
+    dirlist_add(&l, "othersnap-log-9.bj", 10);
+    dirlist_add(&l, "__wal__.bj", 10);
+
+    dbuf out = {0};
+    CHECK_OK(sst_log_candidates(s, l.names.data, (uint32_t)l.names.len, &out));
+    CHECK_I64((long long)dirlist_count(&out), 3);
+    CHECK_STR(dirlist_at(&out, 0), "snap-log-11.bj");
+    CHECK_STR(dirlist_at(&out, 1), "snap-log-7.bj");
+    CHECK_STR(dirlist_at(&out, 2), "snap-log-2.bj");
+    dbuf_free(&out);
+
+    /* Pruning keeps exactly one. */
+    dbuf prune = {0};
+    CHECK_OK(sst_prune_logs_plan(s, l.names.data, (uint32_t)l.names.len,
+                                 "snap-log-11.bj", 14, &prune));
+    CHECK_I64((long long)dirlist_count(&prune), 2);
+    CHECK(!dirlist_has(&prune, "snap-log-11.bj"));
+    CHECK(dirlist_has(&prune, "snap-log-7.bj"));
+    CHECK(dirlist_has(&prune, "snap-log-2.bj"));
+    CHECK(!dirlist_has(&prune, "othersnap-log-9.bj"));
+    CHECK(!dirlist_has(&prune, "__wal__.bj"));
+    dbuf_free(&prune);
+
+    dirlist_free(&l);
+    sst_free(s);
+}
+
 /* ---- WAL command grammar and planner (db_wal.h) ----------------------- */
 
 /* Has `cmd` a top-level field called `name`? The invariant tests below are
@@ -2921,6 +3397,12 @@ TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
 }
 
 int main(void) {
+    RUN(snapshot_names_round_trip_through_the_scanner);
+    RUN(snapshot_adopts_the_newest_generation_that_committed);
+    RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);
+    RUN(snapshot_validates_transferred_files_against_the_leaders_manifest);
+    RUN(snapshot_commit_supersedes_the_previous_generation);
+    RUN(snapshot_log_candidates_are_newest_first);
     RUN(wal_grammar_round_trips_every_op_it_can_emit);
     RUN(wal_grammar_refuses_what_it_cannot_replay);
     RUN(wal_plan_resolves_every_command_to_one_id_and_no_filter);

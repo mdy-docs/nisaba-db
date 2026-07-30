@@ -7,7 +7,7 @@
  * delivers only when the simulation advances, and every random draw
  * comes from the seed — a failing schedule replays exactly.
  */
-import { EntryLog, MemoryHandle, encode, decode, crc32 } from '../wasm/nisaba-wasm.js';
+import { EntryLog, MemoryHandle, encode, decode, crc32, snapshotCheckFiles } from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 
 /** Small, well-known seedable PRNG. */
@@ -189,12 +189,15 @@ export class KvSnapshotter {
         staged.set(role, buf);
       },
       commit() {
-        for (const f of manifest.files) {
-          const buf = staged.get(f.role) || new Uint8Array(0);
-          if (buf.length !== f.size || crc32(buf) !== f.crc) {
-            throw new Error(`snapshot file ${f.role} failed validation`);
-          }
-        }
+        // The same check the real store and the replicated install path
+        // run (snapstore.h). This used to be its own loop -- and a
+        // harness whose validation is laxer than production's passes
+        // exactly the snapshots production would reject, which is the
+        // opposite of what a harness is for.
+        snapshotCheckFiles(
+          [...staged].map(([role, buf]) => ({ role, size: buf.length, crc: crc32(buf) })),
+          manifest.files
+        );
         const { entries } = decode(staged.get('kv') || encode({ entries: [] }));
         snapshotter.machine.map = new Map(entries);
         snapshotter.machine.applied = manifest.lastIncludedIndex;

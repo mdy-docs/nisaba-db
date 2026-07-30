@@ -271,6 +271,10 @@ class WalDb {
     await this._chain.catch(() => {});
     await this._db.close();
     await this._log.close();
+    // The store owns a WASM-side context now (its naming and adoption
+    // policy is C's -- snapstore.h), so closing it is releasing memory,
+    // not just clearing a flag.
+    this._store?.close();
   }
 
   /** All writes flow through here: log order is apply order. Errors
@@ -735,7 +739,9 @@ export async function restoreLatestSnapshot(provider, { snapshotPrefix = SNAP_PR
   }
   const store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
   await store.open();
-  return restoreFromStore(provider, store);
+  // This store is local to the call, so it must release its C context
+  // here -- nobody else holds a reference to close it later.
+  try { return await restoreFromStore(provider, store); } finally { store.close(); }
 }
 
 /** The store-half of restoreLatestSnapshot, for callers that already

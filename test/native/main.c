@@ -28,6 +28,7 @@
 #include "db_catalog.h"
 #include "db_wal.h"
 #include "snapstore.h"
+#include "raft_core.h"
 #include "bjcursor.h"
 #include "db_update.h"
 #include "dbuf.h"
@@ -755,6 +756,51 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
     CHECK_STR(dc_strerror(DC_ERR_EMPTY_KEY_SPEC), "createIndex requires at least one field");
     /* An unmapped code still returns something printable. */
     CHECK(dc_strerror(-9999) != NULL);
+}
+
+TEST(divergence_classification_defaults_to_halting) {
+    /*
+     * A replicated apply loop uses this to tell a RESULT (every replica
+     * reaches it) from DIVERGENCE (this replica alone failed). Getting
+     * it wrong toward halting costs availability and a human notices;
+     * getting it wrong the other way forks the state silently.
+     */
+    static const int deterministic[] = {
+        DC_ERR_DUPLICATE, DC_ERR_ID_MISMATCH, DC_ERR_DUPLICATE_KEY,
+        DC_ERR_MISSING_INDEXED_FIELD, DC_ERR_UNINDEXABLE_VALUE, DC_ERR_UNSUPPORTED_ID,
+        DC_ERR_INVALID_COLLECTION_NAME, DC_ERR_INVALID_DB_NAME, DC_ERR_RESERVED_NAME,
+        DC_ERR_EMPTY_KEY_SPEC, DC_ERR_NON_ASCENDING_KEY,
+        DC_ERR_BULK_EMPTY, DC_ERR_BULK_UNKNOWN_OP, DC_ERR_BULK_MISSING_FIELD,
+        DC_ERR_AGG_BAD_STAGE, DC_ERR_AGG_UNKNOWN_STAGE, DC_ERR_AGG_BAD_ACCUMULATOR,
+        DC_ERR_AGG_PROJECT_MIXED,
+        DC_ERR_BAD_CURRENT_DATE, DC_ERR_CURRENT_DATE_CONFLICT,
+        DC_ERR_INDEX_OPTION_UNSUPPORTED, DC_ERR_TTL_NEEDS_SINGLE_FIELD,
+        DC_ERR_WAL_UNKNOWN_OP, DC_ERR_WAL_MISSING_FIELD, DC_ERR_WAL_BAD_REQUEST
+    };
+    for (size_t i = 0; i < sizeof(deterministic) / sizeof(deterministic[0]); i++) {
+        if (!dc_is_deterministic(deterministic[i]))
+            TAP_FAIL("code %d should be a deterministic result", deterministic[i]);
+    }
+
+    /* Each of these fails on ONE replica and not its peers, so each must
+     * stop the node rather than be reported as an outcome. */
+    static const int divergent[] = {
+        BJ_ERR_OOM,           /* a local resource                        */
+        BJ_ERR_STATE,         /* a programming error; halting finds it   */
+        DC_ERR_CATALOG_ENTRY, /* THIS replica's catalog is damaged       */
+        BJ_ERR_EOF, BJ_ERR_UNKNOWN_TYPE, BJ_ERR_VERIFY, BJ_ERR_DEPTH,
+        BJ_ERR_INT_RANGE, BJ_ERR_POINTER_RANGE, BJ_ERR_RANGE,
+        BJ_OK                 /* not a failure at all                    */
+    };
+    for (size_t i = 0; i < sizeof(divergent) / sizeof(divergent[0]); i++) {
+        if (dc_is_deterministic(divergent[i]))
+            TAP_FAIL("code %d must halt the replica, not become a result", divergent[i]);
+    }
+
+    /* The default. A code nobody has classified -- including one added
+     * next year -- is presumed divergence. */
+    CHECK_I64(dc_is_deterministic(-9999), 0);
+    CHECK_I64(dc_is_deterministic(-36), 0);
 }
 
 TEST(name_validation_matches_the_js_rules) {
@@ -2436,6 +2482,560 @@ TEST(update_many_hands_back_post_images_when_asked) {
     fx_close(&fx);
 }
 
+/* ---- Raft decision rules (raft_core.h) -------------------------------- */
+
+/* A baseline vote request: a current-term candidate with a log as long
+ * as ours, at a node that is a voter and hears from nobody. Each test
+ * changes exactly the field it is about. */
+static raft_vote_in vote_baseline(void) {
+    raft_vote_in in;
+    memset(&in, 0, sizeof(in));
+    in.msg_term = 5;
+    in.candidate_id = 2;
+    in.last_log_index = 10;
+    in.last_log_term = 4;
+    in.current_term = 5;
+    in.voted_for = 0;
+    in.our_last_index = 10;
+    in.our_last_term = 4;
+    in.self_is_voter = 1;
+    in.now = 1000;
+    in.last_leader_contact = -1000000;
+    in.min_election_timeout = 150;
+    return in;
+}
+
+TEST(raft_vote_follows_the_up_to_date_rule) {
+    raft_vote_out out;
+
+    /* Equal logs: granted. */
+    raft_vote_in in = vote_baseline();
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 1);
+    CHECK_I64(out.persist, 1);            /* the vote reaches disk first */
+    CHECK_I64((long long)out.persist_voted_for, 2);
+    CHECK_I64(out.reset_election_timer, 1);
+
+    /* §5.4.1: a candidate with an older last TERM loses, however long
+     * its log. This is the rule that stops a node with more entries but
+     * a stale term from erasing committed history. */
+    in = vote_baseline();
+    in.last_log_term = 3;
+    in.last_log_index = 999;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 0);
+
+    /* Same term, shorter log: loses. */
+    in = vote_baseline();
+    in.last_log_index = 9;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 0);
+
+    /* Same term, longer log: wins. */
+    in = vote_baseline();
+    in.last_log_index = 11;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 1);
+
+    /* Higher term: wins regardless of index. */
+    in = vote_baseline();
+    in.last_log_term = 5;
+    in.last_log_index = 0;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 1);
+}
+
+TEST(raft_vote_is_at_most_one_per_term) {
+    raft_vote_out out;
+
+    /* Already voted for somebody else this term. */
+    raft_vote_in in = vote_baseline();
+    in.voted_for = 7;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 0);
+    CHECK_I64(out.persist, 0);
+
+    /* The same candidate asking again is idempotent, and costs no second
+     * fsync -- a retried RequestVote is ordinary on a lossy network. */
+    in = vote_baseline();
+    in.voted_for = 2;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 1);
+    CHECK_I64(out.persist, 0);
+
+    /* A NEW term clears the old vote, so the same node may vote again --
+     * and the step-down must be reported so the caller persists the term
+     * before replying. */
+    in = vote_baseline();
+    in.voted_for = 7;
+    in.msg_term = 6;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.step_down, 1);
+    CHECK_I64((long long)out.step_down_term, 6);
+    CHECK_I64(out.grant, 1);
+    CHECK_I64((long long)out.persist_term, 6);
+    CHECK_I64((long long)out.reply_term, 6);
+
+    /* A candidate from the past learns our term and gets nothing. */
+    in = vote_baseline();
+    in.msg_term = 4;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 0);
+    CHECK_I64(out.step_down, 0);
+    CHECK_I64((long long)out.reply_term, 5);
+}
+
+TEST(raft_prevote_persists_nothing_and_respects_a_live_leader) {
+    raft_vote_out out;
+
+    /* A pre-vote round never persists and never bumps a term: that is
+     * the whole point -- an isolated node rejoining must not dethrone a
+     * working leader just by arriving with a higher term. */
+    raft_vote_in in = vote_baseline();
+    in.pre_vote = 1;
+    in.msg_term = 99;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 1);
+    CHECK_I64(out.persist, 0);
+    CHECK_I64(out.step_down, 0);
+    CHECK_I64((long long)out.reply_term, 5);
+
+    /* Stickiness: a node hearing from a leader refuses, even to a
+     * perfectly up-to-date candidate. The disruptive case this exists
+     * for is a removed-but-unaware member pre-voting at a healthy
+     * leader's followers. */
+    in = vote_baseline();
+    in.pre_vote = 1;
+    in.leader_id = 3;
+    in.last_leader_contact = 900;      /* 100ms ago, under the 150 floor */
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 0);
+
+    /* Silence past the floor releases it. */
+    in.last_leader_contact = 800;      /* 200ms ago */
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 1);
+
+    /* A leader itself always refuses. */
+    in = vote_baseline();
+    in.pre_vote = 1;
+    in.is_leader = 1;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 0);
+
+    /* A learner holds no franchise, in either round. */
+    in = vote_baseline();
+    in.self_is_voter = 0;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 0);
+    in.pre_vote = 1;
+    raft_decide_vote(&in, &out);
+    CHECK_I64(out.grant, 0);
+}
+
+static raft_append_in append_baseline(void) {
+    raft_append_in in;
+    memset(&in, 0, sizeof(in));
+    in.msg_term = 5;
+    in.leader_id = 3;
+    in.prev_log_index = 10;
+    in.prev_log_term = 4;
+    in.entry_count = 2;
+    in.current_term = 5;
+    in.is_follower = 1;
+    in.our_base_index = 0;
+    in.our_last_index = 10;
+    in.our_prev_term = 4;
+    return in;
+}
+
+TEST(raft_append_consistency_check_hints_where_to_resume) {
+    raft_append_out out;
+
+    raft_append_in in = append_baseline();
+    raft_decide_append(&in, &out);
+    CHECK_I64(out.success, 1);
+    CHECK_I64((long long)out.match_index, 12);   /* prev + entry_count */
+    CHECK_I64(out.has_hint, 0);
+    CHECK_I64(out.stale, 0);
+
+    /* Behind our snapshot boundary: tell the leader where our log
+     * actually starts, so nextIndex jumps forward in one round trip
+     * rather than walking down entries that no longer exist. */
+    in = append_baseline();
+    in.our_base_index = 20;
+    in.our_last_index = 30;
+    raft_decide_append(&in, &out);
+    CHECK_I64(out.success, 0);
+    CHECK_I64(out.has_hint, 1);
+    CHECK_I64((long long)out.hint_index, 21);
+
+    /* Past our tail: the first index we are missing. */
+    in = append_baseline();
+    in.our_last_index = 7;
+    raft_decide_append(&in, &out);
+    CHECK_I64(out.success, 0);
+    CHECK_I64((long long)out.hint_index, 8);
+
+    /* Term disagreement at prev: rewind to the disputed index itself. */
+    in = append_baseline();
+    in.our_prev_term = 3;
+    raft_decide_append(&in, &out);
+    CHECK_I64(out.success, 0);
+    CHECK_I64((long long)out.hint_index, 10);
+
+    /* A stale leader: no side effects at all, not even a refreshed
+     * election timer. Distinct from a rejection, where the leader is
+     * current and only misaligned. */
+    in = append_baseline();
+    in.msg_term = 4;
+    raft_decide_append(&in, &out);
+    CHECK_I64(out.stale, 1);
+    CHECK_I64(out.success, 0);
+    CHECK_I64(out.step_down, 0);
+    CHECK_I64((long long)out.reply_term, 5);
+
+    /* A higher term, or any term while we think we are a candidate or
+     * leader, means conceding. */
+    in = append_baseline();
+    in.msg_term = 6;
+    raft_decide_append(&in, &out);
+    CHECK_I64(out.step_down, 1);
+    CHECK_I64((long long)out.step_down_term, 6);
+    CHECK_I64((long long)out.step_down_leader, 3);
+    CHECK_I64((long long)out.reply_term, 6);
+
+    in = append_baseline();
+    in.is_follower = 0;             /* we thought we were the leader */
+    raft_decide_append(&in, &out);
+    CHECK_I64(out.step_down, 1);
+    CHECK_I64((long long)out.step_down_term, 5);
+    CHECK_I64(out.success, 1);
+}
+
+/* An AppendEntries `entries` array: {index, term, type, payload}. */
+static void entry(bj_builder *b, uint64_t index, uint64_t term, const char *payload) {
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"index", 5); bj_put_int(b, (int64_t)index);
+    bj_put_key(b, (const uint8_t *)"term", 4);  bj_put_int(b, (int64_t)term);
+    bj_put_key(b, (const uint8_t *)"type", 4);  bj_put_int(b, EL_NORMAL);
+    bj_put_key(b, (const uint8_t *)"payload", 7);
+    bj_put_binary(b, (const uint8_t *)payload, (uint32_t)strlen(payload));
+    bj_end_object(b);
+}
+
+TEST(raft_conflict_rule_truncates_only_what_disagrees) {
+    /*
+     * §5.3 against a real log. The rule is subtle in exactly one place:
+     * an entry we ALREADY hold at the same term must be skipped, not
+     * re-appended and not treated as a conflict -- a retried or
+     * overlapping AppendEntries is completely ordinary, and truncating
+     * on one would throw away entries the leader believes are
+     * replicated.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "log.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    CHECK_OK(elog_set_hard_state(log, 2, 0));
+
+    uint64_t at = 0;
+    for (int i = 1; i <= 4; i++) CHECK_OK(elog_append(log, 1, EL_NORMAL, (const uint8_t *)"x", 1, &at));
+    CHECK_OK(elog_sync(log));
+    CHECK_I64((long long)elog_last_index(log), 4);
+
+    uint64_t truncated = 999;
+
+    /* A batch we already hold, verbatim: nothing changes. */
+    bj_builder *same = bj_builder_new();
+    bj_begin_array(same);
+    entry(same, 2, 1, "x");
+    entry(same, 3, 1, "x");
+    bj_end_array(same);
+    size_t slen; const uint8_t *sbuf = bj_builder_data(same, &slen);
+    CHECK_OK(raft_append_entries_to_log(log, sbuf, (uint32_t)slen, &truncated));
+    CHECK_I64((long long)truncated, 0);
+    CHECK_I64((long long)elog_last_index(log), 4);
+
+    /* An overlap that agrees, then extends: only the tail is appended. */
+    bj_builder *ext = bj_builder_new();
+    bj_begin_array(ext);
+    entry(ext, 4, 1, "x");
+    entry(ext, 5, 2, "y");
+    bj_end_array(ext);
+    size_t elen; const uint8_t *ebuf = bj_builder_data(ext, &elen);
+    CHECK_OK(raft_append_entries_to_log(log, ebuf, (uint32_t)elen, &truncated));
+    CHECK_I64((long long)truncated, 0);
+    CHECK_I64((long long)elog_last_index(log), 5);
+
+    /* A genuine conflict at 3: our suffix from there goes, and the
+     * leader's replaces it. Reported so the caller can say so. */
+    bj_builder *conflict = bj_builder_new();
+    bj_begin_array(conflict);
+    entry(conflict, 3, 2, "z");
+    entry(conflict, 4, 2, "z");
+    bj_end_array(conflict);
+    size_t clen; const uint8_t *cbuf = bj_builder_data(conflict, &clen);
+    CHECK_OK(raft_append_entries_to_log(log, cbuf, (uint32_t)clen, &truncated));
+    CHECK_I64((long long)truncated, 3);
+    CHECK_I64((long long)elog_last_index(log), 4);
+    uint64_t t = 0;
+    CHECK_OK(elog_term_at(log, 3, &t));
+    CHECK_I64((long long)t, 2);
+    CHECK_OK(elog_term_at(log, 2, &t));
+    CHECK_I64((long long)t, 1);       /* below the conflict: untouched */
+
+    /* An empty batch is a heartbeat: no truncation, no sync-worthy
+     * change. */
+    bj_builder *none = bj_builder_new();
+    bj_begin_array(none); bj_end_array(none);
+    size_t nlen; const uint8_t *nbuf = bj_builder_data(none, &nlen);
+    CHECK_OK(raft_append_entries_to_log(log, nbuf, (uint32_t)nlen, &truncated));
+    CHECK_I64((long long)truncated, 0);
+    CHECK_I64((long long)elog_last_index(log), 4);
+
+    bj_builder_free(none); bj_builder_free(conflict);
+    bj_builder_free(ext); bj_builder_free(same);
+    elog_free(log);
+    memfs_free(fs);
+}
+
+TEST(raft_follower_commit_never_runs_past_its_own_log) {
+    uint64_t out = 0;
+    /* The leader may have committed entries it has not sent us. */
+    CHECK_I64(raft_follower_commit(20, 5, 12, &out), 1);
+    CHECK_I64((long long)out, 12);
+    CHECK_I64(raft_follower_commit(8, 5, 12, &out), 1);
+    CHECK_I64((long long)out, 8);
+    CHECK_I64(raft_follower_commit(5, 5, 12, &out), 0);
+    CHECK_I64(raft_follower_commit(3, 5, 12, &out), 0);
+    /* A leaderCommit above ours but a log shorter than our commit index
+     * cannot move it backwards. */
+    CHECK_I64(raft_follower_commit(20, 12, 12, &out), 0);
+}
+
+TEST(raft_leader_commits_only_current_term_entries) {
+    uint64_t cand = 0;
+    /* Three voters, quorum 2: the leader plus one peer at 7. */
+    uint64_t matches3[] = { 7, 3 };
+    CHECK_I64(raft_commit_candidate(9, matches3, 2, 2, &cand), 1);
+    CHECK_I64((long long)cand, 7);
+    /* Quorum 3 of 3 needs the slowest. */
+    CHECK_I64(raft_commit_candidate(9, matches3, 2, 3, &cand), 1);
+    CHECK_I64((long long)cand, 3);
+    /* A single-node cluster commits on its own. */
+    CHECK_I64(raft_commit_candidate(4, NULL, 0, 1, &cand), 1);
+    CHECK_I64((long long)cand, 4);
+
+    /*
+     * The figure-8 rule. A candidate index replicated to a quorum is
+     * still NOT committable unless it belongs to the current term --
+     * otherwise a new leader counts an old entry to a majority, commits
+     * it, and then loses it to a node that never held it.
+     */
+    CHECK_I64(raft_may_commit(7, 5, 0, /*term_at*/ 5, /*current*/ 5), 1);
+    CHECK_I64(raft_may_commit(7, 5, 0, /*term_at*/ 4, /*current*/ 5), 0);
+    /* Never backwards, never at or below the snapshot boundary. */
+    CHECK_I64(raft_may_commit(5, 5, 0, 5, 5), 0);
+    CHECK_I64(raft_may_commit(7, 5, 7, 5, 5), 0);
+    CHECK_I64(raft_may_commit(8, 5, 7, 5, 5), 1);
+}
+
+TEST(raft_backoff_believes_a_follower_that_lost_its_disk) {
+    raft_backoff_out out;
+
+    /* An ordinary hint rewinds to it. */
+    raft_backoff(6, 1, 20, 3, &out);
+    CHECK_I64((long long)out.next, 6);
+    CHECK_I64((long long)out.match, 3);
+    CHECK_I64(out.match_regressed, 0);
+
+    /* A hint forward of a plain decrement is not authority: cap it. */
+    raft_backoff(99, 1, 20, 3, &out);
+    CHECK_I64((long long)out.next, 19);
+
+    /* No hint at all: plain decrement. */
+    raft_backoff(0, 0, 20, 3, &out);
+    CHECK_I64((long long)out.next, 19);
+
+    /* Never below 1. */
+    raft_backoff(0, 0, 1, 0, &out);
+    CHECK_I64((long long)out.next, 1);
+
+    /*
+     * The hint falls at or below what we saw the peer hold. Only losing
+     * a disk does that -- a blank replacement reusing the id. Believe
+     * it: match must drop too, or the leader keeps counting a node with
+     * nothing toward its quorums and can commit an entry that exists in
+     * one place.
+     */
+    raft_backoff(4, 1, 20, 10, &out);
+    CHECK_I64((long long)out.next, 4);
+    CHECK_I64((long long)out.match, 3);
+    CHECK_I64(out.match_regressed, 1);
+
+    raft_backoff(1, 1, 20, 10, &out);
+    CHECK_I64((long long)out.next, 1);
+    CHECK_I64((long long)out.match, 0);
+    CHECK_I64(out.match_regressed, 1);
+}
+
+TEST(raft_quorum_counts_voters_only) {
+    CHECK_I64((long long)raft_quorum(1), 1);
+    CHECK_I64((long long)raft_quorum(2), 2);
+    CHECK_I64((long long)raft_quorum(3), 2);
+    CHECK_I64((long long)raft_quorum(4), 3);
+    CHECK_I64((long long)raft_quorum(5), 3);
+}
+
+/* Read an ARRAY of INTs into `out`; returns the count, or -1. */
+static long read_int_array(const uint8_t *obj, size_t len, const char *key,
+                           int64_t *out, uint32_t cap) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(obj, len, (const uint8_t *)key, (uint32_t)strlen(key),
+                      &v, &vlen, &found) != BJ_OK || !found) return -1;
+    cur c = { v, vlen, 0 };
+    uint32_t n;
+    if (array_begin(&c, &n) != BJ_OK) return -1;
+    for (uint32_t i = 0; i < n && i < cap; i++) {
+        double d;
+        if (read_number(&c, &d) != BJ_OK) return -1;
+        out[i] = (int64_t)d;
+    }
+    return (long)n;
+}
+
+TEST(raft_membership_derives_the_same_lists_everywhere) {
+    /* Two nodes adopting the same set must derive the same lists: the
+     * quorum count is taken from a position in one of them, so an
+     * ordering difference is a split-brain waiting to happen. */
+    bj_builder *b = bj_builder_new();
+    bj_begin_array(b);
+    /* Deliberately out of order, and mixing records with bare ids. */
+    bj_begin_object(b);
+      bj_put_key(b, (const uint8_t *)"id", 2); bj_put_int(b, 3);
+      bj_put_key(b, (const uint8_t *)"host", 4); bj_put_string(b, (const uint8_t *)"c", 1);
+      bj_put_key(b, (const uint8_t *)"voting", 6); bj_put_bool(b, 0);
+    bj_end_object(b);
+    bj_put_int(b, 1);
+    bj_begin_object(b);
+      bj_put_key(b, (const uint8_t *)"id", 2); bj_put_int(b, 2);
+      bj_put_key(b, (const uint8_t *)"host", 4); bj_put_string(b, (const uint8_t *)"b", 1);
+    bj_end_object(b);
+    bj_end_array(b);
+    size_t blen; const uint8_t *bbuf = bj_builder_data(b, &blen);
+
+    dbuf out = {0};
+    CHECK_OK(raft_members_adopt(bbuf, (uint32_t)blen, 2, &out));
+
+    int64_t ids[8];
+    CHECK_I64(read_int_array(out.data, out.len, "voters", ids, 8), 2);
+    CHECK_I64((long long)ids[0], 1);      /* sorted, and 3 excluded */
+    CHECK_I64((long long)ids[1], 2);
+    CHECK_I64(read_int_array(out.data, out.len, "peers", ids, 8), 2);
+    CHECK_I64((long long)ids[0], 1);      /* self (2) excluded */
+    CHECK_I64((long long)ids[1], 3);
+
+    /* Records survive whole -- the addresses ARE the address book. */
+    const uint8_t *v; size_t vlen; int found = 0;
+    CHECK_OK(obj_get_field(out.data, out.len, (const uint8_t *)"members", 7, &v, &vlen, &found));
+    CHECK_I64(found, 1);
+    CHECK_I64(arr_count(v, vlen), 3);
+    CHECK(find_bytes(v, vlen, "\x01""c", 2) != NULL || find_bytes(v, vlen, "c", 1) != NULL);
+    dbuf_free(&out);
+
+    /* A node applying its own removal must see itself gone: adopt does
+     * not re-add self. */
+    bj_builder *b2 = bj_builder_new();
+    bj_begin_array(b2); bj_put_int(b2, 1); bj_put_int(b2, 3); bj_end_array(b2);
+    size_t b2len; const uint8_t *b2buf = bj_builder_data(b2, &b2len);
+    dbuf out2 = {0};
+    CHECK_OK(raft_members_adopt(b2buf, (uint32_t)b2len, 2, &out2));
+    CHECK_I64(read_int_array(out2.data, out2.len, "voters", ids, 8), 2);
+    CHECK_I64(read_int_array(out2.data, out2.len, "peers", ids, 8), 2);
+    CHECK_I64((long long)ids[0], 1);
+    CHECK_I64((long long)ids[1], 3);
+    dbuf_free(&out2);
+
+    bj_builder_free(b2);
+    bj_builder_free(b);
+}
+
+TEST(raft_membership_merge_cannot_erase_an_address) {
+    /* changeMembership([1,2,3,4]) must not silently destroy the
+     * addresses the log carries -- the log being the single source of
+     * truth for the cluster's shape is what removes the separate address
+     * book, and that holds only if an id-only proposal is harmless. */
+    bj_builder *k = bj_builder_new();
+    bj_begin_array(k);
+    for (int i = 1; i <= 2; i++) {
+        bj_begin_object(k);
+        bj_put_key(k, (const uint8_t *)"id", 2); bj_put_int(k, i);
+        bj_put_key(k, (const uint8_t *)"host", 4);
+        bj_put_string(k, (const uint8_t *)(i == 1 ? "alpha" : "beta"), i == 1 ? 5 : 4);
+        bj_put_key(k, (const uint8_t *)"port", 4); bj_put_int(k, 9000 + i);
+        bj_end_object(k);
+    }
+    bj_end_array(k);
+    size_t klen; const uint8_t *kbuf = bj_builder_data(k, &klen);
+
+    /* Bare ids plus one brand-new member with an address. */
+    bj_builder *i = bj_builder_new();
+    bj_begin_array(i);
+    bj_put_int(i, 1);
+    bj_put_int(i, 2);
+    bj_begin_object(i);
+    bj_put_key(i, (const uint8_t *)"id", 2); bj_put_int(i, 3);
+    bj_put_key(i, (const uint8_t *)"host", 4); bj_put_string(i, (const uint8_t *)"gamma", 5);
+    bj_end_object(i);
+    bj_end_array(i);
+    size_t ilen; const uint8_t *ibuf = bj_builder_data(i, &ilen);
+
+    dbuf out = {0};
+    CHECK_OK(raft_members_merge(ibuf, (uint32_t)ilen, kbuf, (uint32_t)klen, &out));
+    CHECK_I64(arr_count(out.data, out.len), 3);
+    CHECK(find_bytes(out.data, out.len, "alpha", 5) != NULL);
+    CHECK(find_bytes(out.data, out.len, "beta", 4) != NULL);
+    CHECK(find_bytes(out.data, out.len, "gamma", 5) != NULL);
+    dbuf_free(&out);
+
+    /* A record that DOES state a host is making a statement -- that is
+     * how a restarted node corrects the log -- so it wins. */
+    bj_builder *m = bj_builder_new();
+    bj_begin_array(m);
+    bj_begin_object(m);
+    bj_put_key(m, (const uint8_t *)"id", 2); bj_put_int(m, 1);
+    bj_put_key(m, (const uint8_t *)"host", 4); bj_put_string(m, (const uint8_t *)"moved", 5);
+    bj_end_object(m);
+    bj_end_array(m);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(m, &mlen);
+    dbuf out2 = {0};
+    CHECK_OK(raft_members_merge(mbuf, (uint32_t)mlen, kbuf, (uint32_t)klen, &out2));
+    CHECK(find_bytes(out2.data, out2.len, "moved", 5) != NULL);
+    CHECK(find_bytes(out2.data, out2.len, "alpha", 5) == NULL);
+    dbuf_free(&out2);
+
+    /* An empty set, or one with an unusable id, is refused. */
+    bj_builder *e = bj_builder_new();
+    bj_begin_array(e); bj_end_array(e);
+    size_t elen; const uint8_t *ebuf = bj_builder_data(e, &elen);
+    dbuf out3 = {0};
+    CHECK_RC(raft_members_merge(ebuf, (uint32_t)elen, kbuf, (uint32_t)klen, &out3), RAFT_ERR_MEMBER);
+    dbuf_free(&out3);
+
+    bj_builder *z = bj_builder_new();
+    bj_begin_array(z); bj_put_int(z, 0); bj_end_array(z);
+    size_t zlen; const uint8_t *zbuf = bj_builder_data(z, &zlen);
+    dbuf out4 = {0};
+    CHECK_RC(raft_members_merge(zbuf, (uint32_t)zlen, kbuf, (uint32_t)klen, &out4), RAFT_ERR_MEMBER);
+    dbuf_free(&out4);
+
+    bj_builder_free(z); bj_builder_free(e); bj_builder_free(m);
+    bj_builder_free(i); bj_builder_free(k);
+}
+
 /* ---- snapshot store policy (snapstore.h) ------------------------------ */
 
 /* A NUL-separated listing, and a parallel size array, built by hand
@@ -3397,6 +3997,17 @@ TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
 }
 
 int main(void) {
+    RUN(raft_vote_follows_the_up_to_date_rule);
+    RUN(raft_vote_is_at_most_one_per_term);
+    RUN(raft_prevote_persists_nothing_and_respects_a_live_leader);
+    RUN(raft_append_consistency_check_hints_where_to_resume);
+    RUN(raft_conflict_rule_truncates_only_what_disagrees);
+    RUN(raft_follower_commit_never_runs_past_its_own_log);
+    RUN(raft_leader_commits_only_current_term_entries);
+    RUN(raft_backoff_believes_a_follower_that_lost_its_disk);
+    RUN(raft_quorum_counts_voters_only);
+    RUN(raft_membership_derives_the_same_lists_everywhere);
+    RUN(raft_membership_merge_cannot_erase_an_address);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);
@@ -3442,6 +4053,7 @@ int main(void) {
     RUN(bulk_grammar_rejects_malformed_lists_and_names_the_index);
     RUN(ttl_cutoff_and_filter);
     RUN(strerror_covers_every_code_the_layer_can_raise);
+    RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);
     RUN(index_key_spec_validates_and_emits_its_fields);
     RUN(file_names_match_the_original_js_scheme);

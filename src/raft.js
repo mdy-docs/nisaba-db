@@ -106,7 +106,7 @@
  * detected lazily, on the group's next use — the RaftGroupHost
  * (src/raft-host.js) drives both ends.
  */
-import { ENTRYLOG_TYPE, encode, decode } from '../wasm/nisaba-wasm.js';
+import { ENTRYLOG_TYPE, encode, decode, raft } from '../wasm/nisaba-wasm.js';
 
 export class NotLeaderError extends Error {
   /** @param {number} leaderId - the last known leader (0 if unknown) */
@@ -232,15 +232,17 @@ export class RaftNode {
    * bookkeeping follows the set, and `onConfig` fires with the records.
    */
   _setMembers(input) {
-    const records = input
-      .map((m) => (typeof m === 'number' ? { id: m } : { ...m }))
-      .sort((a, b) => a.id - b.id);
-    this.memberInfo = records;
-    this.members = records.map((m) => m.id);
+    // Sorting, the voting-flag reading and the self-exclusion are C's
+    // (raft_core.h): two nodes adopting the same set must derive the
+    // same lists, because the quorum count is read from a position in
+    // one of them, and a divergence there is a split brain.
+    const { members, voters, peers } = raft.membersAdopt(input, this.id);
+    this.memberInfo = members;
+    this.members = members.map((m) => m.id);
     /** Quorum electorate: members without `voting: false`. Replication
      * (this.peers) spans everyone; only voters count and campaign. */
-    this.voters = records.filter((m) => m.voting !== false).map((m) => m.id);
-    this.peers = this.members.filter((p) => p !== this.id);
+    this.voters = voters;
+    this.peers = peers;
     if (this._next) {
       for (const p of this.peers) {
         if (!this._next.has(p)) {
@@ -448,27 +450,26 @@ export class RaftNode {
    * replication path handles that once it is a member.
    */
   async changeMembership(members) {
-    const next = new Map();
-    for (const m of members) {
-      const record = typeof m === 'number' ? { id: m } : { ...m };
-      if (!Number.isInteger(record.id) || record.id <= 0) {
-        throw new Error('changeMembership requires member records with positive integer ids');
-      }
-      if (record.host === undefined) {
-        const known = this.memberInfo.find((k) => k.id === record.id);
-        if (known) Object.assign(record, { ...known, ...record });
-      }
-      next.set(record.id, record);
-    }
-    if (next.size === 0) {
-      throw new Error('changeMembership requires a non-empty member set');
+    // The merge is C's (raft_core.h): an id-only entry inherits the
+    // known record, which is what stops changeMembership([1,2,3,4]) from
+    // erasing the addresses the log carries -- and the log being the one
+    // source of truth for the cluster's shape is what removes the
+    // separate address book entirely.
+    let next;
+    try {
+      next = raft.membersMerge(members, this.memberInfo);
+    } catch (err) {
+      throw new Error(
+        'changeMembership requires a non-empty set of member records with positive integer ids',
+        { cause: err }
+      );
     }
     if (this._configInFlight) {
       throw new Error('a membership change is already in flight; wait for it to commit');
     }
     this._configInFlight = true;
     try {
-      return await this.propose(encode({ members: [...next.values()] }), ENTRYLOG_TYPE.CONFIG);
+      return await this.propose(encode({ members: next }), ENTRYLOG_TYPE.CONFIG);
     } finally {
       this._configInFlight = false;
     }
@@ -565,86 +566,85 @@ export class RaftNode {
     }
   }
 
+  /**
+   * §5.2/§5.4.1. The decision is C's (raft_core.h's raft_decide_vote);
+   * this gathers the inputs and carries out the answer IN THE ORDER
+   * GIVEN — step down, then persist, then reply — because that order is
+   * itself a safety rule: a vote must reach the disk before the reply
+   * leaves, or a machine that loses power can vote twice in one term.
+   */
   _onRequestVote(msg) {
-    const currentTerm = this.log.currentTerm;
-    if (msg.term < currentTerm) return { term: currentTerm, voteGranted: false };
+    const d = raft.decideVote({
+      msgTerm: msg.term,
+      candidateId: msg.candidateId,
+      lastLogIndex: msg.lastLogIndex,
+      lastLogTerm: msg.lastLogTerm,
+      preVote: !!msg.preVote,
+      currentTerm: this.log.currentTerm,
+      votedFor: this.log.votedFor,
+      ourLastIndex: this.log.lastIndex,
+      ourLastTerm: this.log.lastTerm,
+      selfIsVoter: this.voters.includes(this.id),
+      isLeader: this.role === ROLE.LEADER,
+      leaderId: this.leaderId,
+      now: this._now,
+      lastLeaderContact: this._lastLeaderContact,
+      minElectionTimeout: this.electionTimeoutMs[0]
+    });
 
-    // Learners (and removed nodes) hold no franchise: a candidate only
-    // solicits voters, but a stale-config straggler may still ask.
-    if (!this.voters.includes(this.id)) return { term: currentTerm, voteGranted: false };
-
-    const upToDate =
-      msg.lastLogTerm > this.log.lastTerm ||
-      (msg.lastLogTerm === this.log.lastTerm && msg.lastLogIndex >= this.log.lastIndex);
-
-    if (msg.preVote) {
-      // Persist nothing, grant nothing durable: "would I vote for you?".
-      // Leader stickiness: refuse while a live leader is heard from —
-      // and a healthy leader IS that leader, so it always refuses (the
-      // classic disruptive case is a removed-but-unaware member whose
-      // log is up to date pre-voting at the still-working leader).
-      const sticky = this.role === ROLE.LEADER ||
-        (this.leaderId !== 0 && this._now - this._lastLeaderContact < this.electionTimeoutMs[0]);
-      return { term: currentTerm, voteGranted: !sticky && upToDate };
-    }
-
-    if (msg.term > currentTerm) this._becomeFollower(msg.term, 0);
-    let granted = false;
-    const votedFor = this.log.votedFor;
-    if ((votedFor === 0 || votedFor === msg.candidateId) && upToDate) {
-      if (votedFor !== msg.candidateId) {
-        // Persist the vote BEFORE replying — Raft's cardinal rule, and
-        // setHardState commits + fsyncs immediately (entrylog.h).
-        this.log.setHardState(this.log.currentTerm, msg.candidateId);
-      }
-      granted = true;
-      this._resetElectionTimer();
-    }
-    return { term: this.log.currentTerm, voteGranted: granted };
+    if (d.stepDown) this._becomeFollower(d.stepDownTerm, 0);
+    // setHardState commits + fsyncs immediately (entrylog.h), so this
+    // line IS the durability point the reply below depends on.
+    if (d.persist) this.log.setHardState(d.persistTerm, d.persistVotedFor);
+    if (d.resetTimer) this._resetElectionTimer();
+    return { term: this.log.currentTerm, voteGranted: d.grant };
   }
 
+  /**
+   * §5.3. The consistency check, its resume hint, and the conflict rule
+   * are all C's (raft_core.h) — including the entry loop, which runs
+   * against this node's own EntryLog handle, so "skip what we already
+   * hold, truncate at the first disagreement" has one implementation.
+   */
   _onAppendEntries(msg) {
-    let currentTerm = this.log.currentTerm;
-    if (msg.term < currentTerm) return { term: currentTerm, success: false };
-    if (msg.term > currentTerm || this.role !== ROLE.FOLLOWER) {
-      this._becomeFollower(msg.term, msg.leaderId);
-    }
+    const prevInRange = msg.prevLogIndex >= this.log.baseIndex &&
+                        msg.prevLogIndex <= this.log.lastIndex;
+    const d = raft.decideAppend({
+      msgTerm: msg.term,
+      leaderId: msg.leaderId,
+      prevLogIndex: msg.prevLogIndex,
+      prevLogTerm: msg.prevLogTerm,
+      entryCount: msg.entries.length,
+      currentTerm: this.log.currentTerm,
+      isFollower: this.role === ROLE.FOLLOWER,
+      ourBaseIndex: this.log.baseIndex,
+      ourLastIndex: this.log.lastIndex,
+      ourPrevTerm: prevInRange ? this.log.termAt(msg.prevLogIndex) : 0
+    });
+
+    // A stale leader gets our term and nothing else -- not even a
+    // refreshed election timer, which a mere rejection does earn.
+    if (d.stale) return { term: d.replyTerm, success: false };
+
+    if (d.stepDown) this._becomeFollower(d.stepDownTerm, d.stepDownLeader);
     this.leaderId = msg.leaderId;
     this._lastLeaderContact = this._now;
     this._resetElectionTimer();
-    currentTerm = this.log.currentTerm;
+    const currentTerm = this.log.currentTerm;
 
-    const { prevLogIndex, prevLogTerm } = msg;
-    if (prevLogIndex < this.log.baseIndex) {
-      // The leader is offering entries our snapshot already covers; tell
-      // it where our log actually starts so nextIndex can jump forward.
-      return { term: currentTerm, success: false, hintIndex: this.log.baseIndex + 1 };
-    }
-    if (prevLogIndex > this.log.lastIndex) {
-      return { term: currentTerm, success: false, hintIndex: this.log.lastIndex + 1 };
-    }
-    if (this.log.termAt(prevLogIndex) !== prevLogTerm) {
-      return { term: currentTerm, success: false, hintIndex: prevLogIndex };
-    }
+    if (!d.success) return { term: currentTerm, success: false, hintIndex: d.hintIndex };
 
-    let appended = false;
-    for (const e of msg.entries) {
-      if (e.index <= this.log.lastIndex) {
-        if (this.log.termAt(e.index) === e.term) continue; // already have it
-        // The conflict rule (§5.3): ours is wrong, discard our suffix.
-        // Raft guarantees no conflict at or below the commit index —
-        // EntryLog's own truncate guard enforces exactly that invariant.
-        this._emit('truncate', { from: e.index, oldLastIndex: this.log.lastIndex });
-        this.log.truncateFrom(e.index);
-      }
-      this.log.append(e.term, e.payload, e.type);
-      appended = true;
-    }
-    if (appended) this.log.sync(); // durable BEFORE the ack
+    // The entries were decoded off the wire and are re-encoded to cross
+    // back into C. That round trip is the cost of this seam and it goes
+    // away when C owns the message grammar too -- at which point nothing
+    // decodes an AppendEntries in JavaScript at all.
+    const oldLastIndex = this.log.lastIndex;
+    const truncatedFrom = raft.appendEntries(this.log, msg.entries);
+    if (truncatedFrom) this._emit('truncate', { from: truncatedFrom, oldLastIndex });
 
-    const matchIndex = prevLogIndex + msg.entries.length;
-    if (msg.leaderCommit > this.commitIndex) {
-      this.commitIndex = Math.min(msg.leaderCommit, this.log.lastIndex);
+    const advanced = raft.followerCommit(msg.leaderCommit, this.commitIndex, this.log.lastIndex);
+    if (advanced !== null) {
+      this.commitIndex = advanced;
       this.log.setCommitIndex(this.commitIndex); // advisory; rides next sync
       this._pumpApply();
     }
@@ -653,7 +653,7 @@ export class RaftNode {
       this._quiesced = true;
       this._electionDeadline = Infinity;
     }
-    return { term: currentTerm, success: true, matchIndex };
+    return { term: currentTerm, success: true, matchIndex: d.matchIndex };
   }
 
   async _onInstallSnapshot(msg) {
@@ -862,16 +862,12 @@ export class RaftNode {
         this._maybePromote(peer);
         again = this._next.get(peer) <= this.log.lastIndex;
       } else {
-        // Back up along the follower's hint (never forward of a plain
-        // decrement). The hint may fall below matchIndex: a follower can
-        // regress like that only by losing its disk (a blank replacement
-        // reusing the id) — believe it, and drop matchIndex with it so a
-        // replica that no longer holds the entries stops counting toward
-        // quorums, and nextIndex can fall back to the install path.
-        const hint = reply.hintIndex !== undefined ? reply.hintIndex : next - 1;
-        const backedTo = Math.max(1, Math.min(hint, next - 1));
-        if (backedTo <= this._match.get(peer)) this._match.set(peer, backedTo - 1);
-        this._next.set(peer, backedTo);
+        // Where to resume, and whether the peer's match index has to
+        // regress with it -- raft_core.h's raft_backoff, which explains
+        // why believing a hint below matchIndex is the safe reading.
+        const b = raft.backoff(reply.hintIndex, next, this._match.get(peer) ?? 0);
+        this._match.set(peer, b.match);
+        this._next.set(peer, b.next);
         again = true;
       }
     } catch {
@@ -990,22 +986,27 @@ export class RaftNode {
   }
 
   /** Majority of VOTERS — learners add capacity, not quorum weight. */
-  _quorum() { return Math.floor(this.voters.length / 2) + 1; }
+  _quorum() { return raft.quorum(this.voters.length); }
 
+  /**
+   * §5.4.2. Both halves are C's: which index a quorum holds, and whether
+   * that index may actually commit. The second is the figure-8 rule --
+   * only a CURRENT-term entry commits by counting replicas -- and
+   * omitting it is the classic way to lose committed data.
+   */
   _advanceCommit() {
     if (this.role !== ROLE.LEADER) return;
-    const matches = [
-      this.log.lastIndex, // the leader is always a voter
-      ...this.peers.filter((p) => this.voters.includes(p)).map((p) => this._match.get(p))
-    ].sort((a, b) => b - a);
-    const n = matches[this._quorum() - 1];
-    // §5.4.2: only entries of the CURRENT term commit by counting; earlier
-    // terms commit implicitly once a current-term entry above them does.
-    if (n > this.commitIndex && n > this.log.baseIndex && this.log.termAt(n) === this.log.currentTerm) {
-      this.commitIndex = n;
-      this.log.setCommitIndex(n);
-      this._pumpApply();
-    }
+    const matches = this.peers
+      .filter((p) => this.voters.includes(p))
+      .map((p) => this._match.get(p) ?? 0);
+    // The leader is always a voter and always holds its own last index.
+    const n = raft.commitCandidate(this.log.lastIndex, matches, this._quorum());
+    if (n === null) return;
+    const termAt = n > this.log.baseIndex && n <= this.log.lastIndex ? this.log.termAt(n) : 0;
+    if (!raft.mayCommit(n, this.commitIndex, this.log.baseIndex, termAt, this.log.currentTerm)) return;
+    this.commitIndex = n;
+    this.log.setCommitIndex(n);
+    this._pumpApply();
   }
 
   // ---- apply --------------------------------------------------------------

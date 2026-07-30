@@ -104,6 +104,61 @@ const char *dc_strerror(int code) {
     }
 }
 
+int dc_is_deterministic(int code) {
+    switch (code) {
+        /* Facts about the command and the state it lands on. Every
+         * replica applying this entry reaches the same verdict. */
+        case DC_ERR_DUPLICATE:
+        case DC_ERR_ID_MISMATCH:
+        case DC_ERR_DUPLICATE_KEY:
+        case DC_ERR_MISSING_INDEXED_FIELD:
+        case DC_ERR_UNINDEXABLE_VALUE:
+        case DC_ERR_UNSUPPORTED_ID:
+        /* Facts about the command's shape. The bytes are identical on
+         * every replica, so the rejection is too. */
+        case DC_ERR_INVALID_COLLECTION_NAME:
+        case DC_ERR_INVALID_DB_NAME:
+        case DC_ERR_RESERVED_NAME:
+        case DC_ERR_EMPTY_KEY_SPEC:
+        case DC_ERR_NON_ASCENDING_KEY:
+        case DC_ERR_BULK_EMPTY:
+        case DC_ERR_BULK_UNKNOWN_OP:
+        case DC_ERR_BULK_MISSING_FIELD:
+        case DC_ERR_AGG_BAD_STAGE:
+        case DC_ERR_AGG_UNKNOWN_STAGE:
+        case DC_ERR_AGG_BAD_ACCUMULATOR:
+        case DC_ERR_AGG_PROJECT_MIXED:
+        case DC_ERR_BAD_CURRENT_DATE:
+        case DC_ERR_CURRENT_DATE_CONFLICT:
+        case DC_ERR_INDEX_OPTION_UNSUPPORTED:
+        case DC_ERR_TTL_NEEDS_SINGLE_FIELD:
+        case DC_ERR_WAL_UNKNOWN_OP:
+        case DC_ERR_WAL_MISSING_FIELD:
+        case DC_ERR_WAL_BAD_REQUEST:
+            return 1;
+
+        /* Deliberately NOT deterministic, and each for its own reason:
+         *
+         *   DC_ERR_CATALOG_ENTRY   this replica's catalog is damaged or
+         *                          older; a healthy one would succeed.
+         *   BJ_ERR_OOM             a local resource, not the command.
+         *   BJ_ERR_STATE           a programming error; halting is how
+         *                          it gets found.
+         *   BJ_ERR_EOF and the other structural codes -- they arise
+         *                          from parsing a command (identical
+         *                          everywhere) OR from reading a
+         *                          damaged local file (not), and an
+         *                          ambiguity in this classification
+         *                          must resolve toward halting.
+         *
+         * Anything unlisted, including anything added later, lands here
+         * too: a new code is presumed to be divergence until somebody
+         * decides otherwise. */
+        default:
+            return 0;
+    }
+}
+
 /* The rules shared by collection and database names. */
 static int name_is_wellformed(const char *name, size_t len) {
     if (len == 0) return 0;

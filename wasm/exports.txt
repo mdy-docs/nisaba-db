@@ -32,6 +32,7 @@ _dnw_len
 _dvw_new
 _dvw_free
 _dvw_strerror
+_dvw_is_deterministic
 _dvw_strerror_len
 _dvw_check_collection_name
 _dvw_check_db_name
@@ -141,3 +142,19 @@ _walw_preimage_ptr
 _walw_preimage_len
 _walw_target_id
 _walw_parse
+
+# Raft decision rules (raft_core.h)
+_rcw_new
+_rcw_free
+_rcw_out_ptr
+_rcw_out_len
+_rcw_decide_vote
+_rcw_decide_append
+_rcw_append_entries
+_rcw_follower_commit
+_rcw_commit_candidate
+_rcw_may_commit
+_rcw_quorum
+_rcw_backoff
+_rcw_members_adopt
+_rcw_members_merge

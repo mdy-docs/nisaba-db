@@ -22,6 +22,11 @@
 
 EMSCRIPTEN_KEEPALIVE const char *dvw_strerror(int code) { return dc_strerror(code); }
 
+/* Is this a deterministic command failure (a result every replica
+ * computes) rather than divergence (this replica alone failing)? See
+ * db_validate.h -- a replicated apply loop rests on the distinction. */
+EMSCRIPTEN_KEEPALIVE int dvw_is_deterministic(int code) { return dc_is_deterministic(code); }
+
 EMSCRIPTEN_KEEPALIVE int dvw_strerror_len(int code) {
     return (int)strlen(dc_strerror(code));
 }

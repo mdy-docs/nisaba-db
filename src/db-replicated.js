@@ -47,7 +47,7 @@
  * the RaftNode owns replay, applying exactly the committed prefix — an
  * uncommitted local suffix stays unapplied until a leader settles it.
  */
-import { connect, EntryLog, crc32 } from '../wasm/nisaba-wasm.js';
+import { connect, EntryLog, crc32, isDeterministicError } from '../wasm/nisaba-wasm.js';
 import { RaftNode, NotLeaderError } from './raft.js';
 import {
   WalDb, WAL_FILE, SNAP_PREFIX,
@@ -84,7 +84,14 @@ export class DbStateMachine {
       // one. Anything else (I/O, a bridged storage exception underneath)
       // is real trouble: rethrow so the apply pump stops the node rather
       // than let replicas diverge.
-      if (err.name === 'Error' || err.cause) throw err;
+      //
+      // This used to read `err.name === 'Error' || err.cause`, which
+      // rested consensus safety on a JavaScript runtime detail: any code
+      // path throwing a plain Error for a deterministic reason halted
+      // the cluster, and a typed error raised by an I/O path was
+      // swallowed as a result. It is a numeric classification now, and
+      // it lives with the codes it classifies (db_validate.h).
+      if (!isDeterministicError(err)) throw err;
       outcome = { error: err };
     }
     this._results.set(entry.index, outcome);

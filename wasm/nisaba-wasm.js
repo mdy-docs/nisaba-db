@@ -183,6 +183,29 @@ function check(code) {
 }
 
 /**
+ * Is `err` a DETERMINISTIC command failure -- one every replica applying
+ * the same command against the same state would reach -- rather than
+ * this replica alone failing?
+ *
+ * A replicated apply loop rests on the distinction: a deterministic
+ * failure is a result to report, anything else is divergence and the
+ * node must stop rather than skip an entry and fork the state.
+ *
+ * Three conditions, all required. It must carry a numeric code, C must
+ * classify that code as deterministic (db_validate.h -- an allowlist,
+ * because an unclassified code has to be presumed divergence), and it
+ * must carry no `cause`: a cause means a bridged host exception was
+ * swallowed into this error (bridgeHandle turns a storage failure into a
+ * short write so C can unwind), and the storage failing is exactly the
+ * kind of thing one replica does alone.
+ */
+function isDeterministicError(err) {
+  if (!err || typeof err.code !== 'number' || err.code === 0) return false;
+  if (err.cause) return false;
+  return requireModule()._dvw_is_deterministic(err.code) === 1;
+}
+
+/**
  * Copy `bytes` into the WASM heap, invoke `fn(ptr, len)`, then free. The C
  * builder copies immediately, so the scratch allocation is safe to release.
  */
@@ -1075,6 +1098,108 @@ function walParse(payload) {
   if (op < 0) throw codeError(op, 'WAL command');
   return op;
 }
+
+let raftCtx = 0;
+
+function raftCall(fn, context) {
+  const M = requireModule();
+  if (!raftCtx) {
+    raftCtx = M._rcw_new();
+    if (!raftCtx) throw codeError(-1, 'rcw_new');
+  }
+  const rc = fn(M, raftCtx);
+  if (rc !== 0) throw codeError(rc, context);
+  const ptr = M._rcw_out_ptr(raftCtx);
+  const len = M._rcw_out_len(raftCtx);
+  return len ? decode(M.HEAPU8.slice(ptr, ptr + len)) : null;
+}
+
+function raftDecide(name, input, context) {
+  return raftCall((M, ctx) => withBytes(M, encode(input), (p, n) => M[name](ctx, p, n)), context);
+}
+
+/**
+ * The Raft rules whose violation is a consensus bug (wasm/include/
+ * raft_core.h). src/raft.js decides nothing about safety on its own any
+ * more: it gathers the inputs, asks, and carries out the answer in the
+ * order it is given -- the order being itself a rule, since a vote must
+ * reach the disk before the reply leaves.
+ *
+ * These are exported rather than hidden behind the RaftNode class because
+ * the point of moving them is that a host with no JavaScript runs the
+ * identical rules; keeping them addressable here is what makes the two
+ * paths comparable.
+ */
+const raft = {
+  /** §5.2/§5.4.1: grant this vote? Returns what to do, in order. */
+  decideVote: (input) => raftDecide('_rcw_decide_vote', input, 'requestVote'),
+
+  /** §5.3: accept these entries? The consistency check and its hint. */
+  decideAppend: (input) => raftDecide('_rcw_decide_append', input, 'appendEntries'),
+
+  /** §5.3's conflict rule against a real log: skip what we already hold,
+   * truncate at the first disagreement, append the rest, sync if
+   * anything landed. Returns the index truncation began at, or 0. */
+  appendEntries(log, entries) {
+    const M = requireModule();
+    const rc = withBytes(M, encode(entries), (p, n) => M._rcw_append_entries(log.ctx, p, n));
+    if (rc < 0) throw codeError(rc, 'appendEntries');
+    return rc;
+  },
+
+  /** The follower's new commit index, or null if it does not advance. */
+  followerCommit(leaderCommit, ourCommit, ourLastIndex) {
+    const n = requireModule()._rcw_follower_commit(leaderCommit, ourCommit, ourLastIndex);
+    return n < 0 ? null : n;
+  },
+
+  /** The highest index a quorum of voters holds, or null. `matches` is
+   * one entry per VOTING peer; the leader's own last index is separate
+   * because a leader always holds its own. */
+  commitCandidate(leaderLast, matches, quorum) {
+    const M = requireModule();
+    const buf = new Float64Array(matches);
+    const p = M._malloc(buf.length * 8 || 1);
+    try {
+      if (buf.length) M.HEAPU8.set(new Uint8Array(buf.buffer), p);
+      const n = M._rcw_commit_candidate(leaderLast, p, buf.length, quorum);
+      return n < 0 ? null : n;
+    } finally { M._free(p); }
+  },
+
+  /** §5.4.2: may this candidate index actually commit? */
+  mayCommit: (candidate, commitIndex, baseIndex, termAtCandidate, currentTerm) =>
+    requireModule()._rcw_may_commit(candidate, commitIndex, baseIndex, termAtCandidate, currentTerm) === 1,
+
+  quorum: (voterCount) => requireModule()._rcw_quorum(voterCount),
+
+  /** Where a leader resumes after a rejection, and whether the peer's
+   * match index had to regress with it. */
+  backoff: (hint, next, match) => raftCall(
+    (M, ctx) => M._rcw_backoff(ctx, hint ?? 0, hint === undefined ? 0 : 1, next, match),
+    'backoff'
+  ),
+
+  /** { members, voters, peers } from a member set. */
+  membersAdopt: (members, selfId) => raftCall(
+    (M, ctx) => withBytes(M, encode(members), (p, n) => M._rcw_members_adopt(ctx, p, n, selfId)),
+    'members'
+  ),
+
+  /** A proposed set merged with what is known, so an id-only entry can
+   * never erase an address the log already carries. */
+  membersMerge: (input, known) => raftCall((M, ctx) => {
+    const i = encode(input);
+    const k = encode(known);
+    const ip = M._malloc(i.length || 1);
+    const kp = M._malloc(k.length || 1);
+    try {
+      if (i.length) M.HEAPU8.set(i, ip);
+      if (k.length) M.HEAPU8.set(k, kp);
+      return M._rcw_members_merge(ctx, ip, i.length, kp, k.length);
+    } finally { M._free(kp); M._free(ip); }
+  }, 'members')
+};
 
 let ttlCtx = 0;
 
@@ -3199,8 +3324,11 @@ export {
   MemoryStorageProvider,
   OPFSStorageProvider,
   resolveCurrentDate,
+  isDeterministicError,
   runBulkWrite,
   ttlFilters,
+  // The Raft rules whose violation is a consensus bug (raft_core.h).
+  raft,
   // The WAL command grammar (db_wal.h). src/db-wal.js plans through
   // walPlan and dispatches on WAL_OP, so the opcode spellings live in C
   // and nowhere else.

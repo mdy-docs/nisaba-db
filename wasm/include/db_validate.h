@@ -44,6 +44,30 @@ extern "C" {
 #define DC_ERR_NON_ASCENDING_KEY       (-19)
 
 /*
+ * Is `code` a DETERMINISTIC command failure -- one every replica
+ * applying the same command against the same state computes identically?
+ *
+ * A replicated state machine has to tell two kinds of failure apart. A
+ * duplicate key is a RESULT: every replica reaches it, so the leader
+ * reports it to the caller and the cluster carries on. An I/O error is
+ * DIVERGENCE: this replica failed where others did not, so its apply
+ * loop must stop rather than skip an entry and fork the state.
+ *
+ * src/db-replicated.js decided this with `err.name === 'Error' ||
+ * err.cause`, which rests consensus safety on a JavaScript runtime
+ * detail: any code path throwing a plain Error for a perfectly
+ * deterministic reason halted the cluster, and a typed error raised by
+ * an I/O path was swallowed as a result. The classification belongs with
+ * the codes, which is here.
+ *
+ * The list is an ALLOWLIST and the default is 0. Getting this wrong in
+ * the safe direction costs availability and a human notices; getting it
+ * wrong the other way lets replicas diverge silently, which nobody
+ * notices until the answers stop matching.
+ */
+int dc_is_deterministic(int code);
+
+/*
  * Human-readable text for any BJ_ERR_* or DC_ERR_* code. Never NULL:
  * an unrecognized code yields a generic string naming it. The returned
  * pointer is static storage and outlives any caller.

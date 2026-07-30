@@ -148,6 +148,44 @@ describe('replicated db: basics', () => {
     });
     for (const m of cluster.values()) await m.rdb.close();
   });
+
+  it('an infrastructure failure halts the replica instead of becoming a result', async () => {
+    // The other side of the same coin, and the one that actually matters:
+    // swallowing a failure only THIS replica hit would let it skip an
+    // entry and fork the state, silently. It must stop instead.
+    //
+    // The classification is a numeric code now (db_validate.h's
+    // dc_is_deterministic) rather than `err.name === 'Error' ||
+    // err.cause`, which was a JavaScript runtime detail holding up
+    // consensus safety. Nothing tested this branch before, so the old
+    // predicate could have been inverted and every test still passed.
+    const sim = new Sim(56);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeDbCluster(3, sim, net);
+    const leader = leaderOf(cluster);
+    const users = await leader.rdb.collection('users');
+    await settle(sim, cluster, users.insertOne({ _id: oid(1), n: 1 }));
+
+    // A follower's apply throws something with no code at all -- the
+    // shape a bridged storage exception or a bug arrives in.
+    const follower = [...cluster.values()].find((m) => m !== leader);
+    expect(follower.node.isRunning).toBe(true);
+    const halted = [];
+    follower.node.onEvent = (e) => { if (e.type === 'halt') halted.push(e); };
+    follower.rdb._applyCommand = async () => { throw new Error('disk on fire'); };
+
+    await settle(sim, cluster, users.insertOne({ _id: oid(2), n: 2 }));
+
+    expect(follower.node.isRunning).toBe(false);   // stopped, not skipped
+    expect(halted.length).toBe(1);
+    // The leader and the healthy follower carry on: one replica halting
+    // is an availability loss, which is the correct trade against a
+    // silent fork.
+    expect(leader.node.isRunning).toBe(true);
+    expect((await (await leader.rdb.collection('users')).findOne({ _id: oid(2) })).n).toBe(2);
+
+    for (const m of cluster.values()) await m.rdb.close();
+  });
 });
 
 describe('replicated db: DDL', () => {

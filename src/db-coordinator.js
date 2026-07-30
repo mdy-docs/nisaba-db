@@ -367,6 +367,48 @@ class Coordinator {
   }
 }
 
+/**
+ * The iteration half of a cursor whose results arrive in one piece.
+ *
+ * Both cursors this class hands out are like that: there is no streaming
+ * batch protocol across a BroadcastChannel, so the first pull fetches
+ * everything and the rest is local bookkeeping. That bookkeeping -- fetch
+ * once, hand out what has not been handed out, end on close or early exit
+ * -- was written twice, identically, once for find() and once for
+ * aggregate().
+ *
+ * `fetch` is called at most once, lazily, and only if something actually
+ * pulls. Callers add their own members (chainable setters, explain) to the
+ * returned object.
+ */
+function materializingCursor(fetch) {
+  let items = null;
+  let idx = 0;
+  let closed = false;
+  const cursor = {
+    async toArray() {
+      if (closed) return [];
+      if (items === null) items = await fetch();
+      const rest = items.slice(idx);
+      idx = items.length;
+      closed = true;
+      return rest;
+    },
+    async next() {
+      if (closed) return { value: undefined, done: true };
+      if (items === null) items = await fetch();
+      if (idx >= items.length) { closed = true; return { value: undefined, done: true }; }
+      return { value: items[idx++], done: false };
+    },
+    [Symbol.asyncIterator]() { return cursor; },
+    /** Safe to call more than once, or on an already-exhausted cursor. */
+    async close() { closed = true; },
+    /** Invoked by `for await` on early exit (break/throw). */
+    async return() { await cursor.close(); return { value: undefined, done: true }; }
+  };
+  return cursor;
+}
+
 class SharedCollection {
   constructor(coordinator, name) {
     this._coord = coordinator;
@@ -393,68 +435,27 @@ class SharedCollection {
       limit: options.limit || 0,
       projection: options.projection || null
     };
-    let items = null; // full result set, fetched by the first pull
-    let idx = 0;
-    let closed = false;
-    const cursor = {
-      sort(spec) { state.sort = spec; return cursor; },
-      skip(n) { state.skip = n; return cursor; },
-      limit(n) { state.limit = n; return cursor; },
-      project(spec) { state.projection = spec; return cursor; },
-
-      async toArray() {
-        if (closed) return [];
-        if (items === null) items = await coord.dispatch(name, 'find', [filter, { ...state }]);
-        const rest = items.slice(idx);
-        idx = items.length;
-        closed = true;
-        return rest;
-      },
-
-      /** Manual pull, `{ value, done }` -- same shape as the real cursor's. */
-      async next() {
-        if (closed) return { value: undefined, done: true };
-        if (items === null) items = await coord.dispatch(name, 'find', [filter, { ...state }]);
-        if (idx >= items.length) { closed = true; return { value: undefined, done: true }; }
-        return { value: items[idx++], done: false };
-      },
-
-      [Symbol.asyncIterator]() { return cursor; },
-
-      /** The plan this cursor's filter gets on the leader -- see Collection.explain. */
-      async explain() { return coord.dispatch(name, 'explain', [filter]); },
-
-      /** Safe to call more than once, or on an already-exhausted cursor. */
-      async close() { closed = true; },
-
-      /** Invoked by `for await` on early exit (break/throw). */
-      async return() { await cursor.close(); return { value: undefined, done: true }; }
-    };
+    // One RPC with the fully resolved filter + options, on the first pull.
+    // Unlike the real cursor this materializes rather than streaming --
+    // which also means it works after .sort(), where the real cursor's
+    // streaming path refuses.
+    const cursor = materializingCursor(() => coord.dispatch(name, 'find', [filter, { ...state }]));
+    cursor.sort = (spec) => { state.sort = spec; return cursor; };
+    cursor.skip = (n) => { state.skip = n; return cursor; };
+    cursor.limit = (n) => { state.limit = n; return cursor; };
+    cursor.project = (spec) => { state.projection = spec; return cursor; };
+    /** The plan this cursor's filter gets on the leader -- see Collection.explain. */
+    cursor.explain = async () => coord.dispatch(name, 'explain', [filter]);
     return cursor;
   }
+
 
   /** Same cursor-like shape as the real aggregate(); one RPC on first pull. */
   aggregate(pipeline = []) {
     const coord = this._coord, name = this.name;
-    let items = null;
-    let idx = 0;
-    const cursor = {
-      async toArray() {
-        if (items === null) items = await coord.dispatch(name, 'aggregate', [pipeline]);
-        const rest = items.slice(idx);
-        idx = items.length;
-        return rest;
-      },
-      async next() {
-        if (items === null) items = await coord.dispatch(name, 'aggregate', [pipeline]);
-        return idx < items.length ? { value: items[idx++], done: false } : { value: undefined, done: true };
-      },
-      [Symbol.asyncIterator]() { return cursor; },
-      async close() { items = items || []; idx = items.length; },
-      async return() { await cursor.close(); return { value: undefined, done: true }; }
-    };
-    return cursor;
+    return materializingCursor(() => coord.dispatch(name, 'aggregate', [pipeline]));
   }
+
   /** Runs on the leader (the only context holding the files). An operation
    * from any tab that races the swap simply queues behind it on the real
    * Collection's compaction gate (wasm/nisaba-wasm.js, _compacting) -- a

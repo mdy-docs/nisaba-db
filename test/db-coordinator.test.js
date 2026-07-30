@@ -335,8 +335,13 @@ describe('db-coordinator: election, RPC, and handover logic', () => {
     const realDb = await connect(new MemoryStorageProvider());
     const realColl = await realDb.collection('users');
 
-    // Reflect over the real Collection rather than hardcoding a list, so a
-    // method added there without a SharedCollection counterpart fails here.
+    // This used to be a tripwire: the forwarders were hand-written, and
+    // this test reported the drift after it had already happened. They
+    // are generated from Collection.prototype now (see db-coordinator.js),
+    // so existence drift is impossible by construction and what this
+    // checks is that the generation actually covers the surface -- that
+    // the exception set has not quietly grown, and that the three
+    // hand-written members (find/aggregate/watch) are still there.
     const publicMethods = Object.getOwnPropertyNames(Object.getPrototypeOf(realColl))
       .filter((n) => n !== 'constructor' && !n.startsWith('_') && typeof realColl[n] === 'function');
     expect(publicMethods.length).toBeGreaterThan(20); // guards the filter itself

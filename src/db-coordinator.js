@@ -45,7 +45,7 @@
  * `err.result`/`err.writeErrors`) are re-attached on the follower side so
  * error handling code works unchanged too.
  */
-import { encode, decode, connect, ChangeStream } from '../wasm/nisaba-wasm.js';
+import { encode, decode, connect, ChangeStream, Collection } from '../wasm/nisaba-wasm.js';
 
 const REQUEST_TIMEOUT_MS = 5000;
 const REELECT_WAIT_MS = 2000;
@@ -373,13 +373,6 @@ class SharedCollection {
     this.name = name;
   }
 
-  async createIndex(keys, options = {}) { return this._coord.dispatch(this.name, 'createIndex', [keys, options]); }
-  async dropIndex(name) { return this._coord.dispatch(this.name, 'dropIndex', [name]); }
-  async listIndexes() { return this._coord.dispatch(this.name, 'listIndexes', []); }
-  async findByIndex(name, values) { return this._coord.dispatch(this.name, 'findByIndex', [name, values]); }
-  async insertOne(doc) { return this._coord.dispatch(this.name, 'insertOne', [doc]); }
-  async insertMany(docs, options = {}) { return this._coord.dispatch(this.name, 'insertMany', [docs, options]); }
-  async findOne(filter = {}, options = {}) { return this._coord.dispatch(this.name, 'findOne', [filter, options]); }
 
   /**
    * Mirrors Collection.find()'s lazy cursor (wasm/nisaba-wasm.js): chain
@@ -440,20 +433,6 @@ class SharedCollection {
     return cursor;
   }
 
-  async deleteOne(filter = {}) { return this._coord.dispatch(this.name, 'deleteOne', [filter]); }
-  async deleteMany(filter = {}) { return this._coord.dispatch(this.name, 'deleteMany', [filter]); }
-  async findOneAndDelete(filter = {}) { return this._coord.dispatch(this.name, 'findOneAndDelete', [filter]); }
-  async replaceOne(filter, replacement, options = {}) { return this._coord.dispatch(this.name, 'replaceOne', [filter, replacement, options]); }
-  async findOneAndReplace(filter, replacement, options = {}) { return this._coord.dispatch(this.name, 'findOneAndReplace', [filter, replacement, options]); }
-  async updateOne(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateOne', [filter, update, options]); }
-  async findOneAndUpdate(filter, update, options = {}) { return this._coord.dispatch(this.name, 'findOneAndUpdate', [filter, update, options]); }
-  async updateMany(filter, update, options = {}) { return this._coord.dispatch(this.name, 'updateMany', [filter, update, options]); }
-  async countDocuments(filter = {}) { return this._coord.dispatch(this.name, 'countDocuments', [filter]); }
-  async estimatedDocumentCount() { return this._coord.dispatch(this.name, 'estimatedDocumentCount', []); }
-  async appliedIndex() { return this._coord.dispatch(this.name, 'appliedIndex', []); }
-  async setAppliedIndex(index) { return this._coord.dispatch(this.name, 'setAppliedIndex', [index]); }
-  async distinct(field, filter = {}) { return this._coord.dispatch(this.name, 'distinct', [field, filter]); }
-  async explain(filter = {}) { return this._coord.dispatch(this.name, 'explain', [filter]); }
   /** Same cursor-like shape as the real aggregate(); one RPC on first pull. */
   aggregate(pipeline = []) {
     const coord = this._coord, name = this.name;
@@ -476,13 +455,10 @@ class SharedCollection {
     };
     return cursor;
   }
-  async bulkWrite(operations, options = {}) { return this._coord.dispatch(this.name, 'bulkWrite', [operations, options]); }
-  async pruneExpired() { return this._coord.dispatch(this.name, 'pruneExpired', []); }
   /** Runs on the leader (the only context holding the files). An operation
    * from any tab that races the swap simply queues behind it on the real
    * Collection's compaction gate (wasm/nisaba-wasm.js, _compacting) -- a
    * brief wait inside the normal RPC timeout, not an error. */
-  async compact() { return this._coord.dispatch(this.name, 'compact', []); }
 
   /** Same shape/scope limits as Collection.watch() (wasm/nisaba-wasm.js),
    * but sees writes from every tab sharing this database, not just this
@@ -494,6 +470,47 @@ class SharedCollection {
     }
     return this._coord.watch(this.name, options);
   }
+}
+
+/*
+ * SharedCollection's forwarders, derived from Collection itself.
+ *
+ * They were 24 hand-written one-liners, all the identical shape, kept in
+ * step with Collection by a reflection test that could only report the
+ * drift after it happened. Generating them means a method added to
+ * Collection cannot be missed here at all -- you cannot drift from a list
+ * you generate from.
+ *
+ * Only three public methods are not a plain request/response call, and
+ * each is hand-written above for a reason that is about this transport,
+ * not about the method:
+ *
+ *   find, aggregate -- return a cursor. There is no streaming batch
+ *     protocol across a BroadcastChannel, so these materialize on first
+ *     pull rather than streaming (see find()'s own comment).
+ *   watch -- a local ChangeStream fed by broadcast events, not an RPC.
+ *
+ * Note what this is NOT: a table of method names in C. The plan called
+ * for one, on the assumption that C would own the Collection surface.
+ * After the catalog moved, it still does not -- find, watch, compact and
+ * the bulk loop are JavaScript orchestration, and names like
+ * countDocuments have no 1:1 dc_* counterpart. A list of JS method names
+ * hard-coded in C would be something C could neither use nor validate,
+ * while reflecting over the real class is exact by construction.
+ */
+const SHARED_NON_FORWARDING = new Set(['find', 'aggregate', 'watch']);
+
+for (const method of Object.getOwnPropertyNames(Collection.prototype)) {
+  if (method === 'constructor' || method.startsWith('_')) continue;
+  if (typeof Collection.prototype[method] !== 'function') continue;
+  if (SHARED_NON_FORWARDING.has(method)) continue;
+  // Arguments pass through as given rather than with defaults applied
+  // here: the leader invokes the real Collection method, whose own
+  // defaults then apply. Restating them would be a second place to keep
+  // them right.
+  SharedCollection.prototype[method] = function (...args) {
+    return this._coord.dispatch(this.name, method, args);
+  };
 }
 
 class SharedDb {

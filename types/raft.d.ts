@@ -123,8 +123,10 @@ export declare class RaftNode {
   hasQuorumContact(withinMs: number): boolean;
   start(now?: number): Promise<void>;
   stop(): Promise<void>;
-  /** Release the C node. Optional: a stopped node keeps answering
-   * status questions, which is why stop() does not do this. */
+  /** Release the C node — the end of this object's life. Throws if the
+   * node is still running (stop() first), and every accessor throws
+   * afterwards rather than reading through a freed pointer. stop() does
+   * NOT do this: a stopped node keeps answering status questions. */
   free(): void;
   tick(now: number): void;
   quiesce(): void;

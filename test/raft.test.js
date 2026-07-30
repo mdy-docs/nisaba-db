@@ -422,6 +422,37 @@ describe('raft: membership is one fact, or it is an error', () => {
   });
 });
 
+describe('raft: the end of a node\'s life', () => {
+  it('free() refuses a running node, and a freed one refuses to answer', async () => {
+    // The C node is memory this object owns; free() gives it back. What
+    // must never happen after that is a plausible ANSWER: a freed
+    // pointer is 0, 0 is readable, and reading through it would report a
+    // follower at term 0 with nothing committed — a lie a host would act
+    // on. Refusal is the only honest reading.
+    const { sim, cluster, leader } = await electedCluster(53);
+    const L = leader().node;
+    await settle(sim, cluster, L.propose(kvSet('a', 1)));
+
+    // Live nodes are not freeable: the delivery path would reach through
+    // the pointer on the next reply.
+    expect(() => L.free()).toThrow(/stop\(\)/);
+    expect(L.role).toBe('leader');
+
+    await L.stop();
+    // Stopped is not freed: a host inspecting a crash-stopped member
+    // still gets answers, which is why the two are separate verbs.
+    expect(L.role).toBe('leader');
+    expect(L.commitIndex).toBeGreaterThan(0);
+
+    L.free();
+    expect(() => L.role).toThrow(/freed/);
+    expect(() => L.commitIndex).toThrow(/freed/);
+    expect(() => L.tick(9999)).not.toThrow(); // stopped nodes tick to nothing
+    L.free();                                 // idempotent
+    cluster.delete(L.id);
+  });
+});
+
 describe('raft: config precedence on restart', () => {
   it('a restarted survivor keeps the latest-in-log CONFIG over older replayed ones (leader removed itself)', async () => {
     // The stuck-survivor shape behind graceful node retirement (drain):

@@ -456,10 +456,25 @@ export class RaftNode {
     await this._applyChain.catch(() => {});
   }
 
-  /** Release the C node. Optional — a stopped node keeps answering
-   * status questions, which is why stop() does not do this; call it when
-   * the host is done with the group for good. */
+  /**
+   * Release the C node — the end of this object's life, not a pause.
+   *
+   * Separate from stop() on purpose: stop() takes a node out of service
+   * and leaves it answering questions about itself, which is what a host
+   * inspecting a crash-stopped member needs. This gives its memory back,
+   * and every accessor afterwards throws rather than reading through a
+   * freed pointer. A host that closes a group calls it (see
+   * ReplicatedDb.close); one raft_node per group is a small leak, and a
+   * small leak per tenant on a long-lived server is not.
+   *
+   * Refuses a running node instead of pulling the log out from under an
+   * in-flight tick or reply: stop() first, which is not a courtesy but
+   * an ordering the delivery path depends on.
+   */
   free() {
+    if (this.isRunning) {
+      throw new Error('raft: stop() the node before free()ing it');
+    }
     this._core.free();
   }
 

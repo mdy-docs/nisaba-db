@@ -1324,13 +1324,32 @@ class RaftCore {
     M._rnw_set_limits(this._ptr, maxBatchBytes);
   }
 
+  /**
+   * Release the C node. Idempotent, and after it every call below
+   * refuses rather than reaching through a freed pointer.
+   */
   free() {
     if (this._ptr) { requireModule()._rnw_free(this._ptr); this._ptr = 0; }
   }
 
+  /**
+   * The node, or an explicit refusal.
+   *
+   * A freed pointer is 0, and 0 is a readable address in linear memory:
+   * calling on through it returns plausible garbage -- role 0 is
+   * "follower", commit index 0 is "nothing committed" -- rather than
+   * failing. Answers like those are worse than a crash, because a host
+   * acts on them. Every method goes through here so that use after free
+   * is a sentence, not a silent lie.
+   */
+  get _p() {
+    if (!this._ptr) throw new Error('raft: this node has been freed');
+    return this._ptr;
+  }
+
   /** Point the node at a different log (EntryLog cannot rebase in place,
    * so both compaction paths swap it). The old log must already be quiet. */
-  setLog(log) { requireModule()._rnw_set_log(this._ptr, log.ctx); }
+  setLog(log) { requireModule()._rnw_set_log(this._p, log.ctx); }
 
   /**
    * Adopt a member set, or throw and adopt none of it. A refusal
@@ -1345,7 +1364,7 @@ class RaftCore {
     const p = M._malloc(enc.length || 1);
     try {
       if (enc.length) M.HEAPU8.set(enc, p);
-      const rc = M._rnw_set_members(this._ptr, p, enc.length);
+      const rc = M._rnw_set_members(this._p, p, enc.length);
       if (rc !== 0) throw codeError(rc, 'setMembers');
     } finally { M._free(p); }
   }
@@ -1353,14 +1372,14 @@ class RaftCore {
   /** The largest peer count (members excluding self) this build holds. */
   get maxPeers() { return requireModule()._rnw_max_peers(); }
 
-  start(now, random01) { requireModule()._rnw_start(this._ptr, now, random01); }
-  stop() { requireModule()._rnw_stop(this._ptr); }
+  start(now, random01) { requireModule()._rnw_start(this._p, now, random01); }
+  stop() { requireModule()._rnw_stop(this._p); }
   tick(now, random01) {
-    const rc = requireModule()._rnw_tick(this._ptr, now, random01);
+    const rc = requireModule()._rnw_tick(this._p, now, random01);
     if (rc !== 0) throw codeError(rc, 'tick');
   }
-  quiesce() { requireModule()._rnw_quiesce(this._ptr); }
-  wake(now, random01) { requireModule()._rnw_wake(this._ptr, now, random01); }
+  quiesce() { requireModule()._rnw_quiesce(this._p); }
+  wake(now, random01) { requireModule()._rnw_wake(this._p, now, random01); }
 
   /** An incoming request. Its reply lands in the outbox addressed back
    * to `from` with the same correlation id. `random01` seeds any election
@@ -1371,7 +1390,7 @@ class RaftCore {
     const p = M._malloc(bytes.length || 1);
     try {
       if (bytes.length) M.HEAPU8.set(bytes, p);
-      return M._rnw_handle(this._ptr, from, corr, p, bytes.length, random01);
+      return M._rnw_handle(this._p, from, corr, p, bytes.length, random01);
     } finally { M._free(p); }
   }
 
@@ -1381,12 +1400,12 @@ class RaftCore {
     const p = M._malloc(bytes.length || 1);
     try {
       if (bytes.length) M.HEAPU8.set(bytes, p);
-      return M._rnw_on_reply(this._ptr, corr, p, bytes.length, random01);
+      return M._rnw_on_reply(this._p, corr, p, bytes.length, random01);
     } finally { M._free(p); }
   }
 
   /** The request with this correlation id will never be answered. */
-  onFail(corr) { return requireModule()._rnw_on_fail(this._ptr, corr); }
+  onFail(corr) { return requireModule()._rnw_on_fail(this._p, corr); }
 
   /**
    * Everything queued, as plain objects, and the queue is cleared. The
@@ -1396,58 +1415,58 @@ class RaftCore {
    */
   drainOutbox() {
     const M = requireModule();
-    const n = M._rnw_out_count(this._ptr);
+    const n = M._rnw_out_count(this._p);
     const out = [];
     for (let i = 0; i < n; i++) {
-      const ptr = M._rnw_out_ptr(this._ptr, i);
-      const len = M._rnw_out_len(this._ptr, i);
+      const ptr = M._rnw_out_ptr(this._p, i);
+      const len = M._rnw_out_len(this._p, i);
       out.push({
-        peer: M._rnw_out_peer(this._ptr, i),
-        corr: M._rnw_out_corr(this._ptr, i),
-        isReply: M._rnw_out_is_reply(this._ptr, i) === 1,
+        peer: M._rnw_out_peer(this._p, i),
+        corr: M._rnw_out_corr(this._p, i),
+        isReply: M._rnw_out_is_reply(this._p, i) === 1,
         bytes: len ? M.HEAPU8.slice(ptr, ptr + len) : new Uint8Array(0)
       });
     }
-    M._rnw_out_clear(this._ptr);
+    M._rnw_out_clear(this._p);
     return out;
   }
 
   /** What C could not do itself: apply, read a file, settle a promise. */
   drainEffects() {
     const M = requireModule();
-    const n = M._rnw_effect_count(this._ptr);
+    const n = M._rnw_effect_count(this._p);
     const out = [];
     for (let i = 0; i < n; i++) {
       out.push({
-        kind: M._rnw_effect_kind(this._ptr, i),
-        arg: M._rnw_effect_arg(this._ptr, i),
-        flag: M._rnw_effect_flag(this._ptr, i) === 1
+        kind: M._rnw_effect_kind(this._p, i),
+        arg: M._rnw_effect_arg(this._p, i),
+        flag: M._rnw_effect_flag(this._p, i) === 1
       });
     }
-    M._rnw_effects_clear(this._ptr);
+    M._rnw_effects_clear(this._p);
     return out;
   }
 
   /** Sticky: the node once had an effect to report and no room for it,
    * so the host's picture of it has a hole that draining cannot fill.
    * Unreachable for a host that drains after every call. */
-  get effectsLost() { return requireModule()._rnw_effects_lost(this._ptr) === 1; }
+  get effectsLost() { return requireModule()._rnw_effects_lost(this._p) === 1; }
 
-  get role() { return requireModule()._rnw_role(this._ptr); }
-  get leaderId() { return requireModule()._rnw_leader_id(this._ptr); }
-  get commitIndex() { return requireModule()._rnw_commit_index(this._ptr); }
-  get quorum() { return requireModule()._rnw_quorum(this._ptr); }
-  get quiesced() { return requireModule()._rnw_is_quiesced(this._ptr) === 1; }
-  matchOf(peer) { return requireModule()._rnw_match(this._ptr, peer); }
-  nextOf(peer) { return requireModule()._rnw_next(this._ptr, peer); }
+  get role() { return requireModule()._rnw_role(this._p); }
+  get leaderId() { return requireModule()._rnw_leader_id(this._p); }
+  get commitIndex() { return requireModule()._rnw_commit_index(this._p); }
+  get quorum() { return requireModule()._rnw_quorum(this._p); }
+  get quiesced() { return requireModule()._rnw_is_quiesced(this._p) === 1; }
+  matchOf(peer) { return requireModule()._rnw_match(this._p, peer); }
+  nextOf(peer) { return requireModule()._rnw_next(this._p, peer); }
   /** The correlation id outstanding at `peer`, or 0. */
-  inflightOf(peer) { return requireModule()._rnw_inflight(this._ptr, peer); }
+  inflightOf(peer) { return requireModule()._rnw_inflight(this._p, peer); }
   hasQuorumContact(withinMs) {
-    return requireModule()._rnw_has_quorum_contact(this._ptr, withinMs) === 1;
+    return requireModule()._rnw_has_quorum_contact(this._p, withinMs) === 1;
   }
-  replicate(peer) { return requireModule()._rnw_replicate(this._ptr, peer); }
+  replicate(peer) { return requireModule()._rnw_replicate(this._p, peer); }
   installed(peer, boundary) {
-    return requireModule()._rnw_installed(this._ptr, peer, boundary);
+    return requireModule()._rnw_installed(this._p, peer, boundary);
   }
 
   /**
@@ -1461,30 +1480,30 @@ class RaftCore {
     const out = M._malloc(8);
     try {
       if (payload.length) M.HEAPU8.set(payload, p);
-      const rc = M._rnw_propose(this._ptr, type, p, payload.length, out);
+      const rc = M._rnw_propose(this._p, type, p, payload.length, out);
       if (rc !== 0) throw codeError(rc, 'propose');
       return readF64(M, out);
     } finally { M._free(out); M._free(p); }
   }
 
   /** Seed the commit index at startup (never lowers it). */
-  seedCommit(index) { requireModule()._rnw_seed_commit(this._ptr, index); }
+  seedCommit(index) { requireModule()._rnw_seed_commit(this._p, index); }
 
   /** Stand for election now, skipping pre-vote (TimeoutNow, §3.10). */
   campaign(random01 = 0.5) {
-    const rc = requireModule()._rnw_campaign(this._ptr, random01);
+    const rc = requireModule()._rnw_campaign(this._p, random01);
     if (rc !== 0) throw codeError(rc, 'campaign');
   }
 
   /** A leader's term on a message the HOST answered (InstallSnapshot):
    * adopt it as an AppendEntries would. False means it was stale. */
   observeLeader(term, leaderId, random01 = 0.5) {
-    return requireModule()._rnw_observe_leader(this._ptr, term, leaderId, random01) === 1;
+    return requireModule()._rnw_observe_leader(this._p, term, leaderId, random01) === 1;
   }
 
   /** A higher term on a reply the HOST awaited: step down. */
   stepDown(term, random01 = 0.5) {
-    return requireModule()._rnw_step_down(this._ptr, term, random01) === 1;
+    return requireModule()._rnw_step_down(this._p, term, random01) === 1;
   }
 }
 

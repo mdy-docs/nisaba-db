@@ -384,4 +384,25 @@ describe('replicated db: failures and recovery', () => {
     expect(await users2.countDocuments({})).toBe(4);
     await reborn.rdb.close();
   });
+
+  it('close() gives the C node back, and the closed group refuses to answer', async () => {
+    // One group per tenant database on a long-lived seat: a raft_node
+    // left behind per close is a leak that grows with tenant churn. The
+    // proof that it went is that the node refuses afterwards — a freed
+    // pointer that still answered would be reporting on memory it no
+    // longer owns.
+    const sim = new Sim(96);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeDbCluster(1, sim, net);
+    const solo = cluster.get(1);
+    const users = await solo.rdb.collection('users');
+    const { error } = await settle(sim, cluster, users.insertOne({ _id: oid(1), i: 1 }));
+    expect(error).toBeUndefined();
+    expect(solo.node.role).toBe('leader');
+
+    await solo.rdb.close();
+    expect(() => solo.node.role).toThrow(/freed/);
+    // Closing twice is not an error, and does not double-free.
+    await solo.rdb.close();
+  });
 });

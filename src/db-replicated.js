@@ -203,7 +203,15 @@ export class ReplicatedDb extends WalDb {
 
   async close() {
     if (!this.isOpen) return;
-    if (this._raft) await this._raft.stop();
+    if (this._raft) {
+      await this._raft.stop();
+      // And give the C node back. The seat model is one group per tenant
+      // database on a long-lived process, so a raft_node left behind per
+      // close is a leak that grows with tenant churn rather than a
+      // rounding error. Ordered: stop() first, because free() refuses a
+      // running node.
+      this._raft.free();
+    }
     await super.close();
   }
 

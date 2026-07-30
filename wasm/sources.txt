@@ -29,6 +29,7 @@ wasm/src/db_agg.c
 wasm/src/db_wal.c
 wasm/src/raft_core.c
 wasm/src/raft_msg.c
+wasm/src/raft_drive.c
 wasm/src/db_names_wasm.c
 wasm/src/db_validate_wasm.c
 wasm/src/db_ttl_wasm.c
@@ -39,4 +40,5 @@ wasm/src/db_agg_wasm.c
 wasm/src/db_wal_wasm.c
 wasm/src/raft_core_wasm.c
 wasm/src/raft_msg_wasm.c
+wasm/src/raft_drive_wasm.c
 wasm/src/db_currentdate_wasm.c

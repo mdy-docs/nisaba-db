@@ -113,7 +113,7 @@
  * detected lazily, on the group's next use — the RaftGroupHost
  * (src/raft-host.js) drives both ends.
  */
-import { ENTRYLOG_TYPE, encode, decode, raft, raftMsg } from '../wasm/nisaba-wasm.js';
+import { ENTRYLOG_TYPE, encode, decode, raft, raftMsg, raftDrive } from '../wasm/nisaba-wasm.js';
 
 export class NotLeaderError extends Error {
   /** @param {number} leaderId - the last known leader (0 if unknown) */
@@ -917,29 +917,38 @@ export class RaftNode {
     const req = raftMsg.buildRequestVote(
       term, this.id, this.log.lastIndex, this.log.lastTerm, preVote
     );
-    let granted = 1; // self
-    let settled = false;
+
+    // The tally is C's (raft_drive.h). Four guards decide whether a
+    // reply still belongs to the world it was asked in -- the node may
+    // have stepped down, won, or moved on a term while it was in
+    // flight -- and getting one wrong is a node declaring victory on
+    // votes cast for a different term, which is a split brain reached
+    // through liveness code rather than a safety rule.
+    const round = raftDrive.round(term, quorum, preVote);
     const votingPeers = this.peers.filter((p) => this.voters.includes(p));
+    let live = votingPeers.length;
+    const done = () => { if (--live <= 0) round.free(); };
+
     for (const p of votingPeers) {
       this.transport.call(p, req).then((raw) => {
+        if (!this.isRunning || round.settled) return;
         const reply = decode(raw);
-        if (settled || !this.isRunning) return;
-        if (reply.term > this.log.currentTerm) {
-          settled = true;
-          return this._becomeFollower(reply.term, 0);
+        const { action, term: stepTerm } = round.onReply(
+          reply.term, reply.voteGranted === true,
+          {
+            currentTerm: this.log.currentTerm,
+            isLeader: this.role === ROLE.LEADER,
+            isCandidate: this.role === ROLE.CANDIDATE
+          }
+        );
+        switch (action) {
+          case raftDrive.ROUND.STEP_DOWN: return this._becomeFollower(stepTerm, 0);
+          case raftDrive.ROUND.WON:
+            return preVote ? this._startElection(false) : this._becomeLeader();
+          default: return; // IGNORE or PENDING
         }
-        // The round is only valid while the world it was started in holds.
-        if (preVote) {
-          if (this.role === ROLE.LEADER || this.log.currentTerm !== term - 1) { settled = true; return; }
-        } else if (this.role !== ROLE.CANDIDATE || this.log.currentTerm !== term) {
-          settled = true;
-          return;
-        }
-        if (reply.voteGranted && ++granted >= quorum) {
-          settled = true;
-          return preVote ? this._startElection(false) : this._becomeLeader();
-        }
-      }).catch(() => { /* unreachable peer; the timeout retries */ });
+      }).catch(() => { /* unreachable peer; the timeout retries */ })
+        .then(done, done);
     }
   }
 
@@ -969,12 +978,16 @@ export class RaftNode {
   async _replicate(peer, { quiesce = false } = {}) {
     if (this.role !== ROLE.LEADER || this._inflight.has(peer)) return;
     const next = this._next.get(peer);
-    if (next <= this.log.baseIndex) {
-      // AppendEntries can never catch this peer up — the entries are
-      // compacted away. Stream the snapshot instead, or park the peer
-      // for the host if we can't serve one.
-      if (this.snapshotter && this.snapshotter.latest()) return this._sendSnapshot(peer);
-      this._needsSnapshot.add(peer);
+    // What this peer is owed, decided in C (raft_drive.h). The boundary
+    // is next > baseIndex: below it, AppendEntries can never catch the
+    // peer up however far the leader rewinds, because the entries are
+    // compacted away.
+    const action = raftDrive.replAction(
+      next, this.log.baseIndex, !!(this.snapshotter && this.snapshotter.latest())
+    );
+    if (action === raftDrive.REPL.SNAPSHOT) return this._sendSnapshot(peer);
+    if (action === raftDrive.REPL.PARK) {
+      this._needsSnapshot.add(peer);  // the host serves this one
       return;
     }
     this._needsSnapshot.delete(peer);
@@ -1077,35 +1090,47 @@ export class RaftNode {
         return reply.success === true; // restart/false: give up, retry from the top later
       };
 
-      if (files.length === 0) {
-        installed = await send({ ...base, manifest, role: null, offset: 0, data: EMPTY, done: true });
-      } else {
-        let first = true;
-        outer:
-        for (let f = 0; f < files.length; f++) {
-          const file = files[f];
-          const handle = await this.snapshotter.openFile(file.role);
-          try {
-            let offset = 0;
-            do {
-              const n = Math.min(this.snapshotChunkBytes, file.size - offset);
-              const data = new Uint8Array(n);
-              if (n) handle.read(data, { at: offset });
-              const done = f === files.length - 1 && offset + n >= file.size;
-              const msg = { ...base, role: file.role, offset, data, done };
-              if (first) { msg.manifest = manifest; first = false; }
-              if (!await send(msg)) break outer;
-              offset += n;
-              if (done) installed = true;
-            } while (offset < file.size);
-          } finally {
-            if (handle.close) await handle.close();
+      // The chunk walk is C's (raft_drive.h): which file, which offset,
+      // which chunk carries the manifest and which ends the stream. It
+      // replaces a doubly-nested loop with a labelled break, a `first`
+      // flag mutated across both levels, and a `done` computed from two
+      // indices at once. The cursor comes BACK from C rather than being
+      // derived here -- offset + len cannot distinguish "sent the empty
+      // file" from "have not", which is an infinite loop on any snapshot
+      // whose last file is empty.
+      const sizes = files.map((f) => f.size);
+      let handle = null, openRole = null;
+      try {
+        let cursor = { file: 0, offset: 0 };
+        for (;;) {
+          const c = raftDrive.chunkNext(sizes, this.snapshotChunkBytes, cursor.file, cursor.offset);
+          if (!c) break;
+          const file = files[c.fileIndex] ?? null;
+
+          // One handle at a time, held across the chunks of its own file.
+          if (file && openRole !== file.role) {
+            if (handle?.close) await handle.close();
+            handle = await this.snapshotter.openFile(file.role);
+            openRole = file.role;
           }
+          const data = new Uint8Array(c.len);
+          if (c.len) handle.read(data, { at: c.offset });
+
+          const msg = { ...base, role: file ? file.role : null, offset: c.offset, data, done: c.isDone };
+          if (c.isFirst) msg.manifest = manifest;
+          if (!await send(msg)) break;
+          if (c.isDone) { installed = true; break; }
+          cursor = { file: c.nextFile, offset: c.nextOffset };
         }
+      } finally {
+        if (handle?.close) await handle.close();
       }
       if (installed) {
-        if (boundary > this._match.get(peer)) this._match.set(peer, boundary);
-        this._next.set(peer, this._match.get(peer) + 1);
+        // Match never regresses: a peer already past the snapshot keeps
+        // what it had (raft_drive.h).
+        const at = raftDrive.installed(boundary, this._match.get(peer) ?? 0);
+        this._match.set(peer, at.match);
+        this._next.set(peer, at.next);
         this._needsSnapshot.delete(peer);
         this._advanceCommit();
       }

@@ -30,6 +30,7 @@
 #include "snapstore.h"
 #include "raft_core.h"
 #include "raft_msg.h"
+#include "raft_drive.h"
 #include "bjcursor.h"
 #include "db_update.h"
 #include "dbuf.h"
@@ -4535,6 +4536,183 @@ TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
     fx_close(&fx);
 }
 
+
+/* ---- the leader's and candidate's own bookkeeping (raft_drive.h) -------- */
+
+TEST(election_round_ignores_votes_from_a_world_that_ended) {
+    /*
+     * The guards that matter are not "did they say yes" -- they are
+     * "does this reply still belong to the world it was asked in". A
+     * vote reply arrives asynchronously, so by the time it lands the
+     * node may have stepped down, won already, or moved on a term. Every
+     * one of these cases counted a vote in an earlier draft of the JS.
+     */
+    raft_round r;
+
+    /* A quorum of grants wins, and the round latches so a late fourth
+     * grant cannot win it twice. */
+    raft_round_begin(&r, 5, 2, 0);
+    CHECK_I64(raft_round_on_reply(&r, 5, 1, 5, 0, 1, NULL), RAFT_ROUND_WON);
+    CHECK_I64(r.settled, 1);
+    CHECK_I64(raft_round_on_reply(&r, 5, 1, 5, 0, 1, NULL), RAFT_ROUND_IGNORE);
+    CHECK_I64((long long)r.granted, 2);
+
+    /* A refusal counts as an answer but not a vote. */
+    raft_round_begin(&r, 5, 3, 0);
+    CHECK_I64(raft_round_on_reply(&r, 5, 0, 5, 0, 1, NULL), RAFT_ROUND_PENDING);
+    CHECK_I64((long long)r.granted, 1);
+
+    /* A higher term deposes, and reports the term to adopt. */
+    {
+        uint64_t step = 0;
+        raft_round_begin(&r, 5, 2, 0);
+        CHECK_I64(raft_round_on_reply(&r, 9, 1, 5, 0, 1, &step), RAFT_ROUND_STEP_DOWN);
+        CHECK_I64((long long)step, 9);
+        CHECK_I64(r.settled, 1);
+    }
+
+    /* No longer a candidate: the grant is from a world that ended. */
+    raft_round_begin(&r, 5, 2, 0);
+    CHECK_I64(raft_round_on_reply(&r, 5, 1, 5, 0, 0, NULL), RAFT_ROUND_IGNORE);
+    CHECK_I64((long long)r.granted, 1);
+
+    /* Still a candidate, but in a LATER term -- this round is stale. */
+    raft_round_begin(&r, 5, 2, 0);
+    CHECK_I64(raft_round_on_reply(&r, 5, 1, 6, 0, 1, NULL), RAFT_ROUND_IGNORE);
+
+    /* A pre-vote polls from term-1 about term. It stays valid only while
+     * the node has not advanced... */
+    raft_round_begin(&r, 5, 2, 1);
+    CHECK_I64(raft_round_on_reply(&r, 4, 1, 4, 0, 0, NULL), RAFT_ROUND_WON);
+
+    /* ...and is void once we already lead: winning it would start an
+     * election that deposes us for no reason. */
+    raft_round_begin(&r, 5, 2, 1);
+    CHECK_I64(raft_round_on_reply(&r, 4, 1, 4, 1, 0, NULL), RAFT_ROUND_IGNORE);
+
+    /* A pre-vote round whose term already advanced is void too. */
+    raft_round_begin(&r, 5, 2, 1);
+    CHECK_I64(raft_round_on_reply(&r, 5, 1, 5, 0, 1, NULL), RAFT_ROUND_IGNORE);
+
+    /* A single-voter group is its own quorum. */
+    raft_round_begin(&r, 2, 1, 0);
+    CHECK_I64((long long)r.granted, 1);
+    CHECK_I64((long long)r.quorum, 1);
+}
+
+TEST(replication_picks_append_snapshot_or_park) {
+    /* The boundary is next > base_index. base_index is the last index
+     * the log no longer holds, so a peer needing it can never be caught
+     * up by rewinding -- off by one here is a leader that backs off
+     * forever against a follower it cannot satisfy. */
+    CHECK_I64(raft_repl_decide(11, 10, 1), RAFT_REPL_APPEND);
+    CHECK_I64(raft_repl_decide(10, 10, 1), RAFT_REPL_SNAPSHOT);
+    CHECK_I64(raft_repl_decide(10, 10, 0), RAFT_REPL_PARK);
+    CHECK_I64(raft_repl_decide(1, 0, 0), RAFT_REPL_APPEND);   /* fresh log */
+
+    /* An install moves the peer to the boundary, and match never
+     * regresses: a peer already past the snapshot keeps what it had. */
+    {
+        uint64_t match = 0, next = 0;
+        raft_repl_installed(40, &match, &next);
+        CHECK_I64((long long)match, 40);
+        CHECK_I64((long long)next, 41);
+
+        match = 55;
+        raft_repl_installed(40, &match, &next);
+        CHECK_I64((long long)match, 55);
+        CHECK_I64((long long)next, 56);
+    }
+}
+
+/* Walk a whole snapshot and report what the receiver would have seen. */
+static void drain_chunks(const uint64_t *sizes, uint32_t n, uint32_t chunk,
+                         int *chunks, int *firsts, int *dones, uint64_t *bytes) {
+    *chunks = *firsts = *dones = 0; *bytes = 0;
+    uint32_t cf = 0; uint64_t co = 0;
+    raft_chunk c;
+    /* Bounded: a cursor that fails to advance is the bug this guards. */
+    for (int guard = 0; guard < 1000; guard++) {
+        if (!raft_chunk_next(sizes, n, chunk, cf, co, &c)) return;
+        (*chunks)++;
+        *firsts += c.is_first;
+        *dones  += c.is_done;
+        *bytes  += c.len;
+        cf = c.next_file; co = c.next_offset;
+    }
+    TAP_FAIL("chunk cursor did not advance after %d chunks", 1000);
+}
+
+TEST(snapshot_chunking_covers_every_byte_exactly_once) {
+    int chunks, firsts, dones; uint64_t bytes;
+
+    /* Two files, cut at 4 bytes: 10 -> 3 chunks, 6 -> 2. Exactly one
+     * chunk carries the manifest and exactly one ends the stream. */
+    {
+        const uint64_t sizes[] = { 10, 6 };
+        drain_chunks(sizes, 2, 4, &chunks, &firsts, &dones, &bytes);
+        CHECK_I64(chunks, 5);
+        CHECK_I64(firsts, 1);
+        CHECK_I64(dones, 1);
+        CHECK_I64((long long)bytes, 16);
+    }
+
+    /* A chunk never spans two files, so the receiver can write it
+     * without knowing the layout. */
+    {
+        const uint64_t sizes[] = { 3, 3 };
+        raft_chunk c;
+        CHECK(raft_chunk_next(sizes, 2, 100, 0, 0, &c) == 1);
+        CHECK_I64((long long)c.len, 3);
+        CHECK_I64((long long)c.file_index, 0);
+        CHECK_I64(c.is_done, 0);
+        CHECK(raft_chunk_next(sizes, 2, 100, c.next_file, c.next_offset, &c) == 1);
+        CHECK_I64((long long)c.file_index, 1);
+        CHECK_I64(c.is_done, 1);
+    }
+
+    /* An empty file gets its own chunk rather than being skipped: an
+     * absent file and an empty one are different things to the manifest
+     * check on the receiving side. */
+    {
+        const uint64_t sizes[] = { 0, 5 };
+        drain_chunks(sizes, 2, 4, &chunks, &firsts, &dones, &bytes);
+        CHECK_I64(chunks, 3);          /* empty, 4, 1 */
+        CHECK_I64(dones, 1);
+        CHECK_I64((long long)bytes, 5);
+    }
+
+    /* A TRAILING empty file is where a derived cursor loops forever:
+     * offset + len leaves the cursor where it started. drain_chunks
+     * fails loudly rather than hanging if that ever comes back. */
+    {
+        const uint64_t sizes[] = { 5, 0 };
+        drain_chunks(sizes, 2, 4, &chunks, &firsts, &dones, &bytes);
+        CHECK_I64(chunks, 3);          /* 4, 1, empty */
+        CHECK_I64(dones, 1);
+        CHECK_I64((long long)bytes, 5);
+    }
+
+    /* No files at all: the manifest still has to travel, and the
+     * boundary it declares is the whole point of the transfer. */
+    {
+        drain_chunks(NULL, 0, 4, &chunks, &firsts, &dones, &bytes);
+        CHECK_I64(chunks, 1);
+        CHECK_I64(firsts, 1);
+        CHECK_I64(dones, 1);
+        CHECK_I64((long long)bytes, 0);
+    }
+
+    /* Exact multiples do not emit a trailing empty chunk. */
+    {
+        const uint64_t sizes[] = { 8 };
+        drain_chunks(sizes, 1, 4, &chunks, &firsts, &dones, &bytes);
+        CHECK_I64(chunks, 2);
+        CHECK_I64(dones, 1);
+        CHECK_I64((long long)bytes, 8);
+    }
+}
+
 int main(void) {
     RUN(raft_vote_follows_the_up_to_date_rule);
     RUN(raft_vote_is_at_most_one_per_term);
@@ -4549,6 +4727,9 @@ int main(void) {
     RUN(raft_membership_merge_cannot_erase_an_address);
     RUN(raft_request_vote_runs_end_to_end_in_c);
     RUN(raft_append_entries_round_trips_between_two_logs);
+    RUN(election_round_ignores_votes_from_a_world_that_ended);
+    RUN(replication_picks_append_snapshot_or_park);
+    RUN(snapshot_chunking_covers_every_byte_exactly_once);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);

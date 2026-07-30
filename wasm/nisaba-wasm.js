@@ -588,6 +588,17 @@ function writeU32(M, addr, v) {
   b[addr + 3] = (v >>> 24) & 0xff;
 }
 
+/** f64 read/write against the heap. HEAPF64 isn't exported either, and a
+ * one-element Float64Array view is how the rest of this file already
+ * moves doubles across (see raft.commitCandidate). */
+function readF64(M, addr) {
+  return new Float64Array(M.HEAPU8.slice(addr, addr + 8).buffer)[0];
+}
+
+function writeF64(M, addr, v) {
+  M.HEAPU8.set(new Uint8Array(new Float64Array([v]).buffer), addr);
+}
+
 /** Little-endian signed i32 read from the heap -- for out-params carrying a BJ_ERR_* code (can be negative). */
 function readI32(M, addr) {
   return readU32(M, addr) | 0;
@@ -1199,6 +1210,88 @@ const raft = {
       return M._rcw_members_merge(ctx, ip, i.length, kp, k.length);
     } finally { M._free(kp); M._free(ip); }
   }, 'members')
+};
+
+/**
+ * The leader's and candidate's own bookkeeping (wasm/include/raft_drive.h):
+ * tallying an election round, choosing what a peer is owed, and walking a
+ * snapshot as a chunk stream.
+ *
+ * All scalars, so all direct calls -- no context object and no binjson.
+ */
+const raftDrive = {
+  ROUND: Object.freeze({ IGNORE: 0, PENDING: 1, WON: 2, STEP_DOWN: 3 }),
+  REPL: Object.freeze({ APPEND: 0, SNAPSHOT: 1, PARK: 2 }),
+
+  /**
+   * Begin an election round seeking `term`. Returns a handle with
+   * `onReply()` and `free()`; the caller MUST free it, which the
+   * election path does by dropping the round when it settles.
+   */
+  round(term, quorum, preVote) {
+    const M = requireModule();
+    const ptr = M._rdw_round_new(term, quorum, preVote ? 1 : 0);
+    if (!ptr) throw codeError(-1, 'rdw_round_new');
+    return {
+      get granted() { return requireModule()._rdw_round_granted(ptr); },
+      get settled() { return requireModule()._rdw_round_settled(ptr) === 1; },
+      /** One vote reply, judged against the node AS IT IS NOW. Returns
+       * { action, term } where term matters only for STEP_DOWN. */
+      onReply(replyTerm, voteGranted, { currentTerm, isLeader, isCandidate }) {
+        const Mi = requireModule();
+        const slot = Mi._malloc(8);
+        try {
+          const action = Mi._rdw_round_on_reply(
+            ptr, replyTerm, voteGranted ? 1 : 0, currentTerm,
+            isLeader ? 1 : 0, isCandidate ? 1 : 0, slot
+          );
+          return { action, term: readF64(Mi, slot) };
+        } finally { Mi._free(slot); }
+      },
+      free() { requireModule()._rdw_round_free(ptr); }
+    };
+  },
+
+  /** APPEND, SNAPSHOT or PARK for a peer whose next index is `next`. */
+  replAction: (next, baseIndex, hasSnapshot) =>
+    requireModule()._rdw_repl_action(next, baseIndex, hasSnapshot ? 1 : 0),
+
+  /** Where a peer stands once an install completes. */
+  installed(boundary, match) {
+    const M = requireModule();
+    const p = M._malloc(16);
+    try {
+      writeF64(M, p, match);
+      M._rdw_repl_installed(boundary, p);
+      return { match: readF64(M, p), next: readF64(M, p + 8) };
+    } finally { M._free(p); }
+  },
+
+  /**
+   * The chunk following the cursor, or null at the end of the stream.
+   * Start at { file: 0, offset: 0 } and advance with the returned
+   * `nextFile` / `nextOffset` -- never by adding len to offset, which is
+   * ambiguous for an empty file (see raft_drive.h).
+   */
+  chunkNext(fileSizes, chunkBytes, cursorFile, cursorOffset) {
+    const M = requireModule();
+    const n = fileSizes.length;
+    const sizes = M._malloc(Math.max(8, n * 8));
+    const out = M._malloc(7 * 8);
+    try {
+      for (let i = 0; i < n; i++) writeF64(M, sizes + i * 8, fileSizes[i]);
+      if (!M._rdw_chunk_next(sizes, n, chunkBytes, cursorFile, cursorOffset, out)) return null;
+      return {
+        fileIndex: readF64(M, out),
+        offset: readF64(M, out + 8),
+        len: readF64(M, out + 16),
+        isFirst: readF64(M, out + 24) === 1,
+        isDone: readF64(M, out + 32) === 1,
+        nextFile: readF64(M, out + 40),
+        nextOffset: readF64(M, out + 48)
+      };
+    } finally { M._free(out); M._free(sizes); }
+  }
 };
 
 let raftMsgCtx = 0;
@@ -3430,6 +3523,7 @@ export {
   // (raft_msg.h).
   raft,
   raftMsg,
+  raftDrive,
   // The WAL command grammar (db_wal.h). src/db-wal.js plans through
   // walPlan and dispatches on WAL_OP, so the opcode spellings live in C
   // and nowhere else.

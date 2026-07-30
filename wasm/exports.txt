@@ -171,3 +171,13 @@ _rmw_request_vote
 _rmw_append_entries
 _rmw_build_request_vote
 _rmw_build_append_entries
+
+# The leader's and candidate's own bookkeeping (raft_drive.h)
+_rdw_round_new
+_rdw_round_free
+_rdw_round_granted
+_rdw_round_settled
+_rdw_round_on_reply
+_rdw_repl_action
+_rdw_repl_installed
+_rdw_chunk_next

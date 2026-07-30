@@ -1201,6 +1201,103 @@ const raft = {
   }, 'members')
 };
 
+let raftMsgCtx = 0;
+
+/** Slot order of the packed node state rmw_* reads (raft_msg_wasm.c). */
+const RAFT_STATE_SLOTS = 9;
+
+function raftMsgCall(fn, context) {
+  const M = requireModule();
+  if (!raftMsgCtx) {
+    raftMsgCtx = M._rmw_new();
+    if (!raftMsgCtx) throw codeError(-1, 'rmw_new');
+  }
+  const rc = fn(M, raftMsgCtx);
+  if (rc !== 0) throw codeError(rc, context);
+  const rp = M._rmw_reply_ptr(raftMsgCtx);
+  const rl = M._rmw_reply_len(raftMsgCtx);
+  const ep = M._rmw_eff_ptr(raftMsgCtx);
+  const el = M._rmw_eff_len(raftMsgCtx);
+  return {
+    reply: rl ? M.HEAPU8.slice(rp, rp + rl) : new Uint8Array(0),
+    effect: el ? decode(M.HEAPU8.slice(ep, ep + el)) : null
+  };
+}
+
+/**
+ * Call `fn` with the node state packed into a heap array of f64s in the
+ * slot order raft_msg_wasm.c documents.
+ */
+function withRaftState(st, fn) {
+  const M = requireModule();
+  const p = M._malloc(RAFT_STATE_SLOTS * 8);
+  try {
+    const view = new Float64Array([
+      st.selfId, st.isFollower ? 1 : 0, st.isLeader ? 1 : 0, st.selfIsVoter ? 1 : 0,
+      st.leaderId, st.commitIndex, st.now, st.lastLeaderContact, st.minElectionTimeout
+    ]);
+    M.HEAPU8.set(new Uint8Array(view.buffer), p);
+    return fn(M, p);
+  } finally { M._free(p); }
+}
+
+/**
+ * The Raft wire grammar and the two RPC handlers that run entirely in C
+ * (wasm/include/raft_msg.h).
+ *
+ * These take the message as the bytes it arrived as and return the reply
+ * as the bytes to send back. Nothing decodes an AppendEntries in
+ * JavaScript any more -- which is what stopped the entries crossing the
+ * bridge twice, and what a host with no JavaScript needs in order to
+ * speak the same protocol.
+ */
+const raftMsg = {
+  KIND: Object.freeze({
+    REQUEST_VOTE: 0, APPEND_ENTRIES: 1, INSTALL_SNAPSHOT: 2, JOIN: 3, LEAVE: 4
+  }),
+
+  /** Which kind is this, without interpreting it. Negative on a message
+   * this build does not understand. */
+  kind(bytes) {
+    const M = requireModule();
+    return withBytes(M, bytes, (p, n) => M._rmw_kind(p, n));
+  },
+
+  /** Handle a RequestVote. The vote is on disk before this returns. */
+  requestVote: (log, state, bytes) => raftMsgCall(
+    (M, ctx) => withRaftState(state, (MM, sp) =>
+      withBytes(MM, bytes, (p, n) => MM._rmw_request_vote(ctx, log.ctx, sp, p, n))),
+    'requestVote'
+  ),
+
+  /** Handle an AppendEntries. The entries are on disk before this
+   * returns, and never left the buffer they arrived in. */
+  appendEntries: (log, state, bytes) => raftMsgCall(
+    (M, ctx) => withRaftState(state, (MM, sp) =>
+      withBytes(MM, bytes, (p, n) => MM._rmw_append_entries(ctx, log.ctx, sp, p, n))),
+    'appendEntries'
+  ),
+
+  buildRequestVote: (term, candidateId, lastLogIndex, lastLogTerm, preVote) => raftMsgCall(
+    (M, ctx) => M._rmw_build_request_vote(ctx, term, candidateId, lastLogIndex,
+                                          lastLogTerm, preVote ? 1 : 0),
+    'requestVote'
+  ).reply,
+
+  /** Build an AppendEntries, taking the batch straight out of the log.
+   * Returns { message, matchIndex } -- the index a success will imply. */
+  buildAppendEntries(log, { term, leaderId, nextIndex, prevLogTerm, leaderCommit,
+                            maxBytes, quiesce = false }) {
+    const { reply, effect } = raftMsgCall(
+      (M, ctx) => M._rmw_build_append_entries(ctx, log.ctx, term, leaderId, nextIndex,
+                                              prevLogTerm, leaderCommit, maxBytes,
+                                              quiesce ? 1 : 0),
+      'appendEntries'
+    );
+    return { message: reply, matchIndex: effect.matchIndex };
+  }
+};
+
 let ttlCtx = 0;
 
 /**
@@ -3327,8 +3424,11 @@ export {
   isDeterministicError,
   runBulkWrite,
   ttlFilters,
-  // The Raft rules whose violation is a consensus bug (raft_core.h).
+  // The Raft rules whose violation is a consensus bug (raft_core.h),
+  // and the wire grammar plus the two handlers C owns end to end
+  // (raft_msg.h).
   raft,
+  raftMsg,
   // The WAL command grammar (db_wal.h). src/db-wal.js plans through
   // walPlan and dispatches on WAL_OP, so the opcode spellings live in C
   // and nowhere else.

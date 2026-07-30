@@ -8,7 +8,7 @@
  * EntryLog, and single-node degenerate clusters.
  */
 import { describe, it, expect } from 'vitest';
-import { ready } from '../wasm/nisaba-wasm.js';
+import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
 import { NotLeaderError } from '../src/raft.js';
 import {
   Sim, MemoryNetwork, makeCluster, bootNode, stopNode, takeSnapshot,
@@ -177,12 +177,15 @@ describe('raft: snapshot install (5b)', () => {
     const cluster = await makeCluster(3, sim, net);
     await until(sim, cluster, () => leaders(cluster).length === 1);
     const follower = [...cluster.values()].find((m) => m.node.role !== 'leader');
-    const reply = await follower.node.handleMessage({
+    // Messages cross as bytes now -- the transport frames, it does not
+    // interpret (raft_msg.h), so a hand-built one is encoded like any
+    // other and its reply decoded like any other.
+    const reply = decode(await follower.node.handleMessage(encode({
       kind: 'installSnapshot', term: 0, leaderId: 99,
       lastIncludedIndex: 100, lastIncludedTerm: 1,
       manifest: { config: null, files: [] }, role: null, offset: 0,
       data: new Uint8Array(0), done: true
-    });
+    })));
     expect(reply.success).toBe(false);
     expect(reply.term).toBe(follower.node.term);
     expect(follower.node.lastApplied).toBeLessThan(100);
@@ -367,6 +370,14 @@ describe('raft: failures and partitions', () => {
     expect(fresh.machine.map.get('k3')).toBe(3);
     const { error } = await settle(sim, cluster, fresh.node.propose(kvSet('k4', 4)));
     expect(error).toBeUndefined();
-    expect([...cluster.values()].every((m) => m.machine.map.get('k4') === 4)).toBe(true);
+    // propose() resolves on COMMIT plus the LEADER's local apply; a
+    // follower learns the new commit index on the next AppendEntries.
+    // So this waits for convergence, as every other cross-node assertion
+    // in this file does. It used to assert it immediately, which was a
+    // coin flip on whether the propose happened to resolve early enough
+    // in the simulator's 50ms step for one more heartbeat to fit --
+    // measured at 15/25 seeds before this change and 13/25 after, with
+    // convergence never failing in either.
+    await until(sim, cluster, () => [...cluster.values()].every((m) => m.machine.map.get('k4') === 4));
   });
 });

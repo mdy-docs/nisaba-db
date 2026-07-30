@@ -158,3 +158,16 @@ _rcw_quorum
 _rcw_backoff
 _rcw_members_adopt
 _rcw_members_merge
+
+# Raft wire grammar and the synchronous RPC handlers (raft_msg.h)
+_rmw_new
+_rmw_free
+_rmw_reply_ptr
+_rmw_reply_len
+_rmw_eff_ptr
+_rmw_eff_len
+_rmw_kind
+_rmw_request_vote
+_rmw_append_entries
+_rmw_build_request_vote
+_rmw_build_append_entries

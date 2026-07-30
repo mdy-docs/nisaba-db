@@ -32,6 +32,8 @@
  * idle groups send nothing at all — it is deliberately not implemented
  * here.
  */
+import { encode, decode } from '../wasm/nisaba-wasm.js';
+
 
 export class RaftGroupHost {
   /**
@@ -85,6 +87,8 @@ export class RaftGroupHost {
    * envelope. Hand it to connectReplicated / new RaftNode. */
   groupTransport(groupId) {
     return {
+      // `msg` is already the encoded bytes the node produced; the
+      // envelope only says which group it belongs to.
       call: (peerNodeId, msg) => this._transport.call(peerNodeId, { group: groupId, msg })
     };
   }
@@ -231,7 +235,10 @@ async function seedRequest(transport, groupId, msg, { seeds, attempts = 20, dela
     for (const addr of targets) {
       let reply;
       try {
-        reply = await transport.callAddress(addr, { group: groupId, msg });
+        // Messages cross as bytes -- the transport frames, it does not
+        // interpret (raft_msg.h). This helper is the one place that has
+        // to look inside a reply, so it decodes here.
+        reply = decode(await transport.callAddress(addr, { group: groupId, msg: encode(msg) }));
       } catch (err) {
         lastError = err;
         continue; // seed down; try the next

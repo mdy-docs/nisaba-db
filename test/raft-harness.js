@@ -10,6 +10,17 @@
 import { EntryLog, MemoryHandle, encode, decode, crc32, snapshotCheckFiles } from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 
+/**
+ * Send `msg` to `node` the way a transport would: encoded on the way in,
+ * decoded on the way out. Messages cross the node's boundary as bytes
+ * now -- the transport frames, it does not interpret (raft_msg.h) -- so
+ * a test driving handleMessage directly speaks the same protocol the
+ * wire does rather than a privileged object-shaped one.
+ */
+export async function rpc(node, msg) {
+  return decode(await node.handleMessage(encode(msg)));
+}
+
 /** Small, well-known seedable PRNG. */
 export function mulberry32(seed) {
   let a = seed >>> 0;

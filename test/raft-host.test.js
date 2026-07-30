@@ -8,7 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { ready, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { RaftGroupHost } from '../src/raft-host.js';
-import { Sim, MemoryNetwork, KvMachine, KvSnapshotter, kvSet, until, settle } from './raft-harness.js';
+import { Sim, MemoryNetwork, KvMachine, KvSnapshotter, kvSet, until, settle, rpc } from './raft-harness.js';
 
 await ready();
 
@@ -225,13 +225,13 @@ describe('raft: member records, address sync, join/leave (sim)', () => {
     const joinMsg = { kind: 'join', member: { id: 4, host: 'node4', port: 7004 } };
     // Follower: refusal carries the leader's id AND address (it knows
     // both from the records) — a joiner needs no id->address table.
-    const redirect = await follower.node.handleMessage(joinMsg);
+    const redirect = await rpc(follower.node, joinMsg);
     expect(redirect.ok).toBe(false);
     expect(redirect.leaderId).toBe(leader.node.id);
     expect(redirect.leaderAddress).toEqual({ host: `node${leader.node.id}`, port: 7000 + leader.node.id });
 
     // Leader: commits the CONFIG entry and replies with the new set.
-    const joined = leader.node.handleMessage(joinMsg);
+    const joined = rpc(leader.node, joinMsg);
     await advanceUntil(sim, hosts, () => leader.node.members.includes(4));
     const reply = await joined;
     expect(reply.ok).toBe(true);
@@ -239,7 +239,7 @@ describe('raft: member records, address sync, join/leave (sim)', () => {
 
     // Idempotent retry: same record, no new log entry.
     const before = leader.node.log.lastIndex;
-    expect((await leader.node.handleMessage(joinMsg)).ok).toBe(true);
+    expect((await rpc(leader.node, joinMsg)).ok).toBe(true);
     expect(leader.node.log.lastIndex).toBe(before);
 
     // The newcomer's address reached every host's peer table via the log.
@@ -255,12 +255,12 @@ describe('raft: member records, address sync, join/leave (sim)', () => {
     const leader = [...members.values()].find((m) => m.node.role === 'leader');
     const goner = [...members.values()].find((m) => m.node.role !== 'leader');
 
-    const left = leader.node.handleMessage({ kind: 'leave', id: goner.node.id });
+    const left = rpc(leader.node, { kind: 'leave', id: goner.node.id });
     await advanceUntil(sim, hosts, () => !leader.node.members.includes(goner.node.id));
     expect((await left).ok).toBe(true);
 
     const before = leader.node.log.lastIndex;
-    expect((await leader.node.handleMessage({ kind: 'leave', id: goner.node.id })).ok).toBe(true);
+    expect((await rpc(leader.node, { kind: 'leave', id: goner.node.id })).ok).toBe(true);
     expect(leader.node.log.lastIndex).toBe(before); // idempotent
   });
 
@@ -271,7 +271,7 @@ describe('raft: member records, address sync, join/leave (sim)', () => {
     await advanceUntil(sim, hosts, () => [...members.values()].some((m) => m.node.role === 'leader'));
     const leader = [...members.values()].find((m) => m.node.role === 'leader');
     // Commit a CONFIG entry so the log carries the records.
-    const joined = leader.node.handleMessage({ kind: 'join', member: { id: 4, host: 'node4', port: 7004 } });
+    const joined = rpc(leader.node, { kind: 'join', member: { id: 4, host: 'node4', port: 7004 } });
     await advanceUntil(sim, hosts, () => leader.node.members.includes(4));
     await joined;
 
@@ -310,7 +310,7 @@ describe('raft: learners (non-voting members)', () => {
 
     // Join node 4 while it is OFFLINE: it becomes a learner in the log
     // but can never catch up, so it must never be promoted or counted.
-    const joined = leader().node.handleMessage({
+    const joined = rpc(leader().node, {
       kind: 'join', member: { id: 4, host: 'node4', port: 7004 }
     });
     await until(sim, cluster, () => leader().node.members.includes(4));
@@ -341,7 +341,7 @@ describe('raft: learners (non-voting members)', () => {
       random: sim.rng
     });
     await learner.start(sim.time);
-    const vote = learner.handleMessage({
+    const vote = await rpc(learner, {
       kind: 'requestVote', term: 99, candidateId: 1, lastLogIndex: 100, lastLogTerm: 9, preVote: false
     });
     expect(vote.voteGranted).toBe(false);
@@ -377,7 +377,7 @@ describe('raft: learners (non-voting members)', () => {
     const leader = () => rawLeaders(cluster)[0];
 
     // Add an offline learner, then re-propose the full set by BARE IDS.
-    const joined = leader().node.handleMessage({
+    const joined = rpc(leader().node, {
       kind: 'join', member: { id: 9, host: 'node9', port: 7009 }
     });
     await until(sim, cluster, () => leader().node.members.includes(9));

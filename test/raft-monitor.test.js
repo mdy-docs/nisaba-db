@@ -10,7 +10,7 @@ import { ready, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { RaftGroupHost } from '../src/raft-host.js';
 import { RaftMonitor } from '../src/raft-monitor.js';
-import { Sim, MemoryNetwork, makeCluster, KvMachine, kvSet, leaders, until, settle } from './raft-harness.js';
+import { Sim, MemoryNetwork, makeCluster, KvMachine, kvSet, leaders, until, settle, rpc } from './raft-harness.js';
 
 await ready();
 
@@ -34,7 +34,7 @@ describe('raft observability: events and status', () => {
 
     // A join produces config events on every node as the entry applies.
     events.length = 0;
-    const joined = leader().node.handleMessage({
+    const joined = rpc(leader().node, {
       kind: 'join', member: { id: 4, host: 'node4', port: 7004 }
     });
     await until(sim, cluster, () => leader().node.members.includes(4));

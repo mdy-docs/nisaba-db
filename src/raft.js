@@ -24,11 +24,18 @@
  * drives a whole cluster on a virtual clock with a seeded rng; a real
  * host calls tick from setInterval and passes Math.random.
  *
- * The transport is one function: `call(peerId, message) -> Promise<reply>`
- * (binjson-framable messages; entry payloads are Uint8Arrays). Incoming
- * messages are handed to node.handleMessage(message), which returns the
- * reply — the host wires the two together (a WebSocket adapter in the
- * service, an in-memory network in tests). The node never owns a socket.
+ * The transport is one function: `call(peerId, bytes) -> Promise<bytes>`.
+ * Incoming messages are handed to node.handleMessage(bytes), which
+ * returns the reply bytes — the host wires the two together (a WebSocket
+ * adapter in the service, an in-memory network in tests). The node never
+ * owns a socket, and the transport never reads a field: it FRAMES, it
+ * does not interpret. The grammar is C's (wasm/include/raft_msg.h), so
+ * the two hot RPCs are never decoded on this side at all — a
+ * requestVote or appendEntries goes to C as the bytes it arrived as,
+ * runs there against this node's own log, and the reply comes back as
+ * the bytes to send. That is what a host with no JavaScript needs, and
+ * it is also what stopped every AppendEntries batch crossing the bridge
+ * twice.
  *
  * Elections run pre-vote first (a round that persists nothing and bumps
  * no term — an isolated node rejoins without dethroning a live leader),
@@ -106,7 +113,7 @@
  * detected lazily, on the group's next use — the RaftGroupHost
  * (src/raft-host.js) drives both ends.
  */
-import { ENTRYLOG_TYPE, encode, decode, raft } from '../wasm/nisaba-wasm.js';
+import { ENTRYLOG_TYPE, encode, decode, raft, raftMsg } from '../wasm/nisaba-wasm.js';
 
 export class NotLeaderError extends Error {
   /** @param {number} leaderId - the last known leader (0 if unknown) */
@@ -493,14 +500,14 @@ export class RaftNode {
   _onJoin(msg) {
     const member = msg.member;
     if (!member || !Number.isInteger(member.id) || member.id <= 0) {
-      return { ok: false, error: 'join requires member { id, host, port }' };
+      return encode({ ok: false, error: 'join requires member { id, host, port }' });
     }
     if (this.role !== ROLE.LEADER) return this._redirectToLeader();
     const existing = this.memberInfo.find((m) => m.id === member.id);
     if (existing && existing.host === member.host && existing.port === member.port) {
-      return { ok: true, members: this.memberInfo };
+      return encode({ ok: true, members: this.memberInfo });
     }
-    if (this._configInFlight) return { ok: false, retry: true };
+    if (this._configInFlight) return encode({ ok: false, retry: true });
     const record = { ...member };
     delete record.voting;
     if (existing) {
@@ -510,8 +517,8 @@ export class RaftNode {
     }
     const next = [...this.memberInfo.filter((m) => m.id !== member.id), record];
     return this.changeMembership(next).then(
-      () => ({ ok: true, members: this.memberInfo }),
-      (err) => ({ ok: false, error: String(err?.message ?? err) })
+      () => encode({ ok: true, members: this.memberInfo }),
+      (err) => encode({ ok: false, error: String(err?.message ?? err) })
     );
   }
 
@@ -520,29 +527,32 @@ export class RaftNode {
    * dead one. Same redirect/idempotence rules as join. */
   _onLeave(msg) {
     if (!Number.isInteger(msg.id) || msg.id <= 0) {
-      return { ok: false, error: 'leave requires a member id' };
+      return encode({ ok: false, error: 'leave requires a member id' });
     }
     if (this.role !== ROLE.LEADER) return this._redirectToLeader();
     if (!this.members.includes(msg.id)) {
-      return { ok: true, members: this.memberInfo };
+      return encode({ ok: true, members: this.memberInfo });
     }
-    if (this._configInFlight) return { ok: false, retry: true };
+    if (this._configInFlight) return encode({ ok: false, retry: true });
     const next = this.memberInfo.filter((m) => m.id !== msg.id);
     return this.changeMembership(next).then(
-      () => ({ ok: true, members: this.memberInfo }),
-      (err) => ({ ok: false, error: String(err?.message ?? err) })
+      () => encode({ ok: true, members: this.memberInfo }),
+      (err) => encode({ ok: false, error: String(err?.message ?? err) })
     );
   }
 
+  /** Every reply leaves this node as bytes -- the transport frames, it
+   * does not interpret (raft_msg.h). The three handlers still written
+   * here encode their own; the two in C already return bytes. */
   _redirectToLeader() {
     const leader = this.memberInfo.find((m) => m.id === this.leaderId);
-    return {
+    return encode({
       ok: false,
       leaderId: this.leaderId,
       leaderAddress: leader && leader.host !== undefined
         ? { host: leader.host, port: leader.port }
         : null
-    };
+    });
   }
 
   // ---- RPC handlers -------------------------------------------------------
@@ -550,19 +560,25 @@ export class RaftNode {
   /** The transport hands every incoming message here; the return value is
    * the reply (a promise for installSnapshot; synchronous otherwise —
    * all log operations are). */
-  handleMessage(msg) {
+  handleMessage(bytes) {
     if (this._exclusive) {
-      return this._exclusive.then(() => this.handleMessage(msg));
+      return this._exclusive.then(() => this.handleMessage(bytes));
     }
     if (!this.isRunning) throw new Error('node is stopped');
     this.wake(); // any traffic un-quiesces the group on this node
-    switch (msg.kind) {
-      case 'requestVote': return this._onRequestVote(msg);
-      case 'appendEntries': return this._onAppendEntries(msg);
-      case 'installSnapshot': return this._onInstallSnapshot(msg);
-      case 'join': return this._onJoin(msg);
-      case 'leave': return this._onLeave(msg);
-      default: throw new Error(`raft: unknown message kind "${msg.kind}"`);
+
+    // The grammar is C's (raft_msg.h): the kind comes back as a number,
+    // and for the two hot handlers the message is never decoded on this
+    // side at all -- it goes to C as the bytes it arrived as, and the
+    // reply comes back as the bytes to send.
+    const kind = raftMsg.kind(bytes);
+    if (kind < 0) throw new Error('raft: unrecognized message');
+    switch (kind) {
+      case raftMsg.KIND.REQUEST_VOTE: return this._onRequestVote(bytes);
+      case raftMsg.KIND.APPEND_ENTRIES: return this._onAppendEntries(bytes);
+      case raftMsg.KIND.INSTALL_SNAPSHOT: return this._onInstallSnapshot(decode(bytes));
+      case raftMsg.KIND.JOIN: return this._onJoin(decode(bytes));
+      default: return this._onLeave(decode(bytes));
     }
   }
 
@@ -573,92 +589,78 @@ export class RaftNode {
    * itself a safety rule: a vote must reach the disk before the reply
    * leaves, or a machine that loses power can vote twice in one term.
    */
-  _onRequestVote(msg) {
-    const d = raft.decideVote({
-      msgTerm: msg.term,
-      candidateId: msg.candidateId,
-      lastLogIndex: msg.lastLogIndex,
-      lastLogTerm: msg.lastLogTerm,
-      preVote: !!msg.preVote,
-      currentTerm: this.log.currentTerm,
-      votedFor: this.log.votedFor,
-      ourLastIndex: this.log.lastIndex,
-      ourLastTerm: this.log.lastTerm,
-      selfIsVoter: this.voters.includes(this.id),
+  /** The volatile state the C handlers read (raft_msg.h). */
+  _msgState() {
+    return {
+      selfId: this.id,
+      isFollower: this.role === ROLE.FOLLOWER,
       isLeader: this.role === ROLE.LEADER,
+      selfIsVoter: this.voters.includes(this.id),
       leaderId: this.leaderId,
+      commitIndex: this.commitIndex,
       now: this._now,
       lastLeaderContact: this._lastLeaderContact,
       minElectionTimeout: this.electionTimeoutMs[0]
-    });
-
-    if (d.stepDown) this._becomeFollower(d.stepDownTerm, 0);
-    // setHardState commits + fsyncs immediately (entrylog.h), so this
-    // line IS the durability point the reply below depends on.
-    if (d.persist) this.log.setHardState(d.persistTerm, d.persistVotedFor);
-    if (d.resetTimer) this._resetElectionTimer();
-    return { term: this.log.currentTerm, voteGranted: d.grant };
+    };
   }
 
-  /**
-   * §5.3. The consistency check, its resume hint, and the conflict rule
-   * are all C's (raft_core.h) — including the entry loop, which runs
-   * against this node's own EntryLog handle, so "skip what we already
-   * hold, truncate at the first disagreement" has one implementation.
-   */
-  _onAppendEntries(msg) {
-    const prevInRange = msg.prevLogIndex >= this.log.baseIndex &&
-                        msg.prevLogIndex <= this.log.lastIndex;
-    const d = raft.decideAppend({
-      msgTerm: msg.term,
-      leaderId: msg.leaderId,
-      prevLogIndex: msg.prevLogIndex,
-      prevLogTerm: msg.prevLogTerm,
-      entryCount: msg.entries.length,
-      currentTerm: this.log.currentTerm,
-      isFollower: this.role === ROLE.FOLLOWER,
-      ourBaseIndex: this.log.baseIndex,
-      ourLastIndex: this.log.lastIndex,
-      ourPrevTerm: prevInRange ? this.log.termAt(msg.prevLogIndex) : 0
-    });
-
-    // A stale leader gets our term and nothing else -- not even a
-    // refreshed election timer, which a mere rejection does earn.
-    if (d.stale) return { term: d.replyTerm, success: false };
-
-    if (d.stepDown) this._becomeFollower(d.stepDownTerm, d.stepDownLeader);
-    this.leaderId = msg.leaderId;
-    this._lastLeaderContact = this._now;
-    this._resetElectionTimer();
-    const currentTerm = this.log.currentTerm;
-
-    if (!d.success) return { term: currentTerm, success: false, hintIndex: d.hintIndex };
-
-    // The entries were decoded off the wire and are re-encoded to cross
-    // back into C. That round trip is the cost of this seam and it goes
-    // away when C owns the message grammar too -- at which point nothing
-    // decodes an AppendEntries in JavaScript at all.
-    const oldLastIndex = this.log.lastIndex;
-    const truncatedFrom = raft.appendEntries(this.log, msg.entries);
-    if (truncatedFrom) this._emit('truncate', { from: truncatedFrom, oldLastIndex });
-
-    const advanced = raft.followerCommit(msg.leaderCommit, this.commitIndex, this.log.lastIndex);
-    if (advanced !== null) {
-      this.commitIndex = advanced;
-      this.log.setCommitIndex(this.commitIndex); // advisory; rides next sync
+  /** Adopt what a C handler changed. Everything durable already
+   * happened inside the call; these are the volatile fields the node
+   * still owns. */
+  _applyEffect(eff) {
+    if (eff.becameFollower) {
+      const wasLeader = this.role === ROLE.LEADER;
+      this.role = ROLE.FOLLOWER;
+      this.leaderId = eff.leaderId;
+      if (wasLeader) this._rejectWaiters(new NotLeaderError(eff.leaderId));
+      this._emit('role', { role: this.role, leaderId: eff.leaderId, wasLeader });
+    }
+    if (eff.touchedLeader) {
+      this.leaderId = eff.leaderId;
+      this._lastLeaderContact = eff.lastLeaderContact;
+    }
+    if (eff.resetTimer) this._resetElectionTimer();
+    if (eff.truncatedFrom) {
+      this._emit('truncate', { from: eff.truncatedFrom, oldLastIndex: this.log.lastIndex });
+    }
+    if (eff.commitIndex) {
+      this.commitIndex = eff.commitIndex;
       this._pumpApply();
     }
-    if (msg.quiesce) {
+    if (eff.quiesce) {
       // The leader is parking the group: park with it (see quiesce()).
       this._quiesced = true;
       this._electionDeadline = Infinity;
     }
-    return { term: currentTerm, success: true, matchIndex: d.matchIndex };
+  }
+
+  /**
+   * §5.2/§5.4.1, entirely in C (raft_msg.h): the message arrives as the
+   * bytes it came in on, the vote reaches the disk before the call
+   * returns, and the reply leaves as the bytes to send back. Nothing on
+   * this side reads a field of either.
+   */
+  _onRequestVote(bytes) {
+    const { reply, effect } = raftMsg.requestVote(this.log, this._msgState(), bytes);
+    this._applyEffect(effect);
+    return reply;
+  }
+
+  /**
+   * §5.3, entirely in C (raft_msg.h): the consistency check, the
+   * conflict rule, the append and the sync all run against this node's
+   * own log inside one synchronous call, with the entries never leaving
+   * the buffer they arrived in.
+   */
+  _onAppendEntries(bytes) {
+    const { reply, effect } = raftMsg.appendEntries(this.log, this._msgState(), bytes);
+    this._applyEffect(effect);
+    return reply;
   }
 
   async _onInstallSnapshot(msg) {
     const currentTerm = this.log.currentTerm;
-    if (msg.term < currentTerm) return { term: currentTerm, success: false };
+    if (msg.term < currentTerm) return encode({ term: currentTerm, success: false });
     if (msg.term > currentTerm || this.role !== ROLE.FOLLOWER) {
       this._becomeFollower(msg.term, msg.leaderId);
     }
@@ -667,7 +669,7 @@ export class RaftNode {
     this._resetElectionTimer();
 
     if (!this.snapshotter || !this.rebaseLog) {
-      return { term: this.log.currentTerm, success: false };
+      return encode({ term: this.log.currentTerm, success: false });
     }
 
     if (msg.manifest) {
@@ -692,7 +694,7 @@ export class RaftNode {
         install.lastIncludedTerm !== msg.lastIncludedTerm) {
       // A chunk for an install we never started (leader restarted, or we
       // aborted): ask for the manifest again.
-      return { term: this.log.currentTerm, success: false, restart: true };
+      return encode({ term: this.log.currentTerm, success: false, restart: true });
     }
     if (msg.role != null && msg.data && msg.data.length) {
       await install.tx.writeChunk(msg.role, msg.offset, msg.data);
@@ -723,10 +725,10 @@ export class RaftNode {
         // transfer) adopts nothing; have the leader start over.
         this._install = null;
         this._emit('install', { phase: 'failed', lastIncludedIndex: msg.lastIncludedIndex, error: String(err?.message ?? err) });
-        return { term: this.log.currentTerm, success: false, restart: true };
+        return encode({ term: this.log.currentTerm, success: false, restart: true });
       }
     }
-    return { term: this.log.currentTerm, success: true };
+    return encode({ term: this.log.currentTerm, success: true });
   }
 
   async _abortInstall() {
@@ -771,15 +773,15 @@ export class RaftNode {
     if (quorum === 1) {
       return preVote ? this._startElection(false) : this._becomeLeader();
     }
-    const req = {
-      kind: 'requestVote', term, candidateId: this.id,
-      lastLogIndex: this.log.lastIndex, lastLogTerm: this.log.lastTerm, preVote
-    };
+    const req = raftMsg.buildRequestVote(
+      term, this.id, this.log.lastIndex, this.log.lastTerm, preVote
+    );
     let granted = 1; // self
     let settled = false;
     const votingPeers = this.peers.filter((p) => this.voters.includes(p));
     for (const p of votingPeers) {
-      this.transport.call(p, req).then((reply) => {
+      this.transport.call(p, req).then((raw) => {
+        const reply = decode(raw);
         if (settled || !this.isRunning) return;
         if (reply.term > this.log.currentTerm) {
           settled = true;
@@ -834,19 +836,25 @@ export class RaftNode {
     }
     this._needsSnapshot.delete(peer);
     const term = this.log.currentTerm;
-    const prevLogIndex = next - 1;
-    const prevLogTerm = this.log.termAt(prevLogIndex);
-    const entries = next <= this.log.lastIndex ? this.log.getBatch(next, this.maxBatchBytes) : [];
+    const prevLogTerm = this.log.termAt(next - 1);
+
+    // Framed BEFORE the try: the catch below reads any throw as an
+    // unreachable peer, which is right for the network and wrong for a
+    // log or grammar failure -- that one must surface, not be retried
+    // forever as if the wire were down.
+    //
+    // C reads the batch straight out of the log and frames the message,
+    // so the entries are copied once, into the buffer that goes on the
+    // wire, and never become JavaScript objects at all.
+    const { message } = raftMsg.buildAppendEntries(this.log, {
+      term, leaderId: this.id, nextIndex: next, prevLogTerm,
+      leaderCommit: this.commitIndex, maxBytes: this.maxBatchBytes, quiesce
+    });
 
     this._inflight.add(peer);
     let again = false;
     try {
-      const msg = {
-        kind: 'appendEntries', term, leaderId: this.id,
-        prevLogIndex, prevLogTerm, entries, leaderCommit: this.commitIndex
-      };
-      if (quiesce) msg.quiesce = true;
-      const reply = await this.transport.call(peer, msg);
+      const reply = decode(await this.transport.call(peer, message));
       if (!this.isRunning || this.role !== ROLE.LEADER || this.log.currentTerm !== term) return;
       if (this._reachable.get(peer) === false) {
         this._reachable.set(peer, true);
@@ -915,7 +923,7 @@ export class RaftNode {
         members: this.memberInfo
       };
       const send = async (msg) => {
-        const reply = await this.transport.call(peer, msg);
+        const reply = decode(await this.transport.call(peer, encode(msg)));
         if (!this.isRunning || this.role !== ROLE.LEADER || this.log.currentTerm !== term) return false;
         if (reply.term > term) { this._becomeFollower(reply.term, 0); return false; }
         return reply.success === true; // restart/false: give up, retry from the top later

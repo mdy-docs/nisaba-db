@@ -29,6 +29,7 @@
 #include "db_wal.h"
 #include "snapstore.h"
 #include "raft_core.h"
+#include "raft_msg.h"
 #include "bjcursor.h"
 #include "db_update.h"
 #include "dbuf.h"
@@ -3036,6 +3037,209 @@ TEST(raft_membership_merge_cannot_erase_an_address) {
     bj_builder_free(i); bj_builder_free(k);
 }
 
+/* ---- the RPC handlers, end to end in C (raft_msg.h) ------------------- */
+
+/* A follower with `n` entries at term 1, hard state at `term`. */
+typedef struct { memfs *fs; elog *log; } follower;
+
+static int follower_open(follower *f, uint64_t term, int n) {
+    memset(f, 0, sizeof(*f));
+    f->fs = memfs_new();
+    if (!f->fs) return -1;
+    bj_io io;
+    if (memfs_open(f->fs, "log.bj", &io) != BJ_OK) return -1;
+    f->log = elog_create(&io);
+    if (!f->log) return -1;
+    if (term && elog_set_hard_state(f->log, term, EL_VOTED_NONE)) return -1;
+    uint64_t at;
+    for (int i = 0; i < n; i++) {
+        if (elog_append(f->log, 1, EL_NORMAL, (const uint8_t *)"x", 1, &at)) return -1;
+    }
+    return n ? elog_sync(f->log) : 0;
+}
+static void follower_close(follower *f) {
+    elog_free(f->log);
+    memfs_free(f->fs);
+}
+
+static raft_msg_state msg_state(void) {
+    raft_msg_state st;
+    memset(&st, 0, sizeof(st));
+    st.self_id = 2;
+    st.is_follower = 1;
+    st.self_is_voter = 1;
+    st.now = 1000;
+    st.last_leader_contact = -1000000;
+    st.min_election_timeout = 150;
+    return st;
+}
+
+static void msg_kv_int(bj_builder *b, const char *k, int64_t v) {
+    bj_put_key(b, (const uint8_t *)k, (uint32_t)strlen(k));
+    bj_put_int(b, v);
+}
+static void msg_kind(bj_builder *b, const char *kind) {
+    bj_put_key(b, (const uint8_t *)"kind", 4);
+    bj_put_string(b, (const uint8_t *)kind, (uint32_t)strlen(kind));
+}
+
+TEST(raft_request_vote_runs_end_to_end_in_c) {
+    /*
+     * The whole handler, with no host: the message arrives as bytes, the
+     * vote reaches the disk, the reply leaves as bytes. Driving it from
+     * a plain executable is the point -- this is what a server with no
+     * JavaScript runtime will call.
+     */
+    follower f;
+    CHECK_FATAL(follower_open(&f, 5, 3) == 0);
+    raft_msg_state st = msg_state();
+    raft_msg_effect eff;
+    dbuf reply = {0};
+
+    bj_builder *m = bj_builder_new();
+    bj_begin_object(m);
+    msg_kind(m, "requestVote");
+    msg_kv_int(m, "term", 5);
+    msg_kv_int(m, "candidateId", 7);
+    msg_kv_int(m, "lastLogIndex", 3);
+    msg_kv_int(m, "lastLogTerm", 1);
+    bj_end_object(m);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(m, &mlen);
+
+    CHECK_OK(rmsg_handle_request_vote(f.log, &st, mbuf, (uint32_t)mlen, &eff, &reply));
+    CHECK_I64(eff.granted_vote, 1);
+    /* Durable BEFORE the reply exists -- the log already says so. */
+    CHECK_I64((long long)elog_voted_for(f.log), 7);
+    {
+        const uint8_t *v; size_t vlen; int found = 0;
+        CHECK_OK(obj_get_field(reply.data, reply.len, (const uint8_t *)"voteGranted", 11,
+                               &v, &vlen, &found));
+        CHECK_I64(found, 1);
+        CHECK(vlen >= 1 && v[0] == BJ_TYPE_TRUE);
+    }
+    dbuf_free(&reply);
+
+    /* A second candidate this term is refused, and nothing is written. */
+    bj_builder *m2 = bj_builder_new();
+    bj_begin_object(m2);
+    msg_kind(m2, "requestVote");
+    msg_kv_int(m2, "term", 5);
+    msg_kv_int(m2, "candidateId", 9);
+    msg_kv_int(m2, "lastLogIndex", 3);
+    msg_kv_int(m2, "lastLogTerm", 1);
+    bj_end_object(m2);
+    size_t m2len; const uint8_t *m2buf = bj_builder_data(m2, &m2len);
+    CHECK_OK(rmsg_handle_request_vote(f.log, &st, m2buf, (uint32_t)m2len, &eff, &reply));
+    CHECK_I64(eff.granted_vote, 0);
+    CHECK_I64((long long)elog_voted_for(f.log), 7);
+    dbuf_free(&reply);
+
+    /* A message this build does not understand is refused rather than
+     * half-read: a peer speaking an unknown grammar cannot be answered. */
+    bj_builder *bad = bj_builder_new();
+    bj_begin_object(bad);
+    msg_kind(bad, "teleport");
+    bj_end_object(bad);
+    size_t blen; const uint8_t *bbuf = bj_builder_data(bad, &blen);
+    CHECK_RC(rmsg_handle_request_vote(f.log, &st, bbuf, (uint32_t)blen, &eff, &reply),
+             RAFT_ERR_MESSAGE);
+    int kind = -1;
+    CHECK_RC(rmsg_kind(bbuf, (uint32_t)blen, &kind), RAFT_ERR_MESSAGE);
+    dbuf_free(&reply);
+
+    bj_builder_free(bad); bj_builder_free(m2); bj_builder_free(m);
+    follower_close(&f);
+}
+
+TEST(raft_append_entries_round_trips_between_two_logs) {
+    /*
+     * A leader frames a batch straight out of its log; a follower
+     * accepts it straight into its own. Neither side ever holds the
+     * entries as anything but the bytes in the message -- which is what
+     * removed the decode/re-encode the JavaScript path used to pay on
+     * every AppendEntries.
+     */
+    follower leader, peer;
+    CHECK_FATAL(follower_open(&leader, 3, 5) == 0);
+    CHECK_FATAL(follower_open(&peer, 3, 2) == 0);
+
+    raft_msg_state st = msg_state();
+    raft_msg_effect eff;
+    dbuf msg = {0}, reply = {0};
+
+    /* The follower holds 2 of the leader's 5; resume at 3. */
+    uint64_t prev_term = 0;
+    CHECK_OK(elog_term_at(leader.log, 2, &prev_term));
+    uint32_t count = 0;
+    CHECK_OK(rmsg_build_append_entries(leader.log, 3, /*leaderId*/ 1, /*next*/ 3,
+                                       prev_term, /*leaderCommit*/ 5, 65536, 0, &count, &msg));
+    CHECK_I64((long long)count, 3);
+
+    CHECK_OK(rmsg_handle_append_entries(peer.log, &st, msg.data, (uint32_t)msg.len, &eff, &reply));
+    CHECK_I64(eff.success, 1);
+    CHECK_I64((long long)eff.match_index, 5);
+    CHECK_I64((long long)elog_last_index(peer.log), 5);
+    /* The leader's commit index travels with the message, bounded by
+     * what the follower now actually holds. */
+    CHECK_I64((long long)eff.new_commit_index, 5);
+    CHECK_I64(eff.touched_leader, 1);
+    CHECK_I64((long long)eff.new_leader_id, 1);
+    dbuf_free(&reply); msg.len = 0;
+
+    /* Replaying the identical message changes nothing: every entry is
+     * already held at the same term. Overlapping AppendEntries are
+     * ordinary, and truncating on one would discard entries the leader
+     * believes are replicated. */
+    CHECK_OK(rmsg_build_append_entries(leader.log, 3, 1, 3, prev_term, 5, 65536, 0, &count, &msg));
+    CHECK_OK(rmsg_handle_append_entries(peer.log, &st, msg.data, (uint32_t)msg.len, &eff, &reply));
+    CHECK_I64(eff.success, 1);
+    CHECK_I64((long long)eff.truncated_from, 0);
+    CHECK_I64((long long)elog_last_index(peer.log), 5);
+    dbuf_free(&reply); msg.len = 0;
+
+    /* A prevLogIndex past the follower's tail is rejected with the hint
+     * that lets the leader resume in one round trip. */
+    CHECK_OK(rmsg_build_append_entries(leader.log, 3, 1, 9, prev_term, 5, 65536, 0, &count, &msg));
+    CHECK_OK(rmsg_handle_append_entries(peer.log, &st, msg.data, (uint32_t)msg.len, &eff, &reply));
+    CHECK_I64(eff.success, 0);
+    {
+        const uint8_t *v; size_t vlen; int found = 0;
+        CHECK_OK(obj_get_field(reply.data, reply.len, (const uint8_t *)"hintIndex", 9,
+                               &v, &vlen, &found));
+        CHECK_I64(found, 1);
+        cur c = { v, vlen, 0 };
+        double d;
+        CHECK_OK(read_number(&c, &d));
+        CHECK_I64((long long)d, 6);
+    }
+    /* A rejection still refreshes the election timer: the leader is
+     * current, only misaligned. */
+    CHECK_I64(eff.reset_election_timer, 1);
+    dbuf_free(&reply); msg.len = 0;
+
+    /* A leader from the past gets our term and NOTHING else. */
+    bj_builder *stale = bj_builder_new();
+    bj_begin_object(stale);
+    msg_kind(stale, "appendEntries");
+    msg_kv_int(stale, "term", 1);
+    msg_kv_int(stale, "leaderId", 1);
+    msg_kv_int(stale, "prevLogIndex", 0);
+    msg_kv_int(stale, "prevLogTerm", 0);
+    msg_kv_int(stale, "leaderCommit", 0);
+    bj_end_object(stale);
+    size_t slen; const uint8_t *sbuf = bj_builder_data(stale, &slen);
+    CHECK_OK(rmsg_handle_append_entries(peer.log, &st, sbuf, (uint32_t)slen, &eff, &reply));
+    CHECK_I64(eff.success, 0);
+    CHECK_I64(eff.touched_leader, 0);
+    CHECK_I64(eff.reset_election_timer, 0);
+    dbuf_free(&reply);
+
+    bj_builder_free(stale);
+    dbuf_free(&msg);
+    follower_close(&peer);
+    follower_close(&leader);
+}
+
 /* ---- snapshot store policy (snapstore.h) ------------------------------ */
 
 /* A NUL-separated listing, and a parallel size array, built by hand
@@ -4008,6 +4212,8 @@ int main(void) {
     RUN(raft_quorum_counts_voters_only);
     RUN(raft_membership_derives_the_same_lists_everywhere);
     RUN(raft_membership_merge_cannot_erase_an_address);
+    RUN(raft_request_vote_runs_end_to_end_in_c);
+    RUN(raft_append_entries_round_trips_between_two_logs);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);

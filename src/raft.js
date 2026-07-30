@@ -309,13 +309,18 @@ export class RaftNode {
     // same lists, because the quorum count is read from a position in
     // one of them, and a divergence there is a split brain.
     const { members, voters, peers } = raft.membersAdopt(input, this.id);
+    // THE NODE FIRST, and it either takes the whole set or throws. If it
+    // refuses, this side must adopt nothing either: these two lists are
+    // one fact derived twice, and the moment they can disagree there are
+    // two clusters. Assigning first and asking after is how that
+    // happens, so the order here is load-bearing, not stylistic.
+    this._core.setMembers(members);
     this.memberInfo = members;
     this.members = members.map((m) => m.id);
     /** Quorum electorate: members without `voting: false`. Replication
      * (this.peers) spans everyone; only voters count and campaign. */
     this.voters = voters;
     this.peers = peers;
-    this._core.setMembers(members);
     if (this.onConfig) {
       try { this.onConfig(this.memberInfo); } catch { /* host hook; never ours to crash on */ }
     }
@@ -643,6 +648,16 @@ export class RaftNode {
     }
     if (this._configInFlight) {
       throw new Error('a membership change is already in flight; wait for it to commit');
+    }
+    // Refuse an oversized set HERE, where a caller is standing and can
+    // be told why. Proposed instead, it would commit, and then every
+    // replica in the cluster would hit the same refusal at apply — where
+    // the only honest response left is to halt (see _adoptConfig).
+    const maxMembers = this._core.maxPeers + 1; // peers exclude self
+    if (next.length > maxMembers) {
+      throw new Error(
+        `changeMembership: ${next.length} members exceeds this build's limit of ${maxMembers}`
+      );
     }
     this._configInFlight = true;
     try {
@@ -1181,6 +1196,16 @@ export class RaftNode {
     }
   }
 
+  /**
+   * A committed CONFIG entry, applied. _setMembers throws if the node
+   * refuses the set (malformed, or larger than this build can hold), and
+   * the throw is deliberately not caught: it reaches the apply pump,
+   * which halts. Halting is the honest answer — every replica refuses
+   * the same entry for the same reason, so the cluster stops together
+   * instead of one node quietly replicating to a different membership
+   * than the rest. changeMembership refuses such a set before it can
+   * ever be proposed; reaching here means it arrived some other way.
+   */
   _adoptConfig(members, index) {
     this._setMembers(members);
     this._configIndex = index;

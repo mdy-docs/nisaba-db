@@ -9,6 +9,9 @@
 #include "db_catalog.h"
 #include "db_wal.h"
 #include "db.h"
+#include "raft_core.h"
+#include "raft_msg.h"
+#include "raft_node.h"
 #include "bjcursor.h"
 
 #include <string.h>
@@ -100,6 +103,21 @@ const char *dc_strerror(int code) {
         case DC_ERR_WAL_BAD_REQUEST:
             return "WAL: malformed write request (empty batch, or a document "
                    "request with no collection)";
+        /* raft_core.h / raft_msg.h / raft_node.h. These reach a host the
+         * same way every other code does, and a consensus refusal that
+         * prints "unknown error" is a refusal nobody can act on. */
+        case RAFT_ERR_MEMBER:
+            return "Raft: a member record is malformed, or a voter is not a member "
+                   "(ids must be positive integers; 0 means \"voted for nobody\")";
+        case RAFT_ERR_MESSAGE:
+            return "Raft: not a message this build understands (unknown kind, or a "
+                   "known kind missing a field it cannot proceed without)";
+        case RAFT_ERR_PEER:
+            return "Raft: no such peer, or a correlation id nobody issued";
+        case RAFT_ERR_CAPACITY:
+            return "Raft: the member set is larger than this build can hold; it is "
+                   "refused whole rather than trimmed, because a node replicating "
+                   "to a trimmed set has a different cluster from everyone else";
         default:                    return "unknown error";
     }
 }

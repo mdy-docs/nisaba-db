@@ -40,6 +40,8 @@ EMSCRIPTEN_KEEPALIVE int rnw_set_members(raft_node *n, const uint8_t *members, i
     return rn_set_members(n, members, (uint32_t)len);
 }
 
+EMSCRIPTEN_KEEPALIVE int rnw_max_peers(void) { return (int)rn_max_peers(); }
+
 EMSCRIPTEN_KEEPALIVE void rnw_set_timing(raft_node *n, double min_election,
                                          double max_election, double heartbeat) {
     rn_set_timing(n, (int64_t)min_election, (int64_t)max_election, (int64_t)heartbeat);

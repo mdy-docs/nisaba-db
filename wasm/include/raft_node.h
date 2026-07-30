@@ -76,6 +76,10 @@ extern "C" {
 /* A peer that is not a member, or a correlation id nobody issued. */
 #define RAFT_ERR_PEER (-52)
 
+/* The member set is larger than this build can hold (rn_max_peers).
+ * Refused whole -- see rn_set_members. */
+#define RAFT_ERR_CAPACITY (-53)
+
 typedef struct raft_node raft_node;
 
 /* Roles, matching src/raft.js's ROLE. */
@@ -114,8 +118,25 @@ void rn_set_log(raft_node *n, elog *log);
  *
  * A peer that disappears loses its cursors; one that arrives starts at
  * next = lastIndex + 1, which is what a fresh leader would give it.
+ *
+ * ALL OR NOTHING. Every input is validated before anything is adopted,
+ * so a refusal leaves the previous set intact and the caller holding an
+ * error it has to do something about. RAFT_ERR_CAPACITY if the set
+ * exceeds rn_max_peers(); RAFT_ERR_MEMBER if it is malformed, or if its
+ * voter list names someone who is not a member.
+ *
+ * A partial adoption would be worse than either: a host derives its own
+ * member list from the same raft_members_adopt, and the two agreeing is
+ * the property that removes the second source of truth. They cannot
+ * agree about a set that only one of them trimmed.
  */
 int rn_set_members(raft_node *n, const uint8_t *members, uint32_t len);
+
+/* The largest peer count (members excluding self) this build can hold.
+ * A host that proposes membership should refuse a larger set at the
+ * caller, where a human is standing, rather than at apply, where every
+ * replica can only halt. */
+uint32_t rn_max_peers(void);
 
 /*
  * Timing. `min_election` and `max_election` bound the randomised

@@ -1332,6 +1332,13 @@ class RaftCore {
    * so both compaction paths swap it). The old log must already be quiet. */
   setLog(log) { requireModule()._rnw_set_log(this._ptr, log.ctx); }
 
+  /**
+   * Adopt a member set, or throw and adopt none of it. A refusal
+   * (malformed, a voter who is not a member, or more members than
+   * maxPeers + 1) leaves the node's previous set exactly as it was —
+   * which is what lets a host treat "C took it" as permission to record
+   * the same set on its own side.
+   */
   setMembers(records) {
     const M = requireModule();
     const enc = encode(records);
@@ -1342,6 +1349,9 @@ class RaftCore {
       if (rc !== 0) throw codeError(rc, 'setMembers');
     } finally { M._free(p); }
   }
+
+  /** The largest peer count (members excluding self) this build holds. */
+  get maxPeers() { return requireModule()._rnw_max_peers(); }
 
   start(now, random01) { requireModule()._rnw_start(this._ptr, now, random01); }
   stop() { requireModule()._rnw_stop(this._ptr); }

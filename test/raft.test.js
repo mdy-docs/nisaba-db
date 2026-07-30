@@ -382,6 +382,46 @@ describe('raft: failures and partitions', () => {
   });
 });
 
+describe('raft: membership is one fact, or it is an error', () => {
+  it('refuses a set larger than the node can hold, at the caller, changing nothing', async () => {
+    // The node's peer table and this side's member list are the same
+    // fact derived twice (both from raft_members_adopt). A set the node
+    // cannot hold must therefore be refused rather than trimmed — a
+    // trimmed adoption is two different clusters — and refused HERE,
+    // where a caller can be told, rather than at apply, where every
+    // replica could only halt.
+    const { sim, cluster, leader } = await electedCluster(51);
+    const L = leader().node;
+    const before = { members: [...L.members], voters: [...L.voters], term: L.term };
+
+    const tooMany = Array.from({ length: 200 }, (_, i) => ({ id: i + 1 }));
+    await expect(L.changeMembership(tooMany)).rejects.toThrow(/exceeds this build's limit/);
+
+    // Nothing moved: not the membership, not the log, not the term.
+    expect(L.members).toEqual(before.members);
+    expect(L.voters).toEqual(before.voters);
+    expect(L.term).toBe(before.term);
+    // And the group still serves — a refused proposal is not a wound.
+    const w = await settle(sim, cluster, L.propose(kvSet('after', 1)));
+    expect(w.error).toBeUndefined();
+    expect(leader().machine.map.get('after')).toBe(1);
+  });
+
+  it('a set the node refuses is adopted on neither side', async () => {
+    // The ordering that makes the two lists one: ask the node FIRST, and
+    // record nothing here if it says no. Assigning first and asking
+    // after would leave this side describing a cluster the node never
+    // adopted — the exact divergence the funnel exists to prevent.
+    const { cluster, leader } = await electedCluster(52);
+    const L = leader().node;
+    const before = [...L.members];
+    // A malformed record: ids must be positive integers.
+    expect(() => L._setMembers([{ id: 0 }])).toThrow();
+    expect(L.members).toEqual(before);
+    expect(L.voters).toEqual(before);
+  });
+});
+
 describe('raft: config precedence on restart', () => {
   it('a restarted survivor keeps the latest-in-log CONFIG over older replayed ones (leader removed itself)', async () => {
     // The stuck-survivor shape behind graceful node retirement (drain):

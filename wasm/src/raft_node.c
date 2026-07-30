@@ -181,76 +181,103 @@ void rn_stop(raft_node *n) {
 
 /* ---- membership --------------------------------------------------------- */
 
+/*
+ * Adopt a member set, or adopt NONE of it.
+ *
+ * Everything is built into scratch and validated before a single field
+ * of the node changes, so a refusal leaves the previous set exactly as
+ * it was. That is not tidiness: a node that half-adopts has a peer list,
+ * a voter count and a quorum that describe three different clusters, and
+ * every safety argument in raft_core.h is stated over one cluster.
+ *
+ * Every parse failure is returned rather than broken out of. This used
+ * to truncate at RN_MAX_PEERS and stop at the first unreadable element,
+ * both silently, both leaving the host's own member list -- derived from
+ * the same raft_members_adopt -- describing a cluster this node was not
+ * actually replicating to.
+ */
 int rn_set_members(raft_node *n, const uint8_t *members, uint32_t len) {
     dbuf adopted = {0};
     int e = raft_members_adopt(members, len, n->self_id, &adopted);
     if (e) { dbuf_free(&adopted); return e; }
 
     /*
-     * raft_members_adopt hands back { peers, voters, selfIsVoter }. The
+     * raft_members_adopt hands back { members, voters, peers }. The
      * cursors of a peer that survives the change survive with it: a
      * membership edit is not a reason to re-send a follower its whole
      * log. New peers start where a fresh leader would put them.
      */
-    rn_peer old[RN_MAX_PEERS];
-    uint32_t nold = n->npeers;
-    memcpy(old, n->peers, sizeof(old));
-
-    n->npeers = 0;
-    n->self_voting = 0;
-    n->voter_count = 0;
+    rn_peer next[RN_MAX_PEERS];
+    uint32_t nnext = 0;
+    int self_voting = 0;
+    uint32_t voter_count = 0;
 
     const uint8_t *v; size_t vlen; int found = 0;
     uint64_t last = elog_last_index(n->log);
+    uint32_t cnt = 0;
 
     e = obj_get_field(adopted.data, adopted.len, (const uint8_t *)"peers", 5, &v, &vlen, &found);
-    if (!e && found) {
+    if (e || !found) { dbuf_free(&adopted); return e ? e : RAFT_ERR_MEMBER; }
+    {
         cur c = { v, vlen, 0 };
-        uint32_t cnt;
-        if (array_begin(&c, &cnt) == BJ_OK) {
-            for (uint32_t i = 0; i < cnt && n->npeers < RN_MAX_PEERS; i++) {
-                double d;
-                if (read_number(&c, &d) != BJ_OK) break;
-                rn_peer *p = &n->peers[n->npeers++];
-                memset(p, 0, sizeof(*p));
-                p->id = (uint64_t)d;
-                p->reachable = -1;
-                p->ack_at = INT64_MIN;   /* never heard from; see check-quorum */
-                p->next = last + 1;
-                for (uint32_t j = 0; j < nold; j++) {
-                    if (old[j].id != p->id) continue;
-                    p->next = old[j].next;
-                    p->match = old[j].match;
-                    p->ack_at = old[j].ack_at;
-                    p->reachable = old[j].reachable;
-                    p->inflight = old[j].inflight;
-                    break;
-                }
+        if (array_begin(&c, &cnt) != BJ_OK) { dbuf_free(&adopted); return RAFT_ERR_MEMBER; }
+        /* Refused whole, never trimmed to fit: a cluster this build
+         * cannot represent is a cluster it must not pretend to. */
+        if (cnt > RN_MAX_PEERS) { dbuf_free(&adopted); return RAFT_ERR_CAPACITY; }
+        for (uint32_t i = 0; i < cnt; i++) {
+            double d;
+            if (read_number(&c, &d) != BJ_OK) { dbuf_free(&adopted); return RAFT_ERR_MEMBER; }
+            rn_peer *p = &next[nnext++];
+            memset(p, 0, sizeof(*p));
+            p->id = (uint64_t)d;
+            p->reachable = -1;
+            p->ack_at = INT64_MIN;   /* never heard from; see check-quorum */
+            p->next = last + 1;
+            for (uint32_t j = 0; j < n->npeers; j++) {
+                if (n->peers[j].id != p->id) continue;
+                p->next = n->peers[j].next;
+                p->match = n->peers[j].match;
+                p->ack_at = n->peers[j].ack_at;
+                p->reachable = n->peers[j].reachable;
+                p->inflight = n->peers[j].inflight;
+                break;
             }
         }
     }
 
     found = 0;
     e = obj_get_field(adopted.data, adopted.len, (const uint8_t *)"voters", 6, &v, &vlen, &found);
-    if (!e && found) {
+    if (e || !found) { dbuf_free(&adopted); return e ? e : RAFT_ERR_MEMBER; }
+    {
         cur c = { v, vlen, 0 };
-        uint32_t cnt;
-        if (array_begin(&c, &cnt) == BJ_OK) {
-            for (uint32_t i = 0; i < cnt; i++) {
-                double d;
-                if (read_number(&c, &d) != BJ_OK) break;
-                uint64_t id = (uint64_t)d;
-                n->voter_count++;
-                if (id == n->self_id) { n->self_voting = 1; continue; }
-                rn_peer *p = peer_of(n, id);
-                if (p) p->voting = 1;
-            }
+        if (array_begin(&c, &cnt) != BJ_OK) { dbuf_free(&adopted); return RAFT_ERR_MEMBER; }
+        for (uint32_t i = 0; i < cnt; i++) {
+            double d;
+            if (read_number(&c, &d) != BJ_OK) { dbuf_free(&adopted); return RAFT_ERR_MEMBER; }
+            uint64_t id = (uint64_t)d;
+            voter_count++;
+            if (id == n->self_id) { self_voting = 1; continue; }
+            /* A voter who is not a member: the two lists contradict each
+             * other, and counting it would put a node in the quorum
+             * arithmetic that has no cursor to replicate to. */
+            rn_peer *p = NULL;
+            for (uint32_t j = 0; j < nnext; j++) if (next[j].id == id) { p = &next[j]; break; }
+            if (!p) { dbuf_free(&adopted); return RAFT_ERR_MEMBER; }
+            p->voting = 1;
         }
     }
+
+    /* Nothing above touched the node. Commit the whole set at once. */
+    if (nnext) memcpy(n->peers, next, sizeof(rn_peer) * nnext);
+    n->npeers = nnext;
+    n->self_voting = self_voting;
+    n->voter_count = voter_count;
 
     dbuf_free(&adopted);
     return BJ_OK;
 }
+
+uint32_t rn_max_peers(void) { return RN_MAX_PEERS; }
 
 uint32_t rn_quorum(const raft_node *n) { return raft_quorum(n->voter_count); }
 

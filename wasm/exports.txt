@@ -187,6 +187,7 @@ _rnw_new
 _rnw_free
 _rnw_set_log
 _rnw_set_members
+_rnw_max_peers
 _rnw_set_timing
 _rnw_set_limits
 _rnw_start

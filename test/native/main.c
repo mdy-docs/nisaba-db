@@ -776,6 +776,9 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_RESERVED_NAME, DC_ERR_EMPTY_KEY_SPEC, DC_ERR_NON_ASCENDING_KEY,
         DC_ERR_BULK_EMPTY, DC_ERR_BULK_UNKNOWN_OP, DC_ERR_BULK_MISSING_FIELD,
         DC_ERR_WAL_UNKNOWN_OP, DC_ERR_WAL_MISSING_FIELD, DC_ERR_WAL_BAD_REQUEST,
+        /* The consensus layer's refusals reach a host the same way, and
+         * one that prints "unknown error" is one nobody can act on. */
+        RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
     };
     for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
         const char *s = dc_strerror(codes[i]);
@@ -4812,6 +4815,86 @@ TEST(a_single_voter_group_commits_the_moment_it_elects_itself) {
     memfs_free(fs);
 }
 
+TEST(a_member_set_is_adopted_whole_or_refused_whole) {
+    /*
+     * The node's peer table and the host's member list are one fact
+     * derived twice, from the same raft_members_adopt. They agree only
+     * as long as neither can quietly keep a DIFFERENT version of it --
+     * so a set this build cannot hold is refused, not trimmed to fit,
+     * and the refusal leaves the previous set untouched.
+     *
+     * This used to stop at RN_MAX_PEERS and return success. A group over
+     * the cap would have left the host replicating, in its own
+     * bookkeeping, to members the node had never heard of, with a quorum
+     * counted over one list and cursors kept for the other.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "raft.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(1, log);
+    CHECK_FATAL(n != NULL);
+
+    /* A three-node group, adopted normally. */
+    bj_builder *ok = bj_builder_new();
+    bj_begin_array(ok);
+    for (int i = 1; i <= 3; i++) {
+        bj_begin_object(ok);
+        bj_put_key(ok, (const uint8_t *)"id", 2);
+        bj_put_int(ok, i);
+        bj_end_object(ok);
+    }
+    bj_end_array(ok);
+    size_t oklen; const uint8_t *okbuf = bj_builder_data(ok, &oklen);
+    CHECK_OK(rn_set_members(n, okbuf, (uint32_t)oklen));
+    CHECK_I64(rn_quorum(n), 2);
+    CHECK_I64((long long)rn_next(n, 2), 1);
+    CHECK_I64((long long)rn_next(n, 3), 1);
+
+    /* One member too many for this build: refused by capacity. */
+    uint32_t cap = rn_max_peers();
+    bj_builder *big = bj_builder_new();
+    bj_begin_array(big);
+    for (uint32_t i = 1; i <= cap + 2; i++) {   /* cap + 1 peers, plus self */
+        bj_begin_object(big);
+        bj_put_key(big, (const uint8_t *)"id", 2);
+        bj_put_int(big, (int64_t)i);
+        bj_end_object(big);
+    }
+    bj_end_array(big);
+    size_t biglen; const uint8_t *bigbuf = bj_builder_data(big, &biglen);
+    CHECK_I64(rn_set_members(n, bigbuf, (uint32_t)biglen), RAFT_ERR_CAPACITY);
+
+    /* And the group it already had is exactly as it was. */
+    CHECK_I64(rn_quorum(n), 2);
+    CHECK_I64((long long)rn_next(n, 2), 1);
+    CHECK_I64((long long)rn_next(n, 3), 1);
+    CHECK_I64((long long)rn_next(n, 4), 0);   /* never adopted */
+
+    /* Exactly at the cap is fine: the boundary is a refusal of MORE. */
+    bj_builder *edge = bj_builder_new();
+    bj_begin_array(edge);
+    for (uint32_t i = 1; i <= cap + 1; i++) {
+        bj_begin_object(edge);
+        bj_put_key(edge, (const uint8_t *)"id", 2);
+        bj_put_int(edge, (int64_t)i);
+        bj_end_object(edge);
+    }
+    bj_end_array(edge);
+    size_t edgelen; const uint8_t *edgebuf = bj_builder_data(edge, &edgelen);
+    CHECK_OK(rn_set_members(n, edgebuf, (uint32_t)edgelen));
+    CHECK_I64((long long)rn_quorum(n), (long long)((cap + 1) / 2 + 1));
+
+    bj_builder_free(edge);
+    bj_builder_free(big);
+    bj_builder_free(ok);
+    rn_free(n);
+    elog_free(log);
+    memfs_free(fs);
+}
+
 /* A vote reply as it comes off the wire. */
 static void vote_reply(bj_builder *b, int64_t term, int granted) {
     bj_begin_object(b);
@@ -5011,6 +5094,7 @@ int main(void) {
     RUN(three_nodes_elect_a_leader_and_commit_without_a_host_language);
     RUN(a_single_voter_group_commits_the_moment_it_elects_itself);
     RUN(a_stale_prevote_grant_cannot_elect_the_real_round);
+    RUN(a_member_set_is_adopted_whole_or_refused_whole);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);

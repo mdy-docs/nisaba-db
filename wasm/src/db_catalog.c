@@ -1145,6 +1145,23 @@ static int compact_into(bj_ns *ns, const uint8_t *name, uint32_t name_len,
     int e = ns->open(ns->ctx, (const char *)name, name_len,
                      BJ_NS_CREATE | BJ_NS_TRUNC, &dst);
     if (e) return e;
+    /*
+     * TRUNC is a request, not a guarantee: bjns_bridge.c ignores flags
+     * because the host opened the file before C ran, and re-opening is
+     * exactly what an asynchronous open forbids. So do it here too,
+     * where every adapter can.
+     *
+     * It matters when a compaction is retried after one crashed
+     * mid-build. The catalog still records the old generation, so the
+     * plan names gen+1 again -- the same name, over the dead attempt's
+     * partial file. Without this the rebuilt tree keeps that tail, and
+     * dst.size() below reports it: a compaction that reclaims nothing
+     * and records a compactedBytes bigger than the file it just wrote.
+     */
+    if (dst.truncate && (e = dst.truncate(dst.ctx, 0))) {
+        if (ns->close) ns->close(ns->ctx, &dst);
+        return e;
+    }
     e = (kind == DC_SRC_RTREE) ? rtree_compact((rtree *)src, &dst)
                                : bpt_compact((bpt *)src, &dst);
     if (!e && dst.size) *bytes += dst.size(dst.ctx);

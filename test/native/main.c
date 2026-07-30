@@ -37,6 +37,7 @@
 
 #include "docs.h"
 #include "memfs.h"
+#include "nscheck.h"
 #include "tap.h"
 
 #include <fcntl.h>
@@ -2307,9 +2308,27 @@ TEST(sweep_execute_drives_a_real_namespace) {
     dbuf ls = {0};
     listing(&ls, files, 6);
 
+    /*
+     * Through the checking adapter, with NOTHING declared. A sweep is
+     * pure deletion: it may unlink anything (bjns.h lets the browser
+     * defer those) but it must never open a file, because a sweep runs
+     * with no plan behind it and so has no name it could legally open.
+     * If one ever appeared it would be BJ_ERR_STATE in a browser and
+     * silently fine here -- which is the whole reason this wrapper
+     * exists.
+     */
+    bj_ns checked;
+    nscheck *k = nscheck_new(&ns, &checked);
+    CHECK_FATAL(k != NULL);
+    nscheck_begin(k);
+
     uint32_t deleted = 0;
-    CHECK_OK(dc_sweep_execute(&ns, catalog, cat_len, (const char *)ls.data, ls.len, &deleted));
+    CHECK_OK(dc_sweep_execute(&checked, catalog, cat_len, (const char *)ls.data, ls.len, &deleted));
     CHECK_I64(deleted, 2);
+    CHECK_I64(nscheck_opens(k), 0);
+    CHECK_I64(nscheck_removes(k), 2);
+    CHECK_I64(nscheck_violations(k), 0);
+    nscheck_free(k);
 
     /* The orphans are really gone from the filesystem... */
     bj_io probe;
@@ -2383,12 +2402,36 @@ TEST(compact_execute_builds_and_flips_over_real_files) {
     dbuf plan = {0};
     CHECK_OK(dc_compact_plan(entry.data, entry.len, "users", 5, &plan));
 
+    /*
+     * Execute through the checking adapter rather than the bare POSIX
+     * one, with the declaration read straight out of the plan -- so this
+     * asserts that the PLAN and the EXECUTOR agree about which files
+     * exist, which is the property the browser depends on and the one
+     * openat cannot fail to satisfy.
+     */
+    bj_ns checked;
+    nscheck *k = nscheck_new(&ns, &checked);
+    CHECK_FATAL(k != NULL);
+    nscheck_begin(k);
+    CHECK_OK(nscheck_declare_compact_plan(k, plan.data, plan.len));
+
     void *sources[1] = { primary };
     int kinds[1] = { DC_SRC_BPT };
     uint64_t built = 0;
-    CHECK_OK(dc_compact_execute(&ns, catalog, "users", 5, plan.data, plan.len,
+    CHECK_OK(dc_compact_execute(&checked, catalog, "users", 5, plan.data, plan.len,
                                 sources, kinds, 1, &built));
     CHECK(built > 0);
+
+    /* No undeclared open, and no declared name left unopened: a plan
+     * that named a file nobody wanted would cost the browser an awaited
+     * OPFS handle for nothing. Two files here -- the primary and the
+     * journal; the collection carries no indexes. */
+    if (nscheck_violations(k))
+        TAP_FAIL("plan/execute violation: %s", nscheck_first_violation(k));
+    CHECK_I64(nscheck_opens(k), 2);
+    CHECK_I64(nscheck_unopened(k), 0);
+    nscheck_end(k);
+    nscheck_free(k);
     /* Reclaiming is the point: 60 inserts and 60 deletes leave an
      * append-only file far larger than the empty tree it compacts to. */
     CHECK(built < before);
@@ -2423,6 +2466,240 @@ TEST(compact_execute_builds_and_flips_over_real_files) {
     bjns_posix_free(&ns);
     close(dirfd);
     /* Leave the directory for the OS; the files are all in tmpl. */
+}
+
+/* Build a twenty-document collection with a catalog holding its entry, and
+ * plan its compaction. Returns 0, or -1 with everything the caller must
+ * still free left in whatever state it reached. Used by the plan/execute
+ * tests below, which need a real compaction to intercept rather than a
+ * mock of one. */
+static int compact_fixture(bj_ns *ns, bj_io *cio, bpt **primary,
+                           dc_collection **coll, bj_io *kio, bpt **catalog,
+                           dbuf *entry, dbuf *plan) {
+    if (ns->open(ns->ctx, "coll-users.bj", 13, BJ_NS_CREATE, cio) != BJ_OK) return -1;
+    *primary = bpt_create(cio, ORDER);
+    if (!*primary) return -1;
+    *coll = dc_collection_open(*primary);
+    if (!*coll) return -1;
+    for (uint32_t i = 1; i <= 20; i++)
+        if (insert_person(*coll, i, "person", "core", (int64_t)i) != BJ_OK) return -1;
+
+    if (ns->open(ns->ctx, "__catalog__.bj", 14, BJ_NS_CREATE, kio) != BJ_OK) return -1;
+    *catalog = bpt_create(kio, ORDER);
+    if (!*catalog) return -1;
+    if (dc_catalog_new_entry("users", 5, entry) != BJ_OK) return -1;
+    {
+        bpt_key key = { .is_string = 1, .num = 0, .str = (const uint8_t *)"users", .str_len = 5 };
+        if (bpt_add(*catalog, &key, entry->data, (uint32_t)entry->len) != BJ_OK) return -1;
+    }
+    return dc_compact_plan(entry->data, entry->len, "users", 5, plan) == BJ_OK ? 0 : -1;
+}
+
+TEST(an_undeclared_open_is_caught_the_way_a_browser_catches_it) {
+    /*
+     * The checker guarding the compaction test is only worth anything if
+     * it would actually fail. So: drive it into every violation it can
+     * report, including one raised by the real dc_compact_execute rather
+     * than by a hand-made call.
+     *
+     * This is the test docs/db-plan.md's plan calls the highest-leverage
+     * one in the port, and the reason is entirely about a build it never
+     * runs: an undeclared open works perfectly under openat and is
+     * BJ_ERR_STATE in a browser, in the one operation hardest to reach
+     * from a test.
+     */
+    char tmpl[] = "/tmp/nisaba-nscheck-XXXXXX";
+    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    bj_io io;
+
+    /* ---- A name no plan named is refused, and named in the report. */
+    {
+        bj_ns checked;
+        nscheck *k = nscheck_new(&ns, &checked);
+        CHECK_FATAL(k != NULL);
+        nscheck_begin(k);
+        CHECK_OK(nscheck_declare(k, "declared.bj", 11));
+
+        CHECK_OK(checked.open(checked.ctx, "declared.bj", 11, BJ_NS_CREATE, &io));
+        CHECK_OK(checked.close(checked.ctx, &io));
+        CHECK_I64(nscheck_opens(k), 1);
+        CHECK_I64(nscheck_violations(k), 0);
+
+        CHECK_RC(checked.open(checked.ctx, "sneaky.bj", 9, BJ_NS_CREATE, &io), BJ_ERR_STATE);
+        CHECK_I64(nscheck_violations(k), 1);
+        CHECK_STR(nscheck_first_violation(k), "open of undeclared name \"sneaky.bj\"");
+        /* Refused, not merely counted: the inner namespace never saw it,
+         * so the file does not exist. */
+        CHECK_RC(ns.open(ns.ctx, "sneaky.bj", 9, 0, &io), BJ_ERR_STATE);
+        nscheck_free(k);
+    }
+
+    /* ---- A declaration covers exactly one operation. The browser host
+     * deletes Module.bjnsScopes[scope] in a finally, so a stale entry can
+     * never satisfy a later, undeclared request -- "the IMMEDIATELY
+     * preceding plan call" is literal. */
+    {
+        bj_ns checked;
+        nscheck *k = nscheck_new(&ns, &checked);
+        CHECK_FATAL(k != NULL);
+        nscheck_begin(k);
+        CHECK_OK(nscheck_declare(k, "declared.bj", 11));
+        nscheck_end(k);
+        CHECK_RC(checked.open(checked.ctx, "declared.bj", 11, 0, &io), BJ_ERR_STATE);
+        CHECK_I64(nscheck_violations(k), 1);
+        nscheck_free(k);
+    }
+
+    /* ---- And the real executor is really intercepted. Declare the
+     * primary but not the journal -- the mistake a host would make by
+     * pre-opening from the wrong field -- and dc_compact_execute fails
+     * exactly where a browser fails it, on the name it could not
+     * resolve. */
+    {
+        bj_io cio, kio;
+        bpt *primary = NULL, *catalog = NULL;
+        dc_collection *coll = NULL;
+        dbuf entry = {0}, plan = {0};
+        CHECK_FATAL(compact_fixture(&ns, &cio, &primary, &coll, &kio, &catalog,
+                                    &entry, &plan) == 0);
+
+        bj_ns checked;
+        nscheck *k = nscheck_new(&ns, &checked);
+        CHECK_FATAL(k != NULL);
+        nscheck_begin(k);
+        CHECK_OK(nscheck_declare(k, "g1-coll-users.bj", 16));
+
+        void *sources[1] = { primary };
+        int kinds[1] = { DC_SRC_BPT };
+        uint64_t built = 0;
+        CHECK_RC(dc_compact_execute(&checked, catalog, "users", 5, plan.data, plan.len,
+                                    sources, kinds, 1, &built),
+                 BJ_ERR_STATE);
+        CHECK_STR(nscheck_first_violation(k),
+                  "open of undeclared name \"g1-coll-users-journal.bj\"");
+
+        /* The failure left the collection wholly on its old generation --
+         * dc_compact_execute's ordering contract, which holds however it
+         * fails. */
+        {
+            bpt_key key = { .is_string = 1, .num = 0, .str = (const uint8_t *)"users", .str_len = 5 };
+            int found = 0; const uint8_t *vp = NULL; size_t vlen = 0;
+            CHECK_OK(bpt_search(catalog, &key, &found, &vp, &vlen));
+            CHECK(found);
+            if (found) CHECK(find_bytes(vp, vlen, "g1-coll-users.bj", 16) == NULL);
+        }
+
+        nscheck_free(k);
+        dbuf_free(&plan); dbuf_free(&entry);
+        dc_collection_free(coll);
+        bpt_free(catalog); bpt_free(primary);
+    }
+
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
+TEST(compaction_reclaims_space_without_the_truncate_flag) {
+    /*
+     * bjns_bridge.c ignores flags outright -- the host already opened the
+     * file, with `{create: true}` and nothing else, and re-opening is the
+     * one thing an async open forbids. So BJ_NS_TRUNC is a POSIX
+     * optimisation that a browser silently does not perform, and any code
+     * depending on it is correct here and wrong there.
+     *
+     * dc_compact_execute depended on it. Retrying a compaction after one
+     * crashed mid-build reopens the SAME generation name -- the catalog
+     * still records the old gen, so the plan names gen+1 again -- over a
+     * partially written file. Natively TRUNC cleared it. In a browser the
+     * stale bytes stayed, so the rebuilt file kept whatever tail the dead
+     * attempt had left and dst.size() reported it: a compaction that
+     * reclaimed nothing and recorded a compactedBytes larger than the
+     * file it had just rewritten, which is Db.compact()'s growth
+     * baseline.
+     *
+     * The checking adapter strips the flag, so this runs under browser
+     * rules on a real filesystem.
+     */
+    char tmpl[] = "/tmp/nisaba-trunc-XXXXXX";
+    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    bj_io cio, kio;
+    bpt *primary = NULL, *catalog = NULL;
+    dc_collection *coll = NULL;
+    dbuf entry = {0}, plan = {0};
+    CHECK_FATAL(compact_fixture(&ns, &cio, &primary, &coll, &kio, &catalog,
+                                &entry, &plan) == 0);
+
+    /* The wreckage of an earlier attempt: the generation the plan is
+     * about to name again, already on disk and far larger than the tree
+     * that will replace it. */
+    {
+        bj_io junk;
+        CHECK_FATAL(ns.open(ns.ctx, "g1-coll-users.bj", 16, BJ_NS_CREATE, &junk) == BJ_OK);
+        static uint8_t filler[64 * 1024];
+        memset(filler, 0xAB, sizeof(filler));
+        for (int i = 0; i < 4; i++)
+            CHECK_OK(junk.write(junk.ctx, (uint64_t)i * sizeof(filler), filler, sizeof(filler)));
+        CHECK_I64(junk.size(junk.ctx), 4 * (int)sizeof(filler));
+        CHECK_OK(ns.close(ns.ctx, &junk));
+    }
+
+    bj_ns checked;
+    nscheck *k = nscheck_new(&ns, &checked);
+    CHECK_FATAL(k != NULL);
+    nscheck_begin(k);
+    CHECK_OK(nscheck_declare_compact_plan(k, plan.data, plan.len));
+
+    void *sources[1] = { primary };
+    int kinds[1] = { DC_SRC_BPT };
+    uint64_t built = 0;
+    CHECK_OK(dc_compact_execute(&checked, catalog, "users", 5, plan.data, plan.len,
+                                sources, kinds, 1, &built));
+    if (nscheck_violations(k))
+        TAP_FAIL("plan/execute violation: %s", nscheck_first_violation(k));
+
+    /* Twenty small documents do not occupy 256 KB. Both halves matter:
+     * the file really shrank, and the number the catalog records is that
+     * file's size rather than the corpse's. */
+    bj_io probe;
+    CHECK_FATAL(ns.open(ns.ctx, "g1-coll-users.bj", 16, 0, &probe) == BJ_OK);
+    CHECK(probe.size(probe.ctx) < 4 * 64 * 1024);
+    CHECK_I64(built, (long long)probe.size(probe.ctx));
+    CHECK_OK(ns.close(ns.ctx, &probe));
+
+    /* And it is a tree, not a tree with a tail: reopening finds exactly
+     * the twenty documents and nothing the dead attempt left behind. */
+    CHECK_FATAL(ns.open(ns.ctx, "g1-coll-users.bj", 16, 0, &probe) == BJ_OK);
+    {
+        bpt *t = bpt_open(&probe);
+        CHECK_FATAL(t != NULL);
+        dc_collection *c = dc_collection_open(t);
+        CHECK_FATAL(c != NULL);
+        const uint8_t *f; uint32_t flen;
+        bj_builder *fb = empty_filter(&f, &flen);
+        int64_t count = 0;
+        CHECK_OK(dc_count(c, f, flen, &count));
+        CHECK_I64(count, 20);
+        bj_builder_free(fb);
+        dc_collection_free(c);
+        bpt_free(t);
+    }
+    CHECK_OK(ns.close(ns.ctx, &probe));
+
+    nscheck_free(k);
+    dbuf_free(&plan); dbuf_free(&entry);
+    dc_collection_free(coll);
+    bpt_free(catalog); bpt_free(primary);
+    bjns_posix_free(&ns);
+    close(dirfd);
 }
 
 TEST(update_many_hands_back_post_images_when_asked) {
@@ -4229,6 +4506,8 @@ int main(void) {
     RUN(wal_plan_rejects_before_it_logs_rather_than_after);
     RUN(update_many_hands_back_post_images_when_asked);
     RUN(compact_execute_builds_and_flips_over_real_files);
+    RUN(an_undeclared_open_is_caught_the_way_a_browser_catches_it);
+    RUN(compaction_reclaims_space_without_the_truncate_flag);
     RUN(sweep_execute_drives_a_real_namespace);
     RUN(compact_plan_regenerates_every_name_and_keeps_every_option);
     RUN(compact_plan_advances_from_the_recorded_generation);

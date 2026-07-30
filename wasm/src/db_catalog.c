@@ -5,6 +5,7 @@
 #include "db_names.h"
 #include "db_validate.h"
 #include "bjcursor.h"
+#include "rtree.h"
 
 #include <string.h>
 
@@ -1133,4 +1134,139 @@ int dc_sweep_execute(bj_ns *ns, const uint8_t *catalog, size_t catalog_len,
     }
     dbuf_free(&victims);
     return e;
+}
+
+/* ---- executing a compaction --------------------------------------------- */
+
+/* Stream one live structure into a freshly opened destination. */
+static int compact_into(bj_ns *ns, const uint8_t *name, uint32_t name_len,
+                        void *src, int kind, uint64_t *bytes) {
+    bj_io dst;
+    int e = ns->open(ns->ctx, (const char *)name, name_len,
+                     BJ_NS_CREATE | BJ_NS_TRUNC, &dst);
+    if (e) return e;
+    e = (kind == DC_SRC_RTREE) ? rtree_compact((rtree *)src, &dst)
+                               : bpt_compact((bpt *)src, &dst);
+    if (!e && dst.size) *bytes += dst.size(dst.ctx);
+    if (ns->close) ns->close(ns->ctx, &dst);
+    return e;
+}
+
+int dc_compact_execute(bj_ns *ns, bpt *catalog,
+                       const char *coll, size_t coll_len,
+                       const uint8_t *plan, size_t plan_len,
+                       void *const *sources, const int *source_kinds,
+                       uint32_t nsources, uint64_t *bytes_built) {
+    *bytes_built = 0;
+    if (!ns || !ns->open || !catalog) return BJ_ERR_STATE;
+
+    const uint8_t *entry; size_t entry_len; int found = 0;
+    int e = obj_get_field(plan, plan_len, (const uint8_t *)"newEntry", 8,
+                          &entry, &entry_len, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_CATALOG_ENTRY;
+
+    uint32_t used = 0;
+
+    /* ---- Build. The old structures are only READ (bpt_compact and
+     * rtree_compact never touch their source), so a failure anywhere in
+     * here leaves the collection entirely live on its old generation. */
+    {
+        const uint8_t *sp; uint32_t slen;
+        if ((e = str_field(entry, entry_len, "file", &sp, &slen, &found))) return e;
+        if (!found) return DC_ERR_CATALOG_ENTRY;
+        if (used >= nsources) return BJ_ERR_RANGE;
+        if ((e = compact_into(ns, sp, slen, sources[used], source_kinds[used], bytes_built)))
+            return e;
+        used++;
+    }
+
+    const uint8_t *build; size_t build_len; int has_build = 0;
+    if ((e = obj_get_field(plan, plan_len, (const uint8_t *)"build", 5,
+                           &build, &build_len, &has_build))) return e;
+    if (has_build && build_len >= 1 && build[0] == BJ_TYPE_ARRAY) {
+        cur c = { build, build_len, 0 };
+        uint32_t n;
+        if ((e = array_begin(&c, &n))) return e;
+        for (uint32_t i = 0; i < n; i++) {
+            size_t dstart = c.pos;
+            if ((e = skip_value(&c))) return e;
+            const uint8_t *def = build + dstart;
+            size_t def_len = c.pos - dstart;
+
+            const uint8_t *files; size_t files_len; int has_files = 0;
+            if ((e = obj_get_field(def, def_len, (const uint8_t *)"files", 5,
+                                   &files, &files_len, &has_files))) return e;
+            if (!has_files || files_len < 1 || files[0] != BJ_TYPE_ARRAY)
+                return DC_ERR_CATALOG_ENTRY;
+            cur fc = { files, files_len, 0 };
+            uint32_t fn;
+            if ((e = array_begin(&fc, &fn))) return e;
+            for (uint32_t j = 0; j < fn; j++) {
+                const uint8_t *sp; uint32_t slen;
+                if (take_string(&fc, &sp, &slen) != BJ_OK) return DC_ERR_CATALOG_ENTRY;
+                if (used >= nsources) return BJ_ERR_RANGE;
+                if ((e = compact_into(ns, sp, slen, sources[used], source_kinds[used],
+                                      bytes_built))) return e;
+                used++;
+            }
+        }
+    }
+
+    /* ---- The new generation's own empty journal. The old one's recorded
+     * lengths describe the old files only, so it cannot be carried over;
+     * TRUNC also clears a leftover from a crashed earlier attempt. */
+    {
+        const uint8_t *sp; uint32_t slen;
+        if ((e = str_field(entry, entry_len, "journal", &sp, &slen, &found))) return e;
+        if (!found) return DC_ERR_CATALOG_ENTRY;
+        bj_io jio;
+        if ((e = ns->open(ns->ctx, (const char *)sp, slen,
+                          BJ_NS_CREATE | BJ_NS_TRUNC, &jio))) return e;
+        if (jio.truncate) e = jio.truncate(jio.ctx, 0);
+        if (!e && jio.sync) e = jio.sync(jio.ctx);
+        if (ns->close) ns->close(ns->ctx, &jio);
+        if (e) return e;
+    }
+
+    /* ---- Flip. The entry gains compactedBytes -- Db.compact()'s growth
+     * baseline -- and is written as a single catalog commit, then made
+     * durable BEFORE the caller deletes the old files: a lost flip after
+     * those deletes would leave the catalog pointing at files that no
+     * longer exist. */
+    {
+        bj_builder *b = bj_builder_new();
+        if (!b) return BJ_ERR_OOM;
+        bj_begin_object(b);
+        cur c = { entry, entry_len, 0 };
+        uint32_t n;
+        if ((e = object_begin(&c, &n))) { bj_builder_free(b); return e; }
+        for (uint32_t i = 0; i < n; i++) {
+            const uint8_t *kp; uint32_t klen;
+            if ((e = take_key(&c, &kp, &klen))) { bj_builder_free(b); return e; }
+            size_t vstart = c.pos;
+            if ((e = skip_value(&c))) { bj_builder_free(b); return e; }
+            if (klen == 14 && memcmp(kp, "compactedBytes", 14) == 0) continue;
+            bj_put_key(b, kp, klen);
+            bj_put_raw(b, entry + vstart, (uint32_t)(c.pos - vstart));
+        }
+        bj_put_key(b, (const uint8_t *)"compactedBytes", 14);
+        bj_put_int(b, (int64_t)*bytes_built);
+        bj_end_object(b);
+        if ((e = bj_builder_error(b))) { bj_builder_free(b); return e; }
+
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        if (!data) { bj_builder_free(b); return BJ_ERR_STATE; }
+
+        bpt_key key;
+        key.is_string = 1;
+        key.num = 0;
+        key.str = (const uint8_t *)coll;
+        key.str_len = (uint32_t)coll_len;
+        e = bpt_add(catalog, &key, data, (uint32_t)len);
+        bj_builder_free(b);
+        if (e) return e;
+        return bpt_sync(catalog);
+    }
 }

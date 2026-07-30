@@ -117,6 +117,33 @@ EMSCRIPTEN_KEEPALIVE int catw_sweep_execute(int scope,
     return e ? e : (int)deleted;
 }
 
+/*
+ * Build and flip, through the browser's namespace adapter. `sources` and
+ * `kinds` are heap arrays of `nsources` i32s the caller filled with the
+ * live structures' context pointers and their kinds, in the plan's build
+ * order.
+ *
+ * Returns the bytes built (>= 0) or a negative error code -- the count
+ * doubles as the success value because the caller wants it for the
+ * growth baseline and there is nothing else to report.
+ */
+EMSCRIPTEN_KEEPALIVE double catw_compact_execute(int scope, bpt *catalog,
+                                                 const char *coll, int coll_len,
+                                                 const uint8_t *plan, int plan_len,
+                                                 void *const *sources,
+                                                 const int *kinds, int nsources) {
+    if (coll_len < 0 || plan_len < 0 || nsources < 0) return BJ_ERR_RANGE;
+    bj_ns ns;
+    int e = bjns_bridge_open(scope, &ns);
+    if (e) return e;
+    uint64_t built = 0;
+    e = dc_compact_execute(&ns, catalog, coll, (size_t)coll_len,
+                           plan, (size_t)plan_len, sources, kinds,
+                           (uint32_t)nsources, &built);
+    bjns_bridge_free(&ns);
+    return e ? (double)e : (double)built;
+}
+
 EMSCRIPTEN_KEEPALIVE const uint8_t *catw_ptr(const catw *w) { return w->buf.data; }
 
 EMSCRIPTEN_KEEPALIVE int catw_len(const catw *w) {

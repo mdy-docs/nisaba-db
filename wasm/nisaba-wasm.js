@@ -551,6 +551,16 @@ function readU32(M, addr) {
   return (b[addr] | (b[addr + 1] << 8) | (b[addr + 2] << 16) | (b[addr + 3] * 0x1000000)) >>> 0;
 }
 
+/** Little-endian u32 write into the heap (HEAPU32 isn't exported), for
+ * building the small pointer arrays C takes as array arguments. */
+function writeU32(M, addr, v) {
+  const b = M.HEAPU8;
+  b[addr] = v & 0xff;
+  b[addr + 1] = (v >>> 8) & 0xff;
+  b[addr + 2] = (v >>> 16) & 0xff;
+  b[addr + 3] = (v >>> 24) & 0xff;
+}
+
 /** Little-endian signed i32 read from the heap -- for out-params carrying a BJ_ERR_* code (can be negative). */
 function readI32(M, addr) {
   return readU32(M, addr) | 0;
@@ -1295,8 +1305,11 @@ function makeCursorToken(ptr) {
 }
 
 class Collection {
-  constructor(name, tree, { catalog, provider, order }) {
+  constructor(name, tree, { catalog, provider, order, nsScope = 0 }) {
     this.name = name;
+    // The owning Db's bj_ns scope: the name -> fd table compact() fills in
+    // before handing control to C (bjns_bridge.c).
+    this._nsScope = nsScope;
     this._tree = tree;       // BPlusTree, opened by Db.collection()
     this._catalog = catalog; // shared Db catalog tree, for this collection's index list
     this._provider = provider;
@@ -2534,6 +2547,7 @@ class Collection {
     }
     let settleCompacting;
     this._compacting = new Promise((resolve) => { settleCompacting = resolve; });
+    const M = requireModule();
     const created = []; // new-generation files, deleted on pre-flip failure
     let flipped = false;
     try {
@@ -2561,54 +2575,76 @@ class Collection {
       const generation = cplan.gen;
       const bytesBefore = this._storageBytes();
 
-      // ---- Build: stream every live structure into gen-prefixed files.
-      // The old trees stay untouched (bpt_compact/rtw_compact only read
-      // their source), so a failure anywhere in here leaves the
-      // collection fully live.
-      let bytesBuilt = 0;
-      const compactInto = async (structure, fileName) => {
-        const dest = await this._provider.openFile(fileName, { create: true });
-        created.push(fileName);
-        const { newSize } = await structure.compact(dest); // truncates, streams, flushes, closes dest
-        bytesBuilt += newSize;
-      };
-
       const oldFiles = cplan.oldFiles;
       const newEntry = cplan.newEntry;
-      await compactInto(this._tree, newEntry.file);
 
-      // cplan.build lines up with the new entry's indexes, each carrying
-      // its new files in attach order; this side only has to know which
-      // live structure corresponds to each.
+      // ---- Pre-open every file the plan named, and register each under
+      // its name in this Db's namespace scope. The browser's bj_ns
+      // adapter resolves names from that table rather than opening
+      // (bjns_bridge.c): OPFS opens are async and bj_ns.open must be
+      // synchronous, so the awaits happen here, once, before C runs.
       const TEXT_ROLES = ['index', 'docTerms', 'docLengths'];
+      const scope = this._nsScope;
+      const table = (M.bjnsScopes ||= {})[scope] = {};
+      const sources = [];   // live structures, in the plan's build order
+      const kinds = [];     // 0 = bpt, 1 = rtree
+
+      const declare = async (fileName) => {
+        const handle = await this._provider.openFile(fileName, { create: true });
+        created.push(fileName);
+        table[fileName] = registerHandle(M, handle);
+        return handle;
+      };
+
+      await declare(newEntry.file);
+      sources.push(this._tree.ctx); kinds.push(0);
       for (const def of cplan.build) {
         const ix = this._indexes.get(def.name);
-        if (def.kind === 1) {
-          for (let r = 0; r < TEXT_ROLES.length; r++) {
-            await compactInto(ix.trees[TEXT_ROLES[r]], def.files[r]);
-          }
-        } else {
-          await compactInto(def.kind === 2 ? ix.rt : ix.tree, def.files[0]);
+        for (let j = 0; j < def.files.length; j++) {
+          await declare(def.files[j]);
+          if (def.kind === 1) { sources.push(ix.trees[TEXT_ROLES[j]].ctx); kinds.push(0); }
+          else if (def.kind === 2) { sources.push(ix.rt.ctx); kinds.push(1); }
+          else { sources.push(ix.tree.ctx); kinds.push(0); }
         }
       }
+      await declare(newEntry.journal);
 
-      // The new generation starts with its own empty journal: the old
-      // one's recorded lengths describe the old files only. truncate(0)
-      // clears a stale leftover from a crashed earlier attempt.
-      const jh = await this._provider.openFile(newEntry.journal, { create: true });
-      created.push(newEntry.journal);
-      jh.truncate(0);
-      jh.flush();
-      await jh.close();
-
-      newEntry.compactedBytes = bytesBuilt; // Db.compact()'s growth-factor baseline
-
-      // ---- Flip: one atomic catalog commit points this collection at the
-      // new generation. Flushed before the old files go away -- if the OS
-      // lost an unflushed flip after the deletes below, the recovered
-      // catalog would reference deleted files.
-      this._catalog.add(this.name, newEntry);
-      this._catalog.flush();
+      // ---- Build and flip: ONE synchronous call. Between the last byte
+      // of the new generation and the catalog write that adopts it,
+      // nothing may see the collection half-migrated -- and a synchronous
+      // WASM call cannot be interleaved at all, where the await-spanning
+      // version relied on the gate holding across each one.
+      //
+      // This does not make the gate unnecessary: the pre-open above and
+      // the adopt below still await, so concurrent operations must still
+      // be kept out across them.
+      const srcPtr = M._malloc(Math.max(1, sources.length * 4));
+      const kindPtr = M._malloc(Math.max(1, kinds.length * 4));
+      let bytesBuilt = 0;
+      try {
+        for (let i = 0; i < sources.length; i++) {
+          writeU32(M, srcPtr + i * 4, sources[i]);
+          writeU32(M, kindPtr + i * 4, kinds[i]);
+        }
+        const planEnc = encode(cplan);
+        const pp = M._malloc(planEnc.length || 1);
+        const cn = allocStr(M, this.name);
+        try {
+          if (planEnc.length) M.HEAPU8.set(planEnc, pp);
+          const rc = M._catw_compact_execute(
+            scope, this._catalog.ctx, cn.ptr, cn.len, pp, planEnc.length,
+            srcPtr, kindPtr, sources.length
+          );
+          if (rc < 0) throw codeError(rc, 'compact');
+          bytesBuilt = rc;
+        } finally { cn.free(); M._free(pp); }
+      } finally {
+        M._free(kindPtr); M._free(srcPtr);
+        delete M.bjnsScopes[scope];
+      }
+      newEntry.compactedBytes = bytesBuilt;
+      // The flip already happened, inside C, and was made durable there
+      // before these old files can be deleted.
       flipped = true;
 
       // ---- Adopt: reopen everything from the flipped entry. Watchers
@@ -2825,7 +2861,8 @@ class Db {
         const collection = new Collection(name, tree, {
           catalog: this._catalog,
           provider: this._provider,
-          order: this._order
+          order: this._order,
+          nsScope: this._nsScope
         });
         await collection._open();
         this._collections.set(name, collection);

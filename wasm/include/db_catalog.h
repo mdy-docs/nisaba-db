@@ -41,6 +41,7 @@
 #include "binjson.h"
 #include "dbuf.h"
 #include "bjns.h"
+#include "bplustree.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -264,6 +265,44 @@ int dc_compact_plan(const uint8_t *entry, size_t entry_len,
  */
 int dc_sweep_execute(bj_ns *ns, const uint8_t *catalog, size_t catalog_len,
                      const char *names, size_t names_len, uint32_t *deleted);
+
+/* What kind of live structure a compaction source is. */
+typedef enum { DC_SRC_BPT = 0, DC_SRC_RTREE = 1 } dc_source_kind;
+
+/*
+ * Build a compacted generation and flip the catalog to it, in ONE
+ * synchronous call.
+ *
+ * `plan` is dc_compact_plan's output. `sources` are the live structures
+ * to stream from, in the plan's build order: the primary first, then each
+ * index's files (three for a text index, one otherwise). `catalog` is the
+ * catalog tree; `coll` its key for this collection.
+ *
+ * Every destination is opened through `ns` -- which is why the caller
+ * must have made every name in the plan resolvable first. Under the
+ * browser adapter that means pre-opening them; under POSIX the adapter
+ * just opens.
+ *
+ * Why one call. Between the last byte of the new generation and the
+ * catalog write that adopts it, nothing may observe the collection
+ * half-migrated. Spanning that window with awaits meant relying on the
+ * JS-side gate to hold across every one of them; a synchronous call
+ * cannot be interleaved at all.
+ *
+ * It does NOT make the gate unnecessary. The caller still awaits before
+ * (pre-opening) and after (reopening its wrappers, deleting the old
+ * files), so a concurrent operation must still be kept out across those.
+ *
+ * Ordering is the contract: the flip is the LAST thing this does, so a
+ * failure anywhere leaves the collection fully on the old generation with
+ * the new files merely orphaned. The caller deletes them; a crash instead
+ * leaves them for the next sweep.
+ */
+int dc_compact_execute(bj_ns *ns, bpt *catalog,
+                       const char *coll, size_t coll_len,
+                       const uint8_t *plan, size_t plan_len,
+                       void *const *sources, const int *source_kinds,
+                       uint32_t nsources, uint64_t *bytes_built);
 
 #ifdef __cplusplus
 }

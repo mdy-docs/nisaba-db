@@ -67,6 +67,7 @@ _catw_collection_files
 _catw_new_entry
 _catw_compact_plan
 _catw_sweep_execute
+_catw_compact_execute
 _catw_ptr
 _catw_len
 

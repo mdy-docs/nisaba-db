@@ -2281,7 +2281,101 @@ TEST(sweep_execute_drives_a_real_namespace) {
     rmdir(tmpl);
 }
 
+TEST(compact_execute_builds_and_flips_over_real_files) {
+    /*
+     * The same dc_compact_execute the browser calls, here over
+     * bjio_posix. Natively there is no pre-open step at all -- ns->open
+     * really opens -- which is the clearest demonstration that the
+     * plan/execute discipline costs the server nothing and buys the
+     * browser everything.
+     */
+    char tmpl[] = "/tmp/nisaba-compact-XXXXXX";
+    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    /* A collection with garbage to reclaim: insert, then delete most. */
+    bj_io cio;
+    CHECK_FATAL(ns.open(ns.ctx, "coll-users.bj", 13, BJ_NS_CREATE, &cio) == BJ_OK);
+    bpt *primary = bpt_create(&cio, ORDER);
+    CHECK_FATAL(primary != NULL);
+    dc_collection *coll = dc_collection_open(primary);
+    CHECK_FATAL(coll != NULL);
+    for (uint32_t i = 1; i <= 60; i++)
+        CHECK_OK(insert_person(coll, i, "person", "core", (int64_t)i));
+    {
+        doc *q = doc_new();
+        doc_str(q, "team", "core");
+        uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
+        int64_t deleted = 0;
+        CHECK_OK(dc_delete_many(coll, qb, qlen, &deleted));
+        CHECK_I64(deleted, 60);
+        doc_free(q);
+    }
+    uint64_t before = cio.size(cio.ctx);
+    CHECK(before > 0);
+
+    /* A catalog holding this collection's entry. */
+    bj_io kio;
+    CHECK_FATAL(ns.open(ns.ctx, "__catalog__.bj", 14, BJ_NS_CREATE, &kio) == BJ_OK);
+    bpt *catalog = bpt_create(&kio, ORDER);
+    CHECK_FATAL(catalog != NULL);
+    dbuf entry = {0};
+    CHECK_OK(dc_catalog_new_entry("users", 5, &entry));
+    {
+        bpt_key k = { .is_string = 1, .num = 0, .str = (const uint8_t *)"users", .str_len = 5 };
+        CHECK_OK(bpt_add(catalog, &k, entry.data, (uint32_t)entry.len));
+    }
+
+    dbuf plan = {0};
+    CHECK_OK(dc_compact_plan(entry.data, entry.len, "users", 5, &plan));
+
+    void *sources[1] = { primary };
+    int kinds[1] = { DC_SRC_BPT };
+    uint64_t built = 0;
+    CHECK_OK(dc_compact_execute(&ns, catalog, "users", 5, plan.data, plan.len,
+                                sources, kinds, 1, &built));
+    CHECK(built > 0);
+    /* Reclaiming is the point: 60 inserts and 60 deletes leave an
+     * append-only file far larger than the empty tree it compacts to. */
+    CHECK(built < before);
+
+    /* The new generation exists on disk... */
+    bj_io probe;
+    CHECK_OK(ns.open(ns.ctx, "g1-coll-users.bj", 16, 0, &probe));
+    CHECK(probe.size(probe.ctx) > 0);
+    CHECK_OK(ns.close(ns.ctx, &probe));
+    /* ...its own empty journal was created... */
+    CHECK_OK(ns.open(ns.ctx, "g1-coll-users-journal.bj", 24, 0, &probe));
+    CHECK_I64(probe.size(probe.ctx), 0);
+    CHECK_OK(ns.close(ns.ctx, &probe));
+
+    /* ...and the catalog was flipped to it, durably, before any old file
+     * is deleted -- a lost flip after those deletes would leave the
+     * catalog pointing at files that no longer exist. */
+    {
+        bpt_key k = { .is_string = 1, .num = 0, .str = (const uint8_t *)"users", .str_len = 5 };
+        int found = 0; const uint8_t *vp = NULL; size_t vlen = 0;
+        CHECK_OK(bpt_search(catalog, &k, &found, &vp, &vlen));
+        CHECK(found);
+        if (found) {
+            CHECK(find_bytes(vp, vlen, "g1-coll-users.bj", 16) != NULL);
+            CHECK(find_bytes(vp, vlen, "compactedBytes", 14) != NULL);
+        }
+    }
+
+    dbuf_free(&plan); dbuf_free(&entry);
+    dc_collection_free(coll);
+    bpt_free(catalog); bpt_free(primary);
+    bjns_posix_free(&ns);
+    close(dirfd);
+    /* Leave the directory for the OS; the files are all in tmpl. */
+}
+
 int main(void) {
+    RUN(compact_execute_builds_and_flips_over_real_files);
     RUN(sweep_execute_drives_a_real_namespace);
     RUN(compact_plan_regenerates_every_name_and_keeps_every_option);
     RUN(compact_plan_advances_from_the_recorded_generation);

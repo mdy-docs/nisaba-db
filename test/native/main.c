@@ -4769,6 +4769,49 @@ static int leader_count(rn_member *m, int count, int *which) {
     return n;
 }
 
+TEST(a_single_voter_group_commits_the_moment_it_elects_itself) {
+    /*
+     * Regression. The three-node test above passed while this was
+     * broken: a lone voter reaches quorum without sending anything, so
+     * nothing ever arrives to trigger the commit check, and it elected
+     * itself and then committed nothing forever. src/raft.js ends
+     * _becomeLeader with the same call for the same reason.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "raft.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(1, log);
+    CHECK_FATAL(n != NULL);
+
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    bj_begin_object(members);
+    bj_put_key(members, (const uint8_t *)"id", 2);
+    bj_put_int(members, 1);
+    bj_end_object(members);
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+    CHECK_OK(rn_set_members(n, mbuf, (uint32_t)mlen));
+    CHECK_I64(rn_quorum(n), 1);
+
+    rn_start(n, 0, 0.0);
+    for (int64_t t = 0; t <= 1000 && rn_role(n) != RAFT_LEADER; t += 10)
+        rn_tick(n, t, 0.5);
+
+    CHECK_I64(rn_role(n), RAFT_LEADER);
+    CHECK(rn_commit_index(n) > 0);
+    /* Nobody to talk to, so nothing was ever queued. */
+    CHECK_I64(rn_out_count(n), 0);
+
+    bj_builder_free(members);
+    rn_free(n);
+    elog_free(log);
+    memfs_free(fs);
+}
+
 TEST(three_nodes_elect_a_leader_and_commit_without_a_host_language) {
     /*
      * The end-to-end claim of the whole port, at the Raft layer: three
@@ -4878,6 +4921,7 @@ int main(void) {
     RUN(replication_picks_append_snapshot_or_park);
     RUN(snapshot_chunking_covers_every_byte_exactly_once);
     RUN(three_nodes_elect_a_leader_and_commit_without_a_host_language);
+    RUN(a_single_voter_group_commits_the_moment_it_elects_itself);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);

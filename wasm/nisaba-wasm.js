@@ -1294,6 +1294,138 @@ const raftDrive = {
   }
 };
 
+/**
+ * The replication state machine and its outbox (wasm/include/raft_node.h).
+ *
+ * This is the seam that lets Raft leave JavaScript. Instead of
+ * `await transport.call(peer, msg)` -- which suspends the state machine
+ * on a promise, and there are no promises under WASI -- C queues what it
+ * wants sent, the host delivers it however it likes, and the answer
+ * comes back keyed by a correlation id.
+ *
+ * The node pointer IS the handle: the outbox lives inside it, so two
+ * nodes in one process (which is every Raft test) cannot trample each
+ * other the way a shared scratch context would.
+ */
+const RAFT_ROLE = Object.freeze({ FOLLOWER: 0, CANDIDATE: 1, LEADER: 2 });
+const RN_EFFECT = Object.freeze({
+  ROLE: 0, COMMIT: 1, NEEDS_SNAPSHOT: 2, PROMOTE: 3, REACHABLE: 4, TRUNCATED: 5
+});
+
+class RaftCore {
+  /** `log` is an EntryLog; it is BORROWED and outlives nothing here. */
+  constructor(id, log, { electionTimeoutMs = [150, 300], heartbeatMs = 50,
+                         maxBatchBytes = 65536 } = {}) {
+    const M = requireModule();
+    this._ptr = M._rnw_new(id, log.ctx);
+    if (!this._ptr) throw codeError(-1, 'rnw_new');
+    M._rnw_set_timing(this._ptr, electionTimeoutMs[0], electionTimeoutMs[1], heartbeatMs);
+    M._rnw_set_limits(this._ptr, maxBatchBytes);
+  }
+
+  free() {
+    if (this._ptr) { requireModule()._rnw_free(this._ptr); this._ptr = 0; }
+  }
+
+  setMembers(records) {
+    const M = requireModule();
+    const enc = encode(records);
+    const p = M._malloc(enc.length || 1);
+    try {
+      if (enc.length) M.HEAPU8.set(enc, p);
+      const rc = M._rnw_set_members(this._ptr, p, enc.length);
+      if (rc !== 0) throw codeError(rc, 'setMembers');
+    } finally { M._free(p); }
+  }
+
+  start(now, random01) { requireModule()._rnw_start(this._ptr, now, random01); }
+  stop() { requireModule()._rnw_stop(this._ptr); }
+  tick(now, random01) {
+    const rc = requireModule()._rnw_tick(this._ptr, now, random01);
+    if (rc !== 0) throw codeError(rc, 'tick');
+  }
+  quiesce() { requireModule()._rnw_quiesce(this._ptr); }
+  wake(now, random01) { requireModule()._rnw_wake(this._ptr, now, random01); }
+
+  /** An incoming request. Its reply lands in the outbox addressed back
+   * to `from` with the same correlation id. */
+  handle(from, corr, bytes) {
+    const M = requireModule();
+    const p = M._malloc(bytes.length || 1);
+    try {
+      if (bytes.length) M.HEAPU8.set(bytes, p);
+      return M._rnw_handle(this._ptr, from, corr, p, bytes.length);
+    } finally { M._free(p); }
+  }
+
+  /** A reply to something this node sent. */
+  onReply(corr, bytes) {
+    const M = requireModule();
+    const p = M._malloc(bytes.length || 1);
+    try {
+      if (bytes.length) M.HEAPU8.set(bytes, p);
+      return M._rnw_on_reply(this._ptr, corr, p, bytes.length);
+    } finally { M._free(p); }
+  }
+
+  /** The request with this correlation id will never be answered. */
+  onFail(corr) { return requireModule()._rnw_on_fail(this._ptr, corr); }
+
+  /**
+   * Everything queued, as plain objects, and the queue is cleared. The
+   * bytes are COPIED out: they point into C-owned buffers that the very
+   * next call may reuse, and a host that delivers asynchronously would
+   * otherwise send whatever landed there later.
+   */
+  drainOutbox() {
+    const M = requireModule();
+    const n = M._rnw_out_count(this._ptr);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const ptr = M._rnw_out_ptr(this._ptr, i);
+      const len = M._rnw_out_len(this._ptr, i);
+      out.push({
+        peer: M._rnw_out_peer(this._ptr, i),
+        corr: M._rnw_out_corr(this._ptr, i),
+        isReply: M._rnw_out_is_reply(this._ptr, i) === 1,
+        bytes: len ? M.HEAPU8.slice(ptr, ptr + len) : new Uint8Array(0)
+      });
+    }
+    M._rnw_out_clear(this._ptr);
+    return out;
+  }
+
+  /** What C could not do itself: apply, read a file, settle a promise. */
+  drainEffects() {
+    const M = requireModule();
+    const n = M._rnw_effect_count(this._ptr);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      out.push({
+        kind: M._rnw_effect_kind(this._ptr, i),
+        arg: M._rnw_effect_arg(this._ptr, i),
+        flag: M._rnw_effect_flag(this._ptr, i) === 1
+      });
+    }
+    M._rnw_effects_clear(this._ptr);
+    return out;
+  }
+
+  get role() { return requireModule()._rnw_role(this._ptr); }
+  get leaderId() { return requireModule()._rnw_leader_id(this._ptr); }
+  get commitIndex() { return requireModule()._rnw_commit_index(this._ptr); }
+  get quorum() { return requireModule()._rnw_quorum(this._ptr); }
+  matchOf(peer) { return requireModule()._rnw_match(this._ptr, peer); }
+  nextOf(peer) { return requireModule()._rnw_next(this._ptr, peer); }
+  hasQuorumContact(withinMs) {
+    return requireModule()._rnw_has_quorum_contact(this._ptr, withinMs) === 1;
+  }
+  replicate(peer) { return requireModule()._rnw_replicate(this._ptr, peer); }
+  installed(peer, boundary) {
+    return requireModule()._rnw_installed(this._ptr, peer, boundary);
+  }
+}
+
 let raftMsgCtx = 0;
 
 /** Slot order of the packed node state rmw_* reads (raft_msg_wasm.c). */
@@ -3524,6 +3656,9 @@ export {
   raft,
   raftMsg,
   raftDrive,
+  RaftCore,
+  RAFT_ROLE,
+  RN_EFFECT,
   // The WAL command grammar (db_wal.h). src/db-wal.js plans through
   // walPlan and dispatches on WAL_OP, so the opcode spellings live in C
   // and nowhere else.

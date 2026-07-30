@@ -254,6 +254,7 @@ static void become_follower(raft_node *n, uint64_t term, uint64_t leader_id,
 }
 
 static int replicate_to(raft_node *n, rn_peer *p);
+static void advance_commit(raft_node *n);
 
 static int become_leader(raft_node *n) {
     n->leader_id = n->self_id;
@@ -283,6 +284,14 @@ static int become_leader(raft_node *n) {
 
     n->heartbeat_due = n->now;
     for (uint32_t i = 0; i < n->npeers; i++) replicate_to(n, &n->peers[i]);
+
+    /* A single-voter group has nobody to hear from, so nothing will ever
+     * arrive to trigger this: it commits the moment it appends. Without
+     * this line such a group elects a leader and then commits nothing,
+     * forever -- which is how the JS found it too (src/raft.js's
+     * _becomeLeader ends with the same call, commented "single-node
+     * clusters"). */
+    advance_commit(n);
     return BJ_OK;
 }
 

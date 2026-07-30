@@ -42,4 +42,5 @@ wasm/src/db_wal_wasm.c
 wasm/src/raft_core_wasm.c
 wasm/src/raft_msg_wasm.c
 wasm/src/raft_drive_wasm.c
+wasm/src/raft_node_wasm.c
 wasm/src/db_currentdate_wasm.c

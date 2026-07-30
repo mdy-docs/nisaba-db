@@ -11,6 +11,7 @@
 
 #define RN_MAX_PEERS 64
 #define RN_MAX_OUT   256
+#define RN_MAX_PENDING 16
 
 /*
  * The effect queue is sized from the peer cap, not guessed.
@@ -69,6 +70,12 @@ struct raft_node {
     uint32_t npeers;      /* excludes self                              */
     int      self_voting;
     uint32_t voter_count; /* including self when self_voting             */
+    /* The adopted set as raft_members_adopt normalized it: the member
+     * RECORDS (ids, addresses, voting flags), the voter ids and the peer
+     * ids, in one binjson object. Kept rather than derived twice: a host
+     * that ran the same normalization on its own side would be a second
+     * place the cluster's shape is written down. */
+    dbuf     adopted;
 
     int64_t  now;
     int64_t  election_deadline;
@@ -98,6 +105,22 @@ struct raft_node {
      * Never cleared -- the host's view of it is incomplete from that
      * moment on, and the only safe reading is that it stays so. */
     int      effects_lost;
+
+    /*
+     * Membership orchestration. One change may be in flight at a time --
+     * the single-server-change safety argument rests on changes
+     * serializing -- and `pending` holds the join/leave requests waiting
+     * on the one in flight, so each can be answered when it lands.
+     *
+     * A request that cannot be answered NOW is the only thing in this
+     * file that does not reply within its own rn_handle: the answer is a
+     * fact about a log entry that has not committed yet. The host holds
+     * the promise (raft_node.h's division), and the reply reaches it
+     * through the outbox like every other message.
+     */
+    int      config_in_flight;
+    struct { uint64_t peer, corr; } pending[RN_MAX_PENDING];
+    uint32_t npending;
 };
 
 /* The coalescing argument above, as arithmetic the compiler checks:
@@ -108,6 +131,9 @@ _Static_assert(RN_MAX_EFF >= RN_MAX_PEERS * 3 + 8,
                "effect queue must hold every peer's actionable effects at once");
 
 /* ---- small helpers ------------------------------------------------------ */
+
+/* Answers everyone waiting on a membership change; see its definition. */
+static void flush_pending(raft_node *n, int ok);
 
 static rn_peer *peer_of(raft_node *n, uint64_t id) {
     for (uint32_t i = 0; i < n->npeers; i++)
@@ -213,6 +239,7 @@ raft_node *rn_new(uint64_t self_id, elog *log) {
 void rn_free(raft_node *n) {
     if (!n) return;
     for (uint32_t i = 0; i < RN_MAX_OUT; i++) dbuf_free(&n->out[i].bytes);
+    dbuf_free(&n->adopted);
     free(n);
 }
 
@@ -330,14 +357,63 @@ int rn_set_members(raft_node *n, const uint8_t *members, uint32_t len) {
         }
     }
 
-    /* Nothing above touched the node. Commit the whole set at once. */
+    /* Nothing above touched the node. Commit the whole set at once --
+     * the cursors, the arithmetic, and the records themselves, which the
+     * node keeps so nobody has to normalize them a second time. */
     if (nnext) memcpy(n->peers, next, sizeof(rn_peer) * nnext);
     n->npeers = nnext;
     n->self_voting = self_voting;
     n->voter_count = voter_count;
+    dbuf_free(&n->adopted);
+    n->adopted = adopted;          /* moved, not copied */
 
-    dbuf_free(&adopted);
+    /* A set is in force, so no change is in flight, and anyone waiting on
+     * one has their answer. */
+    n->config_in_flight = 0;
+    flush_pending(n, 1);
     return BJ_OK;
+}
+
+const uint8_t *rn_adopted(const raft_node *n, uint32_t *len) {
+    *len = (uint32_t)n->adopted.len;
+    return n->adopted.data;
+}
+
+/* The `members` ARRAY inside the adopted set -- the records themselves,
+ * which is what a membership answer carries and what a redirect reads an
+ * address out of. */
+static const uint8_t *members_span(const raft_node *n, uint32_t *len) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    *len = 0;
+    if (!n->adopted.len) return NULL;
+    if (obj_get_field(n->adopted.data, n->adopted.len,
+                      (const uint8_t *)"members", 7, &v, &vlen, &found) || !found) return NULL;
+    *len = (uint32_t)vlen;
+    return v;
+}
+
+/* The record for `id`, or NULL. */
+static const uint8_t *record_of(const raft_node *n, uint64_t id, uint32_t *len) {
+    uint32_t mlen = 0;
+    const uint8_t *m = members_span(n, &mlen);
+    *len = 0;
+    if (!m) return NULL;
+    cur c = { m, mlen, 0 };
+    uint32_t count;
+    if (array_begin(&c, &count) != BJ_OK) return NULL;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c) != BJ_OK) return NULL;
+        const uint8_t *rec = m + start;
+        uint32_t rlen = (uint32_t)(c.pos - start);
+        const uint8_t *idv; uint32_t idlen;
+        if (rmsg_record_field(rec, rlen, "id", &idv, &idlen) || !idv) continue;
+        cur ic = { idv, idlen, 0 };
+        double d;
+        if (read_number(&ic, &d) != BJ_OK) continue;
+        if ((uint64_t)d == id) { *len = rlen; return rec; }
+    }
+    return NULL;
 }
 
 uint32_t rn_max_peers(void) { return RN_MAX_PEERS; }
@@ -353,6 +429,11 @@ static void become_follower(raft_node *n, uint64_t term, uint64_t leader_id,
     n->round_live = 0;
     set_role(n, RAFT_FOLLOWER);
     arm_election(n, random01);
+    /* Whatever membership change this node was carrying, it is not the
+     * one who can finish it now. Everyone waiting gets a redirect rather
+     * than a promise nobody will keep. */
+    n->config_in_flight = 0;
+    flush_pending(n, 0);
 }
 
 static int replicate_to(raft_node *n, rn_peer *p);
@@ -595,6 +676,229 @@ static void adopt(raft_node *n, const raft_msg_effect *eff, double random01) {
     if (eff->quiesce) rn_quiesce(n);
 }
 
+/* ---- the three kinds a node answers without touching its log ------------ */
+
+/* Queue one reply, taking ownership of nothing. */
+static int reply_with(raft_node *n, uint64_t peer, uint64_t corr, dbuf *r) {
+    int e = queue(n, peer, corr, 1, r->data, r->len);
+    dbuf_free(r);
+    return e;
+}
+
+/* A redirect: who leads, and where to find them. */
+static int reply_redirect(raft_node *n, uint64_t peer, uint64_t corr) {
+    uint32_t llen = 0;
+    const uint8_t *leader = n->leader_id ? record_of(n, n->leader_id, &llen) : NULL;
+    dbuf r = {0};
+    int e = rmsg_build_membership_reply(0, NULL, 0, NULL, 0, n->leader_id, leader, llen, &r);
+    if (e) { dbuf_free(&r); return e; }
+    return reply_with(n, peer, corr, &r);
+}
+
+/* `{ok:true, members}` -- the current set, which is the answer to a
+ * request that asks for a change already in force. */
+static int reply_members(raft_node *n, uint64_t peer, uint64_t corr) {
+    uint32_t mlen = 0;
+    const uint8_t *members = members_span(n, &mlen);
+    dbuf r = {0};
+    int e = rmsg_build_membership_reply(1, members, mlen, NULL, 0, 0, NULL, 0, &r);
+    if (e) { dbuf_free(&r); return e; }
+    return reply_with(n, peer, corr, &r);
+}
+
+static int reply_error(raft_node *n, uint64_t peer, uint64_t corr,
+                       const char *error, int retry) {
+    dbuf r = {0};
+    int e = rmsg_build_membership_reply(0, NULL, 0, error, retry, 0, NULL, 0, &r);
+    if (e) { dbuf_free(&r); return e; }
+    return reply_with(n, peer, corr, &r);
+}
+
+/* Park a requester until the change it asked for lands. */
+static int defer(raft_node *n, uint64_t peer, uint64_t corr) {
+    if (n->npending >= RN_MAX_PENDING) {
+        return reply_error(n, peer, corr, NULL, 1);   /* busy; retry */
+    }
+    n->pending[n->npending].peer = peer;
+    n->pending[n->npending].corr = corr;
+    n->npending++;
+    return BJ_OK;
+}
+
+/* Copy `record` with `voting` forced to `voting_flag`, dropping any
+ * voting the record carried. */
+static int record_with_voting(const uint8_t *record, uint32_t len, int voting_flag,
+                              bj_builder *b) {
+    cur c = { record, len, 0 };
+    uint32_t count;
+    int e = object_begin(&c, &count);
+    if (e) return e;
+    e = bj_begin_object(b);
+    for (uint32_t i = 0; i < count && !e; i++) {
+        const uint8_t *k; uint32_t klen;
+        e = take_key(&c, &k, &klen);
+        if (e) break;
+        size_t start = c.pos;
+        e = skip_value(&c);
+        if (e) break;
+        if (klen == 6 && memcmp(k, "voting", 6) == 0) continue;   /* ours to say */
+        e = bj_put_key(b, k, klen);
+        if (!e) e = bj_put_raw(b, record + start, (uint32_t)(c.pos - start));
+    }
+    if (!e) e = bj_put_key(b, (const uint8_t *)"voting", 6);
+    if (!e) e = bj_put_bool(b, voting_flag);
+    if (!e) e = bj_end_object(b);
+    return e;
+}
+
+/*
+ * A join: the applicant's record, upserted into the member set.
+ *
+ * A NEW member always enters as a learner, whatever it asked for --
+ * adding capacity must never thin the failure margin, and the leader
+ * promotes it automatically once its match index proves it caught up. A
+ * re-join of an EXISTING member keeps whatever status it already has: an
+ * established voter is not demoted by re-announcing itself.
+ */
+static int handle_join(raft_node *n, uint64_t corr, const uint8_t *msg, uint32_t len) {
+    const uint8_t *rec; uint32_t rlen; uint64_t id = 0;
+    if (rmsg_join_member(msg, len, &rec, &rlen, &id)) {
+        return reply_error(n, 0, corr, "join requires member { id, host, port }", 0);
+    }
+    /* The applicant is not a member yet, so it has no id to address a
+     * reply to -- the reply rides back on the correlation id alone, and
+     * the host returns it to whoever asked. */
+    if (n->role != RAFT_LEADER) return reply_redirect(n, 0, corr);
+
+    uint32_t elen = 0;
+    const uint8_t *existing = record_of(n, id, &elen);
+    if (existing) {
+        /* Identical to what the log already says: nothing to change, and
+         * saying so is what makes a retried join harmless. */
+        const uint8_t *h1, *h2, *p1, *p2; uint32_t h1l, h2l, p1l, p2l;
+        rmsg_record_field(existing, elen, "host", &h1, &h1l);
+        rmsg_record_field(rec, rlen, "host", &h2, &h2l);
+        rmsg_record_field(existing, elen, "port", &p1, &p1l);
+        rmsg_record_field(rec, rlen, "port", &p2, &p2l);
+        if (h1l == h2l && p1l == p2l &&
+            (!h1l || memcmp(h1, h2, h1l) == 0) && (!p1l || memcmp(p1, p2, p1l) == 0)) {
+            return reply_members(n, 0, corr);
+        }
+    }
+    if (n->config_in_flight) return reply_error(n, 0, corr, NULL, 1);
+
+    /* Everyone else, plus the applicant. */
+    int voting = 0;
+    if (existing) {
+        const uint8_t *v; uint32_t vlen;
+        rmsg_record_field(existing, elen, "voting", &v, &vlen);
+        voting = !(vlen && v[0] == BJ_TYPE_FALSE);
+    }
+    uint32_t mlen = 0;
+    const uint8_t *members = members_span(n, &mlen);
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+    if (members) {
+        cur c = { members, mlen, 0 };
+        uint32_t count;
+        if (!e && array_begin(&c, &count) == BJ_OK) {
+            for (uint32_t i = 0; i < count && !e; i++) {
+                size_t start = c.pos;
+                if (skip_value(&c) != BJ_OK) { e = RAFT_ERR_MEMBER; break; }
+                const uint8_t *r2 = members + start;
+                uint32_t r2l = (uint32_t)(c.pos - start);
+                const uint8_t *idv; uint32_t idl;
+                if (!rmsg_record_field(r2, r2l, "id", &idv, &idl) && idv) {
+                    cur ic = { idv, idl, 0 };
+                    double d;
+                    if (read_number(&ic, &d) == BJ_OK && (uint64_t)d == id) continue;
+                }
+                e = bj_put_raw(b, r2, r2l);
+            }
+        }
+    }
+    if (!e) e = record_with_voting(rec, rlen, voting, b);
+    if (!e) e = bj_end_array(b);
+    uint64_t at = 0;
+    if (!e) {
+        size_t nlen; const uint8_t *next = bj_builder_data(b, &nlen);
+        e = next ? rn_change_membership(n, next, (uint32_t)nlen, &at) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    if (e == RAFT_ERR_BUSY) return reply_error(n, 0, corr, NULL, 1);
+    if (e) return reply_error(n, 0, corr, "membership change refused", 0);
+    return defer(n, 0, corr);
+}
+
+/* A leave: the id, removed. Same redirect and idempotence rules. */
+static int handle_leave(raft_node *n, uint64_t corr, const uint8_t *msg, uint32_t len) {
+    uint64_t id = 0;
+    if (rmsg_leave_id(msg, len, &id)) {
+        return reply_error(n, 0, corr, "leave requires a member id", 0);
+    }
+    if (n->role != RAFT_LEADER) return reply_redirect(n, 0, corr);
+
+    uint32_t elen = 0;
+    if (!record_of(n, id, &elen)) return reply_members(n, 0, corr);  /* already gone */
+    if (n->config_in_flight) return reply_error(n, 0, corr, NULL, 1);
+
+    uint32_t mlen = 0;
+    const uint8_t *members = members_span(n, &mlen);
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+    cur c = { members, mlen, 0 };
+    uint32_t count;
+    if (!e && array_begin(&c, &count) == BJ_OK) {
+        for (uint32_t i = 0; i < count && !e; i++) {
+            size_t start = c.pos;
+            if (skip_value(&c) != BJ_OK) { e = RAFT_ERR_MEMBER; break; }
+            const uint8_t *r2 = members + start;
+            uint32_t r2l = (uint32_t)(c.pos - start);
+            const uint8_t *idv; uint32_t idl;
+            if (!rmsg_record_field(r2, r2l, "id", &idv, &idl) && idv) {
+                cur ic = { idv, idl, 0 };
+                double d;
+                if (read_number(&ic, &d) == BJ_OK && (uint64_t)d == id) continue;
+            }
+            e = bj_put_raw(b, r2, r2l);
+        }
+    }
+    if (!e) e = bj_end_array(b);
+    uint64_t at = 0;
+    if (!e) {
+        size_t nlen; const uint8_t *next = bj_builder_data(b, &nlen);
+        e = next ? rn_change_membership(n, next, (uint32_t)nlen, &at) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    if (e == RAFT_ERR_BUSY) return reply_error(n, 0, corr, NULL, 1);
+    if (e) return reply_error(n, 0, corr, "membership change refused", 0);
+    return defer(n, 0, corr);
+}
+
+/*
+ * TimeoutNow (section 3.10): the transferring leader certifies we are
+ * fully caught up and asks us to stand NOW -- a real election, skipping
+ * pre-vote, whose leader stickiness exists precisely to block challengers
+ * while that leader still lives. Refused when stale-termed, when we
+ * already lead, or when we hold no franchise (a learner cannot win the
+ * election this would start).
+ */
+static int handle_timeout_now(raft_node *n, uint64_t peer, uint64_t corr,
+                              const uint8_t *msg, uint32_t len, double random01) {
+    uint64_t term = 0;
+    rmsg_term(msg, len, &term);
+    int ok = term >= elog_current_term(n->log) &&
+             n->role != RAFT_LEADER && n->self_voting;
+    int e = ok ? rn_campaign(n, random01) : BJ_OK;
+    if (e) return e;
+    dbuf r = {0};
+    e = rmsg_build_ack(elog_current_term(n->log), ok, &r);
+    if (e) { dbuf_free(&r); return e; }
+    return reply_with(n, peer, corr, &r);
+}
+
 int rn_handle(raft_node *n, uint64_t corr,
               const uint8_t *msg, uint32_t len, double random01) {
     int kind = -1;
@@ -606,9 +910,22 @@ int rn_handle(raft_node *n, uint64_t corr,
      * JS one did, not know it at all and pass 0, which then rode into
      * the outbox and broke this file's own "every entry is addressed"
      * invariant on every inbound message. */
+    /*
+     * join and leave come from OUTSIDE the cluster -- an applicant has
+     * no id yet, and an admin removing a dead node is not a member --
+     * so they name no sender and are answered on the correlation id
+     * alone. Everything else must say who it is.
+     */
+    if (kind == RAFT_MSG_JOIN)  return handle_join(n, corr, msg, len);
+    if (kind == RAFT_MSG_LEAVE) return handle_leave(n, corr, msg, len);
+
     uint64_t from = 0;
     e = rmsg_sender(msg, len, &from);
     if (e) return e;
+
+    if (kind == RAFT_MSG_TIMEOUT_NOW) {
+        return handle_timeout_now(n, from, corr, msg, len, random01);
+    }
 
     raft_msg_state st;
     fill_state(n, &st);
@@ -621,9 +938,8 @@ int rn_handle(raft_node *n, uint64_t corr,
     } else if (kind == RAFT_MSG_APPEND_ENTRIES) {
         e = rmsg_handle_append_entries(n->log, &st, msg, len, &eff, &reply);
     } else {
-        /* Everything else -- install, join, leave, timeoutNow -- needs
-         * host resources (files, a promise, a membership proposal), so
-         * it is the host's to answer. See raft_node.h. */
+        /* InstallSnapshot alone is left: it writes FILES, and this layer
+         * has no namespace to write them through. See raft_node.h. */
         dbuf_free(&reply);
         return RAFT_ERR_MESSAGE;
     }
@@ -809,6 +1125,92 @@ uint64_t rn_inflight(const raft_node *n, uint64_t peer) {
 }
 
 int rn_is_quiesced(const raft_node *n) { return n->quiesced; }
+
+/* ---- membership orchestration ------------------------------------------- */
+
+int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
+               uint64_t *out_index);
+
+/*
+ * Answer everyone waiting on the change that just landed.
+ *
+ * `ok` with the adopted records if it landed; a redirect if this node
+ * stopped being the one who could land it. Nobody is left holding a
+ * promise that will never settle -- which for a joiner means a retry
+ * against the new leader rather than a hang until its transport gives up.
+ */
+static void flush_pending(raft_node *n, int ok) {
+    if (!n->npending) return;
+    uint32_t mlen = 0;
+    const uint8_t *members = members_span(n, &mlen);
+    uint32_t llen = 0;
+    const uint8_t *leader = n->leader_id ? record_of(n, n->leader_id, &llen) : NULL;
+
+    for (uint32_t i = 0; i < n->npending; i++) {
+        dbuf reply = {0};
+        int e = rmsg_build_membership_reply(ok, members, mlen, NULL, 0,
+                                            n->leader_id, leader, llen, &reply);
+        if (!e) queue(n, n->pending[i].peer, n->pending[i].corr, 1, reply.data, reply.len);
+        dbuf_free(&reply);
+    }
+    n->npending = 0;
+}
+
+int rn_change_membership(raft_node *n, const uint8_t *members, uint32_t len,
+                         uint64_t *out_index) {
+    if (n->role != RAFT_LEADER) return BJ_ERR_STATE;
+    if (n->config_in_flight) return RAFT_ERR_BUSY;
+
+    /* Merge with what the log already carries, so an id-only proposal
+     * cannot erase an address (raft_core.h's members_merge). */
+    uint32_t known_len = 0;
+    const uint8_t *known = members_span(n, &known_len);
+    dbuf merged = {0};
+    int e = raft_members_merge(members, len, known, known_len, &merged);
+    if (e) { dbuf_free(&merged); return e; }
+
+    /*
+     * Refuse an oversized set HERE, before it is proposed. Committed, it
+     * would be refused at APPLY by every replica alike, where the only
+     * honest response left is to halt -- so the check belongs where a
+     * caller is still standing.
+     */
+    {
+        dbuf probe = {0};
+        e = raft_members_adopt(merged.data, (uint32_t)merged.len, n->self_id, &probe);
+        if (!e) {
+            const uint8_t *v; size_t vlen; int found = 0;
+            uint32_t count = 0;
+            if (!obj_get_field(probe.data, probe.len, (const uint8_t *)"peers", 5,
+                               &v, &vlen, &found) && found) {
+                cur c = { v, vlen, 0 };
+                if (array_begin(&c, &count) != BJ_OK) count = 0;
+            }
+            if (count > RN_MAX_PEERS) e = RAFT_ERR_CAPACITY;
+        }
+        dbuf_free(&probe);
+        if (e) { dbuf_free(&merged); return e; }
+    }
+
+    /* The CONFIG entry's payload: { members: [records] }. */
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&merged); return BJ_ERR_OOM; }
+    e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"members", 7);
+    if (!e) e = bj_put_raw(b, merged.data, (uint32_t)merged.len);
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t plen; const uint8_t *payload = bj_builder_data(b, &plen);
+        if (!payload) e = BJ_ERR_STATE;
+        else e = rn_propose(n, EL_CONFIG, payload, (uint32_t)plen, out_index);
+    }
+    bj_builder_free(b);
+    dbuf_free(&merged);
+    if (!e) n->config_in_flight = 1;
+    return e;
+}
+
+int rn_config_in_flight(const raft_node *n) { return n->config_in_flight; }
 
 /* ---- what the host still owns ------------------------------------------- */
 

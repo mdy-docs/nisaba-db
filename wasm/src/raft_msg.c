@@ -342,3 +342,110 @@ int rmsg_build_append_entries(elog *log, uint64_t term, uint64_t leader_id,
     *out_count = (uint32_t)count;
     return finish(b, out);
 }
+
+/* ---- TimeoutNow, join and leave: the replies ----------------------------- */
+
+int rmsg_build_ack(uint64_t term, int ok, dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = put_key(b, "term");
+    if (!e) e = bj_put_int(b, (int64_t)term);
+    if (!e) e = put_key(b, "ok");
+    if (!e) e = bj_put_bool(b, ok);
+    if (!e) e = bj_end_object(b);
+    return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
+int rmsg_build_membership_reply(int ok, const uint8_t *members, uint32_t members_len,
+                                const char *error, int retry,
+                                uint64_t leader_id, const uint8_t *leader_record,
+                                uint32_t leader_record_len, dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = put_key(b, "ok");
+    if (!e) e = bj_put_bool(b, ok);
+
+    if (ok) {
+        if (!e && members) {
+            e = put_key(b, "members");
+            if (!e) e = bj_put_raw(b, members, members_len);
+        }
+    } else if (error) {
+        if (!e) e = put_key(b, "error");
+        if (!e) e = bj_put_string(b, (const uint8_t *)error, (uint32_t)strlen(error));
+    } else if (retry) {
+        if (!e) e = put_key(b, "retry");
+        if (!e) e = bj_put_bool(b, 1);
+    } else {
+        /* A redirect. The address travels WITH the id: a joiner knows
+         * addresses, not ids, so an id alone would send it back to the
+         * seed it just asked. */
+        if (!e) e = put_key(b, "leaderId");
+        if (!e) e = bj_put_int(b, (int64_t)leader_id);
+        if (!e) e = put_key(b, "leaderAddress");
+        if (leader_record) {
+            const uint8_t *h; size_t hlen; int found = 0;
+            if (!e && obj_get_field(leader_record, leader_record_len,
+                                    (const uint8_t *)"host", 4, &h, &hlen, &found) == BJ_OK && found) {
+                e = bj_begin_object(b);
+                if (!e) e = put_key(b, "host");
+                if (!e) e = bj_put_raw(b, h, (uint32_t)hlen);
+                const uint8_t *p; size_t plen; int pfound = 0;
+                if (!e && obj_get_field(leader_record, leader_record_len,
+                                        (const uint8_t *)"port", 4, &p, &plen, &pfound) == BJ_OK && pfound) {
+                    e = put_key(b, "port");
+                    if (!e) e = bj_put_raw(b, p, (uint32_t)plen);
+                }
+                if (!e) e = bj_end_object(b);
+            } else if (!e) {
+                e = bj_put_null(b);
+            }
+        } else if (!e) {
+            e = bj_put_null(b);
+        }
+    }
+    if (!e) e = bj_end_object(b);
+    return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
+int rmsg_term(const uint8_t *msg, uint32_t len, uint64_t *term) {
+    *term = num_field(msg, len, "term");
+    return BJ_OK;
+}
+
+int rmsg_join_member(const uint8_t *msg, uint32_t len,
+                     const uint8_t **record, uint32_t *record_len, uint64_t *id) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    *record = NULL; *record_len = 0; *id = 0;
+    if (obj_get_field(msg, len, (const uint8_t *)"member", 6, &v, &vlen, &found))
+        return RAFT_ERR_MESSAGE;
+    if (!found || vlen < 1 || v[0] != BJ_TYPE_OBJECT) return RAFT_ERR_MESSAGE;
+    /* An id it can be addressed by is the one field a join cannot omit;
+     * raft_core.h's adopt rules validate the rest when it is proposed. */
+    *id = num_field(v, vlen, "id");
+    if (*id == 0) return RAFT_ERR_MESSAGE;
+    *record = v;
+    *record_len = (uint32_t)vlen;
+    return BJ_OK;
+}
+
+/* One field of a member record, as the encoded span it occupies -- so two
+ * records can be compared on it without decoding either. */
+int rmsg_record_field(const uint8_t *record, uint32_t len, const char *key,
+                      const uint8_t **v, uint32_t *vlen) {
+    const uint8_t *p; size_t plen; int found = 0;
+    *v = NULL; *vlen = 0;
+    if (obj_get_field(record, len, (const uint8_t *)key, (uint32_t)strlen(key), &p, &plen, &found))
+        return RAFT_ERR_MESSAGE;
+    if (!found) return BJ_OK;
+    *v = p;
+    *vlen = (uint32_t)plen;
+    return BJ_OK;
+}
+
+int rmsg_leave_id(const uint8_t *msg, uint32_t len, uint64_t *id) {
+    *id = num_field(msg, len, "id");
+    return *id ? BJ_OK : RAFT_ERR_MESSAGE;
+}

@@ -32,12 +32,14 @@
  *   - the snapshot transfer, which reads FILES: the leader streams chunks
  *     it gets from `snapshotter`, the follower stages them; C's part is
  *     the chunk walk (raft_drive.h) and the cursor bookkeeping
- *   - membership orchestration: join/leave, learner promotion, the
- *     one-change-at-a-time gate, and the CONFIG scan at startup. The
- *     RULES for who is a member and who may vote are C's
- *     (raft_core.h's members_adopt/merge), fed back through
- *     RaftCore.setMembers so the voter list and the peer cursors cannot
- *     drift apart
+ *   - the CONFIG scan at startup (it reads the log), learner promotion's
+ *     trigger, and the promise a membership change resolves with.
+ *     Everything else about membership is the node's: who is a member,
+ *     who may vote, the merge that stops an id-only proposal erasing an
+ *     address, the one-change-at-a-time gate, and the RECORDS themselves
+ *     — addresses included, which is what lets it answer a join with a
+ *     redirect to where the leader actually is. This side reads that set
+ *     back rather than deriving its own
  *   - leadership transfer (§3.10), whose fence is a host policy about
  *     proposals and whose trigger is a promise
  *   - observability: onEvent/status(), assembled from C's effects
@@ -106,12 +108,17 @@
  * silently erase addresses. Extra record fields ride along untouched.
  *
  * Join/leave: a node gets INTO the club by asking any member —
- * 'join'/'leave' messages ride the ordinary transport. A follower
- * answers with the leader's id AND address (it knows both from the
- * records); the leader upserts/removes the record via changeMembership
- * and replies with the adopted member list once committed. Retries are
- * idempotent: re-joining with an identical record, or leaving an
- * already-absent id, succeeds without a new CONFIG entry. The
+ * 'join'/'leave' messages ride the ordinary transport, and the NODE
+ * answers them (raft_node.h). A follower redirects with the leader's id
+ * AND address; the leader upserts or removes the record and answers with
+ * the adopted set once the CONFIG entry lands. Retries are idempotent:
+ * re-joining with an identical record, or leaving an already-absent id,
+ * succeeds without a new entry. What this file contributes is the wait:
+ * a request whose answer depends on an entry that has not committed gets
+ * no reply from the node yet, and handleMessage returns a promise the
+ * node settles through the outbox when it can. That promise is the
+ * host's whole share of it — the decision, the merge and the reply are
+ * all C's. The
  * joinGroup/leaveGroup helpers (src/raft-host.js) drive the
  * seed-address loop; the bootstrap (first) node should list itself
  * WITH its address in `peers` so later joiners learn it from the log.
@@ -136,7 +143,7 @@
  * (src/raft-host.js) drives both ends.
  */
 import {
-  ENTRYLOG_TYPE, encode, decode, raft, raftMsg, raftDrive,
+  ENTRYLOG_TYPE, encode, decode, raftMsg, raftDrive,
   RaftCore, RAFT_ROLE, RN_EFFECT
 } from '../wasm/nisaba-wasm.js';
 
@@ -272,7 +279,6 @@ export class RaftNode {
     this._applyChain = Promise.resolve();
     this._install = null;            // follower: in-progress install transaction
     this._exclusive = null;          // runExclusive gate promise, or null
-    this._configInFlight = false;    // one membership change at a time
     this._transfer = null;           // in-flight transfer: {targetId, deadline, sent, resolve, reject}
     this._leaderAt = 0;              // this._now when we became leader
     /** Correlation ids for messages arriving from the transport. A
@@ -280,6 +286,10 @@ export class RaftNode {
      * transport is request/response), so the host mints one purely to
      * pick its own reply out of the outbox. */
     this._inCorr = 0;
+    /** Requests the node has not answered yet — a join or leave waiting
+     * on a CONFIG entry to commit. Keyed by the correlation id minted
+     * above; the node's reply, whenever it comes, settles them. */
+    this._awaiting = new Map();
   }
 
   /**
@@ -304,17 +314,15 @@ export class RaftNode {
    * come from there, so they cannot drift from this list.
    */
   _setMembers(input) {
-    // Sorting, the voting-flag reading and the self-exclusion are C's
-    // (raft_core.h): two nodes adopting the same set must derive the
+    // The node adopts, and then this side READS BACK what it adopted.
+    // Sorting, the voting-flag reading and the self-exclusion are rules
+    // (raft_core.h) -- two nodes adopting the same set must derive the
     // same lists, because the quorum count is read from a position in
-    // one of them, and a divergence there is a split brain.
-    const { members, voters, peers } = raft.membersAdopt(input, this.id);
-    // THE NODE FIRST, and it either takes the whole set or throws. If it
-    // refuses, this side must adopt nothing either: these two lists are
-    // one fact derived twice, and the moment they can disagree there are
-    // two clusters. Assigning first and asking after is how that
-    // happens, so the order here is load-bearing, not stylistic.
-    this._core.setMembers(members);
+    // one of them -- and running them again over here would be a second
+    // derivation that could disagree with the first. There is nothing to
+    // keep in step now: there is one copy, and this is a view of it.
+    this._core.setMembers(input);
+    const { members, voters, peers } = this._core.adopted;
     this.memberInfo = members;
     this.members = members.map((m) => m.id);
     /** Quorum electorate: members without `voting: false`. Replication
@@ -387,7 +395,7 @@ export class RaftNode {
       quiesced: this.quiesced,
       commitIndex: this.commitIndex,
       lastApplied: this.lastApplied,
-      configInFlight: this._configInFlight,
+      configInFlight: this._core.configInFlight,
       log: {
         baseIndex: this._log.baseIndex,
         lastIndex: this._log.lastIndex,
@@ -453,6 +461,10 @@ export class RaftNode {
       t.reject(new Error('node stopped during leadership transfer'));
     }
     this._rejectWaiters(new NotLeaderError(0));
+    // Anyone still holding a request open gets an answer rather than a
+    // promise that can no longer settle: this node is not going to reply.
+    for (const [, w] of this._awaiting) w.reject(new Error('node stopped'));
+    this._awaiting.clear();
     await this._applyChain.catch(() => {});
   }
 
@@ -647,39 +659,24 @@ export class RaftNode {
    * replication path handles that once it is a member.
    */
   async changeMembership(members) {
-    // The merge is C's (raft_core.h): an id-only entry inherits the
-    // known record, which is what stops changeMembership([1,2,3,4]) from
-    // erasing the addresses the log carries -- and the log being the one
-    // source of truth for the cluster's shape is what removes the
-    // separate address book entirely.
-    let next;
-    try {
-      next = raft.membersMerge(members, this.memberInfo);
-    } catch (err) {
-      throw new Error(
-        'changeMembership requires a non-empty set of member records with positive integer ids',
-        { cause: err }
-      );
+    if (this._exclusive) {
+      await this._exclusive;
+      return this.changeMembership(members);
     }
-    if (this._configInFlight) {
-      throw new Error('a membership change is already in flight; wait for it to commit');
+    if (!this.isRunning || this.role !== ROLE.LEADER) {
+      throw new NotLeaderError(this.leaderId);
     }
-    // Refuse an oversized set HERE, where a caller is standing and can
-    // be told why. Proposed instead, it would commit, and then every
-    // replica in the cluster would hit the same refusal at apply — where
-    // the only honest response left is to halt (see _adoptConfig).
-    const maxMembers = this._core.maxPeers + 1; // peers exclude self
-    if (next.length > maxMembers) {
-      throw new Error(
-        `changeMembership: ${next.length} members exceeds this build's limit of ${maxMembers}`
-      );
-    }
-    this._configInFlight = true;
-    try {
-      return await this.propose(encode({ members: next }), ENTRYLOG_TYPE.CONFIG);
-    } finally {
-      this._configInFlight = false;
-    }
+    // The merge with what the log carries, the one-change-at-a-time gate
+    // and the size limit are all the node's (raft_node.h's
+    // rn_change_membership). What is left here is the promise: the entry
+    // resolves when it APPLIES, like any other proposal.
+    const term = this.term;
+    const index = this._core.changeMembership(members);
+    const promise = new Promise((resolve, reject) => {
+      this._waiters.push({ index, term, resolve, reject });
+    });
+    this._flush();
+    return promise;
   }
 
   // ---- the outbox seam ----------------------------------------------------
@@ -731,10 +728,18 @@ export class RaftNode {
    * correlation id — or say it never came. This is the whole of what
    * `await transport.call(...)` used to do inside the state machine. */
   _send(msg) {
-    // A reply the host did not ask for cannot go anywhere: this
-    // transport is request/response, so replies travel as return values
-    // (see _handleRaftMessage) and never as a fresh call.
-    if (msg.isReply) return;
+    // A reply travels as a return value on this transport, never as a
+    // fresh call. If someone is still holding the request open, this is
+    // what they were waiting for; otherwise it is an answer to a
+    // question nobody is asking any more, and it goes nowhere.
+    if (msg.isReply) {
+      const waiter = this._awaiting.get(msg.corr);
+      if (waiter) {
+        this._awaiting.delete(msg.corr);
+        waiter.resolve(msg.bytes);
+      }
+      return;
+    }
     const corr = msg.corr;
     this.transport.call(msg.peer, msg.bytes).then(
       (reply) => this._deliver((r) => this._core.onReply(corr, reply ?? EMPTY, r)),
@@ -845,15 +850,11 @@ export class RaftNode {
     // reply comes back as the bytes to send.
     const kind = raftMsg.kind(bytes);
     if (kind < 0) throw new Error('raft: unrecognized message');
-    switch (kind) {
-      case raftMsg.KIND.REQUEST_VOTE:
-      case raftMsg.KIND.APPEND_ENTRIES:
-        return this._handleRaftMessage(bytes);
-      case raftMsg.KIND.INSTALL_SNAPSHOT: return this._onInstallSnapshot(decode(bytes));
-      case raftMsg.KIND.JOIN: return this._onJoin(decode(bytes));
-      case raftMsg.KIND.TIMEOUT_NOW: return this._onTimeoutNow(decode(bytes));
-      default: return this._onLeave(decode(bytes));
-    }
+    // InstallSnapshot is the one kind the node refuses: it writes FILES,
+    // and C has no namespace to write them through. Everything else --
+    // votes, entries, join, leave, TimeoutNow -- the node answers itself.
+    if (kind === raftMsg.KIND.INSTALL_SNAPSHOT) return this._onInstallSnapshot(decode(bytes));
+    return this._handleRaftMessage(bytes);
   }
 
   /**
@@ -878,103 +879,23 @@ export class RaftNode {
     const corr = ++this._inCorr;
     const rc = this._core.handle(corr, bytes, this.random());
     if (rc !== 0) throw new Error(`raft: message refused (${rc})`);
-    let reply = EMPTY;
+    let reply = null;
     for (const msg of this._core.drainOutbox()) {
       if (msg.isReply && msg.corr === corr) reply = msg.bytes;
       else this._send(msg);
     }
     for (const eff of this._core.drainEffects()) this._onEffect(eff);
     this._maybeCompleteTransfer();
-    return reply;
-  }
+    if (reply) return reply;
 
-  /** TimeoutNow (§3.10): the transferring leader certifies we are fully
-   * caught up and asks us to campaign NOW — a real election, skipping
-   * pre-vote, whose leader-stickiness exists precisely to block
-   * challengers while that leader still lives. Refused when
-   * stale-termed, when we already lead, or when we hold no franchise
-   * (a learner cannot win the election this would start). */
-  _onTimeoutNow(msg) {
-    const currentTerm = this._log.currentTerm;
-    if (msg.term < currentTerm) return encode({ term: currentTerm, ok: false });
-    if (this.role === ROLE.LEADER || !this.voters.includes(this.id)) {
-      return encode({ term: currentTerm, ok: false });
-    }
-    this._core.campaign(this.random());
-    this._flush();
-    return encode({ term: this._log.currentTerm, ok: true });
-  }
-
-  /**
-   * Handle a join request ({ kind: 'join', member: { id, host, port,
-   * ... } }) — sent to ANY member; a non-leader answers with the
-   * leader's id and address so the joiner can retry there. The leader
-   * upserts the record and replies { ok: true, members } once the
-   * CONFIG entry commits. Idempotent: re-joining with an identical
-   * record succeeds without a new entry (safe to retry).
-   *
-   * A NEW member always enters as a learner (voting: false), whatever
-   * its request claims — adding capacity must never thin the failure
-   * margin, and the leader promotes it automatically once caught up
-   * (_maybePromote). A re-join of an EXISTING member (address change,
-   * restart-with-retry) keeps its current voting status: an established
-   * voter is not demoted by re-announcing itself.
-   */
-  _onJoin(msg) {
-    const member = msg.member;
-    if (!member || !Number.isInteger(member.id) || member.id <= 0) {
-      return encode({ ok: false, error: 'join requires member { id, host, port }' });
-    }
-    if (this.role !== ROLE.LEADER) return this._redirectToLeader();
-    const existing = this.memberInfo.find((m) => m.id === member.id);
-    if (existing && existing.host === member.host && existing.port === member.port) {
-      return encode({ ok: true, members: this.memberInfo });
-    }
-    if (this._configInFlight) return encode({ ok: false, retry: true });
-    const record = { ...member };
-    delete record.voting;
-    if (existing) {
-      if (existing.voting === false) record.voting = false; // still a learner
-    } else {
-      record.voting = false; // new blood starts as a learner, always
-    }
-    const next = [...this.memberInfo.filter((m) => m.id !== member.id), record];
-    return this.changeMembership(next).then(
-      () => encode({ ok: true, members: this.memberInfo }),
-      (err) => encode({ ok: false, error: String(err?.message ?? err) })
-    );
-  }
-
-  /** Handle a leave request ({ kind: 'leave', id }) — graceful
-   * decommission from the departing node itself, or an admin removing a
-   * dead one. Same redirect/idempotence rules as join. */
-  _onLeave(msg) {
-    if (!Number.isInteger(msg.id) || msg.id <= 0) {
-      return encode({ ok: false, error: 'leave requires a member id' });
-    }
-    if (this.role !== ROLE.LEADER) return this._redirectToLeader();
-    if (!this.members.includes(msg.id)) {
-      return encode({ ok: true, members: this.memberInfo });
-    }
-    if (this._configInFlight) return encode({ ok: false, retry: true });
-    const next = this.memberInfo.filter((m) => m.id !== msg.id);
-    return this.changeMembership(next).then(
-      () => encode({ ok: true, members: this.memberInfo }),
-      (err) => encode({ ok: false, error: String(err?.message ?? err) })
-    );
-  }
-
-  /** Every reply leaves this node as bytes -- the transport frames, it
-   * does not interpret (raft_msg.h). The handlers still written here
-   * encode their own; the two in C already return bytes. */
-  _redirectToLeader() {
-    const leader = this.memberInfo.find((m) => m.id === this.leaderId);
-    return encode({
-      ok: false,
-      leaderId: this.leaderId,
-      leaderAddress: leader && leader.host !== undefined
-        ? { host: leader.host, port: leader.port }
-        : null
+    // No answer yet. A join or leave that needs a CONFIG entry cannot be
+    // answered until that entry commits, and the node says so by queuing
+    // nothing: the answer is a fact about a log entry that does not exist
+    // yet. Holding the promise until it does is exactly the host's half
+    // of the seam — the node will address the reply to this correlation
+    // id whenever it has one, and _send hands it back here.
+    return new Promise((resolve, reject) => {
+      this._awaiting.set(corr, { resolve, reject });
     });
   }
 
@@ -1175,7 +1096,7 @@ export class RaftNode {
    * electorate with a replica proven current.
    */
   _maybePromote(peer) {
-    if (this.role !== ROLE.LEADER || this._configInFlight) return;
+    if (this.role !== ROLE.LEADER || this._core.configInFlight) return;
     const record = this.memberInfo.find((m) => m.id === peer);
     if (!record || record.voting !== false) return;
     // Explicit voting:true (not just dropping the flag): changeMembership

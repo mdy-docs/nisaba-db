@@ -100,6 +100,29 @@ Now the replication roadmap. Having read the new primitives' contracts, here's t
      it must not be papered over. Tested natively end to end: plan a
      write, apply what it planned, with no JavaScript in the process.
 
+   - ✅ Three of the four message kinds C used to refuse. rn_handle now
+     answers join, leave and TimeoutNow itself. Each had needed something
+     only a host had, and both needs are gone: the node keeps the adopted
+     member RECORDS -- addresses included -- so a follower's redirect can
+     say where the leader actually IS rather than only who it is; and a
+     request whose answer depends on a CONFIG entry that has not
+     committed is PARKED rather than refused, answered through the outbox
+     when the entry lands (or redirected, if this node stops being the
+     one who can land it). The host's whole remaining share is the wait:
+     handleMessage returns a promise the node settles. Membership
+     orchestration moved with it -- rn_change_membership merges with what
+     the log carries, enforces one-change-at-a-time, refuses an oversized
+     set before it can be proposed, and proposes the CONFIG entry, so
+     src/raft.js's changeMembership is now the promise and nothing else.
+     The learner rule (a NEW member always enters as a non-voter, a
+     re-join keeps its status) is C's too. What that leaves on this side
+     is a VIEW: _setMembers asks the node to adopt and then reads the
+     derivation back, so the voter list, the peer cursors, the addresses
+     and the quorum count are one copy with one owner rather than two
+     that agree by convention. InstallSnapshot stays refused, and stays
+     honestly so: it writes FILES, and this layer has no namespace to
+     write them through -- that is the file-seam piece, not this one.
+
 6. Read semantics and change streams. Decide follower read policy (stale-ok vs. leader leases vs. readIndex). And change streams get a structural upgrade: db-plan.md:781 notes MongoDB's change streams tail the oplog and nisaba had "no analog" — the entry log is the analog now, giving resumable, gap-free streams.
 
 7. Testing, throughout. Deterministic simulation: in-memory transport with drop/delay/partition injection, plus crash-point tests that kill between append/sync/apply at every boundary (MemoryHandle makes that cheap, and the submodule's entrylog.durability-wasm.test.js is the model to copy).

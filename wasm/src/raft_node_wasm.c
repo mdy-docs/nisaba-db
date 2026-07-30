@@ -42,6 +42,32 @@ EMSCRIPTEN_KEEPALIVE int rnw_set_members(raft_node *n, const uint8_t *members, i
 
 EMSCRIPTEN_KEEPALIVE int rnw_max_peers(void) { return (int)rn_max_peers(); }
 
+EMSCRIPTEN_KEEPALIVE const uint8_t *rnw_adopted_ptr(const raft_node *n) {
+    uint32_t len = 0;
+    return rn_adopted(n, &len);
+}
+EMSCRIPTEN_KEEPALIVE int rnw_adopted_len(const raft_node *n) {
+    uint32_t len = 0;
+    rn_adopted(n, &len);
+    return (int)len;
+}
+
+/* The CONFIG entry's index comes back through `out` (one f64 slot); the
+ * return value is the error code, since RAFT_ERR_BUSY is a real answer
+ * ("ask again later") rather than a failure. */
+EMSCRIPTEN_KEEPALIVE int rnw_change_membership(raft_node *n, const uint8_t *members,
+                                               int len, double *out) {
+    if (len < 0) return BJ_ERR_RANGE;
+    uint64_t at = 0;
+    int e = rn_change_membership(n, members, (uint32_t)len, &at);
+    if (out) *out = (double)at;
+    return e;
+}
+
+EMSCRIPTEN_KEEPALIVE int rnw_config_in_flight(const raft_node *n) {
+    return rn_config_in_flight(n);
+}
+
 EMSCRIPTEN_KEEPALIVE void rnw_set_timing(raft_node *n, double min_election,
                                          double max_election, double heartbeat) {
     rn_set_timing(n, (int64_t)min_election, (int64_t)max_election, (int64_t)heartbeat);

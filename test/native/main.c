@@ -779,6 +779,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
+        RAFT_ERR_BUSY,
     };
     for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
         const char *s = dc_strerror(codes[i]);
@@ -5094,6 +5095,240 @@ TEST(a_reply_goes_to_whoever_the_message_says_sent_it) {
     memfs_free(fs);
 }
 
+/* Build `{kind, ...}` for the membership grammar. */
+static void put_member(bj_builder *b, const char *key, uint64_t id,
+                       const char *host, int64_t port) {
+    bj_put_key(b, (const uint8_t *)key, (uint32_t)strlen(key));
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"id", 2);
+    bj_put_int(b, (int64_t)id);
+    if (host) {
+        bj_put_key(b, (const uint8_t *)"host", 4);
+        bj_put_string(b, (const uint8_t *)host, (uint32_t)strlen(host));
+        bj_put_key(b, (const uint8_t *)"port", 4);
+        bj_put_int(b, port);
+    }
+    bj_end_object(b);
+}
+
+/* A top-level boolean field of a reply. -1 when absent. */
+static int reply_bool(const uint8_t *r, uint32_t len, const char *key) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(r, len, (const uint8_t *)key, (uint32_t)strlen(key), &v, &vlen, &found) || !found)
+        return -1;
+    return vlen >= 1 && v[0] == BJ_TYPE_TRUE;
+}
+
+TEST(join_leave_and_timeout_now_are_answered_without_a_host) {
+    /*
+     * The three kinds rn_handle used to refuse. Each needed something
+     * only a host had: a promise for join and leave, and (for the
+     * redirect a follower gives) the ADDRESSES, which lived in the
+     * host's member list rather than in the node.
+     *
+     * Both are gone. The node keeps the adopted records -- addresses
+     * included -- so it can say where the leader is; and a request it
+     * cannot answer yet is parked, answered when the CONFIG entry it
+     * needs lands. Nothing here waits on JavaScript.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "raft.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(1, log);
+    CHECK_FATAL(n != NULL);
+
+    /* A two-member group, WITH addresses. */
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    for (int i = 1; i <= 2; i++) {
+        bj_begin_object(members);
+        bj_put_key(members, (const uint8_t *)"id", 2);
+        bj_put_int(members, i);
+        bj_put_key(members, (const uint8_t *)"host", 4);
+        bj_put_string(members, (const uint8_t *)(i == 1 ? "node1" : "node2"), 5);
+        bj_put_key(members, (const uint8_t *)"port", 4);
+        bj_put_int(members, 7000 + i);
+        bj_end_object(members);
+    }
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+    CHECK_OK(rn_set_members(n, mbuf, (uint32_t)mlen));
+    rn_start(n, 0, 0.5);
+
+    /* A join to a FOLLOWER is redirected -- and the redirect carries the
+     * leader's address, because a joiner knows addresses, not ids. */
+    /* A fresh node is a follower, which is the case under test. */
+    bj_builder *jb = bj_builder_new();
+    bj_begin_object(jb);
+    bj_put_key(jb, (const uint8_t *)"kind", 4);
+    bj_put_string(jb, (const uint8_t *)"join", 4);
+    put_member(jb, "member", 3, "node3", 7003);
+    bj_end_object(jb);
+    size_t jlen; const uint8_t *jbuf = bj_builder_data(jb, &jlen);
+
+    CHECK_OK(rn_handle(n, 41, jbuf, (uint32_t)jlen, 0.5));
+    CHECK_I64((long long)rn_out_count(n), 1);
+    CHECK_I64((long long)rn_out_corr(n, 0), 41);
+    {
+        uint32_t rl = 0;
+        const uint8_t *r = rn_out_bytes(n, 0, &rl);
+        CHECK_I64(reply_bool(r, rl, "ok"), 0);
+        /* Nobody leads yet, so there is nobody to point at -- but the
+         * SHAPE is the redirect, not a refusal. */
+        const uint8_t *v; size_t vlen; int found = 0;
+        CHECK_OK(obj_get_field(r, rl, (const uint8_t *)"leaderId", 8, &v, &vlen, &found));
+        CHECK_I64(found, 1);
+    }
+    rn_out_clear(n);
+
+    /* Elect it (single voter? no -- two members, so drive a real term by
+     * hand is overkill; campaign and count our own vote is enough here). */
+    while (rn_role(n) != RAFT_LEADER && rn_commit_index(n) == 0) {
+        /* One voter cannot elect itself out of a two-member group, so
+         * shrink to one member first: this test is about the three
+         * handlers, not about elections. */
+        bj_builder *solo = bj_builder_new();
+        bj_begin_array(solo);
+        bj_begin_object(solo);
+        bj_put_key(solo, (const uint8_t *)"id", 2);
+        bj_put_int(solo, 1);
+        bj_put_key(solo, (const uint8_t *)"host", 4);
+        bj_put_string(solo, (const uint8_t *)"node1", 5);
+        bj_put_key(solo, (const uint8_t *)"port", 4);
+        bj_put_int(solo, 7001);
+        bj_end_object(solo);
+        bj_end_array(solo);
+        size_t slen; const uint8_t *sbuf = bj_builder_data(solo, &slen);
+        CHECK_OK(rn_set_members(n, sbuf, (uint32_t)slen));
+        bj_builder_free(solo);
+        for (int64_t t = 0; t <= 1000 && rn_role(n) != RAFT_LEADER; t += 10)
+            rn_tick(n, t, 0.5);
+        break;
+    }
+    CHECK_I64(rn_role(n), RAFT_LEADER);
+    rn_out_clear(n);
+    rn_effects_clear(n);
+
+    /* A join to the LEADER is not answered yet: the answer is a fact
+     * about a CONFIG entry that has not committed. */
+    CHECK_OK(rn_handle(n, 42, jbuf, (uint32_t)jlen, 0.5));
+    CHECK_I64((long long)rn_out_count(n), 0);   /* parked, not refused */
+    CHECK_I64(rn_config_in_flight(n), 1);
+
+    /* A second request while that one is in flight is told to retry --
+     * changes serialize, and saying so beats queueing forever. */
+    CHECK_OK(rn_handle(n, 43, jbuf, (uint32_t)jlen, 0.5));
+    CHECK_I64((long long)rn_out_count(n), 1);
+    {
+        uint32_t rl = 0;
+        const uint8_t *r = rn_out_bytes(n, 0, &rl);
+        CHECK_I64(reply_bool(r, rl, "retry"), 1);
+    }
+    rn_out_clear(n);
+
+    /*
+     * The entry applies (the host's pump would call this), and the
+     * parked requester gets its answer -- with the adopted records, and
+     * node 3 in them as a LEARNER, whatever it asked for.
+     */
+    {
+        uint32_t alen = 0;
+        const uint8_t *adopted = rn_adopted(n, &alen);
+        const uint8_t *v; size_t vlen; int found = 0;
+        CHECK_OK(obj_get_field(adopted, alen, (const uint8_t *)"members", 7, &v, &vlen, &found));
+        /* Re-adopting the proposed set is what apply does. Build it from
+         * the entry the node just wrote. */
+        uint64_t at = elog_last_index(log);
+        uint64_t term = 0; int type = 0; const uint8_t *payload = NULL; size_t plen = 0;
+        CHECK_OK(elog_get(log, at, &term, &type, &payload, &plen));
+        CHECK_I64(type, EL_CONFIG);
+        const uint8_t *set; size_t setlen; int f2 = 0;
+        CHECK_OK(obj_get_field(payload, plen, (const uint8_t *)"members", 7, &set, &setlen, &f2));
+        CHECK_I64(f2, 1);
+        /* Copied: the payload lives in the log's output buffer, which the
+         * log owns and the next operation on it reuses. */
+        dbuf held = {0};
+        CHECK_OK(dbuf_put(&held, set, setlen));
+        CHECK_OK(rn_set_members(n, held.data, (uint32_t)held.len));
+        dbuf_free(&held);
+    }
+    CHECK_I64(rn_config_in_flight(n), 0);
+    CHECK_I64((long long)rn_out_count(n), 1);        /* the parked join */
+    {
+        uint32_t rl = 0;
+        const uint8_t *r = rn_out_bytes(n, 0, &rl);
+        CHECK_I64((long long)rn_out_corr(n, 0), 42);
+        CHECK_I64(reply_bool(r, rl, "ok"), 1);
+    }
+    rn_out_clear(n);
+    /* A learner: present, and not counted. */
+    CHECK_I64((long long)rn_quorum(n), 1);           /* still one voter */
+
+    /* Re-joining with the identical record changes nothing and says so
+     * immediately -- which is what makes a retried join harmless. */
+    CHECK_OK(rn_handle(n, 44, jbuf, (uint32_t)jlen, 0.5));
+    CHECK_I64((long long)rn_out_count(n), 1);
+    {
+        uint32_t rl = 0;
+        const uint8_t *r = rn_out_bytes(n, 0, &rl);
+        CHECK_I64(reply_bool(r, rl, "ok"), 1);
+    }
+    CHECK_I64(rn_config_in_flight(n), 0);            /* no new entry */
+    rn_out_clear(n);
+
+    /* Leaving an id that is not a member is equally idempotent. */
+    {
+        bj_builder *lb = bj_builder_new();
+        bj_begin_object(lb);
+        bj_put_key(lb, (const uint8_t *)"kind", 4);
+        bj_put_string(lb, (const uint8_t *)"leave", 5);
+        bj_put_key(lb, (const uint8_t *)"id", 2);
+        bj_put_int(lb, 99);
+        bj_end_object(lb);
+        size_t llen; const uint8_t *lbuf = bj_builder_data(lb, &llen);
+        CHECK_OK(rn_handle(n, 45, lbuf, (uint32_t)llen, 0.5));
+        CHECK_I64((long long)rn_out_count(n), 1);
+        uint32_t rl = 0;
+        const uint8_t *r = rn_out_bytes(n, 0, &rl);
+        CHECK_I64(reply_bool(r, rl, "ok"), 1);
+        CHECK_I64(rn_config_in_flight(n), 0);
+        rn_out_clear(n);
+        bj_builder_free(lb);
+    }
+
+    /* TimeoutNow: a LEADER refuses (it is already what the sender wants
+     * this node to become), and the refusal still carries its term. */
+    {
+        bj_builder *tb = bj_builder_new();
+        bj_begin_object(tb);
+        bj_put_key(tb, (const uint8_t *)"kind", 4);
+        bj_put_string(tb, (const uint8_t *)"timeoutNow", 10);
+        bj_put_key(tb, (const uint8_t *)"term", 4);
+        bj_put_int(tb, (int64_t)elog_current_term(log));
+        bj_put_key(tb, (const uint8_t *)"leaderId", 8);
+        bj_put_int(tb, 2);
+        bj_end_object(tb);
+        size_t tlen; const uint8_t *tbuf = bj_builder_data(tb, &tlen);
+        CHECK_OK(rn_handle(n, 46, tbuf, (uint32_t)tlen, 0.5));
+        CHECK_I64((long long)rn_out_count(n), 1);
+        uint32_t rl = 0;
+        const uint8_t *r = rn_out_bytes(n, 0, &rl);
+        CHECK_I64(reply_bool(r, rl, "ok"), 0);
+        CHECK_I64((long long)rn_out_peer(n, 0), 2);   /* answered to its sender */
+        rn_out_clear(n);
+        bj_builder_free(tb);
+    }
+
+    bj_builder_free(jb);
+    bj_builder_free(members);
+    rn_free(n);
+    elog_free(log);
+    memfs_free(fs);
+}
+
 TEST(effects_coalesce_rather_than_pile_up_and_a_loss_is_never_silent) {
     /*
      * The effect queue used to DROP when full, with a comment saying the
@@ -5457,6 +5692,7 @@ int main(void) {
     RUN(a_stale_prevote_grant_cannot_elect_the_real_round);
     RUN(a_member_set_is_adopted_whole_or_refused_whole);
     RUN(effects_coalesce_rather_than_pile_up_and_a_loss_is_never_silent);
+    RUN(join_leave_and_timeout_now_are_answered_without_a_host);
     RUN(a_reply_goes_to_whoever_the_message_says_sent_it);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);

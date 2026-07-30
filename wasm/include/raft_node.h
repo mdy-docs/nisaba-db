@@ -80,6 +80,11 @@ extern "C" {
  * Refused whole -- see rn_set_members. */
 #define RAFT_ERR_CAPACITY (-53)
 
+/* A membership change is already in flight. Not a failure: changes
+ * serialize by design (the single-server-change safety argument rests on
+ * it), so this is "ask again once that one has committed". */
+#define RAFT_ERR_BUSY (-54)
+
 typedef struct raft_node raft_node;
 
 /* Roles, matching src/raft.js's ROLE. */
@@ -133,10 +138,41 @@ void rn_set_log(raft_node *n, elog *log);
 int rn_set_members(raft_node *n, const uint8_t *members, uint32_t len);
 
 /* The largest peer count (members excluding self) this build can hold.
- * A host that proposes membership should refuse a larger set at the
- * caller, where a human is standing, rather than at apply, where every
- * replica can only halt. */
+ * rn_change_membership refuses a larger set up front, where a caller is
+ * still standing, rather than at apply, where every replica can only
+ * halt. */
 uint32_t rn_max_peers(void);
+
+/*
+ * The adopted set as raft_members_adopt normalized it, as one binjson
+ * object: { members: [records], voters: [ids], peers: [ids] }.
+ *
+ * The node keeps it so that nothing else has to derive it. A host that
+ * ran the same normalization would be a second place the cluster's shape
+ * is written down, and two places is one too many -- this is where
+ * addresses live too, which is what lets a redirect tell a joiner where
+ * the leader actually is.
+ */
+const uint8_t *rn_adopted(const raft_node *n, uint32_t *len);
+
+/*
+ * Propose a new member set -- full replacement, records or bare ids.
+ * Merged with what is known first, so an id-only proposal cannot erase
+ * an address; refused with RAFT_ERR_CAPACITY if the result would not
+ * fit, RAFT_ERR_BUSY if a change is already in flight, BJ_ERR_STATE if
+ * this node does not lead. On success the CONFIG entry's index comes
+ * back through `out_index`, and the host settles its promise when that
+ * index applies, exactly as it does for rn_propose.
+ *
+ * One at a time is a safety rule, not a policy: a single-server change
+ * is safe because it commits under the OLD quorum, which requires that
+ * the next one cannot start until this one has.
+ */
+int rn_change_membership(raft_node *n, const uint8_t *members, uint32_t len,
+                         uint64_t *out_index);
+
+/* Is a membership change in flight? */
+int rn_config_in_flight(const raft_node *n);
 
 /*
  * Timing. `min_election` and `max_election` bound the randomised
@@ -209,11 +245,16 @@ int rn_on_fail(raft_node *n, uint64_t corr);
  * node -- drain immediately, which every host does anyway because there
  * is nothing else to do with them.
  *
- * A peer of 0 never appears: every entry is addressed, replies included,
- * because the sender comes out of the message rather than from whoever
- * called rn_handle. Replies carry the correlation id they are answering;
- * requests carry a fresh one, and ids are issued from a 64-bit counter
- * that never comes back around to one still outstanding.
+ * Every entry is addressed, replies included, because the sender comes
+ * out of the message rather than from whoever called rn_handle -- with
+ * one exception, and it is not a lapse: an answer to a join or a leave
+ * carries peer 0, because those come from OUTSIDE the cluster and their
+ * sender has no id here to be addressed by. They are answered on the
+ * correlation id alone, which is how a host answers them anyway.
+ *
+ * Replies carry the correlation id they are answering; requests carry a
+ * fresh one, and ids are issued from a 64-bit counter that never comes
+ * back around to one still outstanding.
  */
 uint32_t       rn_out_count(const raft_node *n);
 uint64_t       rn_out_peer(const raft_node *n, uint32_t i);

@@ -1403,6 +1403,41 @@ class RaftCore {
   /** The largest peer count (members excluding self) this build holds. */
   get maxPeers() { return requireModule()._rnw_max_peers(); }
 
+  /**
+   * The adopted set as the node normalized it: { members, voters, peers }.
+   * Read rather than re-derived — a host that ran membersAdopt itself
+   * would be a second place the cluster's shape is written down.
+   */
+  get adopted() {
+    const M = requireModule();
+    const ptr = M._rnw_adopted_ptr(this._p);
+    const len = M._rnw_adopted_len(this._p);
+    if (!len) return { members: [], voters: [], peers: [] };
+    return decode(M.HEAPU8.slice(ptr, ptr + len));
+  }
+
+  /**
+   * Propose a new member set (records or bare ids), merged with what the
+   * log already carries. Returns the CONFIG entry's index; throws
+   * RAFT_ERR_BUSY's error if a change is already in flight, and
+   * RAFT_ERR_CAPACITY's if the result would not fit.
+   */
+  changeMembership(members) {
+    const M = requireModule();
+    const enc = encode(members);
+    const p = M._malloc(enc.length || 1);
+    const out = M._malloc(8);
+    try {
+      if (enc.length) M.HEAPU8.set(enc, p);
+      const rc = M._rnw_change_membership(this._p, p, enc.length, out);
+      if (rc !== 0) throw codeError(rc, 'changeMembership');
+      return readF64(M, out);
+    } finally { M._free(out); M._free(p); }
+  }
+
+  /** Is a membership change in flight? One at a time is a safety rule. */
+  get configInFlight() { return requireModule()._rnw_config_in_flight(this._p) === 1; }
+
   start(now, random01) { requireModule()._rnw_start(this._p, now, random01); }
   stop() { requireModule()._rnw_stop(this._p); }
   tick(now, random01) {

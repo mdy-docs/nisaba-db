@@ -140,6 +140,49 @@ int rmsg_handle_append_entries(elog *log, const raft_msg_state *st,
                                const uint8_t *msg, uint32_t len,
                                raft_msg_effect *eff, dbuf *reply);
 
+/* ---- TimeoutNow, join and leave ----------------------------------------- */
+
+/*
+ * The membership grammar, so that the three kinds a node answers without
+ * touching its log are written down in the same file as the two it
+ * answers with one.
+ *
+ * rmsg_join_member returns the member RECORD a join carries, as a span
+ * into `msg`; rmsg_leave_id the id a leave names. RAFT_ERR_MESSAGE if it
+ * is missing, or names id 0 -- which is "nobody" everywhere here.
+ */
+int rmsg_join_member(const uint8_t *msg, uint32_t len,
+                     const uint8_t **record, uint32_t *record_len, uint64_t *id);
+int rmsg_leave_id(const uint8_t *msg, uint32_t len, uint64_t *id);
+
+/* The `term` a message carries (0 if it carries none). */
+int rmsg_term(const uint8_t *msg, uint32_t len, uint64_t *term);
+
+/* One field of a member record, as the encoded span it occupies, so two
+ * records can be compared on it without either being decoded. NULL and
+ * length 0 when the record does not carry that field. */
+int rmsg_record_field(const uint8_t *record, uint32_t len, const char *key,
+                      const uint8_t **v, uint32_t *vlen);
+
+/* `{ term, ok }` -- TimeoutNow's answer. */
+int rmsg_build_ack(uint64_t term, int ok, dbuf *out);
+
+/*
+ * A join/leave answer, in one of its four shapes: adopted
+ * (`{ok:true, members}`), refused (`{ok:false, error}`), busy
+ * (`{ok:false, retry:true}`), or a redirect (`{ok:false, leaderId,
+ * leaderAddress}`). Exactly one of `members` / `error` / `retry` /
+ * `leader_id` applies, in that order of precedence.
+ *
+ * The redirect carries the leader's ADDRESS, lifted out of its member
+ * record, because a joiner knows addresses and not ids: an id alone
+ * would send it back to the seed it just asked.
+ */
+int rmsg_build_membership_reply(int ok, const uint8_t *members, uint32_t members_len,
+                                const char *error, int retry,
+                                uint64_t leader_id, const uint8_t *leader_record,
+                                uint32_t leader_record_len, dbuf *out);
+
 /* ---- building the requests a leader sends ------------------------------ */
 
 /*

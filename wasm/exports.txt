@@ -193,6 +193,10 @@ _rnw_free
 _rnw_set_log
 _rnw_set_members
 _rnw_max_peers
+_rnw_adopted_ptr
+_rnw_adopted_len
+_rnw_change_membership
+_rnw_config_in_flight
 _rnw_set_timing
 _rnw_set_limits
 _rnw_start

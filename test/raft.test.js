@@ -395,7 +395,9 @@ describe('raft: membership is one fact, or it is an error', () => {
     const before = { members: [...L.members], voters: [...L.voters], term: L.term };
 
     const tooMany = Array.from({ length: 200 }, (_, i) => ({ id: i + 1 }));
-    await expect(L.changeMembership(tooMany)).rejects.toThrow(/exceeds this build's limit/);
+    // The refusal — and its text — is the node's, single-sourced with the
+    // one it would give at apply.
+    await expect(L.changeMembership(tooMany)).rejects.toThrow(/larger than this build can hold/);
 
     // Nothing moved: not the membership, not the log, not the term.
     expect(L.members).toEqual(before.members);

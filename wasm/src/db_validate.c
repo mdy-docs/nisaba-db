@@ -114,6 +114,9 @@ const char *dc_strerror(int code) {
                    "known kind missing a field it cannot proceed without)";
         case RAFT_ERR_PEER:
             return "Raft: no such peer, or a correlation id nobody issued";
+        case RAFT_ERR_BUSY:
+            return "Raft: a membership change is already in flight; changes serialize "
+                   "by design, so this one has to wait for that one to commit";
         case RAFT_ERR_CAPACITY:
             return "Raft: the member set is larger than this build can hold; it is "
                    "refused whole rather than trimmed, because a node replicating "

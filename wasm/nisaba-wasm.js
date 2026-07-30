@@ -1110,6 +1110,37 @@ function walParse(payload) {
   return op;
 }
 
+/** Does the C applier drive this opcode, or does it make and unmake
+ * files — which belongs to whoever owns the namespace? */
+function walIsDocument(op) {
+  return requireModule()._walw_is_document(op) === 1;
+}
+
+/**
+ * Apply one logged command to an open collection: stage the entry's
+ * index, perform the mutation the command names, and return the result —
+ * all in C (db_wal.h's dc_wal_apply), which is what lets a host with no
+ * JavaScript apply a committed entry.
+ */
+function walApply(collection, index, payload) {
+  const M = requireModule();
+  const rc = M._malloc(4);
+  const p = M._malloc(payload.length || 1);
+  let handle = 0;
+  try {
+    if (payload.length) M.HEAPU8.set(payload, p);
+    handle = M._walw_apply(collection._collCtx, index, p, payload.length, rc);
+    const code = readI32(M, rc);
+    if (code !== 0) throw codeError(code, 'apply');
+    const ptr = M._walw_result_ptr(handle);
+    const len = M._walw_result_len(handle);
+    return decode(M.HEAPU8.slice(ptr, ptr + len));
+  } finally {
+    if (handle) M._walw_result_free(handle);
+    M._free(p); M._free(rc);
+  }
+}
+
 let raftCtx = 0;
 
 function raftCall(fn, context) {
@@ -2454,6 +2485,53 @@ class Collection {
   }
 
   /**
+   * Apply one logged WAL command — the replay path, shared by crash
+   * recovery and by every replica's Raft apply loop (src/db-wal.js's
+   * _applyCommand).
+   *
+   * The whole mutation is C's (db_wal.h's dc_wal_apply): it stages the
+   * entry's index, performs the write the command names by _id, and
+   * shapes the result. That is what makes a committed entry applicable
+   * without a JavaScript runtime — the reason this method exists rather
+   * than the apply loop calling insertOne/updateOne/deleteOne, which
+   * would put the command's meaning back on this side of the bridge.
+   *
+   * What stays here is what only a browser has: change streams. They are
+   * emitted from the command and the result, and the command is not even
+   * decoded when nobody is watching.
+   */
+  async applyCommand(index, payload) {
+    const result = walApply(this, index, payload);
+    if (this._watchers.size) await this._emitApplied(payload, result);
+    return result;
+  }
+
+  /** The change event one applied command implies. Reads the command
+   * only to name the document; what HAPPENED comes from the result. */
+  async _emitApplied(payload, result) {
+    const cmd = decode(payload);
+    if (result.insertedId !== undefined) {
+      this._emitChange({
+        operationType: 'insert',
+        documentKey: { _id: result.insertedId },
+        fullDocument: cmd.doc
+      });
+      return;
+    }
+    if (result.deletedCount !== undefined) {
+      if (result.deletedCount) this._emitChange({ operationType: 'delete', documentKey: { _id: cmd.id } });
+      return;
+    }
+    if (!result.matchedCount) return;   // the document was already gone
+    const _id = cmd.id;
+    this._emitChange(cmd.update
+      // An update names its changes, not its outcome, so the full
+      // document has to be read back — exactly as updateOne does.
+      ? { operationType: 'update', documentKey: { _id }, fullDocument: await this.findOne({ _id }) }
+      : { operationType: 'replace', documentKey: { _id }, fullDocument: cmd.doc });
+  }
+
+  /**
    * Insert every document in `docs`. `ordered` (default true) stops at the
    * first failing document; `false` attempts every document regardless of
    * earlier failures. Each document's _id is assigned client-side up front
@@ -3374,7 +3452,7 @@ for (const name of [
   'replaceOne', 'findOneAndReplace',
   'updateOne', 'findOneAndUpdate', 'updateMany',
   'countDocuments', 'distinct', 'bulkWrite', 'pruneExpired',
-  'appliedIndex', 'setAppliedIndex'
+  'appliedIndex', 'setAppliedIndex', 'applyCommand'
 ]) {
   const orig = Collection.prototype[name];
   Collection.prototype[name] = async function (...args) {
@@ -3750,6 +3828,7 @@ export {
   // and nowhere else.
   walPlan,
   walParse,
+  walIsDocument,
   WAL_OP,
   WAL_REQ,
   WAL_PLAN,

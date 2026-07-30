@@ -4190,6 +4190,205 @@ TEST(wal_grammar_refuses_what_it_cannot_replay) {
     doc_free(nc); doc_free(wrong); doc_free(torn); doc_free(old); doc_free(unknown);
 }
 
+/* One numeric field of an apply result, or -1. */
+static int64_t result_int(const dbuf *r, const char *key) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(r->data, r->len, (const uint8_t *)key,
+                      (uint32_t)strlen(key), &v, &vlen, &found) || !found) return -1;
+    cur c = { v, vlen, 0 };
+    double d;
+    if (read_number(&c, &d) != BJ_OK) return -1;
+    return (int64_t)d;
+}
+
+TEST(a_logged_command_is_planned_and_applied_with_no_host_language) {
+    /*
+     * The end-to-end claim of the applier: a write is planned into
+     * commands, and those commands are performed against a real
+     * collection, with no JavaScript anywhere in the process. Both halves
+     * of the WAL round trip are C's -- which is what a committed Raft
+     * entry needs, since a replica that cannot apply without a host
+     * runtime cannot be a replica without one.
+     *
+     * The apply half owes three things per entry, and this checks all
+     * three: the applied index is staged (so the mutation's own commit
+     * persists it), the write lands, and the RESULT is the shape a caller
+     * of the driver gets -- which under replication is not decoration but
+     * the answer the leader hands back for a committed write.
+     */
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-apply.bj") == 0);
+    uint8_t id[12];
+    mk_oid(id, 77);
+    uint8_t spare[12];
+    mk_oid(spare, 78);
+
+    /* PLAN an insert, then APPLY what it planned. */
+    doc *d = doc_new();
+    doc_oid(d, "_id", id);
+    doc_str(d, "team", "core");
+    doc_int(d, "age", 36);
+    uint32_t dlen; const uint8_t *dbuf_ = doc_done(d, &dlen);
+
+    dc_wal_plan *p = NULL;
+    CHECK_OK(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
+                               dbuf_, dlen, NULL, 0, 0, spare, &p));
+    CHECK_FATAL(p != NULL);
+    CHECK_I64((long long)dc_wal_plan_count(p), 1);
+
+    uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+    dbuf res = {0};
+    CHECK_OK(dc_wal_apply(fx.coll, 5, cmd, clen, &res));
+    /* Staged with the mutation, not after it. */
+    CHECK_I64((long long)dc_applied_index(fx.coll), 5);
+    {
+        const uint8_t *v; size_t vlen; int found = 0;
+        CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"insertedId", 10,
+                               &v, &vlen, &found));
+        CHECK_I64(found, 1);
+        CHECK(vlen == 13 && v[0] == BJ_TYPE_OID);
+        CHECK(memcmp(v + 1, id, 12) == 0);
+    }
+    dbuf_free(&res);
+    dc_wal_plan_free(p);
+
+    /* The document is really there. */
+    int64_t count = 0;
+    {
+        const uint8_t *f; uint32_t flen;
+        bj_builder *fb = empty_filter(&f, &flen);
+        CHECK_OK(dc_count(fx.coll, f, flen, &count));
+        bj_builder_free(fb);
+    }
+    CHECK_I64(count, 1);
+
+    /* Re-applying the same command is a DETERMINISTIC failure -- a fact
+     * about the command and the state it lands on, which every replica
+     * reaches identically, rather than divergence. */
+    {
+        dc_wal_plan *p2 = NULL;
+        CHECK_OK(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
+                                   dbuf_, dlen, NULL, 0, 0, spare, &p2));
+        uint32_t l2; const uint8_t *c2 = dc_wal_plan_cmd(p2, 0, &l2);
+        dbuf r2 = {0};
+        int e = dc_wal_apply(fx.coll, 6, c2, l2, &r2);
+        CHECK_I64(e, DC_ERR_DUPLICATE);
+        CHECK_I64((long long)r2.len, 0);      /* a failure reports no result */
+        CHECK_I64(dc_is_deterministic(e), 1);
+        dbuf_free(&r2);
+        dc_wal_plan_free(p2);
+    }
+    doc_free(d);   /* `dbuf_` points into it; both plans above read it */
+
+    /* PLAN an update against the real collection -- the planner runs the
+     * one query, resolves the target id, and the command carries no
+     * filter -- then APPLY it. */
+    {
+        doc *filter = doc_new();
+        doc_str(filter, "team", "core");
+        uint32_t flen; const uint8_t *fbuf = doc_done(filter, &flen);
+        doc *set = doc_new();
+        doc_begin_obj(set, "$set");
+        doc_int(set, "age", 37);
+        doc_end_obj(set);
+        uint32_t ulen; const uint8_t *ubuf = doc_done(set, &ulen);
+
+        dc_wal_plan *pu = NULL;
+        CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_ONE,
+                                   fbuf, flen, ubuf, ulen, 0, spare, &pu));
+        CHECK_I64(dc_wal_plan_outcome(pu), DC_PLAN_MATCHED);
+        uint32_t ul; const uint8_t *ucmd = dc_wal_plan_cmd(pu, 0, &ul);
+        dbuf ur = {0};
+        CHECK_OK(dc_wal_apply(fx.coll, 7, ucmd, ul, &ur));
+        CHECK_I64((long long)result_int(&ur, "matchedCount"), 1);
+        CHECK_I64((long long)result_int(&ur, "modifiedCount"), 1);
+        CHECK_I64((long long)dc_applied_index(fx.coll), 7);
+        dbuf_free(&ur);
+        dc_wal_plan_free(pu);
+        doc_free(set);
+        doc_free(filter);
+    }
+
+    /* DELETE the same way, and the count says what happened. */
+    {
+        doc *filter = doc_new();
+        doc_int(filter, "age", 37);
+        uint32_t flen; const uint8_t *fbuf = doc_done(filter, &flen);
+        dc_wal_plan *pd = NULL;
+        CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_DELETE_ONE,
+                                   fbuf, flen, NULL, 0, 0, spare, &pd));
+        uint32_t dl; const uint8_t *dcmd = dc_wal_plan_cmd(pd, 0, &dl);
+        dbuf dr = {0};
+        CHECK_OK(dc_wal_apply(fx.coll, 8, dcmd, dl, &dr));
+        CHECK_I64((long long)result_int(&dr, "deletedCount"), 1);
+        dbuf_free(&dr);
+
+        /* Applying it again deletes nothing, and says so: a result, not
+         * an error. A replica that reported 1 here would be claiming a
+         * document that was not there. */
+        dbuf dr2 = {0};
+        CHECK_OK(dc_wal_apply(fx.coll, 9, dcmd, dl, &dr2));
+        CHECK_I64((long long)result_int(&dr2, "deletedCount"), 0);
+        dbuf_free(&dr2);
+        dc_wal_plan_free(pd);
+        doc_free(filter);
+    }
+
+    /*
+     * A command carrying an UNRESOLVED $currentDate is refused. The
+     * planner resolves it to a concrete Date before anything is logged
+     * (db_wal.h), so one arriving here means a producer broke that rule
+     * -- and the old JavaScript applier would have quietly resolved it
+     * against THIS replica's clock, writing a different timestamp on
+     * every node from the same committed entry. Failing is the only
+     * answer that keeps replicas identical.
+     */
+    {
+        doc *bad = doc_new();
+        doc_str(bad, "c", "people");
+        doc_str(bad, "op", "u");
+        doc_oid(bad, "id", id);
+        doc_begin_obj(bad, "update");
+        doc_begin_obj(bad, "$currentDate");
+        doc_int(bad, "seen", 1);
+        doc_end_obj(bad);
+        doc_end_obj(bad);
+        uint32_t bl; const uint8_t *bcmd = doc_done(bad, &bl);
+        dbuf br = {0};
+        /* Read as a well-formed command -- and still not applied. */
+        int op = -1; const uint8_t *cn; uint32_t cnl;
+        CHECK_OK(dc_wal_parse(bcmd, bl, &op, &cn, &cnl));
+        CHECK_I64(op, DC_WAL_UPDATE);
+        CHECK(dc_wal_apply(fx.coll, 11, bcmd, bl, &br) != BJ_OK);
+        dbuf_free(&br);
+        doc_free(bad);
+    }
+
+    /* DDL is refused, explicitly: it makes and unmakes FILES, which is
+     * the namespace owner's job and not this layer's. */
+    {
+        doc *keys = doc_new();
+        doc_int(keys, "team", 1);
+        uint32_t klen; const uint8_t *kbuf = doc_done(keys, &klen);
+        doc *opts = doc_new();
+        uint32_t olen; const uint8_t *obuf = doc_done(opts, &olen);
+        dc_wal_plan *pi = NULL;
+        CHECK_OK(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_CREATE_INDEX,
+                                   kbuf, klen, obuf, olen, 0, spare, &pi));
+        uint32_t il; const uint8_t *icmd = dc_wal_plan_cmd(pi, 0, &il);
+        dbuf ir = {0};
+        CHECK_I64(dc_wal_apply(fx.coll, 10, icmd, il, &ir), DC_ERR_WAL_NOT_APPLIABLE);
+        CHECK_I64(dc_wal_is_document(DC_WAL_CREATE_INDEX), 0);
+        CHECK_I64(dc_wal_is_document(DC_WAL_INSERT), 1);
+        dbuf_free(&ir);
+        dc_wal_plan_free(pi);
+        doc_free(opts);
+        doc_free(keys);
+    }
+
+    fx_close(&fx);
+}
+
 TEST(wal_plan_resolves_every_command_to_one_id_and_no_filter) {
     /*
      * The invariant db_wal.h exists for: no logged document command
@@ -5268,6 +5467,7 @@ int main(void) {
     RUN(wal_grammar_round_trips_every_op_it_can_emit);
     RUN(wal_grammar_refuses_what_it_cannot_replay);
     RUN(wal_plan_resolves_every_command_to_one_id_and_no_filter);
+    RUN(a_logged_command_is_planned_and_applied_with_no_host_language);
     RUN(upsert_uses_the_id_the_filter_pinned);
     RUN(wal_plan_and_direct_upsert_insert_the_same_document);
     RUN(wal_plan_returns_the_preimage_the_host_would_have_queried_for);

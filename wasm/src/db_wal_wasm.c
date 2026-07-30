@@ -92,3 +92,40 @@ EMSCRIPTEN_KEEPALIVE int walw_parse(const uint8_t *buf, int len) {
     int e = dc_wal_parse(buf, (uint32_t)len, &op, &coll, &coll_len);
     return e ? e : op;
 }
+
+/*
+ * Apply one logged command to an open collection.
+ *
+ * The result buffer is per-call and owned by the caller, not the usual
+ * shared scratch: applies run inside the apply pump while other calls
+ * (a follower's read, another collection's apply) can interleave between
+ * this returning and the host reading it, and a shared slot would hand
+ * back whichever landed last. The host frees it with walw_result_free.
+ */
+typedef struct { dbuf out; } walw_result;
+
+EMSCRIPTEN_KEEPALIVE walw_result *walw_apply(dc_collection *c, double index,
+                                             const uint8_t *cmd, int len, int *rc_out) {
+    if (len < 0) { *rc_out = BJ_ERR_RANGE; return NULL; }
+    walw_result *r = (walw_result *)calloc(1, sizeof(walw_result));
+    if (!r) { *rc_out = BJ_ERR_OOM; return NULL; }
+    int e = dc_wal_apply(c, (uint64_t)index, cmd, (uint32_t)len, &r->out);
+    *rc_out = e;
+    if (e) { dbuf_free(&r->out); free(r); return NULL; }
+    return r;
+}
+
+EMSCRIPTEN_KEEPALIVE const uint8_t *walw_result_ptr(const walw_result *r) {
+    return r ? r->out.data : NULL;
+}
+EMSCRIPTEN_KEEPALIVE int walw_result_len(const walw_result *r) {
+    return r ? (int)r->out.len : 0;
+}
+EMSCRIPTEN_KEEPALIVE void walw_result_free(walw_result *r) {
+    if (!r) return;
+    dbuf_free(&r->out);
+    free(r);
+}
+
+/* Does walw_apply drive this opcode, or is it the namespace owner's? */
+EMSCRIPTEN_KEEPALIVE int walw_is_document(int op) { return dc_wal_is_document(op); }

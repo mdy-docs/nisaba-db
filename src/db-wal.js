@@ -86,6 +86,7 @@ import {
   ttlFilters,
   walPlan,
   walParse,
+  walIsDocument,
   WAL_OP,
   WAL_REQ,
   WAL_PLAN,
@@ -355,13 +356,27 @@ class WalDb {
   /** Apply one logged command to the state machine — the ONLY code that
    * mutates collections, shared verbatim by the live write path and
    * recovery replay (and, in ReplicatedDb, by every replica's apply
-   * loop). Document mutations stage the entry's index first (step 1's
-   * contract), so the mutation's own commit persists it. DDL commands
-   * don't stage (createIndex commits catalog + index files but not the
-   * primary tree, so a staged value wouldn't persist anyway); their
-   * replay is idempotent instead — a re-run createIndex resolves to the
-   * existing index, a re-run drop of a missing target reports "nothing
-   * to do" — bounded by the next snapshot's log compaction.
+   * loop).
+   *
+   * What a document command MEANS is C's (db_wal.h's dc_wal_apply, via
+   * Collection.applyCommand): staging the entry's index so the
+   * mutation's own commit persists it (step 1's contract), performing
+   * the write the command names by _id, and shaping the result. That is
+   * the half a host with no JavaScript has to be able to run, and it is
+   * why this does not call insertOne/updateOne/deleteOne any more —
+   * routing through the driver's methods would leave the meaning of a
+   * logged command living on this side of the bridge, in a switch that
+   * every other host would have to write again and could write
+   * differently.
+   *
+   * What is left here is the half that makes and unmakes FILES, which
+   * belongs to whoever owns the namespace: resolving the collection, and
+   * the DDL three. DDL does not stage an index (createIndex commits
+   * catalog + index files but not the primary tree, so a staged value
+   * wouldn't persist anyway); their replay is idempotent instead — a
+   * re-run createIndex resolves to the existing index, a re-run drop of
+   * a missing target reports "nothing to do" — bounded by the next
+   * snapshot's log compaction.
    *
    * Takes the raw payload, not a decoded command: walParse validates it
    * against the grammar first, so an entry naming an op this build cannot
@@ -380,18 +395,11 @@ class WalDb {
       return dropped;
     }
     const col = await this._db.collection(cmd.c);
+    // Which ops the applier drives is C's classification, not a list
+    // here that could fall out of step with it.
+    if (walIsDocument(op)) return col.applyCommand(index, payload);
     if (op === WAL_OP.CREATE_INDEX) return col.createIndex(cmd.keys, cmd.options);
-    if (op === WAL_OP.DROP_INDEX) return col.dropIndex(cmd.name);
-
-    await col.setAppliedIndex(index);
-    switch (op) {
-      case WAL_OP.INSERT: return col.insertOne(cmd.doc);
-      case WAL_OP.UPDATE: return col.updateOne({ _id: cmd.id }, cmd.update);
-      case WAL_OP.REPLACE: return col.replaceOne({ _id: cmd.id }, cmd.doc);
-      // No default: walParse already rejected anything else, which is
-      // why this switch has no "unknown op" arm to keep in step with C's.
-      default: return col.deleteOne({ _id: cmd.id });
-    }
+    return col.dropIndex(cmd.name);
   }
 
   /** Recovery: replay every committed entry a collection hasn't applied.

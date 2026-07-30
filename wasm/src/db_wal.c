@@ -440,3 +440,151 @@ int dc_wal_parse(const uint8_t *buf, uint32_t len,
     *op_out = op;
     return BJ_OK;
 }
+
+/* ---------------------------------------------------------------- apply */
+
+int dc_wal_is_document(int op) {
+    return op == DC_WAL_INSERT || op == DC_WAL_UPDATE ||
+           op == DC_WAL_REPLACE || op == DC_WAL_DELETE;
+}
+
+/* A field's value span, or NULL. dc_wal_parse has already established
+ * that every field the opcode requires is present and typed, so this
+ * reads rather than validates. */
+static const uint8_t *field(const uint8_t *buf, uint32_t len, const char *k, size_t *out_len) {
+    const uint8_t *vp; size_t vlen; int found = 0;
+    *out_len = 0;
+    if (obj_get_field(buf, len, (const uint8_t *)k, (uint32_t)strlen(k), &vp, &vlen, &found))
+        return NULL;
+    if (!found) return NULL;
+    *out_len = vlen;
+    return vp;
+}
+
+/* `{ _id: <oid> }` -- the only filter apply ever runs against, and it is
+ * a point lookup rather than a query. */
+static int id_filter(const uint8_t id[12], dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"_id", 3);
+    if (!e) e = bj_put_oid(b, id);
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t n; const uint8_t *d = bj_builder_data(b, &n);
+        if (!d) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_put(out, d, n);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+/* One driver-shaped result. `id` is the insertedId (NULL for the count
+ * forms); `counts` and `count_keys` are the numeric fields, in order. */
+static int result_object(dbuf *out, const uint8_t *id, int upserted_null,
+                         const char *const *count_keys, const int64_t *counts, int n) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"acknowledged", 12);
+    if (!e) e = bj_put_bool(b, 1);
+    if (id) {
+        if (!e) e = bj_put_key(b, (const uint8_t *)"insertedId", 10);
+        if (!e) e = bj_put_oid(b, id);
+    }
+    for (int i = 0; i < n && !e; i++) {
+        e = bj_put_key(b, (const uint8_t *)count_keys[i], (uint32_t)strlen(count_keys[i]));
+        if (!e) e = bj_put_int(b, counts[i]);
+    }
+    if (upserted_null) {
+        /* Always present, always null: apply never upserts (the planner
+         * resolved that away), and a key that appears only sometimes is
+         * a key every caller has to test for. */
+        if (!e) e = bj_put_key(b, (const uint8_t *)"upsertedId", 10);
+        if (!e) e = bj_put_null(b);
+    }
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t sz; const uint8_t *d = bj_builder_data(b, &sz);
+        if (!d) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_put(out, d, sz);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+int dc_wal_apply(dc_collection *c, uint64_t index,
+                 const uint8_t *cmd, uint32_t len, dbuf *result) {
+    if (!c || !result) return BJ_ERR_STATE;
+
+    int op = -1;
+    const uint8_t *coll; uint32_t coll_len;
+    int e = dc_wal_parse(cmd, len, &op, &coll, &coll_len);
+    if (e) return e;
+    if (!dc_wal_is_document(op)) return DC_ERR_WAL_NOT_APPLIABLE;
+
+    /*
+     * Staged BEFORE the mutation, so the mutation's own commit persists
+     * both together. The other order would leave a crash window in which
+     * the effect is durable and the record of having applied it is not,
+     * and the entry would be replayed onto a collection that already has
+     * it (roadmap step 1).
+     */
+    if (index) {
+        e = dc_set_applied_index(c, index);
+        if (e) return e;
+    }
+
+    size_t vlen = 0;
+    static const char *const MATCHED[] = { "matchedCount", "modifiedCount" };
+    static const char *const DELETED[] = { "deletedCount" };
+
+    if (op == DC_WAL_INSERT) {
+        const uint8_t *doc = field(cmd, len, "doc", &vlen);
+        if (!doc) return DC_ERR_WAL_MISSING_FIELD;
+        uint8_t id[12];
+        e = dc_document_id(doc, (uint32_t)vlen, id);
+        if (e) return e;
+        e = dc_insert_one(c, doc, (uint32_t)vlen);
+        if (e) return e;
+        return result_object(result, id, 0, NULL, NULL, 0);
+    }
+
+    /* The remaining three name one document, by id. */
+    const uint8_t *idv = field(cmd, len, "id", &vlen);
+    if (!idv || vlen != 13) return DC_ERR_WAL_MISSING_FIELD;
+    const uint8_t *id = idv + 1;   /* past the OID tag */
+
+    dbuf filter = {0};
+    e = id_filter(id, &filter);
+    if (e) { dbuf_free(&filter); return e; }
+
+    int64_t counts[2] = { 0, 0 };
+    if (op == DC_WAL_DELETE) {
+        int deleted = 0;
+        e = dc_delete_one(c, filter.data, (uint32_t)filter.len, &deleted);
+        counts[0] = deleted;
+    } else {
+        const uint8_t *payload = field(cmd, len, op == DC_WAL_UPDATE ? "update" : "doc", &vlen);
+        if (!payload) e = DC_ERR_WAL_MISSING_FIELD;
+        int outcome = 0;
+        uint8_t upserted[12];
+        static const uint8_t NO_DEFAULT_ID[12] = {0};
+        if (!e) {
+            e = op == DC_WAL_UPDATE
+                ? dc_update_one(c, filter.data, (uint32_t)filter.len, payload, (uint32_t)vlen,
+                                NO_DEFAULT_ID, 0, &outcome, upserted)
+                : dc_replace_one(c, filter.data, (uint32_t)filter.len, payload, (uint32_t)vlen,
+                                 NO_DEFAULT_ID, 0, &outcome, upserted);
+        }
+        /* 0 = no such document, 1 = matched and written. 2 (upserted) is
+         * unreachable with upsert off, and would be a lie to report. */
+        counts[0] = counts[1] = (outcome == 1) ? 1 : 0;
+    }
+    dbuf_free(&filter);
+    if (e) return e;
+
+    return op == DC_WAL_DELETE
+        ? result_object(result, NULL, 0, DELETED, counts, 1)
+        : result_object(result, NULL, 1, MATCHED, counts, 2);
+}

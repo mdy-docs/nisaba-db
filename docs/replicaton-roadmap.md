@@ -71,6 +71,35 @@ Now the replication roadmap. Having read the new primitives' contracts, here's t
      that arithmetic moved. Native: 85 tests ASan/UBSan. Node: 430,
      unchanged in count and in what they assert.
 
+   - ✅ The applier, in C. dc_wal_apply (wasm/include/db_wal.h) is the
+     other end of dc_wal_plan_build: the planner says what to write down,
+     and this performs what was written down, with nothing in between
+     that a host could get wrong. It does the three things the apply loop
+     owes each entry -- stage the entry's index so the mutation's own
+     commit persists it, perform the write the command names BY _id (no
+     query, ever: the planner resolved every command to exactly one, and
+     upsert is off because an upsert that found no match was resolved
+     into a plain insert before it was logged), and shape the result --
+     and src/db-wal.js's _applyCommand no longer routes through
+     insertOne/updateOne/deleteOne. That routing was the last place the
+     MEANING of a logged command lived in JavaScript, in a switch every
+     other host would have had to write again and could have written
+     differently. The result shape is C's for the same reason: under
+     replication the result of applying a command is part of the
+     command's semantics, since every replica computes it and the leader
+     hands its copy to the client. What stays host-side is what makes and
+     unmakes FILES -- resolving a collection by name, and the DDL three,
+     which dc_wal_apply refuses explicitly (DC_ERR_WAL_NOT_APPLIABLE)
+     rather than half-doing. Change streams stay host-side too, emitted
+     from the command and the result, and the command is not even decoded
+     when nobody is watching. One behaviour changed for the better: an
+     unresolved $currentDate reaching apply used to be resolved against
+     the applying replica's OWN clock -- every node writing a different
+     timestamp from one committed entry -- and is now a hard error, since
+     the planner resolving it is the invariant and a producer that broke
+     it must not be papered over. Tested natively end to end: plan a
+     write, apply what it planned, with no JavaScript in the process.
+
 6. Read semantics and change streams. Decide follower read policy (stale-ok vs. leader leases vs. readIndex). And change streams get a structural upgrade: db-plan.md:781 notes MongoDB's change streams tail the oplog and nisaba had "no analog" — the entry log is the analog now, giving resumable, gap-free streams.
 
 7. Testing, throughout. Deterministic simulation: in-memory transport with drop/delay/partition injection, plus crash-point tests that kill between append/sync/apply at every boundary (MemoryHandle makes that cheap, and the submodule's entrylog.durability-wasm.test.js is the model to copy).

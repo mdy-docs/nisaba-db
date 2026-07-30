@@ -63,6 +63,7 @@
 #include <stddef.h>
 
 #include "binjson.h"
+#include "dbuf.h"
 #include "db.h"
 
 #ifdef __cplusplus
@@ -73,6 +74,10 @@ extern "C" {
 #define DC_ERR_WAL_UNKNOWN_OP     (-32)
 #define DC_ERR_WAL_MISSING_FIELD  (-33)
 #define DC_ERR_WAL_BAD_REQUEST    (-34)
+/* dc_wal_apply was handed a command it does not apply -- one of the DDL
+ * three, whose apply creates and destroys FILES and therefore belongs to
+ * whoever owns the namespace. Not a malformed command: a misrouted one. */
+#define DC_ERR_WAL_NOT_APPLIABLE  (-35)
 
 /*
  * Opcodes, as they appear in a log entry's `op` field. The wire spellings
@@ -213,6 +218,55 @@ void dc_wal_plan_free(dc_wal_plan *p);
  */
 int dc_wal_parse(const uint8_t *buf, uint32_t len,
                  int *op_out, const uint8_t **coll, uint32_t *coll_len);
+
+/* ---- applying a logged command ------------------------------------------ */
+
+/*
+ * Does dc_wal_apply drive this opcode? The four document ops, yes; the
+ * DDL three, no -- they make and unmake files, which is the namespace
+ * owner's job, not this layer's.
+ */
+int dc_wal_is_document(int op);
+
+/*
+ * Apply one logged command to `c`, an ALREADY-OPEN collection for the
+ * name the command carries. This is the other end of dc_wal_plan_build:
+ * the planner said what to write down, and this performs what was
+ * written down, with nothing in between that a host could get wrong.
+ *
+ * It does the three things the apply loop owes each entry, in the one
+ * order that survives a crash:
+ *
+ *   1. stage `index` (dc_set_applied_index), so the mutation's own commit
+ *      persists "this entry has been applied" atomically WITH its effect.
+ *      Pass 0 for a collection that is not log-driven and it is skipped.
+ *   2. perform the mutation, addressed by the _id the command names --
+ *      never by a filter, because the planner resolved every command to
+ *      exactly one id and apply must never run a query (db_wal.h's top
+ *      comment). Upsert is off for the same reason: an upsert that found
+ *      no match was resolved into a plain insert before it was logged.
+ *   3. append the RESULT to `result` as a binjson object, in the shape a
+ *      caller of the driver gets back.
+ *
+ * The result shape is C's rather than a host decoration because, under
+ * replication, the result of applying a command IS part of the command's
+ * semantics: every replica computes it, and the leader hands its copy to
+ * the client. Two hosts that shaped it differently would be two clusters
+ * that answer the same committed write differently.
+ *
+ *   i  -> { acknowledged, insertedId }
+ *   u  -> { acknowledged, matchedCount, modifiedCount, upsertedId: null }
+ *   r  -> the same as u
+ *   d  -> { acknowledged, deletedCount }
+ *
+ * A deterministic failure (a duplicate id, a unique-index collision) is
+ * returned as its DC_ERR_* code with nothing appended to `result`: it is
+ * a fact about the command and the state it landed on, which every
+ * replica reaches identically (db_validate.h's dc_is_deterministic).
+ * DC_ERR_WAL_NOT_APPLIABLE for a DDL command.
+ */
+int dc_wal_apply(dc_collection *c, uint64_t index,
+                 const uint8_t *cmd, uint32_t len, dbuf *result);
 
 #ifdef __cplusplus
 }

@@ -142,6 +142,11 @@ _walw_preimage_ptr
 _walw_preimage_len
 _walw_target_id
 _walw_parse
+_walw_apply
+_walw_result_ptr
+_walw_result_len
+_walw_result_free
+_walw_is_document
 
 # Raft decision rules (raft_core.h)
 _rcw_new

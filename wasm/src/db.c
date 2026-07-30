@@ -2115,11 +2115,20 @@ int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, 
 }
 
 int dc_delete_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
-                   int64_t *deleted_count) {
+                   int64_t *deleted_count, uint8_t **ids, size_t *ids_len) {
     *deleted_count = 0;
+    if (ids) { *ids = NULL; *ids_len = 0; }
+
+    bj_builder *idb = NULL;
+    if (ids) {
+        idb = bj_builder_new();
+        if (!idb) return BJ_ERR_OOM;
+        bj_begin_array(idb);
+    }
+
     qry_doc *matches; size_t match_count;
     int e = gather_matches(c, filter, filter_len, &matches, &match_count);
-    if (e) return e;
+    if (e) { bj_builder_free(idb); return e; }
 
     for (size_t i = 0; !e && i < match_count; i++) {
         uint8_t id[12];
@@ -2135,10 +2144,28 @@ int dc_delete_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         }
         if (!e) e = commit_journal(c);
         e = mut_end(c, undo, e);
-        if (!e) (*deleted_count)++;
+        if (!e) {
+            (*deleted_count)++;
+            /* After the commit, so no event names a document still present. */
+            if (idb) bj_put_oid(idb, id);
+        }
     }
 
     free_matches(matches, match_count);
+
+    if (idb) {
+        if (!e) {
+            bj_end_array(idb);
+            e = bj_builder_error(idb);
+            if (!e) {
+                size_t l = 0;
+                const uint8_t *d = bj_builder_data(idb, &l);
+                if (!d) e = BJ_ERR_STATE;
+                else e = dbuf_dup(d, l, ids, ids_len);
+            }
+        }
+        bj_builder_free(idb);
+    }
     return e;
 }
 

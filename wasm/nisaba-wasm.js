@@ -2173,12 +2173,17 @@ class Collection {
   async deleteMany(filter = {}) {
     const M = requireModule();
     const watching = this._watchers.size > 0;
-    const preIds = watching ? (await this.find(filter, { projection: { _id: 1 } }).toArray()).map(d => d._id) : null;
+    // C records each removed _id as it commits (dc_delete_many's `ids`),
+    // so a watched deleteMany no longer needs the projected find() that
+    // used to run first just to know what was about to disappear.
     const fbytes = encode(filter);
-    const n = withBytes(M, fbytes, (p, len) => M._dcw_delete_many(this._collCtx, p, len));
+    const n = withBytes(M, fbytes, (p, len) =>
+      M._dcw_delete_many(this._outCtx, this._collCtx, p, len, watching ? 1 : 0));
     if (n < 0) throw codeError(n, 'deleteMany');
     if (watching) {
-      for (const _id of preIds) this._emitChange({ operationType: 'delete', documentKey: { _id } });
+      for (const _id of this._readOut(requireModule()) ?? []) {
+        this._emitChange({ operationType: 'delete', documentKey: { _id } });
+      }
     }
     return { acknowledged: true, deletedCount: n };
   }

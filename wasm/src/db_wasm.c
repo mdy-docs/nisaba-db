@@ -214,10 +214,23 @@ EMSCRIPTEN_KEEPALIVE int dcw_delete_one(dc_collection *c, const uint8_t *filter,
 
 /* Returns the number deleted, or a negative error code (mirrors dcw_count's
  * double-return-for-int64 pattern). */
-EMSCRIPTEN_KEEPALIVE double dcw_delete_many(dc_collection *c, const uint8_t *filter, int filter_len) {
+/* `want_ids` asks for every removed document's _id alongside the count --
+ * what a delete change-event needs, and what the host otherwise had to
+ * pre-read with a projected find(). */
+EMSCRIPTEN_KEEPALIVE double dcw_delete_many(dcw_out *o, dc_collection *c,
+        const uint8_t *filter, int filter_len, int want_ids) {
+    reset_out(o);
     int64_t n = 0;
-    int e = dc_delete_many(c, filter, (uint32_t)filter_len, &n);
-    return e ? (double)e : (double)n;
+    uint8_t *ids = NULL; size_t ids_len = 0;
+    int e = dc_delete_many(c, filter, (uint32_t)filter_len, &n,
+                           want_ids ? &ids : NULL, want_ids ? &ids_len : NULL);
+    if (e) { free(ids); return (double)e; }
+    if (ids) {
+        int de = dbuf_dup(ids, ids_len, &o->buf, &o->len);
+        free(ids);
+        if (de) return (double)de;
+    }
+    return (double)n;
 }
 
 /* Returns 1 if *out holds a document (the pre-image), 0 if not, negative on

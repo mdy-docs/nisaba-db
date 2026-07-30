@@ -1703,6 +1703,37 @@ describe('db: change streams (watch)', () => {
     stream.close();
     await db.close();
   });
+
+  it('deleteMany with a watcher costs no extra query either', async () => {
+    // It used to run a projected find() first, purely to learn what was
+    // about to disappear. C records each removed _id as it commits.
+    const db = await openDb();
+    const users = await db.collection('users');
+    await users.insertMany([
+      { name: 'Ada', team: 'core' },
+      { name: 'Grace', team: 'core' }
+    ]);
+
+    const seen = [];
+    const stream = users.watch();
+    stream.on('change', (e) => seen.push(e));
+
+    const findSpy = vi.spyOn(users, 'find');
+    const { deletedCount } = await users.deleteMany({ team: 'core' });
+    expect(deletedCount).toBe(2);
+    expect(findSpy).not.toHaveBeenCalled();
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(seen).toHaveLength(2);
+    expect(seen.every((e) => e.operationType === 'delete')).toBe(true);
+    expect(seen.every((e) => e.documentKey._id)).toBe(true);
+    // Distinct ids, not the same one twice.
+    expect(new Set(seen.map((e) => String(e.documentKey._id))).size).toBe(2);
+
+    findSpy.mockRestore();
+    stream.close();
+    await db.close();
+  });
 });
 
 describe('db: text index ($text, milestone 6)', () => {

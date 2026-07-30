@@ -389,9 +389,16 @@ int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, 
 /* Delete every document matching `filter`, from the primary tree and every
  * attached index, committing the journal once per deleted document (same
  * per-document granularity as dc_update_many). *deleted_count is the
- * number removed. */
+ * number removed.
+ *
+ * `ids`, when non-NULL, receives a binjson ARRAY of every removed
+ * document's _id -- freshly malloc'd for the caller to free, and recorded
+ * only after each delete commits. Same reasoning as dc_update_many's
+ * `images`: a change-stream consumer needs exactly these, and this loop
+ * already has each one, so the host need not re-query for them. A delete
+ * event carries no full document, so ids are all that is collected. */
 int dc_delete_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
-                   int64_t *deleted_count);
+                   int64_t *deleted_count, uint8_t **ids, size_t *ids_len);
 
 /*
  * Atomically find the first document matching `filter` and delete it.

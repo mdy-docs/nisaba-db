@@ -2310,7 +2310,7 @@ TEST(compact_execute_builds_and_flips_over_real_files) {
         doc_str(q, "team", "core");
         uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
         int64_t deleted = 0;
-        CHECK_OK(dc_delete_many(coll, qb, qlen, &deleted));
+        CHECK_OK(dc_delete_many(coll, qb, qlen, &deleted, NULL, NULL));
         CHECK_I64(deleted, 60);
         doc_free(q);
     }

@@ -31,6 +31,7 @@
 #include "raft_core.h"
 #include "raft_msg.h"
 #include "raft_drive.h"
+#include "raft_node.h"
 #include "bjcursor.h"
 #include "db_update.h"
 #include "dbuf.h"
@@ -4713,6 +4714,152 @@ TEST(snapshot_chunking_covers_every_byte_exactly_once) {
     }
 }
 
+
+/* ---- a three-node cluster, in C, with no host language at all --------- */
+
+typedef struct {
+    uint64_t   id;
+    memfs     *fs;
+    elog      *log;
+    raft_node *node;
+} rn_member;
+
+/*
+ * Deliver everything sitting in every node's outbox, once.
+ *
+ * This IS the outbox model, and it is about twenty lines: read what C
+ * decided to send, hand it to whoever it is addressed to, feed the
+ * answer back by correlation id. A host with sockets substitutes a
+ * write() for the rn_handle call and a read() for the reply; nothing
+ * else about the shape changes, which is the entire claim raft_node.h
+ * makes.
+ */
+static void pump(rn_member *m, int count) {
+    for (int i = 0; i < count; i++) {
+        uint32_t nout = rn_out_count(m[i].node);
+        for (uint32_t k = 0; k < nout; k++) {
+            uint64_t to   = rn_out_peer(m[i].node, k);
+            uint32_t corr = rn_out_corr(m[i].node, k);
+            int is_reply  = rn_out_is_reply(m[i].node, k);
+            uint32_t len = 0;
+            const uint8_t *bytes = rn_out_bytes(m[i].node, k, &len);
+
+            /* Copy: delivering mutates the target's outbox, and on a
+             * self-addressed reply that would be this very buffer. */
+            uint8_t *copy = (uint8_t *)malloc(len ? len : 1);
+            memcpy(copy, bytes, len);
+
+            for (int j = 0; j < count; j++) {
+                if (m[j].id != to) continue;
+                if (is_reply) rn_on_reply(m[j].node, corr, copy, len);
+                else          rn_handle(m[j].node, m[i].id, corr, copy, len);
+                break;
+            }
+            free(copy);
+        }
+        rn_out_clear(m[i].node);
+    }
+}
+
+static int leader_count(rn_member *m, int count, int *which) {
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        if (rn_role(m[i].node) == RAFT_LEADER) { n++; if (which) *which = i; }
+    }
+    return n;
+}
+
+TEST(three_nodes_elect_a_leader_and_commit_without_a_host_language) {
+    /*
+     * The end-to-end claim of the whole port, at the Raft layer: three
+     * nodes, one C state machine each, a network that is a for-loop, and
+     * no JavaScript anywhere in the process. Everything an
+     * `await transport.call` used to do is here as an outbox entry and a
+     * correlation id.
+     */
+    rn_member m[3];
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    for (int i = 0; i < 3; i++) {
+        bj_begin_object(members);
+        bj_put_key(members, (const uint8_t *)"id", 2);
+        bj_put_int(members, i + 1);
+        bj_end_object(members);
+    }
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+
+    for (int i = 0; i < 3; i++) {
+        m[i].id = (uint64_t)(i + 1);
+        m[i].fs = memfs_new();
+        CHECK_FATAL(m[i].fs != NULL);
+        bj_io io;
+        CHECK_FATAL(memfs_open(m[i].fs, "raft.bj", &io) == BJ_OK);
+        m[i].log = elog_create(&io);
+        CHECK_FATAL(m[i].log != NULL);
+        m[i].node = rn_new(m[i].id, m[i].log);
+        CHECK_FATAL(m[i].node != NULL);
+        CHECK_OK(rn_set_members(m[i].node, mbuf, (uint32_t)mlen));
+        rn_set_timing(m[i].node, 150, 300, 50);
+    }
+
+    /* Node 1 gets the shortest timeout, so the first election is
+     * deterministic rather than a race the test has to tolerate. */
+    rn_start(m[0].node, 0, 0.0);
+    rn_start(m[1].node, 0, 0.9);
+    rn_start(m[2].node, 0, 0.95);
+
+    CHECK_I64(rn_quorum(m[0].node), 2);
+
+    int who = -1;
+    for (int64_t t = 0; t <= 2000; t += 10) {
+        for (int i = 0; i < 3; i++) rn_tick(m[i].node, t, 0.5);
+        pump(m, 3);
+        if (leader_count(m, 3, &who) == 1 && rn_commit_index(m[who].node) > 0) break;
+    }
+
+    /* Exactly one leader, and it committed its own term-boundary no-op --
+     * which is what proves a quorum actually replicated, not just that a
+     * node declared itself. */
+    CHECK_I64(leader_count(m, 3, &who), 1);
+    CHECK(who >= 0);
+    if (who >= 0) {
+        CHECK(rn_commit_index(m[who].node) > 0);
+
+        /* A real entry replicates and commits across the cluster. */
+        uint64_t at = 0;
+        CHECK_OK(elog_append(m[who].log, elog_current_term(m[who].log), EL_NORMAL,
+                             (const uint8_t *)"hello", 5, &at));
+        CHECK_OK(elog_sync(m[who].log));
+        for (int i = 0; i < 3; i++) rn_replicate(m[who].node, m[i].id);
+
+        for (int64_t t = 2000; t <= 4000; t += 10) {
+            for (int i = 0; i < 3; i++) rn_tick(m[i].node, t, 0.5);
+            pump(m, 3);
+            if (rn_commit_index(m[who].node) >= at) break;
+        }
+        CHECK(rn_commit_index(m[who].node) >= at);
+
+        /* Every follower holds the entry, at the same term. */
+        for (int i = 0; i < 3; i++) {
+            CHECK(elog_last_index(m[i].log) >= at);
+            uint64_t term = 0;
+            CHECK_OK(elog_term_at(m[i].log, at, &term));
+            CHECK_I64((long long)term, (long long)elog_current_term(m[who].log));
+        }
+
+        /* The leader can prove it still reaches a quorum. */
+        CHECK_I64(rn_has_quorum_contact(m[who].node, 1000), 1);
+    }
+
+    for (int i = 0; i < 3; i++) {
+        rn_free(m[i].node);
+        elog_free(m[i].log);
+        memfs_free(m[i].fs);
+    }
+    bj_builder_free(members);
+}
+
 int main(void) {
     RUN(raft_vote_follows_the_up_to_date_rule);
     RUN(raft_vote_is_at_most_one_per_term);
@@ -4730,6 +4877,7 @@ int main(void) {
     RUN(election_round_ignores_votes_from_a_world_that_ended);
     RUN(replication_picks_append_snapshot_or_park);
     RUN(snapshot_chunking_covers_every_byte_exactly_once);
+    RUN(three_nodes_elect_a_leader_and_commit_without_a_host_language);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);

@@ -30,6 +30,7 @@ wasm/src/db_wal.c
 wasm/src/raft_core.c
 wasm/src/raft_msg.c
 wasm/src/raft_drive.c
+wasm/src/raft_node.c
 wasm/src/db_names_wasm.c
 wasm/src/db_validate_wasm.c
 wasm/src/db_ttl_wasm.c

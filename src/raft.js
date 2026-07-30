@@ -680,8 +680,36 @@ export class RaftNode {
    */
   _flush() {
     for (const eff of this._core.drainEffects()) this._onEffect(eff);
+    // The node ran out of room to tell us something. Nothing recovers
+    // what was never said, and everything below this line acts on a
+    // picture that is now missing a piece of — a commit that never
+    // reaches the apply pump, a step-down the waiters never hear about.
+    // Halt, for the same reason a diverging state machine halts.
+    if (this._core.effectsLost) {
+      this._halt(new Error('raft: the node lost effects it could not queue; state is incomplete'));
+      return;
+    }
     for (const msg of this._core.drainOutbox()) this._send(msg);
     this._maybeCompleteTransfer();
+  }
+
+  /**
+   * Stop, loudly and permanently. Reached from two places, and they are
+   * the same fault in two disguises: a state machine that cannot apply a
+   * committed entry, and a node whose account of itself came back
+   * incomplete. Continuing past either means diverging from the replicas
+   * that did not hit it.
+   */
+  _halt(err) {
+    if (!this.isRunning) return;
+    this.isRunning = false;
+    this._core.stop();
+    this._emit('halt', {
+      error: String(err?.message ?? err),
+      lastApplied: this.lastApplied,
+      commitIndex: this.commitIndex
+    });
+    this._rejectWaiters(err);
   }
 
   /** One outgoing request: deliver it, then feed the answer back by
@@ -1173,10 +1201,7 @@ export class RaftNode {
     this._applyChain = this._applyChain.then(() => this._applyLoop()).catch((err) => {
       // A state machine that throws on a committed entry is unrecoverable
       // divergence; stop rather than skip (skipping would fork replicas).
-      this.isRunning = false;
-      this._core.stop();
-      this._emit('halt', { error: String(err?.message ?? err), lastApplied: this.lastApplied, commitIndex: this.commitIndex });
-      this._rejectWaiters(err);
+      this._halt(err);
     });
   }
 

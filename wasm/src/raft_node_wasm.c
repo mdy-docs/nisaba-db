@@ -122,6 +122,7 @@ EMSCRIPTEN_KEEPALIVE int rnw_effect_flag(const raft_node *n, int i) {
     return rn_effect_flag(n, (uint32_t)i);
 }
 EMSCRIPTEN_KEEPALIVE void rnw_effects_clear(raft_node *n) { rn_effects_clear(n); }
+EMSCRIPTEN_KEEPALIVE int rnw_effects_lost(const raft_node *n) { return rn_effects_lost(n); }
 
 /* ---- accessors ---------------------------------------------------------- */
 

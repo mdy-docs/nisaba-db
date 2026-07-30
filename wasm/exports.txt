@@ -210,6 +210,7 @@ _rnw_effect_kind
 _rnw_effect_arg
 _rnw_effect_flag
 _rnw_effects_clear
+_rnw_effects_lost
 _rnw_role
 _rnw_leader_id
 _rnw_commit_index

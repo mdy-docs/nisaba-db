@@ -1428,6 +1428,11 @@ class RaftCore {
     return out;
   }
 
+  /** Sticky: the node once had an effect to report and no room for it,
+   * so the host's picture of it has a hole that draining cannot fill.
+   * Unreachable for a host that drains after every call. */
+  get effectsLost() { return requireModule()._rnw_effects_lost(this._ptr) === 1; }
+
   get role() { return requireModule()._rnw_role(this._ptr); }
   get leaderId() { return requireModule()._rnw_leader_id(this._ptr); }
   get commitIndex() { return requireModule()._rnw_commit_index(this._ptr); }

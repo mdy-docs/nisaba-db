@@ -11,7 +11,26 @@
 
 #define RN_MAX_PEERS 64
 #define RN_MAX_OUT   256
-#define RN_MAX_EFF   64
+
+/*
+ * The effect queue is sized from the peer cap, not guessed.
+ *
+ * Three of the six kinds are ACTIONABLE and per-peer -- NEEDS_SNAPSHOT,
+ * PROMOTE, REACHABLE -- and emit() coalesces those by (kind, peer), so
+ * however many calls a host makes between drains, they can only occupy
+ * three slots per peer. COMMIT coalesces to its highest index. What is
+ * left is the narrative: ROLE, ELECTION, TRUNCATED, which append,
+ * because collapsing a role trail loses the transition it exists to
+ * report.
+ *
+ * So the queue cannot overflow within any sequence of calls that a host
+ * drains between, which is the contract raft_node.h states. The static
+ * assertion below is the arithmetic; rn_effects_lost is the belt for the
+ * host that ignores the contract, or for a future emit site that breaks
+ * the premise. It was 64 -- smaller than the 64 NEEDS_SNAPSHOT a single
+ * tick can raise on a full cluster.
+ */
+#define RN_MAX_EFF   (RN_MAX_PEERS * 3 + 16)
 
 typedef struct {
     uint64_t id;
@@ -75,7 +94,18 @@ struct raft_node {
     uint32_t nout;
     rn_eff   eff[RN_MAX_EFF];
     uint32_t neff;
+    /* Sticky: this node once had something to say and no room to say it.
+     * Never cleared -- the host's view of it is incomplete from that
+     * moment on, and the only safe reading is that it stays so. */
+    int      effects_lost;
 };
+
+/* The coalescing argument above, as arithmetic the compiler checks:
+ * three actionable slots per peer, plus headroom for the transitions
+ * one call can raise. If a new per-peer effect kind arrives, this fails
+ * here rather than in production. */
+_Static_assert(RN_MAX_EFF >= RN_MAX_PEERS * 3 + 8,
+               "effect queue must hold every peer's actionable effects at once");
 
 /* ---- small helpers ------------------------------------------------------ */
 
@@ -85,8 +115,37 @@ static rn_peer *peer_of(raft_node *n, uint64_t id) {
     return NULL;
 }
 
+/*
+ * Queue one effect, coalescing what can be coalesced.
+ *
+ * The per-peer kinds say "this peer needs something"; saying it twice
+ * asks the host for the same idempotent act twice, so the newer report
+ * replaces the older in place. COMMIT keeps its highest index, since the
+ * host reads the real commit index off the node anyway and the argument
+ * is only a nudge. Everything else is a transition and appends.
+ *
+ * Dropping was the old behaviour when the queue filled, and dropping is
+ * exactly what must not happen: a lost COMMIT stalls the apply pump
+ * until the next one, a lost ROLE leaves the host's idea of this node's
+ * role behind, and neither is visible to anyone. If it ever fills now,
+ * the node records that it failed to speak, and the host halts on it.
+ */
 static void emit(raft_node *n, int kind, uint64_t arg, int flag) {
-    if (n->neff >= RN_MAX_EFF) return;   /* the host is not draining; drop */
+    if (kind == RN_EFFECT_NEEDS_SNAPSHOT || kind == RN_EFFECT_PROMOTE ||
+        kind == RN_EFFECT_REACHABLE) {
+        for (uint32_t i = 0; i < n->neff; i++) {
+            if (n->eff[i].kind != kind || n->eff[i].arg != arg) continue;
+            n->eff[i].flag = flag;   /* the newer report wins */
+            return;
+        }
+    } else if (kind == RN_EFFECT_COMMIT) {
+        for (uint32_t i = 0; i < n->neff; i++) {
+            if (n->eff[i].kind != kind) continue;
+            if (arg > n->eff[i].arg) n->eff[i].arg = arg;
+            return;
+        }
+    }
+    if (n->neff >= RN_MAX_EFF) { n->effects_lost = 1; return; }
     n->eff[n->neff].kind = kind;
     n->eff[n->neff].arg  = arg;
     n->eff[n->neff].flag = flag;
@@ -295,6 +354,20 @@ static void become_follower(raft_node *n, uint64_t term, uint64_t leader_id,
 static int replicate_to(raft_node *n, rn_peer *p);
 static void advance_commit(raft_node *n);
 
+/* Replicate to everyone, keeping the FIRST failure. A message that could
+ * not be queued is a message the host will never send, so the caller
+ * has to hear about it -- these loops used to discard it, which turned a
+ * full outbox into a leader that silently stopped talking to some of its
+ * followers. */
+static int replicate_to_all(raft_node *n) {
+    int first = BJ_OK;
+    for (uint32_t i = 0; i < n->npeers; i++) {
+        int e = replicate_to(n, &n->peers[i]);
+        if (e && !first) first = e;
+    }
+    return first;
+}
+
 static int become_leader(raft_node *n) {
     n->leader_id = n->self_id;
     n->leader_at = n->now;
@@ -323,7 +396,8 @@ static int become_leader(raft_node *n) {
     if (e) return e;
 
     n->heartbeat_due = n->now;
-    for (uint32_t i = 0; i < n->npeers; i++) replicate_to(n, &n->peers[i]);
+    e = replicate_to_all(n);
+    if (e) return e;
 
     /* A single-voter group has nobody to hear from, so nothing will ever
      * arrive to trigger this: it commits the moment it appends. Without
@@ -462,7 +536,7 @@ int rn_tick(raft_node *n, int64_t now, double random01) {
     if (n->role == RAFT_LEADER) {
         if (now >= n->heartbeat_due) {
             n->heartbeat_due = now + n->heartbeat_ms;
-            for (uint32_t i = 0; i < n->npeers; i++) replicate_to(n, &n->peers[i]);
+            return replicate_to_all(n);
         }
         return BJ_OK;
     }
@@ -697,6 +771,10 @@ int      rn_effect_kind_at(const raft_node *n, uint32_t i) { return i < n->neff 
 uint64_t rn_effect_arg(const raft_node *n, uint32_t i) { return i < n->neff ? n->eff[i].arg : 0; }
 int      rn_effect_flag(const raft_node *n, uint32_t i) { return i < n->neff ? n->eff[i].flag : 0; }
 void     rn_effects_clear(raft_node *n) { n->neff = 0; }
+/* Deliberately NOT cleared by rn_effects_clear: once something was lost,
+ * the host's picture of this node has a hole in it that draining cannot
+ * fill. */
+int      rn_effects_lost(const raft_node *n) { return n->effects_lost; }
 
 /* ---- accessors ---------------------------------------------------------- */
 
@@ -735,9 +813,9 @@ int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
     if (e) return e;
     if (out_index) *out_index = at;
 
-    for (uint32_t i = 0; i < n->npeers; i++) replicate_to(n, &n->peers[i]);
+    e = replicate_to_all(n);
     advance_commit(n);   /* single-voter groups: see become_leader */
-    return BJ_OK;
+    return e;
 }
 
 void rn_seed_commit(raft_node *n, uint64_t index) {

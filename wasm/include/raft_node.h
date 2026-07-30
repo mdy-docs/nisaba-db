@@ -235,6 +235,21 @@ uint64_t rn_effect_arg(const raft_node *n, uint32_t i);
 int      rn_effect_flag(const raft_node *n, uint32_t i);
 void     rn_effects_clear(raft_node *n);
 
+/*
+ * Did this node ever have an effect to report and no room to hold it?
+ *
+ * It cannot happen to a host that drains after each call: the queue is
+ * sized so that every peer's actionable effects fit at once, and those
+ * kinds coalesce per peer rather than accumulating (see raft_node.c).
+ * A host that batches many calls between drains can still overrun the
+ * narrative kinds, and this is how it finds out.
+ *
+ * Sticky, and never cleared by rn_effects_clear. There is no way to
+ * recover what was not said, so a host that reads 1 here should stop
+ * rather than keep acting on a picture it knows is incomplete.
+ */
+int      rn_effects_lost(const raft_node *n);
+
 /* ---- accessors ---------------------------------------------------------- */
 
 int      rn_role(const raft_node *n);

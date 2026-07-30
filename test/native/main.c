@@ -4815,6 +4815,85 @@ TEST(a_single_voter_group_commits_the_moment_it_elects_itself) {
     memfs_free(fs);
 }
 
+TEST(effects_coalesce_rather_than_pile_up_and_a_loss_is_never_silent) {
+    /*
+     * The effect queue used to DROP when full, with a comment saying the
+     * host was not draining. Silence is the one thing it must not do: a
+     * lost COMMIT stalls the host's apply pump until the next one
+     * happens along, a lost ROLE leaves it believing this node still
+     * leads, and neither leaves a trace anywhere.
+     *
+     * Two halves. The actionable per-peer kinds and COMMIT coalesce, so
+     * a busy node cannot fill the queue no matter how many times it is
+     * called between drains -- which is what makes the size argument in
+     * raft_node.c hold. And if it fills anyway, the node records that it
+     * failed to speak, permanently, and the host halts on it.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "raft.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(1, log);
+    CHECK_FATAL(n != NULL);
+
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    bj_begin_object(members);
+    bj_put_key(members, (const uint8_t *)"id", 2);
+    bj_put_int(members, 1);
+    bj_end_object(members);
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+    CHECK_OK(rn_set_members(n, mbuf, (uint32_t)mlen));
+
+    rn_start(n, 0, 0.0);
+    for (int64_t t = 0; t <= 1000 && rn_role(n) != RAFT_LEADER; t += 10)
+        rn_tick(n, t, 0.5);
+    CHECK_I64(rn_role(n), RAFT_LEADER);
+    CHECK_I64(rn_effects_lost(n), 0);
+    rn_effects_clear(n);
+
+    /* A lone leader commits on every append. Fifty proposals without a
+     * single drain: fifty commit reports, one slot. */
+    for (int i = 0; i < 50; i++) {
+        uint64_t at = 0;
+        CHECK_OK(rn_propose(n, EL_NORMAL, (const uint8_t *)"x", 1, &at));
+    }
+    uint32_t commits = 0;
+    uint64_t reported = 0;
+    for (uint32_t i = 0; i < rn_effect_count(n); i++) {
+        if (rn_effect_kind_at(n, i) != RN_EFFECT_COMMIT) continue;
+        commits++;
+        reported = rn_effect_arg(n, i);
+    }
+    CHECK_I64((long long)commits, 1);
+    /* And it carries the LATEST index, not the first: the host acts on
+     * the newest truth, not the oldest. */
+    CHECK_I64((long long)reported, (long long)rn_commit_index(n));
+    CHECK_I64(rn_effects_lost(n), 0);
+    rn_effects_clear(n);
+
+    /* Now the belt. Role changes are a trail, not a state, so they
+     * append -- a host that never drains can still overrun them, and
+     * that host must be told rather than quietly kept in the dark. */
+    for (int i = 0; i < 400 && !rn_effects_lost(n); i++) {
+        /* Deposed by a newer term, then told to stand again. */
+        rn_observe_leader(n, elog_current_term(log) + 1, 2, 0.5);
+        rn_campaign(n, 0.5);
+    }
+    CHECK_I64(rn_effects_lost(n), 1);
+    /* Sticky: draining cannot un-lose what was never said. */
+    rn_effects_clear(n);
+    CHECK_I64(rn_effects_lost(n), 1);
+
+    bj_builder_free(members);
+    rn_free(n);
+    elog_free(log);
+    memfs_free(fs);
+}
+
 TEST(a_member_set_is_adopted_whole_or_refused_whole) {
     /*
      * The node's peer table and the host's member list are one fact
@@ -5095,6 +5174,7 @@ int main(void) {
     RUN(a_single_voter_group_commits_the_moment_it_elects_itself);
     RUN(a_stale_prevote_grant_cannot_elect_the_real_round);
     RUN(a_member_set_is_adopted_whole_or_refused_whole);
+    RUN(effects_coalesce_rather_than_pile_up_and_a_loss_is_never_silent);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);

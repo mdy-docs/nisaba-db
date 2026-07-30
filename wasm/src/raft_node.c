@@ -39,12 +39,12 @@ typedef struct {
     uint64_t match;      /* highest index known replicated            */
     int64_t  ack_at;     /* when it last answered without deposing us */
     int      reachable;  /* edge-triggered; -1 = never tried          */
-    uint32_t inflight;   /* correlation id outstanding, 0 = none      */
+    uint64_t inflight;   /* correlation id outstanding, 0 = none      */
 } rn_peer;
 
 typedef struct {
     uint64_t peer;
-    uint32_t corr;
+    uint64_t corr;
     int      is_reply;
     dbuf     bytes;
 } rn_out;
@@ -86,9 +86,9 @@ struct raft_node {
      * round that followed it -- and since a pre-voter grants freely, two
      * candidates can both reach a quorum in one term. Corr ids are issued
      * in order, so the round owns a contiguous range. */
-    uint32_t   round_corr_lo, round_corr_hi;
+    uint64_t   round_corr_lo, round_corr_hi;
 
-    uint32_t next_corr;
+    uint64_t next_corr;
 
     rn_out   out[RN_MAX_OUT];
     uint32_t nout;
@@ -154,7 +154,7 @@ static void emit(raft_node *n, int kind, uint64_t arg, int flag) {
 
 /* Queue one message. Takes the bytes by copy: the caller's builder is
  * usually freed before the host drains. */
-static int queue(raft_node *n, uint64_t peer, uint32_t corr, int is_reply,
+static int queue(raft_node *n, uint64_t peer, uint64_t corr, int is_reply,
                  const uint8_t *bytes, size_t len) {
     if (n->nout >= RN_MAX_OUT) return BJ_ERR_RANGE;
     rn_out *o = &n->out[n->nout];
@@ -168,9 +168,13 @@ static int queue(raft_node *n, uint64_t peer, uint32_t corr, int is_reply,
     return BJ_OK;
 }
 
-static uint32_t fresh_corr(raft_node *n) {
-    if (++n->next_corr == 0) n->next_corr = 1;   /* 0 means "none" */
-    return n->next_corr;
+/* Correlation ids are issued, never reused: a uint64 counter cannot
+ * come back around to an id still outstanding, so no reply can ever be
+ * attributed to a request that is not the one it answers. (The JS glue
+ * carries these as doubles, exact to 2^53 -- the ceiling every index in
+ * this layer already has, and it lives in the glue, not here.) */
+static uint64_t fresh_corr(raft_node *n) {
+    return ++n->next_corr;   /* 0 stays "none" */
 }
 
 static void set_role(raft_node *n, int role) {
@@ -440,7 +444,7 @@ static int start_election(raft_node *n, int pre_vote, double random01) {
     if (!e) {
         for (uint32_t i = 0; i < n->npeers && !e; i++) {
             if (!n->peers[i].voting) continue;
-            uint32_t corr = fresh_corr(n);
+            uint64_t corr = fresh_corr(n);
             if (!n->round_corr_lo) n->round_corr_lo = corr;
             n->round_corr_hi = corr;
             e = queue(n, n->peers[i].id, corr, 0, msg.data, msg.len);
@@ -477,7 +481,7 @@ static int replicate_to(raft_node *n, rn_peer *p) {
                                       n->commit_index, n->max_batch_bytes,
                                       n->quiesced, &count, &msg);
     if (!e) {
-        uint32_t corr = fresh_corr(n);
+        uint64_t corr = fresh_corr(n);
         e = queue(n, p->id, corr, 0, msg.data, msg.len);
         if (!e) p->inflight = corr;
     }
@@ -591,10 +595,19 @@ static void adopt(raft_node *n, const raft_msg_effect *eff, double random01) {
     if (eff->quiesce) rn_quiesce(n);
 }
 
-int rn_handle(raft_node *n, uint64_t from, uint32_t corr,
+int rn_handle(raft_node *n, uint64_t corr,
               const uint8_t *msg, uint32_t len, double random01) {
     int kind = -1;
     int e = rmsg_kind(msg, len, &kind);
+    if (e) return e;
+
+    /* Who to answer comes from the message, not from the caller. A host
+     * that had to name the sender could name it wrongly -- or, as the
+     * JS one did, not know it at all and pass 0, which then rode into
+     * the outbox and broke this file's own "every entry is addressed"
+     * invariant on every inbound message. */
+    uint64_t from = 0;
+    e = rmsg_sender(msg, len, &from);
     if (e) return e;
 
     raft_msg_state st;
@@ -625,13 +638,13 @@ int rn_handle(raft_node *n, uint64_t from, uint32_t corr,
 /* ---- replies ------------------------------------------------------------ */
 
 /* Find the peer whose outstanding request carries `corr`. */
-static rn_peer *peer_by_corr(raft_node *n, uint32_t corr) {
+static rn_peer *peer_by_corr(raft_node *n, uint64_t corr) {
     for (uint32_t i = 0; i < n->npeers; i++)
         if (n->peers[i].inflight == corr) return &n->peers[i];
     return NULL;
 }
 
-static int on_vote_reply(raft_node *n, uint32_t corr, const uint8_t *reply,
+static int on_vote_reply(raft_node *n, uint64_t corr, const uint8_t *reply,
                          uint32_t len, double random01) {
     if (!n->round_live) return BJ_OK;
     /* From a round that is over -- most sharply, the pre-vote round this
@@ -727,7 +740,7 @@ static int on_append_reply(raft_node *n, rn_peer *p, const uint8_t *reply, uint3
     return replicate_to(n, p);
 }
 
-int rn_on_reply(raft_node *n, uint32_t corr, const uint8_t *reply, uint32_t len,
+int rn_on_reply(raft_node *n, uint64_t corr, const uint8_t *reply, uint32_t len,
                 double random01) {
     rn_peer *p = peer_by_corr(n, corr);
     if (p) {
@@ -740,7 +753,7 @@ int rn_on_reply(raft_node *n, uint32_t corr, const uint8_t *reply, uint32_t len,
     return on_vote_reply(n, corr, reply, len, random01);
 }
 
-int rn_on_fail(raft_node *n, uint32_t corr) {
+int rn_on_fail(raft_node *n, uint64_t corr) {
     rn_peer *p = peer_by_corr(n, corr);
     if (!p) return BJ_OK;   /* a vote request nobody answered; the timer retries */
     p->inflight = 0;
@@ -752,7 +765,7 @@ int rn_on_fail(raft_node *n, uint32_t corr) {
 
 uint32_t rn_out_count(const raft_node *n) { return n->nout; }
 uint64_t rn_out_peer(const raft_node *n, uint32_t i) { return i < n->nout ? n->out[i].peer : 0; }
-uint32_t rn_out_corr(const raft_node *n, uint32_t i) { return i < n->nout ? n->out[i].corr : 0; }
+uint64_t rn_out_corr(const raft_node *n, uint32_t i) { return i < n->nout ? n->out[i].corr : 0; }
 int      rn_out_is_reply(const raft_node *n, uint32_t i) { return i < n->nout ? n->out[i].is_reply : 0; }
 
 const uint8_t *rn_out_bytes(const raft_node *n, uint32_t i, uint32_t *len) {
@@ -790,7 +803,7 @@ uint64_t rn_next(const raft_node *n, uint64_t peer) {
     const rn_peer *p = peer_of((raft_node *)n, peer);
     return p ? p->next : 0;
 }
-uint32_t rn_inflight(const raft_node *n, uint64_t peer) {
+uint64_t rn_inflight(const raft_node *n, uint64_t peer) {
     const rn_peer *p = peer_of((raft_node *)n, peer);
     return p ? p->inflight : 0;
 }

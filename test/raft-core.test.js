@@ -40,6 +40,11 @@ async function makeCluster(ids, { electionTimeoutMs = [150, 300], heartbeatMs = 
  * One delivery round: hand every queued message to whoever it is
  * addressed to, and feed each answer back by correlation id.
  *
+ * Note what it does NOT do: tell the receiving node who sent it. Every
+ * message names its own sender, so the reply comes back out addressed
+ * correctly without anyone here restating it -- which is the whole
+ * reason this loop can route replies by `msg.peer` at all.
+ *
  * `drop` lets a test partition the network by refusing to carry a
  * message -- the peer simply never answers, which is what onFail says.
  */
@@ -52,7 +57,7 @@ function pump(nodes, drop = () => false) {
         continue;
       }
       if (msg.isReply) to.core.onReply(msg.corr, msg.bytes);
-      else to.core.handle(from.id, msg.corr, msg.bytes);
+      else to.core.handle(msg.corr, msg.bytes);
     }
   }
 }
@@ -189,6 +194,32 @@ describe('raft core: the outbox seam driven from JavaScript', () => {
       expect(won[0].id).toBeLessThanOrEqual(3);
       expect(nodes[3].core.role).not.toBe(RAFT_ROLE.LEADER);
       expect(nodes[4].core.role).not.toBe(RAFT_ROLE.LEADER);
+    } finally { cleanup(nodes); }
+  });
+
+  it('addresses every reply from the message itself, not from the caller', async () => {
+    // The host is never asked who sent a message, so it cannot answer
+    // wrongly — and this one genuinely does not know: its transport
+    // pairs request and reply with a promise and carries no sender id.
+    const nodes = await makeCluster([1, 2, 3]);
+    try {
+      nodes[0].core.start(0, 0.0);
+      nodes[1].core.start(0, 0.9);
+      nodes[2].core.start(0, 0.95);
+      nodes[0].core.tick(200, 0.5);           // node 1 stands for election
+
+      const requests = nodes[0].core.drainOutbox();
+      expect(requests.length).toBe(2);
+      for (const req of requests) {
+        const to = nodes.find((n) => n.id === req.peer);
+        to.core.handle(req.corr, req.bytes);  // no sender told
+        const [reply] = to.core.drainOutbox();
+        expect(reply.isReply).toBe(true);
+        expect(reply.peer).toBe(nodes[0].id); // back to the candidate
+        expect(reply.corr).toBe(req.corr);    // carrying its own id
+      }
+      // Ids are issued, never reused: two requests, two distinct ids.
+      expect(requests[1].corr).toBeGreaterThan(requests[0].corr);
     } finally { cleanup(nodes); }
   });
 

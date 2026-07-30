@@ -67,21 +67,25 @@ EMSCRIPTEN_KEEPALIVE void rnw_wake(raft_node *n, double now, double random01) {
 
 /* ---- messages ----------------------------------------------------------- */
 
-EMSCRIPTEN_KEEPALIVE int rnw_handle(raft_node *n, double from, int corr,
+/* Correlation ids cross as doubles, exact to 2^53 -- the ceiling every
+ * index in this layer already has. As ints they capped at 2^31, where
+ * the negative guard below would have started refusing every message a
+ * long-lived node sent. */
+EMSCRIPTEN_KEEPALIVE int rnw_handle(raft_node *n, double corr,
                                     const uint8_t *msg, int len, double random01) {
     if (len < 0 || corr < 0) return BJ_ERR_RANGE;
-    return rn_handle(n, (uint64_t)from, (uint32_t)corr, msg, (uint32_t)len, random01);
+    return rn_handle(n, (uint64_t)corr, msg, (uint32_t)len, random01);
 }
 
-EMSCRIPTEN_KEEPALIVE int rnw_on_reply(raft_node *n, int corr,
+EMSCRIPTEN_KEEPALIVE int rnw_on_reply(raft_node *n, double corr,
                                       const uint8_t *reply, int len, double random01) {
     if (len < 0 || corr < 0) return BJ_ERR_RANGE;
-    return rn_on_reply(n, (uint32_t)corr, reply, (uint32_t)len, random01);
+    return rn_on_reply(n, (uint64_t)corr, reply, (uint32_t)len, random01);
 }
 
-EMSCRIPTEN_KEEPALIVE int rnw_on_fail(raft_node *n, int corr) {
+EMSCRIPTEN_KEEPALIVE int rnw_on_fail(raft_node *n, double corr) {
     if (corr < 0) return BJ_ERR_RANGE;
-    return rn_on_fail(n, (uint32_t)corr);
+    return rn_on_fail(n, (uint64_t)corr);
 }
 
 /* ---- outbox ------------------------------------------------------------- */
@@ -90,8 +94,8 @@ EMSCRIPTEN_KEEPALIVE int    rnw_out_count(const raft_node *n) { return (int)rn_o
 EMSCRIPTEN_KEEPALIVE double rnw_out_peer(const raft_node *n, int i) {
     return (double)rn_out_peer(n, (uint32_t)i);
 }
-EMSCRIPTEN_KEEPALIVE int rnw_out_corr(const raft_node *n, int i) {
-    return (int)rn_out_corr(n, (uint32_t)i);
+EMSCRIPTEN_KEEPALIVE double rnw_out_corr(const raft_node *n, int i) {
+    return (double)rn_out_corr(n, (uint32_t)i);
 }
 EMSCRIPTEN_KEEPALIVE int rnw_out_is_reply(const raft_node *n, int i) {
     return rn_out_is_reply(n, (uint32_t)i);
@@ -137,8 +141,8 @@ EMSCRIPTEN_KEEPALIVE double rnw_match(const raft_node *n, double peer) {
 EMSCRIPTEN_KEEPALIVE double rnw_next(const raft_node *n, double peer) {
     return (double)rn_next(n, (uint64_t)peer);
 }
-EMSCRIPTEN_KEEPALIVE int rnw_inflight(const raft_node *n, double peer) {
-    return (int)rn_inflight(n, (uint64_t)peer);
+EMSCRIPTEN_KEEPALIVE double rnw_inflight(const raft_node *n, double peer) {
+    return (double)rn_inflight(n, (uint64_t)peer);
 }
 EMSCRIPTEN_KEEPALIVE int rnw_quorum(const raft_node *n) { return (int)rn_quorum(n); }
 EMSCRIPTEN_KEEPALIVE int rnw_is_quiesced(const raft_node *n) { return rn_is_quiesced(n); }

@@ -4742,7 +4742,7 @@ static void pump(rn_member *m, int count) {
         uint32_t nout = rn_out_count(m[i].node);
         for (uint32_t k = 0; k < nout; k++) {
             uint64_t to   = rn_out_peer(m[i].node, k);
-            uint32_t corr = rn_out_corr(m[i].node, k);
+            uint64_t corr = rn_out_corr(m[i].node, k);
             int is_reply  = rn_out_is_reply(m[i].node, k);
             uint32_t len = 0;
             const uint8_t *bytes = rn_out_bytes(m[i].node, k, &len);
@@ -4755,7 +4755,7 @@ static void pump(rn_member *m, int count) {
             for (int j = 0; j < count; j++) {
                 if (m[j].id != to) continue;
                 if (is_reply) rn_on_reply(m[j].node, corr, copy, len, 0.5);
-                else          rn_handle(m[j].node, m[i].id, corr, copy, len, 0.5);
+                else          rn_handle(m[j].node, corr, copy, len, 0.5);
                 break;
             }
             free(copy);
@@ -4810,6 +4810,86 @@ TEST(a_single_voter_group_commits_the_moment_it_elects_itself) {
     CHECK_I64(rn_out_count(n), 0);
 
     bj_builder_free(members);
+    rn_free(n);
+    elog_free(log);
+    memfs_free(fs);
+}
+
+TEST(a_reply_goes_to_whoever_the_message_says_sent_it) {
+    /*
+     * The host used to be asked who a message came from, and the JS one
+     * did not know: its transport pairs request and reply with a
+     * promise and carries no sender id, so it passed 0. That 0 rode
+     * straight into the outbox, breaking raft_node.h's own "a peer of 0
+     * never appears" invariant on every inbound message -- harmlessly
+     * there, because that host picks its reply out by correlation id,
+     * and not at all harmlessly for a host that routes by address.
+     *
+     * Every message in the grammar names its sender, so nobody has to be
+     * told. A fact nobody has to state is a fact nobody can state
+     * wrongly.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "raft.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(2, log);
+    CHECK_FATAL(n != NULL);
+    rn_start(n, 0, 0.5);
+
+    /* A vote request from candidate 7 -- who is not even a member of
+     * this node's (empty) config, and still gets answered: it may be a
+     * member of a newer one we have not seen. */
+    bj_builder *rv = bj_builder_new();
+    bj_begin_object(rv);
+    msg_kind(rv, "requestVote");
+    msg_kv_int(rv, "term", 3);
+    msg_kv_int(rv, "candidateId", 7);
+    msg_kv_int(rv, "lastLogIndex", 0);
+    msg_kv_int(rv, "lastLogTerm", 0);
+    bj_end_object(rv);
+    size_t rvlen; const uint8_t *rvbuf = bj_builder_data(rv, &rvlen);
+
+    CHECK_OK(rn_handle(n, 99, rvbuf, (uint32_t)rvlen, 0.5));
+    CHECK_I64((long long)rn_out_count(n), 1);
+    CHECK_I64((long long)rn_out_peer(n, 0), 7);    /* the candidate, not 0 */
+    CHECK_I64((long long)rn_out_corr(n, 0), 99);   /* the sender's id, echoed */
+    CHECK_I64(rn_out_is_reply(n, 0), 1);
+    rn_out_clear(n);
+
+    /* An AppendEntries is answered to its leader. */
+    bj_builder *ae = bj_builder_new();
+    bj_begin_object(ae);
+    msg_kind(ae, "appendEntries");
+    msg_kv_int(ae, "term", 3);
+    msg_kv_int(ae, "leaderId", 5);
+    msg_kv_int(ae, "prevLogIndex", 0);
+    msg_kv_int(ae, "prevLogTerm", 0);
+    msg_kv_int(ae, "leaderCommit", 0);
+    bj_end_object(ae);
+    size_t aelen; const uint8_t *aebuf = bj_builder_data(ae, &aelen);
+    CHECK_OK(rn_handle(n, 100, aebuf, (uint32_t)aelen, 0.5));
+    CHECK_I64((long long)rn_out_count(n), 1);
+    CHECK_I64((long long)rn_out_peer(n, 0), 5);
+    rn_out_clear(n);
+
+    /* A message that names nobody is one nobody can answer: refused,
+     * with nothing queued, rather than replied to at address 0. */
+    bj_builder *anon = bj_builder_new();
+    bj_begin_object(anon);
+    msg_kind(anon, "requestVote");
+    msg_kv_int(anon, "term", 3);
+    msg_kv_int(anon, "candidateId", 0);
+    bj_end_object(anon);
+    size_t anonlen; const uint8_t *anonbuf = bj_builder_data(anon, &anonlen);
+    CHECK_I64(rn_handle(n, 101, anonbuf, (uint32_t)anonlen, 0.5), RAFT_ERR_MESSAGE);
+    CHECK_I64((long long)rn_out_count(n), 0);
+
+    bj_builder_free(anon);
+    bj_builder_free(ae);
+    bj_builder_free(rv);
     rn_free(n);
     elog_free(log);
     memfs_free(fs);
@@ -5030,7 +5110,10 @@ TEST(a_stale_prevote_grant_cannot_elect_the_real_round) {
     rn_start(n, 0, 0.0);
     for (int64_t t = 0; t <= 1000 && rn_out_count(n) == 0; t += 10) rn_tick(n, t, 0.5);
     CHECK_I64((long long)rn_out_count(n), 2);
-    uint32_t pre_a = rn_out_corr(n, 0), pre_b = rn_out_corr(n, 1);
+    uint64_t pre_a = rn_out_corr(n, 0), pre_b = rn_out_corr(n, 1);
+    /* Issued, never reused: the counter only ever goes up, so no reply
+     * can be attributed to a request that is not the one it answers. */
+    CHECK(pre_b > pre_a);
     rn_out_clear(n);
     CHECK_I64(rn_role(n), RAFT_FOLLOWER);   /* a pre-voter is nothing yet */
 
@@ -5175,6 +5258,7 @@ int main(void) {
     RUN(a_stale_prevote_grant_cannot_elect_the_real_round);
     RUN(a_member_set_is_adopted_whole_or_refused_whole);
     RUN(effects_coalesce_rather_than_pile_up_and_a_loss_is_never_silent);
+    RUN(a_reply_goes_to_whoever_the_message_says_sent_it);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);
     RUN(snapshot_refuses_a_manifest_whose_files_are_not_there);

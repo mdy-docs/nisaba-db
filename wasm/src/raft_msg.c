@@ -81,6 +81,26 @@ int rmsg_kind(const uint8_t *msg, uint32_t len, int *kind_out) {
     return RAFT_ERR_MESSAGE;
 }
 
+int rmsg_sender(const uint8_t *msg, uint32_t len, uint64_t *out) {
+    *out = 0;
+    int kind = -1;
+    int e = rmsg_kind(msg, len, &kind);
+    if (e) return e;
+    uint64_t id = 0;
+    switch (kind) {
+        case RAFT_MSG_REQUEST_VOTE:     id = num_field(msg, len, "candidateId"); break;
+        case RAFT_MSG_APPEND_ENTRIES:
+        case RAFT_MSG_INSTALL_SNAPSHOT:
+        case RAFT_MSG_TIMEOUT_NOW:      id = num_field(msg, len, "leaderId");    break;
+        default: return RAFT_ERR_MESSAGE;   /* join/leave: not from a member */
+    }
+    /* 0 is "nobody" everywhere in this grammar, so a message that fails
+     * to name its sender is one nobody can answer. */
+    if (id == 0) return RAFT_ERR_MESSAGE;
+    *out = id;
+    return BJ_OK;
+}
+
 /* ---- replies ------------------------------------------------------------ */
 
 static int finish(bj_builder *b, dbuf *out) {

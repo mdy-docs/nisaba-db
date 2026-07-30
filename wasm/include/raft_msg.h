@@ -73,6 +73,17 @@ typedef enum {
 int rmsg_kind(const uint8_t *msg, uint32_t len, int *kind_out);
 
 /*
+ * Who sent it: candidateId on a RequestVote, leaderId on the rest.
+ *
+ * Every message in this grammar names its sender, so nobody has to be
+ * TOLD who a message came from -- and a fact nobody has to state is a
+ * fact nobody can state wrongly. RAFT_ERR_MESSAGE for a kind with no
+ * sender (join and leave come from outside the cluster) or one that
+ * names id 0, which is "nobody" everywhere here.
+ */
+int rmsg_sender(const uint8_t *msg, uint32_t len, uint64_t *out);
+
+/*
  * The node state these handlers read and change. In on the way down,
  * updated on the way back -- the caller writes the changed fields onto
  * its node and fires whatever observability it wants from `changed`.

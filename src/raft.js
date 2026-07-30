@@ -867,13 +867,16 @@ export class RaftNode {
    * with the correlation id minted below — the host picks its own out
    * and returns it; anything else queued alongside (there is normally
    * nothing) goes on the wire.
+   *
+   * The correlation id is minted here because this transport carries
+   * none: request and reply are paired by the promise, not by an id on
+   * the wire. A socket host would echo the id its framing carried
+   * instead. Who SENT the message is not minted here and never was the
+   * host's to say — the node reads it out of the message.
    */
   _handleRaftMessage(bytes) {
-    const corr = (this._inCorr = (this._inCorr + 1) >>> 0) || 1;
-    // `from` is 0: this transport does not name its sender, and C needs
-    // it only to address the reply — which the host is about to take
-    // back out of the outbox by correlation id rather than send.
-    const rc = this._core.handle(0, corr, bytes, this.random());
+    const corr = ++this._inCorr;
+    const rc = this._core.handle(corr, bytes, this.random());
     if (rc !== 0) throw new Error(`raft: message refused (${rc})`);
     let reply = EMPTY;
     for (const msg of this._core.drainOutbox()) {

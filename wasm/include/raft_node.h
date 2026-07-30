@@ -173,15 +173,22 @@ void rn_wake(raft_node *n, int64_t now, double random01);
 
 /*
  * An incoming message. The reply is queued as an outbox entry addressed
- * to `from` with the correlation id the sender used, so a host that
- * cannot distinguish a request from a reply on the wire does not have
- * to: it just sends what the outbox holds.
+ * to whoever sent it, carrying `corr` -- the correlation id the SENDER
+ * used, which a host reads off its own framing and echoes back, so a
+ * host that cannot distinguish a request from a reply on the wire does
+ * not have to: it just sends what the outbox holds.
+ *
+ * The sender is taken from the message (rmsg_sender), never from the
+ * caller. Every message in the grammar names who sent it, so a host has
+ * no business restating it -- and a host that had to state it could
+ * state it wrongly, which is how the outbox's "every entry is addressed"
+ * invariant gets broken from the outside.
  *
  * Only the two hot kinds are answered here (RequestVote, AppendEntries);
  * anything else is RAFT_ERR_MESSAGE, because answering it needs host
  * resources -- see the note at the top.
  */
-int rn_handle(raft_node *n, uint64_t from, uint32_t corr,
+int rn_handle(raft_node *n, uint64_t corr,
               const uint8_t *msg, uint32_t len, double random01);
 
 /*
@@ -189,11 +196,11 @@ int rn_handle(raft_node *n, uint64_t from, uint32_t corr,
  * with it; a stale or unknown id is RAFT_ERR_PEER, which is not an error
  * the host needs to act on -- it means the round it belonged to is over.
  */
-int rn_on_reply(raft_node *n, uint32_t corr, const uint8_t *reply, uint32_t len,
+int rn_on_reply(raft_node *n, uint64_t corr, const uint8_t *reply, uint32_t len,
                 double random01);
 
 /* The request with this correlation id will never be answered. */
-int rn_on_fail(raft_node *n, uint32_t corr);
+int rn_on_fail(raft_node *n, uint64_t corr);
 
 /* ---- the outbox --------------------------------------------------------- */
 
@@ -202,12 +209,15 @@ int rn_on_fail(raft_node *n, uint32_t corr);
  * node -- drain immediately, which every host does anyway because there
  * is nothing else to do with them.
  *
- * A peer of 0 never appears: every entry is addressed. Replies carry the
- * correlation id they are answering; requests carry a fresh one.
+ * A peer of 0 never appears: every entry is addressed, replies included,
+ * because the sender comes out of the message rather than from whoever
+ * called rn_handle. Replies carry the correlation id they are answering;
+ * requests carry a fresh one, and ids are issued from a 64-bit counter
+ * that never comes back around to one still outstanding.
  */
 uint32_t       rn_out_count(const raft_node *n);
 uint64_t       rn_out_peer(const raft_node *n, uint32_t i);
-uint32_t       rn_out_corr(const raft_node *n, uint32_t i);
+uint64_t       rn_out_corr(const raft_node *n, uint32_t i);
 int            rn_out_is_reply(const raft_node *n, uint32_t i);
 const uint8_t *rn_out_bytes(const raft_node *n, uint32_t i, uint32_t *len);
 void           rn_out_clear(raft_node *n);
@@ -259,7 +269,7 @@ uint64_t rn_match(const raft_node *n, uint64_t peer);
 uint64_t rn_next(const raft_node *n, uint64_t peer);
 /* The correlation id outstanding at `peer`, or 0 -- the leader's own
  * "is this one busy" bit, exposed for the host's status snapshot. */
-uint32_t rn_inflight(const raft_node *n, uint64_t peer);
+uint64_t rn_inflight(const raft_node *n, uint64_t peer);
 uint32_t rn_quorum(const raft_node *n);
 int      rn_is_quiesced(const raft_node *n);
 /* Has a quorum of voters answered within `within_ms` (check-quorum)? A

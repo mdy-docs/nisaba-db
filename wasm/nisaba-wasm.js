@@ -1381,16 +1381,21 @@ class RaftCore {
   quiesce() { requireModule()._rnw_quiesce(this._p); }
   wake(now, random01) { requireModule()._rnw_wake(this._p, now, random01); }
 
-  /** An incoming request. Its reply lands in the outbox addressed back
-   * to `from` with the same correlation id. `random01` seeds any election
-   * timer the message re-arms — passed in, never drawn, so a simulated
-   * cluster replays exactly. */
-  handle(from, corr, bytes, random01 = 0.5) {
+  /**
+   * An incoming request. Its reply lands in the outbox addressed back to
+   * whoever the MESSAGE says sent it — the node reads that itself, so a
+   * host with no sender id (this transport carries none) cannot get it
+   * wrong by inventing one. `corr` is the sender's correlation id, which
+   * the reply carries back; `random01` seeds any election timer the
+   * message re-arms — passed in, never drawn, so a simulated cluster
+   * replays exactly.
+   */
+  handle(corr, bytes, random01 = 0.5) {
     const M = requireModule();
     const p = M._malloc(bytes.length || 1);
     try {
       if (bytes.length) M.HEAPU8.set(bytes, p);
-      return M._rnw_handle(this._p, from, corr, p, bytes.length, random01);
+      return M._rnw_handle(this._p, corr, p, bytes.length, random01);
     } finally { M._free(p); }
   }
 

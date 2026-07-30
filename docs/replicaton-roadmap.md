@@ -124,6 +124,11 @@ Now the replication roadmap. Having read the new primitives' contracts, here's t
      write them through -- that is the file-seam piece, not this one, and
      it is specified in docs/steps/install-snapshot-in-c.md.
 
+   NOTE: the remaining work below, and what is left of the C pushdown, is
+   specified one brief per piece in docs/steps/ (see its README for the
+   dependency order). Each is written to be handed to someone who has not
+   been following the effort.
+
 6. Read semantics and change streams. Decide follower read policy (stale-ok vs. leader leases vs. readIndex). And change streams get a structural upgrade: db-plan.md:781 notes MongoDB's change streams tail the oplog and nisaba had "no analog" — the entry log is the analog now, giving resumable, gap-free streams.
 
 7. Testing, throughout. Deterministic simulation: in-memory transport with drop/delay/partition injection, plus crash-point tests that kill between append/sync/apply at every boundary (MemoryHandle makes that cheap, and the submodule's entrylog.durability-wasm.test.js is the model to copy).

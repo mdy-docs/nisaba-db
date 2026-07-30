@@ -11,6 +11,14 @@
 #            It is also the only job that can catch a memory error at all:
 #            the JS suites drive the same C, but a use-after-free there is
 #            invisible.
+#   wasi:    the same C harness cross-compiled to wasm32-wasip1 and run
+#            under Node's WASI host. Not redundant with `native`: wasm32
+#            has 32-bit pointers and a 1 MB stack where the native job has
+#            64-bit pointers and 8 MB, so this is the only job whose memory
+#            model resembles the one the library actually SHIPS on. It
+#            found a regex VM stack frame larger than the entire browser
+#            stack on its first run -- a corruption the native and node
+#            suites had both been passing over for as long as it existed.
 #   node:    the full node suite, including the real OPFS code paths
 #            (node-opfs shims navigator.storage in Node).
 #   browser: the *.browser.test.js suite under Playwright Chromium -- real
@@ -36,6 +44,36 @@ jobs:
         run: ./wasm/build-native.sh
       - name: Structures fuzz (ASan + UBSan)
         run: ./wasm/build-native.sh --fuzz 20000
+
+  wasi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # node:wasi only -- no npm install. wasm/run-wasi.mjs imports nothing
+      # but Node builtins, so this job stays as dependency-free as `native`
+      # and for the same reason: it defends a boundary that npm is on the
+      # wrong side of.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Pinned like emsdk is. A toolchain bump that changes codegen should
+      # arrive as a commit, not as a Tuesday.
+      - name: Install wasi-sdk 33
+        run: |
+          curl -sSLf -o /tmp/wasi-sdk.tar.gz \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz
+          mkdir -p /opt/wasi-sdk
+          tar xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+      - name: C harness on wasm32-wasip1
+        run: ./wasm/build-native.sh --wasi
+        env:
+          WASI_SDK: /opt/wasi-sdk
+      - name: Structures fuzz on wasm32-wasip1
+        run: ./wasm/build-native.sh --wasi --fuzz 20000
+        env:
+          WASI_SDK: /opt/wasi-sdk
 
   node:
     runs-on: ubuntu-latest

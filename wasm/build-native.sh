@@ -8,8 +8,16 @@
 #   ./wasm/build-native.sh --no-san     build + run without sanitizers
 #   ./wasm/build-native.sh --fuzz [n]   run the structures' hostile-file
 #                                       fuzz harness instead
-#   ./wasm/build-native.sh --wasi       cross-compile to wasm32-wasi
-#                                       (requires $WASI_SDK)
+#   ./wasm/build-native.sh --wasi       cross-compile to wasm32-wasip1
+#                                       and run it (requires $WASI_SDK,
+#                                       wasi-sdk 22 or newer)
+#
+# --wasi is the end-to-end proof of the whole C-pushdown effort: the same
+# manifest, the same sources, a different toolchain, and the harness has
+# to pass unchanged. It runs the result through Node's WASI host
+# (wasm/run-wasi.mjs) rather than a standalone runtime -- the artifact
+# imports nothing but wasi_snapshot_preview1 either way, and every CI
+# runner already has Node.
 #
 # --fuzz builds third_party/binjson-structures/test/fuzz.c against THIS
 # repo's checkouts. That submodule ships its own test/fuzz.sh, but it
@@ -37,7 +45,7 @@ for arg in "$@"; do
     --no-run) RUN=0 ;;
     --no-san) SAN=0 ;;
     --fuzz)   FUZZ=1 ;;
-    --wasi)   WASI=1; RUN=0; SAN=0 ;;
+    --wasi)   WASI=1; SAN=0 ;;
     [0-9]*)   FUZZ_ITERS="$arg" ;;
     *) echo "usage: $0 [--no-run] [--no-san] [--fuzz [iters]] [--wasi]" >&2; exit 2 ;;
   esac
@@ -68,7 +76,11 @@ if [ "$WASI" = 1 ]; then
   CC="$WASI_SDK/bin/clang"
   OUT="$OUT.wasm"
   FLAGS+=(
-    --target=wasm32-wasi
+    # wasip1, not the bare "wasm32-wasi" spelling: clang has deprecated
+    # that one and this build is -Werror, so it is a hard error rather
+    # than a warning. Needs wasi-sdk 22 or newer, which is where the
+    # versioned triples arrived.
+    --target=wasm32-wasip1
     --sysroot="$WASI_SDK/share/wasi-sysroot"
     # Not optional. emcc sets -sSTACK_SIZE=1048576 because the tree
     # traversals recurse up to their depth caps (BJ_MAX_DEPTH) on a
@@ -76,13 +88,19 @@ if [ "$WASI" = 1 ]; then
     # smaller, so hostile input smashes the stack instead of being
     # rejected. Keep this in lockstep with build-wasm.sh's value.
     -Wl,-z,stack-size=1048576
-    # A WASI artifact backs its files with real descriptors, so a writable
-    # bj_io with no sync callback is a durability bug rather than a
-    # legitimate memory-backed io -- bjio_check refuses one at open. The
-    # default native build does NOT set this: its harness runs entirely on
-    # memfs, whose writes are as durable as memory gets, which bjio.h
-    # documents as the case where a NULL sync is correct.
-    -DBJIO_REQUIRE_SYNC
+    # NOT -DBJIO_REQUIRE_SYNC, which this build used to set on the
+    # reasoning that a WASI artifact backs its files with real
+    # descriptors, so a writable bj_io with no sync callback is a
+    # durability bug. True of a shipping artifact; false of THIS binary,
+    # which is the test harness, and most of whose tests run on memfs --
+    # where a NULL sync is exactly what bjio.h says it should be. The
+    # flag belongs on the server binary when there is one, not here.
+    #
+    # Setting it here found something anyway, which is why the story is
+    # worth keeping: bjio_check duly refused every memfs io, twelve of
+    # the thirteen bjfile_init call sites ignored the refusal, and the
+    # structures carried on with a zeroed vtable until the first write
+    # trapped. See bjfile.h.
   )
 else
   CC="${CC:-cc}"
@@ -99,6 +117,16 @@ echo "cc: $CC  (${#SOURCES[@]} sources)"
 echo "built $OUT"
 
 if [ "$RUN" = 1 ]; then
+  if [ "$WASI" = 1 ]; then
+    # Two calls rather than an array spread: macOS ships bash 3.2, where
+    # "${ARR[@]}" on an empty array is an unbound-variable error under
+    # `set -u` -- the same reason build-wasm.sh reads its manifests with a
+    # while-read loop instead of mapfile.
+    if [ "$FUZZ" = 1 ]; then
+      exec node --experimental-wasi-unstable-preview1 wasm/run-wasi.mjs "$OUT" "$FUZZ_ITERS" 1
+    fi
+    exec node --experimental-wasi-unstable-preview1 wasm/run-wasi.mjs "$OUT"
+  fi
   if [ "$FUZZ" = 1 ]; then exec "$OUT" "$FUZZ_ITERS" 1; fi
   exec "$OUT"
 fi

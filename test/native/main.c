@@ -40,12 +40,43 @@
 #include "nscheck.h"
 #include "tap.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define ORDER 32   /* matches DB_DEFAULT_ORDER in wasm/nisaba-wasm.js */
+
+/*
+ * Somewhere to put real files, for the tests that exercise bjio_posix.
+ *
+ * Not mkdtemp. That is POSIX-2008 and wasi-libc has no version of it,
+ * because WASI has no global /tmp to invent a random name in: every path
+ * resolves under a directory the runtime preopened, and a program cannot
+ * reach outside one. So the base is the preopened cwd under WASI and
+ * /tmp natively, and uniqueness comes from a counter plus mkdir's
+ * refusal to clobber -- which is everything mkdtemp was providing to a
+ * single-threaded, single-process harness.
+ */
+#ifdef __wasi__
+#define SCRATCH_BASE "."
+#else
+#define SCRATCH_BASE "/tmp"
+#endif
+
+static int scratch_dir(const char *tag, char *out, size_t out_len) {
+    static unsigned seq = 0;
+    for (unsigned tries = 0; tries < 64; tries++) {
+        int n = snprintf(out, out_len, SCRATCH_BASE "/%s-%u", tag, seq++);
+        if (n < 0 || (size_t)n >= out_len) return -1;
+        if (mkdir(out, 0700) == 0) return 0;
+        if (errno != EEXIST) return -1;
+    }
+    return -1;
+}
+
 
 /* ---- fixtures --------------------------------------------------------- */
 
@@ -1317,8 +1348,8 @@ TEST(posix_namespace_backs_a_real_database) {
     /* The whole point of Phase 2: the same dc_* layer, over real files,
      * through bj_ns instead of a JS bridge. If this passes, the server
      * target is an adapter swap rather than a port. */
-    char tmpl[] = "/tmp/nisaba-native-XXXXXX";
-    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-native", tmpl, sizeof tmpl) == 0);
     int dirfd = open(tmpl, O_RDONLY);
     CHECK_FATAL(dirfd >= 0);
 
@@ -2275,8 +2306,8 @@ TEST(sweep_execute_drives_a_real_namespace) {
      * one unlinks immediately, while the browser's queues the name for
      * the host to drain. dc_sweep_execute cannot tell.
      */
-    char tmpl[] = "/tmp/nisaba-sweep-XXXXXX";
-    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-sweep", tmpl, sizeof tmpl) == 0);
     int dirfd = open(tmpl, O_RDONLY);
     CHECK_FATAL(dirfd >= 0);
     bj_ns ns;
@@ -2359,8 +2390,8 @@ TEST(compact_execute_builds_and_flips_over_real_files) {
      * plan/execute discipline costs the server nothing and buys the
      * browser everything.
      */
-    char tmpl[] = "/tmp/nisaba-compact-XXXXXX";
-    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-compact", tmpl, sizeof tmpl) == 0);
     int dirfd = open(tmpl, O_RDONLY);
     CHECK_FATAL(dirfd >= 0);
     bj_ns ns;
@@ -2508,8 +2539,8 @@ TEST(an_undeclared_open_is_caught_the_way_a_browser_catches_it) {
      * BJ_ERR_STATE in a browser, in the one operation hardest to reach
      * from a test.
      */
-    char tmpl[] = "/tmp/nisaba-nscheck-XXXXXX";
-    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-nscheck", tmpl, sizeof tmpl) == 0);
     int dirfd = open(tmpl, O_RDONLY);
     CHECK_FATAL(dirfd >= 0);
     bj_ns ns;
@@ -2624,8 +2655,8 @@ TEST(compaction_reclaims_space_without_the_truncate_flag) {
      * The checking adapter strips the flag, so this runs under browser
      * rules on a real filesystem.
      */
-    char tmpl[] = "/tmp/nisaba-trunc-XXXXXX";
-    CHECK_FATAL(mkdtemp(tmpl) != NULL);
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-trunc", tmpl, sizeof tmpl) == 0);
     int dirfd = open(tmpl, O_RDONLY);
     CHECK_FATAL(dirfd >= 0);
     bj_ns ns;

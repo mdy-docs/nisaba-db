@@ -806,7 +806,11 @@ int dc_sweep_plan(const uint8_t *catalog, size_t catalog_len,
         size_t at = 0;
         while (at < names_len) {
             const char *nm = names + at;
-            size_t nlen = strnlen(nm, names_len - at);
+            /* memchr, not strnlen: strnlen is POSIX-2008, and wasi-libc
+             * does not declare it under -std=c11. Same semantics -- an
+             * unterminated final name runs to the end of the buffer. */
+            const char *nul = (const char *)memchr(nm, '\0', names_len - at);
+            size_t nlen = nul ? (size_t)(nul - nm) : names_len - at;
             if (nlen == 0) { at += 1; continue; }
             /* Unreferenced AND ours: either condition alone deletes the
              * wrong thing. */

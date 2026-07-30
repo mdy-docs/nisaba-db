@@ -469,11 +469,23 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
  * This implementation does not detect no-op updates (e.g. $set to the
  * field's current value): every matched document counts as modified, so a
  * caller-facing modifiedCount can simply mirror *matched_count.
+ *
+ * `images`, when non-NULL, receives a binjson ARRAY of every document's
+ * POST-image -- the updated document, or the inserted one on an upsert --
+ * freshly malloc'd for the caller to free. Pass NULL to skip building it,
+ * which is the normal case.
+ *
+ * It exists because a change-stream consumer needs exactly those
+ * documents, and this loop already has each one in hand: without it the
+ * host had to re-read every matched document afterwards, one query each,
+ * a cost its own comment described as "O(matched) extra round trips".
+ * Collecting here is free.
  */
 int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *update, uint32_t update_len,
                    const uint8_t default_id[12], int upsert,
-                   int64_t *matched_count, int *upserted);
+                   int64_t *matched_count, int *upserted,
+                   uint8_t **images, size_t *images_len);
 
 /* Count of documents matching `filter` ({} is bpt_size of the primary tree,
  * O(1)). */

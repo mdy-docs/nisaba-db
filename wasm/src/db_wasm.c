@@ -294,24 +294,34 @@ EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_update(dcw_out *o, dc_collection *c,
 /* Writes a binjson OBJECT { matchedCount: number, upserted: bool } into the
  * out slot; matchedCount is 0 whenever upserted is true. Returns 0 on
  * success, negative on error. */
+/* `want_images` asks for every post-image alongside the counts -- what a
+ * change-stream consumer needs, and what the host otherwise had to
+ * re-read one query per matched document. */
 EMSCRIPTEN_KEEPALIVE int dcw_update_many(dcw_out *o, dc_collection *c,
         const uint8_t *filter, int filter_len,
         const uint8_t *update, int update_len,
-        const uint8_t *default_id, int upsert) {
+        const uint8_t *default_id, int upsert, int want_images) {
     reset_out(o);
     int64_t matched = 0; int upserted = 0;
+    uint8_t *images = NULL; size_t images_len = 0;
     int e = dc_update_many(c, filter, (uint32_t)filter_len,
                            update, (uint32_t)update_len,
-                           default_id, upsert, &matched, &upserted);
-    if (e) return e;
+                           default_id, upsert, &matched, &upserted,
+                           want_images ? &images : NULL,
+                           want_images ? &images_len : NULL);
+    if (e) { free(images); return e; }
 
     bj_builder *b = bj_builder_new();
-    if (!b) return BJ_ERR_OOM;
+    if (!b) { free(images); return BJ_ERR_OOM; }
     e = bj_begin_object(b);
     if (!e) e = bj_put_key(b, (const uint8_t *)"matchedCount", 12);
     if (!e) e = bj_put_int(b, matched);
     if (!e) e = bj_put_key(b, (const uint8_t *)"upserted", 8);
     if (!e) e = bj_put_bool(b, upserted);
+    if (!e && images) {
+        e = bj_put_key(b, (const uint8_t *)"documents", 9);
+        if (!e) e = bj_put_raw(b, images, (uint32_t)images_len);
+    }
     if (!e) e = bj_end_object(b);
     if (!e) {
         size_t n; const uint8_t *p = bj_builder_data(b, &n);
@@ -319,6 +329,7 @@ EMSCRIPTEN_KEEPALIVE int dcw_update_many(dcw_out *o, dc_collection *c,
         else e = dbuf_dup(p, n, &o->buf, &o->len);
     }
     bj_builder_free(b);
+    free(images);
     return e;
 }
 

@@ -2371,21 +2371,32 @@ class Collection {
     }
     update = resolveCurrentDate(update);
     const watching = this._watchers.size > 0;
-    const preIds = watching ? (await this.find(filter, { projection: { _id: 1 } }).toArray()).map(d => d._id) : null;
+    // With watchers, C hands back every post-image alongside the counts
+    // (dc_update_many's `images`). It already holds each updated document,
+    // so collecting them costs nothing -- where this side previously ran
+    // one find() for the ids and then one findOne() per matched document,
+    // which its own comment called "O(matched) extra round trips".
     const { rc, defaultId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_update_many(this._outCtx, this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0), _defaultId);
+      M._dcw_update_many(this._outCtx, this._collCtx, fp, fn, up, un, dp,
+                         upsert ? 1 : 0, watching ? 1 : 0), _defaultId);
     if (rc !== 0) throw codeError(rc, 'updateMany');
 
     const result = this._readOut(requireModule());
     if (watching) {
+      const images = result.documents || [];
       if (result.upserted) {
-        this._emitChange({ operationType: 'insert', documentKey: { _id: defaultId }, fullDocument: await this.findOne({ _id: defaultId }) });
+        this._emitChange({
+          operationType: 'insert',
+          documentKey: { _id: defaultId },
+          fullDocument: images[0] ?? null
+        });
       } else {
-        // Documented cost note: with active watchers this is O(matched)
-        // extra round trips (one findOne per matched document) -- fine for
-        // a demo/observability feature, not a hot path.
-        for (const _id of preIds) {
-          this._emitChange({ operationType: 'update', documentKey: { _id }, fullDocument: await this.findOne({ _id }) });
+        for (const fullDocument of images) {
+          this._emitChange({
+            operationType: 'update',
+            documentKey: { _id: fullDocument._id },
+            fullDocument
+          });
         }
       }
     }

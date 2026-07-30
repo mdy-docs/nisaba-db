@@ -2469,15 +2469,26 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
 int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *update, uint32_t update_len,
                    const uint8_t default_id[12], int upsert,
-                   int64_t *matched_count, int *upserted) {
+                   int64_t *matched_count, int *upserted,
+                   uint8_t **images, size_t *images_len) {
     *matched_count = 0; *upserted = 0;
+    if (images) { *images = NULL; *images_len = 0; }
+
+    /* Post-images are collected only when asked for; the builder stays
+     * NULL otherwise so a caller with no watchers pays nothing. */
+    bj_builder *img = NULL;
+    if (images) {
+        img = bj_builder_new();
+        if (!img) return BJ_ERR_OOM;
+        bj_begin_array(img);
+    }
 
     int e = upd_validate(update, update_len);
-    if (e) return e;
+    if (e) { bj_builder_free(img); return e; }
 
     qry_doc *matches; size_t match_count;
     e = gather_matches(c, filter, filter_len, &matches, &match_count);
-    if (e) return e;
+    if (e) { bj_builder_free(img); return e; }
 
     if (match_count == 0) {
         if (upsert) {
@@ -2490,6 +2501,8 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             if (!e) e = splice_id(updated, updated_len, default_id, &spliced, &spliced_len);
             free(updated);
             if (!e) e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
+            /* The inserted document is the upsert's post-image. */
+            if (!e && img) bj_put_raw(img, spliced, (uint32_t)spliced_len);
             free(spliced);
             if (!e) *upserted = 1;
         }
@@ -2513,12 +2526,29 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             }
             if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
             if (!e) e = commit_journal(c);
+            /* Recorded only after the write committed, so a caller never
+             * sees an event for a document that did not land. */
+            if (!e && img) bj_put_raw(img, updated, (uint32_t)updated_len);
             free(updated);
             e = mut_end(c, undo, e);
         }
     }
 
     free_matches(matches, match_count);
+
+    if (img) {
+        if (!e) {
+            bj_end_array(img);
+            e = bj_builder_error(img);
+            if (!e) {
+                size_t l = 0;
+                const uint8_t *d = bj_builder_data(img, &l);
+                if (!d) e = BJ_ERR_STATE;
+                else e = dbuf_dup(d, l, images, images_len);
+            }
+        }
+        bj_builder_free(img);
+    }
     return e;
 }
 

@@ -256,7 +256,7 @@ TEST(update_and_delete) {
     mk_oid(default_id, 99);
     int64_t matched = 0; int upserted = 0;
     CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen,
-                            default_id, 0, &matched, &upserted));
+                            default_id, 0, &matched, &upserted, NULL, NULL));
     CHECK_I64(matched, 2);
     CHECK_I64(upserted, 0);
 
@@ -2374,7 +2374,66 @@ TEST(compact_execute_builds_and_flips_over_real_files) {
     /* Leave the directory for the OS; the files are all in tmpl. */
 }
 
+TEST(update_many_hands_back_post_images_when_asked) {
+    /*
+     * A change-stream consumer needs every updated document. The host used
+     * to get them by re-reading each matched _id afterwards -- one query
+     * per document, a cost the JS comment itself called "O(matched) extra
+     * round trips". This loop already holds each post-image, so collecting
+     * them is free.
+     */
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-people.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+    CHECK_OK(insert_person(fx.coll, 2, "Grace", "core", 45));
+    CHECK_OK(insert_person(fx.coll, 3, "Alan", "research", 41));
+
+    doc *q = doc_new();
+    doc_str(q, "team", "core");
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+    doc *u = doc_new();
+    doc_begin_obj(u, "$set");
+    doc_key(u, "seen");
+    bj_put_bool(u->b, 1);
+    doc_end_obj(u);
+    uint32_t ulen; const uint8_t *ubuf = doc_done(u, &ulen);
+
+    uint8_t default_id[12];
+    mk_oid(default_id, 99);
+    int64_t matched = 0; int upserted = 0;
+    uint8_t *images = NULL; size_t images_len = 0;
+    CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 0,
+                            &matched, &upserted, &images, &images_len));
+    CHECK_I64(matched, 2);
+    CHECK_I64(arr_count(images, images_len), 2);
+    /* POST-images: the $set is already applied in what comes back. */
+    CHECK(find_bytes(images, images_len, "seen", 4) != NULL);
+    free(images);
+
+    /* Not asking costs nothing and returns nothing. */
+    images = NULL; images_len = 0;
+    CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 0,
+                            &matched, &upserted, NULL, NULL));
+    CHECK(images == NULL);
+
+    /* An upsert's post-image is the inserted document. */
+    doc *q2 = doc_new();
+    doc_str(q2, "team", "brand-new");
+    uint32_t q2len; const uint8_t *q2buf = doc_done(q2, &q2len);
+    images = NULL; images_len = 0;
+    CHECK_OK(dc_update_many(fx.coll, q2buf, q2len, ubuf, ulen, default_id, 1,
+                            &matched, &upserted, &images, &images_len));
+    CHECK_I64(upserted, 1);
+    CHECK_I64(arr_count(images, images_len), 1);
+    CHECK(find_bytes(images, images_len, "brand-new", 9) != NULL);
+    free(images);
+
+    doc_free(q2); doc_free(u); doc_free(q);
+    fx_close(&fx);
+}
+
 int main(void) {
+    RUN(update_many_hands_back_post_images_when_asked);
     RUN(compact_execute_builds_and_flips_over_real_files);
     RUN(sweep_execute_drives_a_real_namespace);
     RUN(compact_plan_regenerates_every_name_and_keeps_every_option);

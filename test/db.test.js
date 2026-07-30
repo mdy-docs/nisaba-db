@@ -1664,6 +1664,45 @@ describe('db: change streams (watch)', () => {
     spy.mockRestore();
     await db.close();
   });
+
+  it('updateMany with a watcher costs no extra queries either', async () => {
+    // It used to cost one find() for the ids plus one findOne() per
+    // matched document -- "O(matched) extra round trips", by its own
+    // comment. C hands back every post-image alongside the counts now
+    // (dc_update_many's `images`), because the update loop already holds
+    // each one.
+    const db = await openDb();
+    const users = await db.collection('users');
+    await users.insertMany([
+      { name: 'Ada', team: 'core' },
+      { name: 'Grace', team: 'core' },
+      { name: 'Linus', team: 'core' }
+    ]);
+
+    const seen = [];
+    const stream = users.watch();
+    stream.on('change', (e) => seen.push(e));
+
+    const findOneSpy = vi.spyOn(users, 'findOne');
+    const findSpy = vi.spyOn(users, 'find');
+    await users.updateMany({ team: 'core' }, { $set: { onCall: true } });
+    expect(findOneSpy).not.toHaveBeenCalled();
+    expect(findSpy).not.toHaveBeenCalled();
+
+    // ...and the events are still complete, with post-images.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(seen).toHaveLength(3);
+    expect(seen.every((e) => e.operationType === 'update')).toBe(true);
+    expect(seen.every((e) => e.fullDocument.onCall === true)).toBe(true);
+    expect(seen.map((e) => e.fullDocument.name).sort())
+      .toEqual(['Ada', 'Grace', 'Linus']);
+    expect(seen.every((e) => e.documentKey._id)).toBe(true);
+
+    findSpy.mockRestore();
+    findOneSpy.mockRestore();
+    stream.close();
+    await db.close();
+  });
 });
 
 describe('db: text index ($text, milestone 6)', () => {

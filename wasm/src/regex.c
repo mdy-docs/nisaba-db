@@ -106,18 +106,22 @@ static int utf8_to_utf16(const uint8_t *s, size_t len, int nul_terminate,
 
 /* ---- Compiled-pattern cache -------------------------------------------
  *
- * A Program (regexp.h) is a fixed-size struct dominated by its opcode and
- * character-class tables -- ~2MB regardless of how short the pattern text
- * is (verified: sizeof(Program) on this build). db_query.c calls rx_match
- * once per candidate value per document; recompiling a ~2MB structure on
- * every one of those calls during a collection scan would make $regex
- * queries catastrophically slow. Caching a handful of compiled patterns
- * (keyed on the exact pattern bytes + flags) means only the *first*
- * document matched against a new pattern pays the compile cost -- every
- * later call against the same pattern is just regex_exec, which is fast.
- * Bounded (not "cache everything forever") so a workload cycling through
- * many distinct patterns over a process's lifetime has a fixed ~16MB
- * ceiling rather than unbounded growth.
+ * db_query.c calls rx_match once per candidate value per document, and
+ * compiling a pattern means lexing, parsing and code-generating it.
+ * Redoing that on every one of those calls during a collection scan would
+ * make $regex queries catastrophically slow. Caching a handful of compiled
+ * patterns (keyed on the exact pattern bytes + flags) means only the
+ * *first* document matched against a new pattern pays the compile cost --
+ * every later call against the same pattern is just regex_exec.
+ *
+ * This note used to add that a Program was ~2 MB whatever the pattern, so
+ * the cache was also avoiding a large allocation per document, and put the
+ * capacity's ceiling at ~16 MB. Engine v0.3.0 moved the opcode and class
+ * tables onto the heap and sized them to the pattern: sizeof(Program) is
+ * 19,488 bytes now, so the ceiling is ~156 KB and the memory argument is
+ * gone. The compute argument is not, and it was always the stronger one.
+ * Still bounded rather than "cache everything forever", so a workload
+ * cycling through many distinct patterns has a fixed ceiling.
  */
 #define REGEX_CACHE_CAPACITY 8
 

@@ -21,12 +21,18 @@
  * `$options` is a separate, not-yet-done step (db_query.c's own
  * $options-parsing still hard-rejects anything but `i`).
  *
- * Compiling a pattern is expensive here on purpose: a Program is a
- * fixed-size, multi-megabyte struct (regexp.h's opcode/class tables), not
- * a compact bytecode array, so this module keeps a small process-lifetime
- * LRU cache of compiled patterns (see regex.c) rather than recompiling per
- * document the way the old engine's rx_match did -- that was fine for a
- * lightweight parser, catastrophic for this one at collection-scan scale.
+ * Compiling a pattern is expensive, so this module keeps a small
+ * process-lifetime LRU cache of compiled patterns (see regex.c) rather
+ * than recompiling per document the way the old engine's rx_match did --
+ * fine for a lightweight parser, catastrophic for this one at
+ * collection-scan scale.
+ *
+ * The cache once had a second justification: a Program was a fixed-size
+ * ~1.9 MB struct of embedded opcode and class tables. Engine v0.3.0 moved
+ * those to the heap and sized them to the pattern, so a Program is 19 KB
+ * now. The cache stays -- lex, parse and compile still cost far more than
+ * a lookup -- but it is a compute cache, not a memory one, and the ~16 MB
+ * ceiling the old sizing implied is really about 156 KB.
  */
 #ifndef REGEX_H
 #define REGEX_H

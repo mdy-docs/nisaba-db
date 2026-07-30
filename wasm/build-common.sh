@@ -86,7 +86,15 @@ all_sources() {
     echo third_party/binjson/src/binjson.c
     echo third_party/binjson/src/binjson_wasm.c
     read_manifest third_party/binjson-structures/wasm/sources.txt third_party/binjson-structures/
-    echo third_party/regex-engine/src/regexp.c
+    # Four files, not one: the engine split regexp.c into lexer, parser,
+    # compiler and VM at v0.3.0. Listed in dependency-free order -- the
+    # link does not care -- and kept inline rather than in a manifest for
+    # the same reason binjson's two are: this submodule ships no
+    # wasm/sources.txt of its own.
+    echo third_party/regex-engine/src/re_lexer.c
+    echo third_party/regex-engine/src/re_parser.c
+    echo third_party/regex-engine/src/re_compiler.c
+    echo third_party/regex-engine/src/re_vm.c
     echo third_party/regex-engine/src/regex_wasm.c
     read_manifest wasm/sources.txt
   } | while IFS= read -r src; do

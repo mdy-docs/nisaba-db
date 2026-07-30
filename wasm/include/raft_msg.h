@@ -59,7 +59,13 @@ typedef enum {
     RAFT_MSG_APPEND_ENTRIES   = 1,
     RAFT_MSG_INSTALL_SNAPSHOT = 2,
     RAFT_MSG_JOIN             = 3,
-    RAFT_MSG_LEAVE            = 4
+    RAFT_MSG_LEAVE            = 4,
+    /* Graceful leadership transfer (section 3.10). Carried here so the
+     * grammar stays the whole grammar: a kind C cannot name is one the
+     * host has to route by decoding the message itself, which is the
+     * split this header exists to remove. C classifies it; the election
+     * it triggers is still the host's, until phase 7c. */
+    RAFT_MSG_TIMEOUT_NOW      = 5
 } raft_msg_kind;
 
 /* Which kind is this? RAFT_ERR_MESSAGE if it is none of them. Lets a

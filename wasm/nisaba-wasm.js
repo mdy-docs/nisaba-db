@@ -1253,7 +1253,8 @@ function withRaftState(st, fn) {
  */
 const raftMsg = {
   KIND: Object.freeze({
-    REQUEST_VOTE: 0, APPEND_ENTRIES: 1, INSTALL_SNAPSHOT: 2, JOIN: 3, LEAVE: 4
+    REQUEST_VOTE: 0, APPEND_ENTRIES: 1, INSTALL_SNAPSHOT: 2, JOIN: 3, LEAVE: 4,
+    TIMEOUT_NOW: 5
   }),
 
   /** Which kind is this, without interpreting it. Negative on a message

@@ -381,3 +381,148 @@ describe('raft: failures and partitions', () => {
     await until(sim, cluster, () => [...cluster.values()].every((m) => m.machine.map.get('k4') === 4));
   });
 });
+
+describe('raft: config precedence on restart', () => {
+  it('a restarted survivor keeps the latest-in-log CONFIG over older replayed ones (leader removed itself)', async () => {
+    // The stuck-survivor shape behind graceful node retirement (drain):
+    // in a two-voter group the leader commits its OWN removal and steps
+    // down at apply, possibly before the survivor ever learns the new
+    // commit index. The survivor restarts to heal: the boot scan adopts
+    // the removal CONFIG (latest in log, uncommitted locally), but the
+    // apply pump then replays from the state machine's floor — which
+    // sits BELOW the older, committed CONFIG entries. Those replayed
+    // configs must not regress membership over the scan's newer one
+    // (RaftNode._configIndex), or the survivor solicits votes from the
+    // removed leader forever and the group is dead.
+    const { sim, net, cluster, leader } = await electedCluster(31, 2);
+    const L = leader();
+    const F = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    const [lid, fid] = [L.node.id, F.node.id];
+
+    await settle(sim, cluster, L.node.propose(kvSet('kept', 1)));
+    // Two CONFIG entries below the final one: add an absent member 9,
+    // remove it again — the history the pump will later replay.
+    expect((await settle(sim, cluster, L.node.changeMembership([lid, fid, { id: 9, host: 'node9', port: 7009 }]))).error).toBeUndefined();
+    expect((await settle(sim, cluster, L.node.changeMembership([lid, fid]))).error).toBeUndefined();
+
+    // The leader removes ITSELF: the entry commits under the old quorum
+    // (both nodes ack), the leader steps down at apply — its in-flight
+    // propose may reject NotLeaderError even though the change is in.
+    const { error } = await settle(sim, cluster, L.node.changeMembership([fid]));
+    if (error) expect(error).toBeInstanceOf(NotLeaderError);
+    await until(sim, cluster, () => F.log.lastIndex === L.log.lastIndex);
+    expect(L.node.role).not.toBe('leader');
+
+    // The survivor is stuck live (its applied config still names both
+    // voters and the removed leader refuses to vote) — restart it, the
+    // documented heal.
+    await stopNode(net, F);
+    const reborn = await bootNode(fid, [lid, fid], sim, net, F.handle);
+    cluster.set(fid, reborn);
+
+    // The latest-in-log CONFIG survived the replay of its predecessors...
+    await until(sim, cluster, () => reborn.node.voters.length === 1 && reborn.node.role === 'leader');
+    expect(reborn.node.voters).toEqual([fid]);
+    // ...and the sole survivor serves again, data intact.
+    expect(reborn.machine.map.get('kept')).toBe(1);
+    const w = await settle(sim, cluster, reborn.node.propose(kvSet('after', 2)));
+    expect(w.error).toBeUndefined();
+    expect(reborn.machine.map.get('after')).toBe(2);
+  });
+});
+
+describe('raft: leadership transfer (TimeoutNow, §3.10)', () => {
+  it('moves leadership to a caught-up voter: immediate election, old leader steps down, writes continue', async () => {
+    const { sim, cluster, leader } = await electedCluster(41);
+    const old = leader();
+    await settle(sim, cluster, old.node.propose(kvSet('before', 1)));
+    const target = [...cluster.values()].find((m) => m.node.id !== old.node.id);
+
+    const { error } = await settle(sim, cluster, old.node.transferLeadership(target.node.id));
+    expect(error).toBeUndefined();
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    expect(target.node.role).toBe('leader');
+    expect(old.node.role).toBe('follower');
+
+    // Committed data survived and the new leader serves writes.
+    expect(target.machine.map.get('before')).toBe(1);
+    const w = await settle(sim, cluster, target.node.propose(kvSet('after', 2)));
+    expect(w.error).toBeUndefined();
+  });
+
+  it('fences new proposals during the transfer, hinting the TARGET as the leader', async () => {
+    const { sim, cluster, leader } = await electedCluster(42);
+    const old = leader();
+    await settle(sim, cluster, old.node.propose(kvSet('a', 1)));
+    const target = [...cluster.values()].find((m) => m.node.id !== old.node.id);
+
+    const transfer = old.node.transferLeadership(target.node.id);
+    let fenced = null;
+    await old.node.propose(kvSet('b', 2)).catch((err) => (fenced = err));
+    expect(fenced).toBeInstanceOf(NotLeaderError);
+    expect(fenced.leaderId).toBe(target.node.id); // rerouting callers land where leadership is headed
+    expect((await settle(sim, cluster, transfer)).error).toBeUndefined();
+  });
+
+  it('transfer to self is a no-op; a non-voter target and a non-leader caller are refused', async () => {
+    const { sim, cluster, leader } = await electedCluster(43);
+    const old = leader();
+    await expect(old.node.transferLeadership(old.node.id)).resolves.toBeUndefined();
+    await expect(old.node.transferLeadership(99)).rejects.toThrow(/not a voting member/);
+    const follower = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    await expect(follower.node.transferLeadership(old.node.id)).rejects.toThrow(NotLeaderError);
+    // Nothing above disturbed the incumbent.
+    expect(old.node.role).toBe('leader');
+    const w = await settle(sim, cluster, old.node.propose(kvSet('x', 1)));
+    expect(w.error).toBeUndefined();
+  });
+
+  it('aborts when the target is unreachable: the fence lifts and the leader resumes serving', async () => {
+    const { sim, net, cluster, leader } = await electedCluster(44);
+    const old = leader();
+    await settle(sim, cluster, old.node.propose(kvSet('a', 1)));
+    const target = [...cluster.values()].find((m) => m.node.id !== old.node.id);
+    net.partition([...cluster.keys()].filter((id) => id !== target.node.id), [target.node.id]);
+
+    const { error } = await settle(sim, cluster, old.node.transferLeadership(target.node.id));
+    expect(String(error?.message)).toMatch(/timed out/);
+    expect(old.node.role).toBe('leader'); // still the incumbent...
+    const w = await settle(sim, cluster, old.node.propose(kvSet('b', 2)));
+    expect(w.error).toBeUndefined();      // ...and the fence is gone
+  });
+});
+
+describe('raft: check-quorum (hasQuorumContact)', () => {
+  it('true for a reachable leader, false once it cannot reach a quorum, and always true where it is meaningless', async () => {
+    const { sim, net, cluster, leader } = await electedCluster(61);
+    const L = leader();
+    await settle(sim, cluster, L.node.propose(kvSet('a', 1)));
+    expect(L.node.hasQuorumContact(1_000)).toBe(true);
+
+    // A follower has nothing to vouch for: never gates its caller.
+    const F = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    expect(F.node.hasQuorumContact(1)).toBe(true);
+
+    // Isolate the leader. It never learns a higher term, so it keeps
+    // claiming leadership -- but it can no longer prove it.
+    const others = [...cluster.keys()].filter((id) => id !== L.node.id);
+    net.partition(others, [L.node.id]);
+    await sim.advance(2_000, [...cluster.values()].map((m) => m.node));
+    expect(L.node.role).toBe('leader');              // still believes it leads
+    expect(L.node.hasQuorumContact(500)).toBe(false); // but cannot show it
+
+    // Healing restores contact on the next heartbeat round.
+    net.heal();
+    await until(sim, cluster, () => leaders(cluster).length === 1);
+    const settledLeader = leaders(cluster)[0];
+    expect(settledLeader.node.hasQuorumContact(1_000)).toBe(true);
+  });
+
+  it('a single-voter group can always prove leadership (nobody to hear from)', async () => {
+    const { sim, cluster, leader } = await electedCluster(62, 1);
+    const solo = leader();
+    await sim.advance(5_000, [solo.node]);
+    expect(solo.node.role).toBe('leader');
+    expect(solo.node.hasQuorumContact(1)).toBe(true);
+  });
+});

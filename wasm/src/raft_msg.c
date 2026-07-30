@@ -9,7 +9,8 @@
 
 /* The wire spelling of each kind. The only place these strings exist. */
 static const char *const KIND_NAME[] = {
-    "requestVote", "appendEntries", "installSnapshot", "join", "leave"
+    "requestVote", "appendEntries", "installSnapshot", "join", "leave",
+    "timeoutNow"
 };
 #define KIND_COUNT ((int)(sizeof(KIND_NAME) / sizeof(KIND_NAME[0])))
 

@@ -51,7 +51,7 @@ import { connect, EntryLog, crc32, isDeterministicError } from '../wasm/nisaba-w
 import { RaftNode, NotLeaderError } from './raft.js';
 import {
   WalDb, WAL_FILE, SNAP_PREFIX,
-  openWalStorage, restoreFromStore
+  openWalStorage, restoreFromStore, reconcileLogWithAppliedFloor
 } from './db-wal.js';
 
 /** How many recent per-entry results the state machine retains for local
@@ -122,6 +122,20 @@ export class ReplicatedDb extends WalDb {
   /** The RaftNode — role/term/leaderId for routing, tick() for the host's
    * clock, handleMessage() for the transport's receiving half. */
   get raft() { return this._raft; }
+
+  /**
+   * Graceful leadership transfer to another VOTING member — the
+   * zero-data-copy rebalance (RaftNode.transferLeadership, §3.10):
+   * fence new writes (they reject NotLeaderError hinting the target),
+   * catch the target up, TimeoutNow, step down when it wins. Resolves
+   * once leadership has left this node; rejects — and normal service
+   * resumes — if the target doesn't take over in time. Leader-only:
+   * callers route it like any write.
+   */
+  async transferLeadership(targetId, options) {
+    if (!this._raft) throw new Error('transferLeadership: node is not started');
+    return this._raft.transferLeadership(targetId, options);
+  }
 
   /** One JSON-able snapshot: the RaftNode's status plus the database's
    * own facts (collections, snapshot generation, applied position).
@@ -316,7 +330,10 @@ export async function connectReplicated(provider, options = {}) {
   }
   const db = await connect(provider, dbOptions);
   try {
-    const { store, log } = await openWalStorage(provider, { snapshotPrefix });
+    const { store, log: rawLog, logName } = await openWalStorage(provider, { snapshotPrefix });
+    // Restored-applied-state shape (log behind the replay floor): re-base
+    // before the RaftNode ever sees the log — see the helper's contract.
+    const log = await reconcileLogWithAppliedFloor(db, rawLog, logName, provider);
     const rdb = new ReplicatedDb(db, log, { provider, store, dbOptions });
     const machine = new DbStateMachine(rdb);
     const node = new RaftNode({

@@ -3455,6 +3455,33 @@ TEST(raft_request_vote_runs_end_to_end_in_c) {
     CHECK_RC(rmsg_kind(bbuf, (uint32_t)blen, &kind), RAFT_ERR_MESSAGE);
     dbuf_free(&reply);
 
+    /*
+     * Every kind the grammar names classifies, including the ones C does
+     * not itself handle. That matters more than it looks: the host routes
+     * on this number, so a kind missing from KIND_NAME is not "handled
+     * elsewhere" -- it is a message the host cannot recognise at all, and
+     * the node answers a well-formed peer with "unrecognized message".
+     * timeoutNow arrived exactly that way, added to the JS side while the
+     * C table stayed at five.
+     */
+    {
+        static const char *const kinds[] = {
+            "requestVote", "appendEntries", "installSnapshot",
+            "join", "leave", "timeoutNow"
+        };
+        for (int i = 0; i < (int)(sizeof(kinds) / sizeof(kinds[0])); i++) {
+            bj_builder *k = bj_builder_new();
+            bj_begin_object(k);
+            msg_kind(k, kinds[i]);
+            bj_end_object(k);
+            size_t klen; const uint8_t *kbuf = bj_builder_data(k, &klen);
+            int got = -1;
+            CHECK_OK(rmsg_kind(kbuf, (uint32_t)klen, &got));
+            CHECK_I64(got, i);
+            bj_builder_free(k);
+        }
+    }
+
     bj_builder_free(bad); bj_builder_free(m2); bj_builder_free(m);
     follower_close(&f);
 }

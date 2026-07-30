@@ -501,3 +501,48 @@ describe('WAL: semantics under load', () => {
     await db2.close();
   });
 });
+
+describe('WAL: log lost, applied state survives (the backup-restore shape)', () => {
+  it('re-bases the log at the applied floor and keeps serving writes', async () => {
+    const provider = new MemoryStorageProvider();
+    const db1 = await connectWal(provider);
+    const users = await db1.collection('users');
+    for (let i = 1; i <= 3; i++) await users.insertOne({ _id: oid(i), i });
+    await db1.close();
+
+    // Applied files survive, the log does not — a restore of applied
+    // state only, or a hand-deleted WAL. Without reconciliation the
+    // reopened log restarts at index 1 and the first write's
+    // setAppliedIndex(1 < 3) is refused, failing every write forever.
+    await provider.deleteFile(WAL_FILE);
+
+    const db2 = await connectWal(provider);
+    const users2 = await db2.collection('users');
+    expect(await users2.countDocuments({})).toBe(3);
+    expect(db2.log.baseIndex).toBe(3); // re-based at the applied floor
+    expect(db2.log.lastIndex).toBe(3);
+    await users2.insertOne({ _id: oid(4), i: 4 }); // appends resume at floor + 1
+    expect(db2.log.lastIndex).toBe(4);
+    expect(await users2.countDocuments({})).toBe(4);
+    await db2.close();
+
+    // The re-based log is an ordinary log thereafter: reopen replays
+    // nothing (everything applied) and serves normally.
+    const db3 = await connectWal(provider);
+    expect(await (await db3.collection('users')).countDocuments({})).toBe(4);
+    expect(db3.log.baseIndex).toBe(3);
+    await db3.close();
+  });
+
+  it('leaves a consistent log alone', async () => {
+    const provider = new MemoryStorageProvider();
+    const db1 = await connectWal(provider);
+    await (await db1.collection('users')).insertOne({ _id: oid(1) });
+    await db1.close();
+
+    const db2 = await connectWal(provider); // log intact: no re-base
+    expect(db2.log.baseIndex).toBe(0);
+    expect(db2.log.lastIndex).toBe(1);
+    await db2.close();
+  });
+});

@@ -75,6 +75,7 @@ else
   SOURCES+=(test/native/memfs.c test/native/nscheck.c test/native/main.c)
 fi
 
+LIBS=()
 FLAGS=(
   -std=c11 -g -O1
   -Wall -Wextra -Werror
@@ -125,15 +126,19 @@ if [ "$WASI" = 1 ]; then
 else
   CC="${CC:-cc}"
   # geo.c uses sin/cos/atan2/sqrt; emscripten links libm implicitly,
-  # a native toolchain does not.
-  FLAGS+=(-lm)
+  # a native toolchain does not. AFTER the sources on the command line:
+  # GNU ld resolves left to right and drops a library nothing has asked
+  # for yet, so -lm in FLAGS links on macOS and fails on Linux with
+  # --no-san (with sanitizers it survives, because their runtime pulls
+  # libm in behind the objects). build-server.sh hit exactly that.
+  LIBS+=(-lm)
   if [ "$SAN" = 1 ]; then
     FLAGS+=(-fsanitize=address,undefined -fno-sanitize-recover=all)
   fi
 fi
 
 echo "cc: $CC  (${#SOURCES[@]} sources)"
-"$CC" "${FLAGS[@]}" -o "$OUT" "${SOURCES[@]}"
+"$CC" "${FLAGS[@]}" -o "$OUT" "${SOURCES[@]}" ${LIBS+"${LIBS[@]}"}
 echo "built $OUT"
 
 if [ "$RUN" = 1 ]; then

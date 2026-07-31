@@ -47,12 +47,17 @@ while IFS= read -r src; do SOURCES+=("$src"); done < <(all_sources native)
 SOURCES+=(server/main.c)
 
 FLAGS=(-std=c11 -O2 -Wall -Wextra -Werror "${INCLUDE_FLAGS[@]}")
+# Libraries go AFTER the sources: GNU ld resolves left to right and drops
+# a library nothing has needed yet, so -lm among the flags links on macOS
+# and leaves cos/log/floor undefined on Linux.
+LIBS=()
 
 case "$TARGET" in
   native)
     CC="${CC:-cc}"
     OUT=wasm/lib/nisaba-server
-    FLAGS+=(-lm -DNISABA_SOCKETS=1)
+    FLAGS+=(-DNISABA_SOCKETS=1)
+    LIBS+=(-lm)   # geo.c/textindex.c/db_session.c: cos, log, floor
     ;;
   wasip1|wasip2)
     SDK="$(find_wasi_sdk)" || { wasi_sdk_missing; exit 1; }
@@ -74,7 +79,7 @@ case "$TARGET" in
 esac
 
 echo "cc: $CC  (${#SOURCES[@]} sources) -> $OUT"
-"$CC" "${FLAGS[@]}" -o "$OUT" "${SOURCES[@]}"
+"$CC" "${FLAGS[@]}" -o "$OUT" "${SOURCES[@]}" ${LIBS+"${LIBS[@]}"}
 echo "built $OUT ($(wc -c < "$OUT") bytes)"
 
 if [ "$RUN" = 1 ]; then

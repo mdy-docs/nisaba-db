@@ -71,7 +71,24 @@
 static int scratch_dir(const char *tag, char *out, size_t out_len) {
     static unsigned seq = 0;
     for (unsigned tries = 0; tries < 64; tries++) {
+        /* The pid is what makes this survive being run twice. The tests
+         * deliberately leave their directories behind ("the files are all
+         * in tmpl"), /tmp is not cleaned between runs, and a bare counter
+         * collides with the PREVIOUS run's names -- so the 65th run on a
+         * developer machine fails right here, in a test that is otherwise
+         * about compaction. (Observed, at 251 leftover directories.)
+         *
+         * Native only. WASI gets a fresh preopened directory every run so
+         * nothing accumulates, and it has no process ids at all: getpid
+         * there is a deprecated stub that needs -D_WASI_EMULATED_GETPID
+         * and a library to match, which -Werror turns into a build
+         * failure rather than a surprise. */
+#ifdef __wasi__
         int n = snprintf(out, out_len, SCRATCH_BASE "/%s-%u", tag, seq++);
+#else
+        int n = snprintf(out, out_len, SCRATCH_BASE "/%s-%ld-%u",
+                         tag, (long)getpid(), seq++);
+#endif
         if (n < 0 || (size_t)n >= out_len) return -1;
         if (mkdir(out, 0700) == 0) return 0;
         if (errno != EEXIST) return -1;

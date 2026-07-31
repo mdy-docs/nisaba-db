@@ -119,6 +119,8 @@ const char *dc_strerror(int code) {
             return "Malformed request: not an object, or a field has the wrong type";
         case DC_ERR_REQ_UNKNOWN_OP:
             return "Request names an op this server does not know";
+        case DC_ERR_NO_DATABASE:
+            return "No database in this directory: it has no " DC_CATALOG_FILE;
         case DC_ERR_REQ_MISSING_FIELD:
             return "Request is missing a field its op requires "
                    "(a write that needs an _id must carry one: ids are the caller's)";

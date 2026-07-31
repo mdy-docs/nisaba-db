@@ -73,6 +73,10 @@ extern "C" {
 #define DC_ERR_REQ_MALFORMED        (-40)
 #define DC_ERR_REQ_UNKNOWN_OP       (-41)
 #define DC_ERR_REQ_MISSING_FIELD    (-42)
+/* dbs_open found no catalog: this directory holds no database. Distinct
+ * from a catalog that will not parse, because the answers differ --
+ * create one, versus this one is damaged. */
+#define DC_ERR_NO_DATABASE          (-43)
 
 typedef struct dbs dbs;
 

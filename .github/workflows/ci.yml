@@ -95,6 +95,15 @@ jobs:
         run: ./wasm/build-native.sh --wasi
       - name: Structures fuzz on wasm32-wasip1
         run: ./wasm/build-native.sh --wasi --fuzz 20000
+      # The server, on all three targets it can be built for. Building it
+      # here is most of the value: one main() over one engine, and a
+      # target that stops compiling is a boundary that has moved.
+      # test/db.server.test.js drives the artifacts in the `node` job.
+      - name: Server binaries (native, wasip1, wasip2)
+        run: |
+          ./wasm/build-server.sh --native
+          ./wasm/build-server.sh --wasip1
+          ./wasm/build-server.sh --wasip2
 
   node:
     runs-on: ubuntu-latest
@@ -117,7 +126,19 @@ jobs:
           version: 5.0.7
       - run: npm ci
       - run: ./wasm/build-wasm.sh
-      - run: npm test
+      # test/db.server.test.js skips unless these exist, and skipping
+      # quietly is how a suite stops covering the thing it names. The
+      # native build needs no toolchain beyond cc; wasip2 and wasmtime
+      # are what let it drive the deployment target over a real socket.
+      - name: Install wasi-sdk and wasmtime (pinned)
+        run: |
+          ./wasm/get-wasi-sdk.sh --dir /opt/wasi-sdk
+          ./wasm/get-wasmtime.sh --dir /opt/wasmtime
+      - name: Build the server (native + wasip2)
+        run: |
+          ./wasm/build-server.sh --native
+          ./wasm/build-server.sh --wasip2
+      - run: PATH="/opt/wasmtime:$PATH" npm test
 
   browser:
     runs-on: ubuntu-latest

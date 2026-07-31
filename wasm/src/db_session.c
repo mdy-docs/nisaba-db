@@ -327,9 +327,12 @@ int dbs_open(bj_ns *ns, int order, dbs **out) {
     s->ns = ns;
     s->order = order;
 
+    /* No catalog is its own answer: a directory with no database in it is
+     * something a caller can act on ("make one"), where BJ_ERR_STATE
+     * reaches a user as "builder state error" and helps nobody. */
     int e = ns->open(ns->ctx, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE),
                      0, &s->catalog_io);
-    if (e) { free(s); return e; }
+    if (e) { free(s); return DC_ERR_NO_DATABASE; }
 
     s->catalog = bpt_open(&s->catalog_io);
     if (!s->catalog) {

@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# Build the database SERVER -- server/main.c over this package's C
+# sources, with no JavaScript in the process.
+#
+#   ./wasm/build-server.sh              wasm32-wasip2, sockets + --stdio
+#   ./wasm/build-server.sh --native     a native binary, same sources
+#   ./wasm/build-server.sh --wasip1     wasm32-wasip1, --stdio only
+#   ./wasm/build-server.sh --run [args] build, then run it
+#
+# THREE TARGETS, ONE MAIN. The point of building all three from one file
+# is the claim this whole effort rests on: the engine is C, the host is a
+# detail. If server/main.c ever needs to know which of these it is beyond
+# "are there sockets", something has leaked across that line.
+#
+# wasip2 is the deployment target (docs/steps/wasip2-database-server.md).
+# It is the only wasm target with sockets: preview1 has no socket()
+# at all -- not a missing right, no such function -- so the wasip1 build
+# serves --stdio and says so if asked for a port.
+#
+# Sources come from wasm/build-common.sh, the same manifest the browser
+# and native builds read, minus the JS-ABI adapters. The server main is
+# added here rather than in the manifest for the reason test/native's is:
+# a file defining main() must not enter a library build.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+. wasm/build-common.sh
+
+TARGET=wasip2
+RUN=0
+RUN_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --native) TARGET=native; shift ;;
+    --wasip1) TARGET=wasip1; shift ;;
+    --wasip2) TARGET=wasip2; shift ;;
+    --run)    RUN=1; shift; RUN_ARGS=("$@"); break ;;
+    *) echo "usage: $0 [--native|--wasip1|--wasip2] [--run [args...]]" >&2; exit 2 ;;
+  esac
+done
+
+require_submodules
+mkdir -p wasm/lib
+
+SOURCES=()
+while IFS= read -r src; do SOURCES+=("$src"); done < <(all_sources native)
+SOURCES+=(server/main.c)
+
+FLAGS=(-std=c11 -O2 -Wall -Wextra -Werror "${INCLUDE_FLAGS[@]}")
+
+case "$TARGET" in
+  native)
+    CC="${CC:-cc}"
+    OUT=wasm/lib/nisaba-server
+    FLAGS+=(-lm -DNISABA_SOCKETS=1)
+    ;;
+  wasip1|wasip2)
+    SDK="$(find_wasi_sdk)" || { wasi_sdk_missing; exit 1; }
+    warn_unpinned_wasi_sdk "$SDK"
+    CC="$SDK/bin/clang"
+    OUT="wasm/lib/nisaba-server-$TARGET.wasm"
+    FLAGS+=(
+      "--target=wasm32-$TARGET"
+      --sysroot="$SDK/share/wasi-sysroot"
+      # Keep in lockstep with build-wasm.sh and build-native.sh: the tree
+      # traversals recurse to their depth caps on a corrupt file before
+      # rejecting it, and wasi-sdk's default stack is far smaller.
+      -Wl,-z,stack-size=1048576
+    )
+    # Only preview2 has sockets. Preview1 is not missing a right here --
+    # it has no socket() to call.
+    [ "$TARGET" = wasip2 ] && FLAGS+=(-DNISABA_SOCKETS=1)
+    ;;
+esac
+
+echo "cc: $CC  (${#SOURCES[@]} sources) -> $OUT"
+"$CC" "${FLAGS[@]}" -o "$OUT" "${SOURCES[@]}"
+echo "built $OUT ($(wc -c < "$OUT") bytes)"
+
+if [ "$RUN" = 1 ]; then
+  case "$TARGET" in
+    native) exec "./$OUT" ${RUN_ARGS+"${RUN_ARGS[@]}"} ;;
+    *)
+      WT="$(find_wasmtime)" || {
+        echo "error: no wasmtime to run it with -- ./wasm/get-wasmtime.sh" >&2
+        exit 1
+      }
+      # -S inherit-network for the listener; the database directory is
+      # the preopen, and the server opens "." and nothing else.
+      exec "$WT" run -S inherit-network --dir "./data::." "$OUT" ${RUN_ARGS+"${RUN_ARGS[@]}"}
+      ;;
+  esac
+fi

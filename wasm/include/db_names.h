@@ -48,6 +48,13 @@ extern "C" {
  * see docs/format-compatibility.md's three conditions. */
 #define DC_FORMAT_VERSION 1
 
+/* The B+ tree order every collection, index and catalog in this format is
+ * written with. A tree is opened with the order it was written with, so
+ * this is a property of the format rather than a tuning knob -- and
+ * DB_DEFAULT_ORDER in wasm/nisaba-wasm.js must agree with it, because a
+ * JS host and a native one open the same files. */
+#define DC_DEFAULT_ORDER 32
+
 /* The catalog's own file, and the reserved catalog key holding the format
  * stamp. The latter is not a collection name and must never be usable as
  * one (dc_check_collection_name enforces that). */

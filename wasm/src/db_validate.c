@@ -121,6 +121,9 @@ const char *dc_strerror(int code) {
             return "Request names an op this server does not know";
         case DC_ERR_NO_DATABASE:
             return "No database in this directory: it has no " DC_CATALOG_FILE;
+        case DC_ERR_TOO_MANY_CLIENTS:
+            return "The server is already holding as many connections as it will "
+                   "(--max-clients); this one is refused rather than queued";
         case DC_ERR_REQ_MISSING_FIELD:
             return "Request is missing a field its op requires "
                    "(a write that needs an _id must carry one: ids are the caller's)";

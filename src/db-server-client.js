@@ -26,11 +26,14 @@
  * (db_session.h says so at the seam). So every write that might need one
  * carries `id`, and this side is the one that generated it.
  *
- * A CONNECTION YOU HOLD IS A CONNECTION NOBODY ELSE GETS. The server
- * serves one at a time (server/main.c says so at length), so a long-lived
- * client makes every other client wait in the listen backlog. Connect per
- * command, as bin/db.js does, or hold one and know that you own the
- * server while you do.
+ * A CONNECTION COSTS A SLOT, AND THE SLOTS ARE COUNTED. The server polls
+ * every client it has accepted, so holding a connection open no longer
+ * makes anyone else wait -- but it does occupy one of --max-clients
+ * places, and a client arriving when they are all taken is told so
+ * ({ok:false, code:-44}) and disconnected rather than left waiting. That
+ * refusal can arrive before this side has asked anything, which is why a
+ * response to no request is kept rather than discarded: it is the answer
+ * to the next call.
  *
  * WHAT IS NOT HERE. The wire has ten ops (WIRE_OPS below) and this client
  * has exactly those. Indexes, compaction, change streams, listing
@@ -138,8 +141,17 @@ class Connection {
       const frame = new Uint8Array(this._buf.subarray(0, total)); // copy out of the pool
       this._buf = this._buf.subarray(total);
       const p = this._pending.shift();
-      if (!p) {   // a response nobody asked for: framing is gone, so is the connection
+      if (!p) {
+        /* A response nobody asked for. If it is a refusal, it is the
+         * server saying why it is about to close this connection before
+         * we ever got to ask -- its connection table is full. Anything
+         * else means framing is gone, and so is the connection. */
         this._socket.destroy();
+        let unsolicited = null;
+        try { unsolicited = decode(frame); } catch { /* not even a value */ }
+        if (unsolicited && unsolicited.ok === false) {
+          return this._die(new ServerError(unsolicited.code, unsolicited.msg));
+        }
         return this._die(new Error('the server sent a response to no request'));
       }
       let value;

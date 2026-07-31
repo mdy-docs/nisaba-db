@@ -176,10 +176,11 @@ count, distinct, insert, update, updateMany, replace, delete, deleteMany.
 Open the database directly for the rest.
 ```
 
-**The server serves one connection at a time.** A CLI invocation connects,
-asks, and disconnects, so a shell full of them is fine; a client that
-keeps a connection open holds the server while it does, and everyone else
-waits in the listen backlog.
+**The server serves many connections, up to its `--max-clients`.** A CLI
+invocation connects, asks, and disconnects, so a shell full of them is
+fine, and so is a long-lived client alongside them. Past the limit,
+connecting still succeeds and the first command fails with the server's
+own sentence — it is refused, not queued.
 
 The client itself is `src/db-server-client.js`
 (`@mdy-docs/nisaba-db/server-client`) — a socket, the pure-JS binjson

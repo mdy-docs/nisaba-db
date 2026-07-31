@@ -71,7 +71,8 @@ export interface RemoteDb {
  * Connect to a server. There is no database name: the server was pointed
  * at one directory when it started and serves that one for its lifetime.
  *
- * A connection you hold is a connection nobody else gets -- the server
- * serves one at a time.
+ * A held connection occupies one of the server's --max-clients slots;
+ * past that, connecting still succeeds and the first call rejects with a
+ * ServerError (code -44).
  */
 export function connectServer(address: string | { host?: string; port: number }): Promise<RemoteDb>;

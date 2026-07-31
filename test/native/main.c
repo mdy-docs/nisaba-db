@@ -800,7 +800,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
          * codes: it had text only by accident, and the wrong text. */
         DC_ERR_NO_COLLECTION, DC_ERR_TOO_MANY_COLLECTIONS, DC_ERR_TOO_MANY_INDEXES,
         DC_ERR_REQ_MALFORMED, DC_ERR_REQ_UNKNOWN_OP, DC_ERR_REQ_MISSING_FIELD,
-        DC_ERR_NO_DATABASE,
+        DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,

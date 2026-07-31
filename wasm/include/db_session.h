@@ -77,6 +77,10 @@ extern "C" {
  * from a catalog that will not parse, because the answers differ --
  * create one, versus this one is damaged. */
 #define DC_ERR_NO_DATABASE          (-43)
+/* The server is already holding as many connections as it will. The only
+ * refusal here that is about the TRANSPORT rather than about a request:
+ * it is sent before the client has asked anything. */
+#define DC_ERR_TOO_MANY_CLIENTS     (-44)
 
 typedef struct dbs dbs;
 
@@ -151,6 +155,15 @@ void dbs_close(dbs *s);
  * invented here.
  */
 int dbs_handle(dbs *s, const uint8_t *req, size_t req_len, dbuf *out);
+
+/*
+ * Append the refusal { ok:false, code, msg } for `code`, with no request
+ * and no session -- the shape dbs_handle answers every other refusal in,
+ * so a transport that has to refuse before a request arrives (its
+ * connection table is full) says so in the one format a client already
+ * reads. The SHAPE stays owned here; only the decision is the caller's.
+ */
+int dbs_refusal(int code, dbuf *out);
 
 #ifdef __cplusplus
 }

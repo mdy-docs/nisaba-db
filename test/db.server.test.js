@@ -210,26 +210,26 @@ describe.skipIf(!have(WASIP2) || !wasmtime)('nisaba-server: frames over TCP (was
  * to a native build. A client the deployment target has never been driven
  * by is a client nobody has tested.
  *
- * ONE SERVER EACH, and that is not tidiness. server/main.c serves ONE
- * CONNECTION AT A TIME -- accept, serve until EOF, accept again -- so a
- * client that holds a connection open holds the whole server, and the CLI
- * subprocesses below would wait in the backlog forever behind a live
- * client connection in another suite. Found by writing them as one suite
- * and watching it hang. Each suite binds its own port for the same reason
- * a test that needs a database makes its own directory.
+ * ONE SERVER EACH: every suite here writes to the database it is given,
+ * so they get their own seeded directory and their own port for the same
+ * reason a test that needs a database makes its own. (It used to be
+ * load-bearing for a different reason -- the server served one connection
+ * at a time, and a suite holding a connection open hung the next suite's
+ * CLI subprocesses in the listen backlog. That is what the last suite
+ * below now tests is over.)
  */
 const ENGINES = [
   {
     name: 'native',
     ready: () => have(NATIVE),
-    argv: (dir, port) => [path.resolve(NATIVE), ['--port', String(port)], { cwd: dir }]
+    argv: (dir, port, extra) => [path.resolve(NATIVE), ['--port', String(port), ...extra], { cwd: dir }]
   },
   {
     name: 'wasm32-wasip2 under wasmtime',
     ready: () => have(WASIP2) && !!wasmtime,
-    argv: (dir, port) => [wasmtime, [
+    argv: (dir, port, extra) => [wasmtime, [
       'run', '-S', 'inherit-network', '--dir', `${dir}::.`,
-      path.resolve(WASIP2), '--port', String(port)
+      path.resolve(WASIP2), '--port', String(port), ...extra
     ], {}]
   }
 ];
@@ -241,8 +241,8 @@ const ENGINES = [
 let portSlot = 1;
 const nextPort = () => 18000 + (portSlot++) * 1000 + (process.pid % 1000);
 
-async function startServer(engine, port) {
-  const [cmd, args, opts] = engine.argv(await seedDb(), port);
+async function startServer(engine, port, extra = []) {
+  const [cmd, args, opts] = engine.argv(await seedDb(), port, extra);
   const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${engine.name} server did not start`)), 30000);
@@ -355,6 +355,95 @@ for (const engine of ENGINES) {
       const nowhere = spawnSync(process.execPath, ['bin/db.js', '--server', '127.0.0.1:1', 'count', 'users'], { encoding: 'utf8' });
       expect(nowhere.status).toBe(1);
       expect(nowhere.stderr).toMatch(/cannot reach a nisaba server at 127\.0\.0\.1:1/);
+    });
+  });
+
+  /*
+   * More than one connection, and a limit on how many. --max-clients 2
+   * rather than the default 64 because a bound nothing reaches is a bound
+   * nothing tests: two is the smallest number that is more than one.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: many clients, bounded (${engine.name})`, () => {
+    let proc;
+    const port = nextPort();
+    const cli = (...args) => spawnSync(process.execPath, [
+      'bin/db.js', '--server', `127.0.0.1:${port}`, ...args
+    ], { encoding: 'utf8' });
+
+    beforeAll(async () => {
+      proc = await startServer(engine, port, ['--max-clients', '2']);
+      return () => { proc.kill(); };
+    });
+
+    it('serves two connections at once, and a CLI while one of them sits idle', async () => {
+      const a = await connectServer(port);
+      const b = await connectServer(port);
+      try {
+        // Both live, both answered -- interleaved, not one after the other.
+        const [x, y] = await Promise.all([
+          a.collection('users').countDocuments({}),
+          b.collection('users').countDocuments({})
+        ]);
+        expect([x, y]).toEqual([3, 3]);
+
+        // Writes from one connection are visible on the other: one process,
+        // one engine, one open collection behind both sockets.
+        await a.collection('users').insertOne({ name: 'Edsger', team: 'core' });
+        expect(await b.collection('users').countDocuments({})).toBe(4);
+      } finally {
+        await b.close();
+      }
+
+      // The bug this replaced: `a` is connected and idle, and a CLI
+      // invocation used to wait behind it until something was killed.
+      try {
+        expect(cli('count', 'users').stdout.trim()).toBe('4');
+      } finally {
+        await a.close();
+      }
+    });
+
+    it('refuses past the limit, saying so, and takes the next client after a slot frees', async () => {
+      const a = await connectServer(port);
+      const b = await connectServer(port);
+      try {
+        // Accepted and TOLD, not left in the listen backlog looking slow.
+        // One rejection, inspected once: the connection is closed behind
+        // the refusal, so a second request on it races the close and
+        // would be asserting on whichever won.
+        const third = await connectServer(port);
+        let refusal = null;
+        try { await third.collection('users').countDocuments({}); }
+        catch (err) { refusal = err; }
+        expect(refusal).toBeInstanceOf(ServerError);
+        expect(refusal.code).toBe(-44);
+        expect(refusal.message).toMatch(/max-clients/);
+        await third.close();
+
+        // And a client that connects and says nothing still learns why:
+        // the refusal arrives before it has asked anything, which is a
+        // response to no request -- kept, and raised at the first ask.
+        const quiet = await connectServer(port);
+        await new Promise(r => setTimeout(r, 200));
+        await expect(quiet.collection('users').countDocuments({}))
+          .rejects.toMatchObject({ name: 'ServerError', code: -44 });
+        await quiet.close();
+
+        // The two that were already there are unharmed by the refusal.
+        expect(await a.collection('users').countDocuments({})).toBe(4);
+        expect(await b.collection('users').countDocuments({})).toBe(4);
+      } finally {
+        await a.close();
+      }
+
+      // A slot came back when `a` closed, so this one is served.
+      const c = await connectServer(port);
+      try {
+        expect(await c.collection('users').countDocuments({})).toBe(4);
+      } finally {
+        await c.close();
+        await b.close();
+      }
     });
   });
 }

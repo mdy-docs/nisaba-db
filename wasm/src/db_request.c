@@ -165,6 +165,11 @@ static int respond_error(dbuf *out, int code) {
     return e;
 }
 
+int dbs_refusal(int code, dbuf *out) {
+    if (!out) return BJ_ERR_STATE;
+    return respond_error(out, code);
+}
+
 /* ---- the ops ------------------------------------------------------------ */
 
 /* Sum the per-command results a many-form produced into the single result

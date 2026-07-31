@@ -34,6 +34,7 @@ nisaba-server --stdio                              # frames on stdin/stdout
 | `--port N` | TCP listener on loopback (default 8097). Needs sockets: wasip2 or native |
 | `--stdio` | frames on stdin/stdout. Every target, including wasip1 |
 | `--order N` | B+ tree order the files were **written** with (default 32) |
+| `--max-clients N` | connections held at once (default and ceiling 64) |
 
 `--order` is not a preference. Open a tree with the wrong one and its
 pages read as nonsense, so it has to match whatever created the files —
@@ -92,6 +93,12 @@ op, a missing field, no such collection, a duplicate key — comes back as
 `dc_strerror`'s text, the same sentence a native caller would get. The
 connection survives it.
 
+One refusal is about the transport rather than a request, and arrives
+before the client has asked anything: `code: -44`, sent to a connection
+that arrived when all `--max-clients` slots were taken, which is then
+closed. It is in the same shape as every other refusal, so a client reads
+it with the code it already has.
+
 **Ids stay with the caller.** `id` supplies the 12 bytes a write needs if
 it turns out to need one (an insert whose document has no `_id`, an
 upsert that matched nothing). Generating one needs a clock, which
@@ -116,6 +123,21 @@ with no socket and no port.
   writers: wasi-filesystem has no locking to arbitrate them with, so
   there is never more than one. The same rule OPFS enforces in the
   browser and `NodeFSStorageProvider`'s advisory lock enforces in Node.
+- **Many connections, one at a time through the engine.** `poll()` over
+  the listener and every accepted socket; whichever is ready is served,
+  and `dbs_handle` runs to completion for one request before the next is
+  looked at. There are no threads and there is no second engine, so the
+  database sees the same serial stream it saw when there was one
+  connection — what changed is who waits for whom. The sockets are
+  non-blocking and a connection carries the bytes of a request that has
+  only partly arrived and a response that has only partly gone out; a
+  client that stops reading delays nobody but itself.
+- **Bounded, and it says so.** `--max-clients` is a fixed table sized at
+  startup, for the reason every other table here is bounded: a server
+  that grows one per client has a failure mode nobody tests. Nothing is
+  read from a client whose last answer has not gone out, so a pipelining
+  client cannot make the server hold an unbounded number of answers for
+  it either.
 - **The transport frames, it does not interpret.** `server/main.c` never
   reads a field of a request or a response.
 - **Nothing is dropped in silence.** Every refusal is a distinct code
@@ -125,16 +147,17 @@ with no socket and no port.
 
 Stated here rather than discovered later.
 
-- **One connection at a time.** Accept, serve until that client
-  disconnects, accept again. A second client waits in the listen backlog,
-  which is right for a CLI and wrong for anything keeping a connection
-  warm. `poll()` over the accepted fds is the fix, and it changes nothing
-  above `serve()`: one process still owns the files, so engine calls stay
-  serialised either way.
+- **No fairness between clients.** Ready connections are served in table
+  order every time round the loop, so a client that always has a request
+  waiting is always looked at before one further down. Nothing starves
+  while requests are small; a stream of large ones from slot 0 would make
+  slot 5 wait.
 - **Ten operations.** No index management, compaction, change streams,
   collection listing, or the `find-one-and-*` family. Each is an op in
   `wasm/src/db_request.c` plus a method in the client.
 - **No cursors.** A `find` returns every match in one frame.
+- **No idle timeout.** A connection that says nothing holds its slot
+  until the client goes away.
 - **No TLS, no auth, no tenants.** Loopback only. Those belong to the
   gateway in front, not to the database
   (`docs/replicaton-roadmap.md` step 4 records that boundary).

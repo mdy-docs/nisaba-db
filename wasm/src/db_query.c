@@ -609,14 +609,21 @@ static int compare_by_sort(const uint8_t *a, size_t alen, const uint8_t *b, size
                            const uint8_t *sort, size_t sort_len) {
     cur c = { sort, sort_len, 0 };
     uint32_t count;
-    object_begin(&c, &count);
+    /* validate_sort_spec ran before any comparison did, so none of these
+     * can fail here. Checked anyway because a comparator has no error
+     * channel to report it through, and comparing on an uninitialised
+     * count or direction would answer the question wrongly rather than
+     * not answer it: two documents nothing could be said about are equal,
+     * which leaves the caller's order as it found it. */
+    if (object_begin(&c, &count)) return 0;
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *kp; uint32_t klen;
-        take_key(&c, &kp, &klen);
+        if (take_key(&c, &kp, &klen)) return 0;
         size_t vstart = c.pos;
-        skip_value(&c);
+        if (skip_value(&c)) return 0;
         cur vc = { c.d + vstart, c.pos - vstart, 0 };
-        double dir; read_number(&vc, &dir);
+        double dir = 1;
+        if (read_number(&vc, &dir)) return 0;
 
         const uint8_t *av = NULL; size_t al = 0; int af = 0;
         const uint8_t *bv = NULL; size_t bl = 0; int bf = 0;

@@ -391,9 +391,9 @@ static int stage_group(agg *a, const uint8_t *spec, size_t spec_len) {
             size_t acc_len = field.pos - vstart;
             cur ac = { acc, acc_len, 0 };
             uint32_t an;
-            object_begin(&ac, &an);
+            if ((e = object_begin(&ac, &an))) { bj_builder_free(b); goto fail; }
             const uint8_t *ap; uint32_t alen;
-            take_key(&ac, &ap, &alen);
+            if ((e = take_key(&ac, &ap, &alen))) { bj_builder_free(b); goto fail; }
             size_t estart = ac.pos;
             if ((e = skip_value(&ac))) { bj_builder_free(b); goto fail; }
 
@@ -540,7 +540,7 @@ static int stage_project(agg *a, const uint8_t *spec, size_t spec_len) {
                 int dropped = 0;
                 cur sc2 = { spec, spec_len, 0 };
                 uint32_t sn;
-                object_begin(&sc2, &sn);
+                if ((e = object_begin(&sc2, &sn))) goto done;
                 for (uint32_t j = 0; j < sn && !dropped; j++) {
                     const uint8_t *sk; uint32_t sklen;
                     if (take_key(&sc2, &sk, &sklen) != BJ_OK) break;

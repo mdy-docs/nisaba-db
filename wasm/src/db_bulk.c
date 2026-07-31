@@ -100,9 +100,9 @@ int dc_bulk_parse(const uint8_t *ops, size_t len, dbuf *out, int *bad_index) {
         if ((e = skip_value(&c))) { bj_builder_free(b); return e; }
         cur inner = { ops + op_start, c.pos - op_start, 0 };
         uint32_t nkeys;
-        object_begin(&inner, &nkeys);
+        if ((e = object_begin(&inner, &nkeys))) { bj_builder_free(b); return e; }
         const uint8_t *kp; uint32_t klen;
-        take_key(&inner, &kp, &klen);
+        if ((e = take_key(&inner, &kp, &klen))) { bj_builder_free(b); return e; }
         for (size_t s = 0; s < SPEC_COUNT; s++) {
             if (klen == strlen(SPECS[s].name) && memcmp(kp, SPECS[s].name, klen) == 0) {
                 bj_put_int(b, (int64_t)SPECS[s].code);

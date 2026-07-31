@@ -12,7 +12,11 @@
 #            the JS suites drive the same C, but a use-after-free there is
 #            invisible.
 #   wasi:    the same C harness cross-compiled to wasm32-wasip1 and run
-#            under Node's WASI host. Not redundant with `native`: wasm32
+#            under Node's WASI host, at the wasi-sdk this repo pins
+#            (wasm/build-common.sh, fetched by wasm/get-wasi-sdk.sh --
+#            the same two commands a developer runs, which is the point:
+#            this job used to be the only place the target could run at
+#            all). Not redundant with `native`: wasm32
 #            has 32-bit pointers and a 1 MB stack where the native job has
 #            64-bit pointers and 8 MB, so this is the only job whose memory
 #            model resembles the one the library actually SHIPS on. It
@@ -59,21 +63,22 @@ jobs:
         with:
           node-version: 22
       # Pinned like emsdk is. A toolchain bump that changes codegen should
-      # arrive as a commit, not as a Tuesday.
-      - name: Install wasi-sdk 33
-        run: |
-          curl -sSLf -o /tmp/wasi-sdk.tar.gz \
-            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-x86_64-linux.tar.gz
-          mkdir -p /opt/wasi-sdk
-          tar xzf /tmp/wasi-sdk.tar.gz -C /opt/wasi-sdk --strip-components=1
+      # arrive as a commit, not as a Tuesday -- and the pin itself lives
+      # in wasm/build-common.sh, which this script reads, so a bump is one
+      # edit and this job cannot end up on a different toolchain from the
+      # one a developer runs. That is the whole reason CI calls the script
+      # instead of keeping its own copy of the URL.
+      #
+      # /opt/wasi-sdk rather than the script's default (beside the
+      # checkout) because it is on build-native.sh's search path, so the
+      # two steps below need no environment at all -- they are exactly
+      # what a developer types.
+      - name: Install wasi-sdk (pinned)
+        run: ./wasm/get-wasi-sdk.sh --dir /opt/wasi-sdk
       - name: C harness on wasm32-wasip1
         run: ./wasm/build-native.sh --wasi
-        env:
-          WASI_SDK: /opt/wasi-sdk
       - name: Structures fuzz on wasm32-wasip1
         run: ./wasm/build-native.sh --wasi --fuzz 20000
-        env:
-          WASI_SDK: /opt/wasi-sdk
 
   node:
     runs-on: ubuntu-latest

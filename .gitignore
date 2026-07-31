@@ -1,4 +1,8 @@
 wasm/lib/
+# wasm/get-wasi-sdk.sh installs beside the repository, not in it -- but
+# --dir can point anywhere, and 600 MB of toolchain must never become a
+# commit.
+wasi-sdk-*/
 dist/
 .vite/
 *.o

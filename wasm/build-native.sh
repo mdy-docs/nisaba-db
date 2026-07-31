@@ -9,8 +9,7 @@
 #   ./wasm/build-native.sh --fuzz [n]   run the structures' hostile-file
 #                                       fuzz harness instead
 #   ./wasm/build-native.sh --wasi       cross-compile to wasm32-wasip1
-#                                       and run it (requires $WASI_SDK,
-#                                       wasi-sdk 22 or newer)
+#                                       and run it
 #
 # --wasi is the end-to-end proof of the whole C-pushdown effort: the same
 # manifest, the same sources, a different toolchain, and the harness has
@@ -18,6 +17,18 @@
 # (wasm/run-wasi.mjs) rather than a standalone runtime -- the artifact
 # imports nothing but wasi_snapshot_preview1 either way, and every CI
 # runner already has Node.
+#
+# It needs a wasi-sdk, at the version pinned in wasm/build-common.sh. To
+# get one:
+#
+#   ./wasm/get-wasi-sdk.sh      # fetches the pin, beside this repository
+#
+# and then --wasi finds it with no environment set up, along with an
+# explicit $WASI_SDK or a copy in /opt/wasi-sdk (which is where CI's own
+# run of that same script puts it). Run it once; it is a no-op after
+# that. Do not reach for a wasi-sdk from a package manager instead: an
+# unpinned toolchain that silently changes codegen is the thing the pin
+# exists to prevent.
 #
 # --fuzz builds third_party/binjson-structures/test/fuzz.c against THIS
 # repo's checkouts. That submodule ships its own test/fuzz.sh, but it
@@ -72,8 +83,17 @@ FLAGS=(
 )
 
 if [ "$WASI" = 1 ]; then
-  : "${WASI_SDK:?set WASI_SDK to a wasi-sdk checkout, e.g. /opt/wasi-sdk}"
-  CC="$WASI_SDK/bin/clang"
+  # Discovery, not an env var the caller has to know about: $WASI_SDK if
+  # it is set, then what ./wasm/get-wasi-sdk.sh installs, then the shared
+  # location CI uses. All three, and the pinned version they must be,
+  # are wasm/build-common.sh's.
+  #
+  # Into its own name first: assigning straight to WASI_SDK would clear
+  # the caller's value on the failing path, and the message below is
+  # supposed to show every place that was looked -- theirs included.
+  SDK="$(find_wasi_sdk)" || { wasi_sdk_missing; exit 1; }
+  warn_unpinned_wasi_sdk "$SDK"
+  CC="$SDK/bin/clang"
   OUT="$OUT.wasm"
   FLAGS+=(
     # wasip1, not the bare "wasm32-wasi" spelling: clang has deprecated
@@ -81,7 +101,7 @@ if [ "$WASI" = 1 ]; then
     # than a warning. Needs wasi-sdk 22 or newer, which is where the
     # versioned triples arrived.
     --target=wasm32-wasip1
-    --sysroot="$WASI_SDK/share/wasi-sysroot"
+    --sysroot="$SDK/share/wasi-sysroot"
     # Not optional. emcc sets -sSTACK_SIZE=1048576 because the tree
     # traversals recurse up to their depth caps (BJ_MAX_DEPTH) on a
     # corrupt file before erroring out; wasi-sdk's default stack is far

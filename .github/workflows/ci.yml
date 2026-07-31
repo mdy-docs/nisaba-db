@@ -70,7 +70,7 @@ jobs:
       # wrong side of.
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
       # Pinned like emsdk is. A toolchain bump that changes codegen should
       # arrive as a commit, not as a Tuesday -- and the pin itself lives
       # in wasm/build-common.sh, which this script reads, so a bump is one
@@ -102,11 +102,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
+      # 24, not 22: navigator.locks arrived in Node v24.5.0 and
+      # src/db-coordinator.js refuses to run without it, so the whole of
+      # db-coordinator.test.js -- election, RPC, handover, cross-tab
+      # watch() -- fails on 22 with "run it inside a Worker". `cache: npm`
+      # needs the lockfile, which is committed now; see .gitignore.
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
-      - uses: mymindstorm/setup-emsdk@v14
+      - uses: mymindstorm/setup-emsdk@v16
         with:
           # Keep in lockstep with wasm/build-wasm.sh's header comment.
           version: 5.0.7
@@ -122,9 +127,9 @@ jobs:
           submodules: recursive
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
-      - uses: mymindstorm/setup-emsdk@v14
+      - uses: mymindstorm/setup-emsdk@v16
         with:
           version: 5.0.7
       - run: npm ci

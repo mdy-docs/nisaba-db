@@ -2500,6 +2500,11 @@ TEST(compact_execute_builds_and_flips_over_real_files) {
     dbuf_free(&plan); dbuf_free(&entry);
     dc_collection_free(coll);
     bpt_free(catalog); bpt_free(primary);
+    /* The trees BORROW these ios -- bpt_free does not close one, because
+     * the namespace opened it and the namespace closes it (bjns.h). Trees
+     * first: freeing one writes through the io it was given. */
+    CHECK_OK(ns.close(ns.ctx, &cio));
+    CHECK_OK(ns.close(ns.ctx, &kio));
     bjns_posix_free(&ns);
     close(dirfd);
     /* Leave the directory for the OS; the files are all in tmpl. */
@@ -2509,7 +2514,11 @@ TEST(compact_execute_builds_and_flips_over_real_files) {
  * plan its compaction. Returns 0, or -1 with everything the caller must
  * still free left in whatever state it reached. Used by the plan/execute
  * tests below, which need a real compaction to intercept rather than a
- * mock of one. */
+ * mock of one.
+ *
+ * The caller owns both ios and must ns.close each after freeing the tree
+ * that borrows it: the namespace opened them, so the namespace closes
+ * them, and bpt_free will not do it. */
 static int compact_fixture(bj_ns *ns, bj_io *cio, bpt **primary,
                            dc_collection **coll, bj_io *kio, bpt **catalog,
                            dbuf *entry, dbuf *plan) {
@@ -2634,6 +2643,8 @@ TEST(an_undeclared_open_is_caught_the_way_a_browser_catches_it) {
         dbuf_free(&plan); dbuf_free(&entry);
         dc_collection_free(coll);
         bpt_free(catalog); bpt_free(primary);
+        CHECK_OK(ns.close(ns.ctx, &cio));
+        CHECK_OK(ns.close(ns.ctx, &kio));
     }
 
     bjns_posix_free(&ns);
@@ -2735,6 +2746,8 @@ TEST(compaction_reclaims_space_without_the_truncate_flag) {
     dbuf_free(&plan); dbuf_free(&entry);
     dc_collection_free(coll);
     bpt_free(catalog); bpt_free(primary);
+    CHECK_OK(ns.close(ns.ctx, &cio));
+    CHECK_OK(ns.close(ns.ctx, &kio));
     bjns_posix_free(&ns);
     close(dirfd);
 }

@@ -24,6 +24,7 @@ import path from 'node:path';
 import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
 import { connect, ObjectId } from '../src/db.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
+import { connectServer, ServerError, WIRE_OPS } from '../src/db-server-client.js';
 
 await ready();
 
@@ -185,5 +186,124 @@ describe.skipIf(!have(WASIP2) || !wasmtime)('nisaba-server: frames over TCP (was
     expect(res.ok).toBe(true);
     expect(res.result.deletedCount).toBe(2);
     expect((await call({ op: 'count', coll: 'users' })).n).toBe(1);
+  });
+});
+
+/**
+ * The client (src/db-server-client.js) and the CLI driving it -- step 4.
+ *
+ * The tests above speak the protocol by hand, which is what makes them a
+ * check on the SERVER. These go through the shipped client instead,
+ * because what is being checked here is different: that the same commands
+ * a user types locally reach a database in another process, and that a
+ * command the wire does not carry says so instead of failing as a
+ * TypeError somewhere inside a proxy.
+ *
+ * Native rather than wasip2 so they run wherever `cc` does; the socket is
+ * the same socket, and the wasip2 suite above already proves the
+ * deployment target answers on it.
+ *
+ * ONE SERVER EACH, and that is not tidiness. server/main.c serves ONE
+ * CONNECTION AT A TIME -- accept, serve until EOF, accept again -- so a
+ * client that holds a connection open holds the whole server, and the CLI
+ * subprocesses below would wait in the backlog forever behind the live
+ * client connection in the suite above. Found by writing them as one
+ * suite and watching it hang. Both suites bind their own port for the
+ * same reason a test that needs a database makes its own directory.
+ */
+function startServer(dir, port) {
+  const proc = spawn(path.resolve(NATIVE), ['--port', String(port)], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('server did not start')), 20000);
+    proc.stderr.on('data', (d) => {
+      if (String(d).includes('serving')) { clearTimeout(t); resolve(proc); }
+    });
+  });
+}
+
+describe.skipIf(!have(NATIVE))('nisaba-server: the JS client', () => {
+  let proc, db;
+  const port = 19000 + (process.pid % 1000);
+
+  beforeAll(async () => {
+    proc = await startServer(await seedDb(), port);
+    db = await connectServer(port);   // a bare port means loopback
+    return async () => { await db.close(); proc.kill(); };
+  });
+
+  it('reads and writes through connectServer(), with no engine in the client', async () => {
+    const users = db.collection('users');
+    expect(await users.countDocuments({})).toBe(3);
+    expect(await users.distinct('team')).toEqual(expect.arrayContaining(['core', 'research']));
+
+    const sorted = await users.find({ team: 'core' }, { sort: { name: 1 }, limit: 1 }).toArray();
+    expect(sorted.map(d => d.name)).toEqual(['Ada']);
+
+    // The id comes back because this side minted it -- C will not invent
+    // one, and the result it computes counts what happened rather than
+    // naming it.
+    const { insertedId } = await users.insertOne({ name: 'Edsger', team: 'core' });
+    expect(insertedId).toBeInstanceOf(ObjectId);
+    expect((await users.findOne({ name: 'Edsger' }))._id.toHexString()).toBe(insertedId.toHexString());
+
+    expect((await users.updateOne({ name: 'Ada' }, { $set: { onCall: true } })).modifiedCount).toBe(1);
+    expect((await users.findOne({ name: 'Ada' })).onCall).toBe(true);
+    expect((await users.deleteMany({ team: 'research' })).deletedCount).toBe(1);
+    expect(await users.countDocuments({})).toBe(3);
+  });
+
+  it('turns a refusal into an error carrying the code and the sentence', async () => {
+    await expect(db.collection('ghosts').countDocuments({})).rejects.toThrow(ServerError);
+    await expect(db.collection('ghosts').countDocuments({})).rejects.toMatchObject({ code: -37 });
+  });
+
+  it('says what the wire does not carry, rather than failing as a TypeError', async () => {
+    expect(() => db.listCollections()).toThrow(/no listCollections/);
+    expect(() => db.collection('users').createIndex({ team: 1 })).toThrow(/no createIndex/);
+    // The sentence names the ops that DO exist, so the refusal is
+    // actionable without reading the source.
+    expect(() => db.collection('users').watch()).toThrow(WIRE_OPS.join(', '));
+  });
+});
+
+describe.skipIf(!have(NATIVE))('nisaba-server: bin/db.js as a client', () => {
+  let proc;
+  const port = 20000 + (process.pid % 1000);
+  const cli = (...args) => spawnSync(process.execPath, [
+    'bin/db.js', '--server', `127.0.0.1:${port}`, ...args
+  ], { encoding: 'utf8' });
+
+  beforeAll(async () => {
+    proc = await startServer(await seedDb(), port);
+    return () => { proc.kill(); };
+  });
+
+  it('drives the same CLI commands over the socket', () => {
+    expect(cli('count', 'users').stdout.trim()).toBe('3');
+
+    const inserted = cli('insert', 'users', '{"name":"Barbara","team":"research"}');
+    expect(inserted.status).toBe(0);
+    expect(inserted.stdout).toMatch(/^Inserted ObjectId\([0-9a-f]{24}\)\.$/m);
+
+    const found = cli('find', 'users', '{"team":"research"}');
+    expect(found.stdout).toContain('Barbara');
+
+    expect(cli('count', 'users').stdout.trim()).toBe('4');
+  });
+
+  it('refuses, from the CLI, what only a local database can do', () => {
+    const listed = cli('collections');
+    expect(listed.status).toBe(1);
+    expect(listed.stderr).toMatch(/no listCollections/);
+
+    // --order is the server's, decided when it opened the directory.
+    const ordered = cli('count', 'users', '--order', '64');
+    expect(ordered.status).toBe(1);
+    expect(ordered.stderr).toMatch(/--order is the server's/);
+
+    // And an address with nothing behind it names the address.
+    const nowhere = spawnSync(process.execPath, ['bin/db.js', '--server', '127.0.0.1:1', 'count', 'users'], { encoding: 'utf8' });
+    expect(nowhere.status).toBe(1);
+    expect(nowhere.stderr).toMatch(/cannot reach a nisaba server at 127\.0\.0\.1:1/);
   });
 });

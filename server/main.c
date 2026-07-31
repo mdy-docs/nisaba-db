@@ -38,6 +38,17 @@
  * and the process owns it for its lifetime. That is the whole answer to
  * concurrent writers: wasi-filesystem has no locking to arbitrate them
  * with, so there is never more than one.
+ *
+ * ONE CONNECTION AT A TIME, and say it plainly because it is felt from
+ * outside: accept, serve until that client goes away, accept again. A
+ * second client waits in the listen backlog for as long as the first
+ * holds its socket open -- fine for a CLI, which connects per command,
+ * and wrong for a client that keeps a connection warm. Serving several
+ * would mean poll() over the accepted fds (there are no threads here and
+ * one process still owns the files, so the engine calls stay serialised
+ * either way); it is the next thing this file should learn, and it is not
+ * a change to anything above it. A test that held one connection open
+ * and then ran the CLI against the same server hung on exactly this.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -150,17 +161,26 @@ static int listen_on(int port) {
 
 static void usage(const char *me) {
     fprintf(stderr,
-            "usage: %s [--stdio] [--port N]\n"
+            "usage: %s [--stdio] [--port N] [--order N]\n"
             "  serves the database in the preopened directory \".\"\n", me);
 }
 
 int main(int argc, char **argv) {
     int use_stdio = 0;
     int port = DEFAULT_PORT;
+    /* The order the files were WRITTEN with, which is not a preference:
+     * open a tree with the wrong one and its pages read as nonsense. The
+     * default is what every host in this repo creates with, so the flag
+     * exists for a database made with `db ... --order N`. */
+    int order = DC_DEFAULT_ORDER;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdio") == 0) use_stdio = 1;
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--order") == 0 && i + 1 < argc) {
+            order = atoi(argv[++i]);
+            if (order < 3) { fprintf(stderr, "--order must be at least 3\n"); return 2; }
+        }
         else { usage(argv[0]); return 2; }
     }
 
@@ -174,7 +194,7 @@ int main(int argc, char **argv) {
     }
 
     dbs *s = NULL;
-    int e = dbs_open(&ns, DC_DEFAULT_ORDER, &s);
+    int e = dbs_open(&ns, order, &s);
     if (e != BJ_OK) {
         fprintf(stderr, "cannot open the database: %s\n", dc_strerror(e));
         bjns_posix_free(&ns);

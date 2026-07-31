@@ -8,11 +8,15 @@ complete JS API this wraps
 
 ```
 db <name> <command> [args] [options]
+db --server <host:port> <command> [args] [options]
 ```
 
 `<name>` selects (creating if needed) an OPFS subdirectory holding that
 database's catalog and collection/index files. If `<command>` is omitted it
 defaults to `collections`.
+
+With `--server` the same commands run against a database in another
+process — see [Talking to a server](#talking-to-a-server).
 
 ## Where files go
 
@@ -125,6 +129,62 @@ exists to work around in the browser), not silently miss events. There is
 currently no way to run other `db` commands concurrently against a
 database a `watch` is attached to.
 
+## Talking to a server
+
+The database also builds as a server: one process holding one directory,
+speaking binjson over a socket, with no JavaScript in it at all
+(`server/main.c`, built by `./wasm/build-server.sh`). `--server` points
+this CLI at one instead of opening files itself.
+
+```sh
+# start one over a database directory -- natively,
+./wasm/lib/nisaba-server --port 8097            # (cwd = the directory)
+# or as the wasm32-wasip2 command it is meant to be deployed as
+wasmtime run -S inherit-network --dir ~/.nisaba/mydb::. \
+  wasm/lib/nisaba-server-wasip2.wasm --port 8097
+
+db --server 127.0.0.1:8097 count users
+db --server 8097 insert users '{"name":"Ada","team":"core"}'   # bare port = loopback
+db --server 8097 find users '{"team":"core"}' --sort '{"name":1}'
+```
+
+There is **no `<name>`**: the server was pointed at one directory when it
+started and serves that one for its lifetime (one process per database
+directory — the same one-writer rule the advisory lock enforces locally).
+For the same reason `--order` is refused with `--server`: the order the
+files were written with is the server's to know, and it takes its own
+`--order` if they were not made with the default 32.
+
+The wire carries ten operations, and the CLI commands that ride on them:
+
+| Works over `--server` | |
+| --- | --- |
+| `find`, `find-one`, `count`, `distinct` | reads, including `--sort`/`--skip`/`--limit`/`--project` |
+| `insert` | the `_id` is minted by this end — C will not invent one, since that needs a clock |
+| `update-one`, `update-many`, `replace-one` | including `--upsert` |
+| `delete-one`, `delete-many` | |
+
+Everything else — `collections`, `create-index`, `compact`, `dump`,
+`restore`, `watch`, `bulk-write`, `insert-many`, the `find-one-and-*`
+family — is not on the wire yet, and says so rather than pretending:
+
+```
+$ db --server 8097 collections
+Error: the server has no listCollections() -- its wire carries find, findOne,
+count, distinct, insert, update, updateMany, replace, delete, deleteMany.
+Open the database directly for the rest.
+```
+
+**The server serves one connection at a time.** A CLI invocation connects,
+asks, and disconnects, so a shell full of them is fine; a client that
+keeps a connection open holds the server while it does, and everyone else
+waits in the listen backlog.
+
+The client itself is `src/db-server-client.js`
+(`@mdy-docs/nisaba-db/server-client`) — a socket, the pure-JS binjson
+codec, and nothing else. With `--server` this CLI never instantiates the
+WASM engine at all.
+
 ## Options
 
 | Option | Applies to | Description |
@@ -141,7 +201,8 @@ database a `watch` is attached to.
 | `--sparse` | `create-index` | Don't index documents missing the field |
 | `--partial-filter <json>` | `create-index` | Only index documents matching this filter |
 | `--ttl <seconds>` | `create-index` | `expireAfterSeconds` — single-field index only |
-| `--order <n>` | any file-creating command | B+ tree order for new files (default 32, min 3) |
+| `--order <n>` | any file-creating command | B+ tree order for new files (default 32, min 3) — refused with `--server` |
+| `--server <host:port>` | any command the wire carries | Talk to a running server instead of opening files here; a bare port means `127.0.0.1` |
 | `-h`, `--help` | | Show help |
 
 ## Examples

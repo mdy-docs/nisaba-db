@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 import os from 'node:os';
 import path from 'node:path';
-import { ready, connectClient, ObjectId, Pointer } from '../wasm/nisaba-wasm.js';
-import { NodeFSStorageProvider } from '../src/db-node.js';
+// The value types and the codec, from the pure-JS binjson -- the same
+// classes wasm/nisaba-wasm.js re-exports, so an ObjectId is an ObjectId
+// either way. Imported from here rather than from there because with
+// --server this process holds no database: the engine, the storage
+// provider and ready() are loaded below only when there is one to open.
+import { ObjectId, Pointer } from '../third_party/binjson/js/binjson.js';
+import { connectServer } from '../src/db-server-client.js';
 
 // Data root: $NISABA_DIR, else ~/.nisaba -- one subdirectory per database
 // name (NodeFSStorageProvider.subProvider). Earlier versions of this tool
@@ -12,9 +17,18 @@ const DATA_ROOT = process.env.NISABA_DIR || path.join(os.homedir(), '.nisaba');
 
 function usage() {
   console.error(`Usage: db <name> <command> [args] [options]
+       db --server <host:port> <command> [args] [options]
 
 A document database. <name> selects (creating if needed) an OPFS
 subdirectory holding its catalog and collection/index files.
+
+With --server the database is a server process (server/main.c, run
+natively or as a wasm32-wasip2 command) and this is only a client: there
+is no <name>, because the server was pointed at one directory when it
+started and serves that one. The wire carries ten operations -- find,
+find-one, count, distinct, insert, update-one, update-many, replace-one,
+delete-one, delete-many -- and any other command says so rather than
+pretending.
 
 Database commands:
   collections                            List collection names (default)
@@ -87,6 +101,9 @@ Options:
                       create-index: only index documents matching this filter
   --ttl <seconds>     create-index: expireAfterSeconds (single-field index only)
   --order <n>         B+ tree order for newly created files (default 32, min 3)
+  --server <host:port>
+                      Talk to a running server instead of opening files
+                      here. A bare port means 127.0.0.1.
   -h, --help          Show this help`);
   process.exit(1);
 }
@@ -234,6 +251,9 @@ function parseArgs(argv) {
         process.exit(1);
       }
       opts.order = n;
+      opts.orderExplicit = true;
+    } else if (arg === '--server') {
+      opts.server = argv[++i];
     } else {
       positional.push(arg);
     }
@@ -251,17 +271,49 @@ function requireArgs(args, n, message) {
 async function main() {
   const { opts, positional } = parseArgs(process.argv.slice(2));
 
-  const dbName = positional[0];
-  if (!dbName) usage();
+  // Two ways to reach a database, one command set. Locally the first word
+  // names a directory under the data root; with --server it names the
+  // command, because the directory was the server's choice when it
+  // started -- one process per database directory (see
+  // docs/steps/wasip2-database-server.md).
+  const remote = opts.server !== undefined;
+  if (!positional[0]) usage();
 
-  const command = (positional[1] || 'collections').toLowerCase();
-  const args = positional.slice(2);
+  const command = (remote ? positional[0] : (positional[1] || 'collections')).toLowerCase();
+  const args = positional.slice(remote ? 1 : 2);
 
-  await ready();
-
-  const provider = new NodeFSStorageProvider(DATA_ROOT);
-  const client = await connectClient(provider, { order: opts.order });
-  const db = await client.db(dbName);
+  let db, closeAll;
+  if (remote) {
+    if (opts.orderExplicit) {
+      // The order the files were made with is the server's to know; a
+      // client asking for a different one would be asking it to read the
+      // same bytes a second way.
+      console.error('Error: --order is the server\'s, chosen when it opened the directory');
+      process.exit(1);
+    }
+    try {
+      db = await connectServer(opts.server);
+    } catch (err) {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    }
+    closeAll = async () => { if (db.isOpen) await db.close(); };
+  } else {
+    // Loaded here rather than at the top so a client is a client: with
+    // --server this process never instantiates the WASM engine at all.
+    const { ready, connectClient } = await import('../wasm/nisaba-wasm.js');
+    const { NodeFSStorageProvider } = await import('../src/db-node.js');
+    await ready();
+    const provider = new NodeFSStorageProvider(DATA_ROOT);
+    const client = await connectClient(provider, { order: opts.order });
+    db = await client.db(positional[0]);
+    closeAll = async () => {
+      if (db.isOpen) await client.close();
+      // Release the directory locks (a crash leaves a stale-pid lock,
+      // reclaimed on the next run).
+      await provider.close();
+    };
+  }
 
   try {
     switch (command) {
@@ -654,12 +706,10 @@ async function main() {
         usage();
     }
 
-    await client.close();
-    await provider.close(); // release the directory locks (a crash leaves a stale-pid lock, reclaimed on next run)
+    await closeAll();
   } catch (err) {
     console.error(`Error: ${err.message}`);
-    if (db.isOpen) await client.close();
-    await provider.close();
+    await closeAll();
     process.exit(1);
   }
 }

@@ -146,21 +146,50 @@ throws that away.
 
 Each step should land green on its own.
 
-1. **Collection by name, in C.** A session that opens a catalog through
+1. ~~**Collection by name, in C.**~~ **Done** — `wasm/include/db_session.h`,
+   `wasm/src/db_session.c`. A session that opens a catalog through
    `bj_ns`, resolves a collection with `dc_catalog_open_plan`, opens each
    file in attach order and caches the result. This is the piece
    `install-snapshot-in-c.md` says it is blocked on and
    `completions-in-c.md` names as the reason its apply pump cannot move.
-   Native tests, no server yet.
-2. **`dbs_handle` and the request grammar.** Opcodes, dispatch, responses,
-   refusals. Native tests driving it with binjson buffers.
-3. **`main()` and the socket.** Accept loop, framing, one connection at a
-   time to start. A `--wasip2` build target beside `--wasi`.
-4. **A client.** The JS side already has `encode`/`decode`; `bin/db.js`
-   gains a transport that talks to the socket instead of loading the
-   module in-process, so the same CLI drives both.
+2. ~~**`dbs_handle` and the request grammar.**~~ **Done** —
+   `wasm/src/db_request.c`. Ten ops, dispatch, responses, refusals, driven
+   by native tests over buffers with no socket.
+3. ~~**`main()` and the socket.**~~ **Done** — `server/main.c`,
+   `wasm/build-server.sh`, built for native, wasip1 (`--stdio` only) and
+   wasip2.
+4. ~~**A client.**~~ **Done** — `src/db-server-client.js` and `--server`
+   in `bin/db.js`: the same commands, over a socket, in a process that
+   never instantiates the engine. `test/db.server.test.js`.
 5. **CI.** Build the wasip2 target and run a round trip against it.
-   wasmtime is already installed there.
+   wasmtime is already installed there. *Partly done*: CI builds all three
+   server targets in the `wasi` job and runs `test/db.server.test.js` in
+   the `node` job, which drives the wasip2 artifact under wasmtime over a
+   real socket. What is left is the CLI half of that — the `--server`
+   suites currently exercise the native build, so the wasip2 target is
+   covered by the hand-written protocol client and not yet by the shipped
+   one.
+
+## What is left after step 4
+
+Named here rather than discovered later.
+
+- **One connection at a time.** The accept loop serves a client until it
+  disconnects, so a second client waits in the backlog. Right for a CLI,
+  wrong for anything that keeps a connection warm. `poll()` over the
+  accepted fds is the fix, and it changes nothing above `serve()` — the
+  engine calls stay serialised regardless, because one process still owns
+  the files.
+- **The wire is ten ops.** No indexes, no compaction, no change streams,
+  no listing collections, no `find-one-and-*`. Each is an op in
+  `db_request.c` plus a method in the client; the CLI already refuses
+  them by name, so nothing is silently missing.
+- **No cursors.** A `find` returns every match in one frame, bounded only
+  by the 16 MB request cap on the way in. A collection larger than a
+  response is currently a client's problem.
+- **Ids are the client's.** Deliberate (a clock does not belong in the
+  engine), but it means a non-JS client needs its own ObjectId generator
+  before it can insert.
 
 ## What this costs the other targets
 

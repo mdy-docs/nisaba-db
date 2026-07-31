@@ -9,6 +9,7 @@
     ".": { "types": "./types/nisaba.d.ts", "default": "./src/db.js" },
     "./remote": { "types": "./types/remote.d.ts", "default": "./src/db-remote.js" },
     "./node": { "types": "./types/node.d.ts", "default": "./src/db-node.js" },
+    "./server-client": { "types": "./types/server-client.d.ts", "default": "./src/db-server-client.js" },
     "./wasm": { "types": "./types/wasm.d.ts", "default": "./wasm/nisaba-wasm.js" },
     "./coordinator": { "types": "./types/coordinator.d.ts", "default": "./src/db-coordinator.js" },
     "./wal": { "types": "./types/wal.d.ts", "default": "./src/db-wal.js" },

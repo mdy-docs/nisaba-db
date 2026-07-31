@@ -133,8 +133,9 @@ database a `watch` is attached to.
 
 The database also builds as a server: one process holding one directory,
 speaking binjson over a socket, with no JavaScript in it at all
-(`server/main.c`, built by `./wasm/build-server.sh`). `--server` points
-this CLI at one instead of opening files itself.
+(`server/main.c`, built by `./wasm/build-server.sh` — see
+[`docs/db-server.md`](../docs/db-server.md)). `--server` points this CLI
+at one instead of opening files itself.
 
 ```sh
 # start one over a database directory -- natively,

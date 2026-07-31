@@ -1,8 +1,8 @@
 /*
  * server/main.c — the database server's transport, and nothing else.
  *
- * Step 3 of docs/steps/wasip2-database-server.md. Everything this file
- * does is move bytes: read a request frame, hand it to dbs_handle, write
+ * See docs/db-server.md for the wire and the invariants. Everything this
+ * file does is move bytes: read a request frame, hand it to dbs_handle, write
  * the response frame back. It does not know what an op is, what a
  * collection is, or what any field of either object means -- the same
  * rule the Raft transport has always held to, applied to this one.

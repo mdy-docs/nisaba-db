@@ -138,7 +138,15 @@ jobs:
         run: |
           ./wasm/build-server.sh --native
           ./wasm/build-server.sh --wasip2
-      - run: PATH="/opt/wasmtime:$PATH" npm test
+      # NISABA_SERVER_TESTS=required: everything above exists in this job,
+      # so a server suite that SKIPS here is a broken job reporting green.
+      # It asserts the artifacts and wasmtime are there and fails if they
+      # are not; a developer who has not built the server still just sees
+      # them skip. The client and the CLI then run twice over, against the
+      # native binary and against the wasip2 command under wasmtime --
+      # the deployment target, driven by the shipped client rather than
+      # by a test's own protocol code.
+      - run: PATH="/opt/wasmtime:$PATH" NISABA_SERVER_TESTS=required npm test
 
   browser:
     runs-on: ubuntu-latest

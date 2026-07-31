@@ -12,8 +12,8 @@
  * That gap is what this file closes, and it is why three separate pieces
  * of work were blocked on it:
  *
- *   - docs/steps/wasip2-database-server.md — a server has to open a
- *     database before it can serve one.
+ *   - the database server (docs/db-server.md) — it has to open a
+ *     database before it can serve one. Built, on this.
  *   - docs/steps/install-snapshot-in-c.md — "it would need to resolve a
  *     collection BY NAME, which needs a namespace".
  *   - docs/steps/completions-in-c.md — the apply pump stays in the host

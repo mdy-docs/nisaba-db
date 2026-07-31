@@ -275,7 +275,7 @@ async function main() {
   // names a directory under the data root; with --server it names the
   // command, because the directory was the server's choice when it
   // started -- one process per database directory (see
-  // docs/steps/wasip2-database-server.md).
+  // docs/db-server.md).
   const remote = opts.server !== undefined;
   if (!positional[0]) usage();
 

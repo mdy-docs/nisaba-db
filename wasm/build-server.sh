@@ -12,7 +12,7 @@
 # detail. If server/main.c ever needs to know which of these it is beyond
 # "are there sockets", something has leaked across that line.
 #
-# wasip2 is the deployment target (docs/steps/wasip2-database-server.md).
+# wasip2 is the deployment target (docs/db-server.md).
 # It is the only wasm target with sockets: preview1 has no socket()
 # at all -- not a missing right, no such function -- so the wasip1 build
 # serves --stdio and says so if asked for a port.

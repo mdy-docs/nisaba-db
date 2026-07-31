@@ -2,7 +2,7 @@
  * db-server-client.js — the JavaScript client for the database SERVER
  * (server/main.c), over a TCP socket.
  *
- * Step 4 of docs/steps/wasip2-database-server.md. The server is a
+ * The wire it speaks is documented in docs/db-server.md. The server is a
  * wasm32-wasip2 (or native) process with no JavaScript in it; this is the
  * other end of the same wire, and between them there is nothing but
  * binjson frames.

@@ -13,23 +13,57 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [wasip2-database-server.md](wasip2-database-server.md) | A real server: one process per database directory, binjson over sockets, as a wasip2 command. Needs neither 2 nor 3, and delivers the collection-by-name resolution that 2 is blocked on. |
-| 2 | [install-snapshot-in-c.md](install-snapshot-in-c.md) | The last Raft message kind a host must answer. Gives the node a file namespace, which everything below also wants. |
-| 3 | [completions-in-c.md](completions-in-c.md) | Answering a proposal without a promise. Small; can go before or beside 2. |
-| 4 | [native-composition.md](native-composition.md) | Seating several Raft groups over sockets, and deciding what is policy. Sits on top of 1; wants 2 and 3 done. |
-| 5 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
-| 6 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. Its install cases want 2 done; the rest do not wait. |
+| 1 | [install-snapshot-in-c.md](install-snapshot-in-c.md) | The last Raft message kind a host must answer. Gives the node a file namespace, which everything below also wants. |
+| 2 | [completions-in-c.md](completions-in-c.md) | Answering a proposal without a promise. Small; can go before or beside 1. |
+| 3 | [native-composition.md](native-composition.md) | Seating several Raft groups over sockets, and deciding what is policy. Sits on top of the server; wants 1 and 2 done. |
+| 4 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
+| 5 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. Its install cases want 1 done; the rest do not wait. |
 
-1 is the product shape, and its first step is the piece 2 and 3 are both
-waiting on; 2 and 3 are the C pushdown's remaining substance; 4 turns one
-server into a cluster; 5 is a feature; 6 is the coverage all of it rests
-on.
+1 and 2 are the C pushdown's remaining substance; 3 turns one server into
+a cluster; 4 is a feature; 5 is the coverage all of it rests on.
 
-**One decision is deliberately left open**, and 1 says why rather than
-answering it: whether the browser stays a *host* (owning OPFS files) or
-becomes a *client* of a server. It is a product decision, it is worth
-making explicitly, and almost every awkward constraint in the C API
-descends from the answer.
+**The database server is built**, which is why there is no brief for it:
+one process per database directory, binjson over sockets, as a
+`wasm32-wasip2` command, documented in
+[`docs/db-server.md`](../db-server.md). It delivered
+`wasm/include/db_session.h` — resolving a collection by name in C — which
+is the piece 1 and 2 were both blocked on, and it is what 3 sits on top
+of. What it does not do yet (one connection at a time, ten operations, no
+cursors) is listed there rather than here, because those are properties
+of a thing that exists.
+
+**One decision is still deliberately open:** whether the browser stays a
+*host* (owning OPFS files) or becomes a *client* of a server. It is a
+product decision, not a technical one, and almost every awkward
+constraint in the C API descends from the answer. Two constraints get
+conflated when it comes up, so they are worth separating:
+
+- **Exclusive sync access handles per file** is the multi-tab one. It
+  produced `src/db-coordinator.js` (elect one tab, others RPC to it) and
+  the handle-ownership discipline. This is not a wart: it is the same
+  **one writer per database directory** invariant the server gets from
+  process ownership and Node gets from an advisory lock. Multi-tab forced
+  it to be discovered early, in the environment that will not let you
+  cheat.
+- **Asynchronous opens** is the expensive one, and it is *not* multi-tab.
+  OPFS `getFileHandle` and `createSyncAccessHandle` both return promises,
+  and wasm cannot block on a promise without Asyncify or JSPI. That one
+  fact forces the plan/execute split, `bj_ns.open`'s synchronous
+  requirement, the pre-open scope table, and "effects cannot carry
+  buffers". It would hold with exactly one tab open.
+
+So solving multi-tab differently buys the removal of one JS file and one
+discipline; it does not buy back plan/execute. What *would* simplify
+everything is making the browser a client: `src/db-remote.js` already
+exists, the parent project's gateway is already the intended deployment,
+and then every remaining host is POSIX-shaped, `bj_ns.open` is just
+`openat`, and C could own the file lifecycle end to end — which is
+precisely what 1 needs and cannot have. It costs the thing this library
+is pitched on: a local-first embedded database that works offline in a
+browser. **Do not decide it as a side effect of building something
+else.** Decide it deliberately, write down why, and if the answer is
+"keep the browser as a host", then plan/execute is the price of that
+answer and is worth paying.
 
 ## Standing debts
 

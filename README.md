@@ -127,6 +127,10 @@ Deliberate scope limits, stated up front rather than discovered late:
 - [`docs/db-api.md`](docs/db-api.md) — complete JS-facing API reference.
 - [`docs/db-example.js`](docs/db-example.js) — a runnable, narrated tour of
   most of that API (`node docs/db-example.js`).
+- [`docs/db-server.md`](docs/db-server.md) — the database as a *server*
+  process: one directory, binjson over a socket, `wasm32-wasip2` or
+  native, with no JavaScript in it. The wire, the invariants, and what it
+  does not do yet.
 - [`docs/db-plan.md`](docs/db-plan.md) — milestone-by-milestone design
   history and scope decisions (historical; see the note at its top).
 - [`docs/textindex-atomicity.md`](docs/textindex-atomicity.md) — how the

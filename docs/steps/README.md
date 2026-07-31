@@ -24,21 +24,22 @@ a product; 4 is a feature; 5 is the coverage all of it rests on.
 
 ## Standing debts
 
-Independent of the above. Not a design question; known, diagnosed and
-written down rather than fixed on the spot.
+Both are paid. Neither was a design question — known, diagnosed, and now
+fixed.
 
-| Brief | What it is |
-| --- | --- |
-| [browser-compaction-handle-leak.md](browser-compaction-handle-leak.md) | A real bug: compaction never closes the OPFS handles it pre-opens, so the adopt step cannot re-open its own files. Three browser tests have been failing on it. Cause identified, fix named. |
-
-Do this first if you want the ground to stop moving: it removes a
-permanently red suite that trains everyone to ignore it.
-
-The other debt — `--wasi` running only on a CI runner — is paid:
-`./wasm/get-wasi-sdk.sh` fetches the pinned toolchain for the host,
-`./wasm/build-native.sh --wasi` finds it with nothing exported, and CI
-installs it by running that same script, so the pin lives in exactly one
-place (`wasm/build-common.sh`).
+- **The compaction handle leak.** `compact()` never closed the OPFS
+  handles it pre-opened, so the adopt step could not re-open its own
+  files and three browser tests were permanently red. It gives them back
+  now, and `test/db.exclusive-handles.test.js` enforces the browser's
+  one-handle-per-file rule in the Node suite, where that whole class of
+  bug used to be invisible.
+- **`--wasi` on a developer machine.** It ran only on a CI runner.
+  `./wasm/get-wasi-sdk.sh` fetches the pinned toolchain for the host,
+  `./wasm/build-native.sh --wasi` finds it with nothing exported, and CI
+  installs it by running that same script — so the pin lives in one
+  place (`wasm/build-common.sh`). It runs under wasmtime too, which
+  immediately found a durability bug Node's WASI host had been passing
+  over.
 
 ## Shared context every brief assumes
 

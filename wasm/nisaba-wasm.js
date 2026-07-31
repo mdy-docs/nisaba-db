@@ -3335,8 +3335,34 @@ class Collection {
     let settleCompacting;
     this._compacting = new Promise((resolve) => { settleCompacting = resolve; });
     const M = requireModule();
-    const created = []; // new-generation files, deleted on pre-flip failure
+    const created = [];  // new-generation files, deleted on pre-flip failure
+    const declared = []; // { fd, handle } pre-opened for C below, released by release()
     let flipped = false;
+
+    // Give the handles back. The host opened them, so the host closes
+    // them -- bns_close is deliberately a no-op on the handle
+    // (bjns_bridge.c), the same ownership rule hostio.c has always had,
+    // so dropping the scope table alone would leak every one of them.
+    // That matters immediately: the adopt step re-opens these same files
+    // BY NAME, and a browser refuses a second sync access handle while
+    // the first is live.
+    //
+    // Idempotent, because the pre-flip error path calls it too: a file
+    // still holding an open handle can't be deleted either. Every handle
+    // is closed even if one throws, and the first failure is reported
+    // once the rest are shut.
+    const release = async () => {
+      delete M.bjnsScopes?.[this._nsScope];
+      let failure = null;
+      while (declared.length) {
+        const { fd, handle } = declared.pop();
+        unregisterHandle(M, fd);
+        try { handle.flush(); await handle.close(); }
+        catch (err) { failure ||= err; }
+      }
+      if (failure) throw failure;
+    };
+
     try {
       const entry = this._catalog.search(this.name);
       // C names the entire new generation before any of it exists: the
@@ -3379,7 +3405,9 @@ class Collection {
       const declare = async (fileName) => {
         const handle = await this._provider.openFile(fileName, { create: true });
         created.push(fileName);
-        table[fileName] = registerHandle(M, handle);
+        const fd = registerHandle(M, handle);
+        table[fileName] = fd;
+        declared.push({ fd, handle }); // release() closes it; see above
         return handle;
       };
 
@@ -3427,7 +3455,10 @@ class Collection {
         } finally { cn.free(); M._free(pp); }
       } finally {
         M._free(kindPtr); M._free(srcPtr);
-        delete M.bjnsScopes[scope];
+        // After catw_compact_execute returns -- C wrote the new
+        // generation through these handles -- and before _closeHandles()
+        // and the re-open below.
+        await release();
       }
       newEntry.compactedBytes = bytesBuilt;
       // The flip already happened, inside C, and was made durable there
@@ -3451,12 +3482,17 @@ class Collection {
       const bytesAfter = this._storageBytes();
       return { generation, bytesBefore, bytesAfter, bytesFreed: Math.max(0, bytesBefore - bytesAfter) };
     } catch (err) {
-      // Pre-flip failure: the old generation is still live -- drop the
-      // half-built files (one whose dest handle a failed compact left
-      // open can't be deleted yet; the sweep gets it). Post-flip failure
+      // Pre-flip failure: the old generation is still live -- close
+      // whatever is still open (a declare that threw part-way never
+      // reached the release above, and a file with a live handle can't be
+      // deleted), then drop the half-built files. Post-flip failure
       // (adopt threw): the new generation is authoritative -- keep it and
       // surface the error; reopening the Db recovers.
       if (!flipped) {
+        // Best-effort, like the deletes it precedes: this path is already
+        // reporting `err`, and anything left behind is unreferenced by
+        // the catalog and swept at the next Db.open().
+        try { await release(); } catch { /* swept later */ }
         for (const f of created) {
           try { await this._provider.deleteFile(f); } catch { /* swept later */ }
         }

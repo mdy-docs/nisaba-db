@@ -115,6 +115,13 @@ const char *dc_strerror(int code) {
             return "Too many collections open at once in this session";
         case DC_ERR_TOO_MANY_INDEXES:
             return "Collection has more indexes than a session can hold open";
+        case DC_ERR_REQ_MALFORMED:
+            return "Malformed request: not an object, or a field has the wrong type";
+        case DC_ERR_REQ_UNKNOWN_OP:
+            return "Request names an op this server does not know";
+        case DC_ERR_REQ_MISSING_FIELD:
+            return "Request is missing a field its op requires "
+                   "(a write that needs an _id must carry one: ids are the caller's)";
         /* raft_core.h / raft_msg.h / raft_node.h. These reach a host the
          * same way every other code does, and a consensus refusal that
          * prints "unknown error" is a refusal nobody can act on. */

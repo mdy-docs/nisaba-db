@@ -799,6 +799,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
          * DC_ERR_UNSUPPORTED_ID until these three needed the next free
          * codes: it had text only by accident, and the wrong text. */
         DC_ERR_NO_COLLECTION, DC_ERR_TOO_MANY_COLLECTIONS, DC_ERR_TOO_MANY_INDEXES,
+        DC_ERR_REQ_MALFORMED, DC_ERR_REQ_UNKNOWN_OP, DC_ERR_REQ_MISSING_FIELD,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
@@ -1680,6 +1681,258 @@ TEST(a_collection_that_cannot_be_opened_leaves_the_session_untouched) {
         TAP_FAIL("session opened a name no plan declared: %s", nscheck_first_violation(k));
     nscheck_end(k);
     nscheck_free(k);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
+/* Build one request object: {op, coll, <extra key>: <extra raw value>}.
+ * The extra is spliced in raw, because that is how a client sends a
+ * filter or a document -- already encoded. */
+static bj_builder *request(const char *op, const char *coll,
+                           const char *key, const uint8_t *val, size_t val_len,
+                           const uint8_t **out, uint32_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"op", 2);
+    bj_put_string(b, (const uint8_t *)op, (uint32_t)strlen(op));
+    if (coll) {
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)coll, (uint32_t)strlen(coll));
+    }
+    if (key) {
+        bj_put_key(b, (const uint8_t *)key, (uint32_t)strlen(key));
+        bj_put_raw(b, val, (uint32_t)val_len);
+    }
+    bj_end_object(b);
+    size_t len = 0;
+    *out = bj_builder_data(b, &len);
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+/* Read {ok:...} out of a response. */
+static int response_ok(const dbuf *res) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(res->data, res->len, (const uint8_t *)"ok", 2, &v, &vlen, &found) || !found)
+        return -1;
+    cur c = { v, vlen, 0 };
+    int ok = 0;
+    if (read_bool(&c, &ok)) return -1;
+    return ok;
+}
+
+/* Read a numeric field out of a response (or its nested `result`). */
+static int64_t response_num(const dbuf *res, const char *key, int *found_out) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    *found_out = 0;
+    if (obj_get_field(res->data, res->len, (const uint8_t *)key,
+                      (uint32_t)strlen(key), &v, &vlen, &found) || !found)
+        return 0;
+    cur c = { v, vlen, 0 };
+    double d = 0;
+    if (read_number(&c, &d)) return 0;
+    *found_out = 1;
+    return (int64_t)d;
+}
+
+TEST(a_request_is_answered_in_binjson_with_no_transport) {
+    /*
+     * The whole server surface, driven as what it is: one binjson object
+     * in, one binjson object out. No socket, no port, no process -- which
+     * is the entire reason dbs_handle is a function over buffers and
+     * main() only frames. If this needed a listener to test, every future
+     * change to the grammar would too.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-req", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+
+    /* ---- count over everything. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        int f = 0;
+        CHECK_I64(response_num(&res, "n", &f), 3);
+        CHECK_I64(f, 1);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- find with a filter, served by the index the session attached. */
+    {
+        doc *q = doc_new();
+        doc_str(q, "team", "core");
+        uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("find", "users", "filter", qbuf, qlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        /* `docs` is the array dc_find produced, spliced in rather than
+         * rebuilt -- so it decodes as an array of the two core people. */
+        const uint8_t *v; size_t vlen; int found = 0;
+        CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"docs", 4, &v, &vlen, &found));
+        CHECK_I64(found, 1);
+        if (found) {
+            cur c = { v, vlen, 0 };
+            uint32_t n = 0;
+            CHECK_OK(array_begin(&c, &n));
+            CHECK_I64((int64_t)n, 2);
+        }
+        CHECK(find_bytes(res.data, res.len, "Ada", 3) != NULL);
+        CHECK(find_bytes(res.data, res.len, "Grace", 5) != NULL);
+        CHECK(find_bytes(res.data, res.len, "Alan", 4) == NULL);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(q);
+    }
+
+    /* ---- insert, through the WAL grammar, and see the count move. */
+    {
+        uint8_t id[12];
+        mk_oid(id, 99);
+        doc *d = doc_new();
+        doc_oid(d, "_id", id);
+        doc_str(d, "name", "Edsger");
+        doc_str(d, "team", "core");
+        uint32_t dlen; const uint8_t *dbuf_ = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("insert", "users", "doc", dbuf_, dlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(d);
+
+        bj_builder *cb = request("count", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(s, req, req_len, &cres));
+        int f = 0;
+        CHECK_I64(response_num(&cres, "n", &f), 4);
+        dbuf_free(&cres); bj_builder_free(cb);
+    }
+
+    /* ---- deleteMany: many commands, ONE result, summed in C. */
+    {
+        doc *q = doc_new();
+        doc_str(q, "team", "core");
+        uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("deleteMany", "users", "filter", qbuf, qlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        if (response_ok(&res) != 1) { int df=0; TAP_FAIL("deleteMany refused: code %lld", (long long)response_num(&res, "code", &df)); }
+        CHECK_I64(response_ok(&res), 1);
+        /* Three core people were there; one result says three, rather
+         * than three results a client would have had to add up itself. */
+        const uint8_t *v; size_t vlen; int found = 0;
+        CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"result", 6, &v, &vlen, &found));
+        CHECK_I64(found, 1);
+        if (found) {
+            const uint8_t *n; size_t nlen; int nf = 0;
+            CHECK_OK(obj_get_field(v, vlen, (const uint8_t *)"deletedCount", 12, &n, &nlen, &nf));
+            CHECK_I64(nf, 1);
+            if (nf) {
+                cur c = { n, nlen, 0 };
+                double d = 0;
+                CHECK_OK(read_number(&c, &d));
+                CHECK_I64((int64_t)d, 3);
+            }
+        }
+        dbuf_free(&res); bj_builder_free(rb); doc_free(q);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
+TEST(every_way_a_request_can_be_wrong_is_answered_not_thrown) {
+    /*
+     * A refusal is a RESPONSE. The client asked a question; it is owed a
+     * sentence, not a dropped connection -- and dbs_handle returning
+     * BJ_OK for all of these is what lets a transport stay a transport.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-req-bad", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+
+    struct { const char *op; const char *coll; const char *key; int want; } cases[] = {
+        { "explodinate", "users", NULL,  DC_ERR_REQ_UNKNOWN_OP    },
+        { "count",       NULL,    NULL,  DC_ERR_REQ_MISSING_FIELD },
+        { "count",       "nope",  NULL,  DC_ERR_NO_COLLECTION     },
+        { "insert",      "users", NULL,  DC_ERR_REQ_MISSING_FIELD },  /* no doc */
+        { "update",      "users", NULL,  DC_ERR_REQ_MISSING_FIELD },  /* no update */
+        { "distinct",    "users", NULL,  DC_ERR_REQ_MISSING_FIELD },  /* no field */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request(cases[i].op, cases[i].coll, cases[i].key, NULL, 0,
+                                 &req, &req_len);
+        dbuf res = {0};
+        /* BJ_OK: the call succeeded, the request did not. */
+        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        int64_t code = response_num(&res, "code", &f);
+        CHECK_I64(f, 1);
+        if (code != cases[i].want)
+            TAP_FAIL("case %zu (%s): code %lld, want %d",
+                     i, cases[i].op, (long long)code, cases[i].want);
+        /* And the sentence is dc_strerror's, not a second wording. */
+        const uint8_t *m; size_t mlen; int mf = 0;
+        CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"msg", 3, &m, &mlen, &mf));
+        CHECK_I64(mf, 1);
+        if (mf) {
+            cur c = { m, mlen, 0 };
+            const uint8_t *str; uint32_t slen;
+            CHECK_OK(take_string(&c, &str, &slen));
+            const char *want = dc_strerror((int)code);
+            CHECK_I64((int64_t)slen, (int64_t)strlen(want));
+            if (slen == strlen(want)) CHECK(memcmp(str, want, slen) == 0);
+        }
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* An insert with no _id and no `id` is refused rather than given an
+     * id this layer invented: generating one needs a clock. */
+    {
+        doc *d = doc_new();
+        doc_str(d, "name", "no id here");
+        uint32_t dlen; const uint8_t *dbuf_ = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("insert", "users", "doc", dbuf_, dlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_REQ_MISSING_FIELD);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(d);
+    }
+
+    /* Bytes that are not an object at all. */
+    {
+        static const uint8_t junk[] = { 0xff, 0x01, 0x02 };
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, junk, sizeof junk, &res));
+        CHECK_I64(response_ok(&res), 0);
+        dbuf_free(&res);
+    }
+
+    dbs_close(s);
     bjns_posix_free(&ns);
     close(dirfd);
 }
@@ -5984,6 +6237,8 @@ int main(void) {
     RUN(posix_namespace_backs_a_real_database);
     RUN(a_session_resolves_a_collection_by_name_with_no_host_language);
     RUN(a_collection_that_cannot_be_opened_leaves_the_session_untouched);
+    RUN(a_request_is_answered_in_binjson_with_no_transport);
+    RUN(every_way_a_request_can_be_wrong_is_answered_not_thrown);
     RUN(memory_io_is_accepted_without_a_sync_callback);
     RUN(current_date_rewrites_into_set);
     RUN(current_date_is_idempotent_and_passes_others_through);

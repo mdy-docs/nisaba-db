@@ -50,6 +50,7 @@
 
 #include <stddef.h>
 #include "bjns.h"
+#include "dbuf.h"
 #include "db.h"
 
 #ifdef __cplusplus
@@ -67,6 +68,11 @@ extern "C" {
 /* The session's tables are full. */
 #define DC_ERR_TOO_MANY_COLLECTIONS (-38)
 #define DC_ERR_TOO_MANY_INDEXES     (-39)
+/* The request itself is wrong, as opposed to the database being unable
+ * to satisfy a well-formed one. */
+#define DC_ERR_REQ_MALFORMED        (-40)
+#define DC_ERR_REQ_UNKNOWN_OP       (-41)
+#define DC_ERR_REQ_MISSING_FIELD    (-42)
 
 typedef struct dbs dbs;
 
@@ -99,6 +105,48 @@ int dbs_open_count(const dbs *s);
 /* Close every collection, the catalog, and the session. Safe on NULL.
  * Does not touch the namespace. */
 void dbs_close(dbs *s);
+
+/* ---- requests (db_request.c) ------------------------------------------- */
+
+/*
+ * Perform one request and append one response, both binjson objects.
+ *
+ * This is everything the server DECIDES. A transport reads a request,
+ * calls this, and writes the response; it never reads a field of either,
+ * for the same reason the Raft transport has never read a field of a
+ * message. Sockets today, a preopened listener, a wasi:http gateway or a
+ * native binary tomorrow -- all the same function, which is also why the
+ * protocol can be tested with no socket and no port.
+ *
+ *   { op: "find",   coll: "users", filter: {...}, opts: {...} }
+ *      -> { ok: true, docs: [...] }
+ *   { op: "count",  coll: "users", filter: {...} }
+ *      -> { ok: true, n: 3 }
+ *   { op: "insert", coll: "users", doc: {...}, id: <12 bytes> }
+ *      -> { ok: true, result: { acknowledged: true, insertedId: ... } }
+ *
+ * A REFUSAL IS A RESPONSE. Anything the request itself gets wrong -- an
+ * unknown op, a missing field, no such collection, a duplicate key --
+ * comes back as { ok: false, code: <DC_ERR_*>, msg: <dc_strerror text> }
+ * and returns BJ_OK, because the caller asked a question and is owed an
+ * answer. A nonzero return means no response could be built at all (out
+ * of memory), which is the transport's problem rather than the client's.
+ *
+ * Reads go straight to dc_find/dc_count/dc_distinct: filters arrive as
+ * binjson and results leave as binjson, so nothing is re-encoded on the
+ * way through. Writes go through dc_wal_plan_build and dc_wal_apply --
+ * the same path a replicated write takes, so every mutation this serves
+ * is one a log could have carried, and the result shape is the one every
+ * replica computes rather than this file's opinion.
+ *
+ * IDS STAY WITH THE CALLER. `id` supplies the 12 bytes a write uses if it
+ * turns out to need one (an insert whose document has no _id, an upsert
+ * that matched nothing) -- generating them needs a clock, which db.h's
+ * top comment keeps out of this layer deliberately. A write that needs
+ * one and was not given one is DC_ERR_REQ_MISSING_FIELD, not an id
+ * invented here.
+ */
+int dbs_handle(dbs *s, const uint8_t *req, size_t req_len, dbuf *out);
 
 #ifdef __cplusplus
 }

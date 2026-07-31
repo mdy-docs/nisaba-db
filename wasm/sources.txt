@@ -28,6 +28,7 @@ wasm/src/db.c
 wasm/src/db_agg.c
 wasm/src/db_wal.c
 wasm/src/db_session.c
+wasm/src/db_request.c
 wasm/src/raft_core.c
 wasm/src/raft_msg.c
 wasm/src/raft_drive.c

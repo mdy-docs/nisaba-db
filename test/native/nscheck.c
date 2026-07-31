@@ -25,7 +25,7 @@ struct nscheck {
     bj_ns    inner;
     decl     declared[NSCHECK_MAX_DECLS];
     uint32_t ndecl;
-    uint32_t opens, removes, violations;
+    uint32_t opens, closes, removes, violations;
     char     first[NSCHECK_NAME_MAX + 64];
     int      have_first;
 };
@@ -76,6 +76,7 @@ static int32_t nc_open(void *ctx, const char *name, uint32_t name_len,
 
 static int32_t nc_close(void *ctx, bj_io *io) {
     nscheck *k = (nscheck *)ctx;
+    k->closes++;
     return k->inner.close ? k->inner.close(k->inner.ctx, io) : BJ_OK;
 }
 
@@ -185,6 +186,7 @@ int nscheck_declare_compact_plan(nscheck *k, const uint8_t *plan, size_t plan_le
 /* ---- reporting ---------------------------------------------------------- */
 
 uint32_t nscheck_opens(const nscheck *k)      { return k->opens; }
+uint32_t nscheck_closes(const nscheck *k)     { return k->closes; }
 uint32_t nscheck_removes(const nscheck *k)    { return k->removes; }
 uint32_t nscheck_violations(const nscheck *k) { return k->violations; }
 

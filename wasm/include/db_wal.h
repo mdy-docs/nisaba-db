@@ -76,8 +76,16 @@ extern "C" {
 #define DC_ERR_WAL_BAD_REQUEST    (-34)
 /* dc_wal_apply was handed a command it does not apply -- one of the DDL
  * three, whose apply creates and destroys FILES and therefore belongs to
- * whoever owns the namespace. Not a malformed command: a misrouted one. */
-#define DC_ERR_WAL_NOT_APPLIABLE  (-35)
+ * whoever owns the namespace. Not a malformed command: a misrouted one.
+ *
+ * -36, not -35: it shared -35 with DC_ERR_UNSUPPORTED_ID (db.h) until
+ * db_session.h needed the next free numbers and the collision turned up.
+ * Two refusals on one code is one refusal a caller cannot act on -- this
+ * one reached JavaScript as InvalidIdError (nisaba-wasm.js's ERR table),
+ * which is a lie about a misrouted DDL command. The strerror test proves
+ * every code HAS text, which is why it never caught a code with somebody
+ * else's. */
+#define DC_ERR_WAL_NOT_APPLIABLE  (-36)
 
 /*
  * Opcodes, as they appear in a log entry's `op` field. The wire spellings

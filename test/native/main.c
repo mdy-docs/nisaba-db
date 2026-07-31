@@ -27,6 +27,7 @@
 #include "db_agg.h"
 #include "db_catalog.h"
 #include "db_wal.h"
+#include "db_session.h"
 #include "snapstore.h"
 #include "raft_core.h"
 #include "raft_msg.h"
@@ -793,17 +794,33 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_RESERVED_NAME, DC_ERR_EMPTY_KEY_SPEC, DC_ERR_NON_ASCENDING_KEY,
         DC_ERR_BULK_EMPTY, DC_ERR_BULK_UNKNOWN_OP, DC_ERR_BULK_MISSING_FIELD,
         DC_ERR_WAL_UNKNOWN_OP, DC_ERR_WAL_MISSING_FIELD, DC_ERR_WAL_BAD_REQUEST,
+        DC_ERR_WAL_NOT_APPLIABLE,
+        /* db_session.h. NOT_APPLIABLE is here because it shared -35 with
+         * DC_ERR_UNSUPPORTED_ID until these three needed the next free
+         * codes: it had text only by accident, and the wrong text. */
+        DC_ERR_NO_COLLECTION, DC_ERR_TOO_MANY_COLLECTIONS, DC_ERR_TOO_MANY_INDEXES,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
         RAFT_ERR_BUSY,
     };
-    for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); i++) {
+    const size_t n_codes = sizeof(codes) / sizeof(codes[0]);
+    for (size_t i = 0; i < n_codes; i++) {
         const char *s = dc_strerror(codes[i]);
         if (!s || !*s) { TAP_FAIL("code %d has no text", codes[i]); continue; }
         if (strcmp(s, "unknown error") == 0)
             TAP_FAIL("code %d falls through to the default", codes[i]);
     }
+    /* And no two of them may BE the same number. Nothing checked this,
+     * which is how DC_ERR_WAL_NOT_APPLIABLE spent its life sharing -35
+     * with DC_ERR_UNSUPPORTED_ID: it had text, so the loop above passed,
+     * but the text was somebody else's and JS reported a misrouted DDL
+     * command as InvalidIdError. "Every refusal is a distinct code" is
+     * only true if something asserts the distinct half. */
+    for (size_t i = 0; i < n_codes; i++)
+        for (size_t j = i + 1; j < n_codes; j++)
+            if (codes[i] == codes[j])
+                TAP_FAIL("two refusals share code %d", codes[i]);
     /* Callers match on these prefixes; db.test.js and db.client-wasm
      * .test.js assert them by regex. */
     CHECK(strstr(dc_strerror(DC_ERR_INVALID_COLLECTION_NAME), "Invalid collection name") != NULL);
@@ -1461,6 +1478,210 @@ TEST(posix_namespace_backs_a_real_database) {
     bjns_posix_free(&ns);
     close(dirfd);
     rmdir(tmpl);
+}
+
+/* Write a database the way a host writes one: a catalog, a collection
+ * with an index the same planner createIndex uses, and three documents.
+ * Leaves nothing open -- the point is that the bytes on disk are all the
+ * session gets. Returns 0, or -1 having reported the failure itself. */
+static int build_users_db(bj_ns *ns) {
+    bj_io cat_io, coll_io, idx_io;
+    if (ns->open(ns->ctx, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE),
+                 BJ_NS_CREATE, &cat_io) != BJ_OK) return -1;
+    bpt *catalog = bpt_create(&cat_io, ORDER);
+    if (!catalog) return -1;
+
+    if (ns->open(ns->ctx, "coll-users.bj", 13, BJ_NS_CREATE, &coll_io) != BJ_OK) return -1;
+    bpt *primary = bpt_create(&coll_io, ORDER);
+    if (!primary) return -1;
+    dc_collection *coll = dc_collection_open(primary);
+    if (!coll) return -1;
+
+    /* The index definition comes from the create planner, so the name and
+     * the file name are the ones a real createIndex would have chosen --
+     * not this test's guess about the naming scheme. */
+    doc *k = doc_new();
+    doc_int(k, "team", 1);
+    uint32_t klen; const uint8_t *keys = doc_done(k, &klen);
+    doc *o = doc_new();
+    uint32_t olen; const uint8_t *opts = doc_done(o, &olen);
+    dbuf iplan = {0};
+    int e = dc_index_create_plan(keys, klen, opts, olen, "users", 5, &iplan);
+    doc_free(k); doc_free(o);
+    if (e) return -1;
+
+    if (ns->open(ns->ctx, "idx-users-team_1.bj", 19, BJ_NS_CREATE, &idx_io) != BJ_OK) return -1;
+    bpt *idx = bpt_create(&idx_io, ORDER);
+    if (!idx) return -1;
+    const char *names[] = { "team" };
+    const uint8_t *fields; uint32_t fields_len;
+    bj_builder *fb = fields_of(names, 1, &fields, &fields_len);
+    e = dc_collection_add_index(coll, "team_1", 6, idx, fields, fields_len, 0, 0, NULL, 0);
+    bj_builder_free(fb);
+    if (e) return -1;
+
+    if (insert_person(coll, 1, "Ada", "core", 36) != BJ_OK) return -1;
+    if (insert_person(coll, 2, "Grace", "core", 45) != BJ_OK) return -1;
+    if (insert_person(coll, 3, "Alan", "research", 41) != BJ_OK) return -1;
+
+    dbuf entry = {0}, full = {0};
+    if (dc_catalog_new_entry("users", 5, &entry) != BJ_OK) return -1;
+    if (dc_catalog_put_index(entry.data, entry.len, iplan.data, iplan.len, &full) != BJ_OK) return -1;
+    bpt_key ckey = { .is_string = 1, .num = 0, .str = (const uint8_t *)"users", .str_len = 5 };
+    e = bpt_add(catalog, &ckey, full.data, (uint32_t)full.len);
+    dbuf_free(&full); dbuf_free(&entry); dbuf_free(&iplan);
+    if (e) return -1;
+
+    /* Trees first, then the ios: freeing a tree writes through the io it
+     * borrows, and the namespace opened these so the namespace closes
+     * them. */
+    dc_collection_free(coll);
+    bpt_free(idx); bpt_free(primary); bpt_free(catalog);
+    ns->close(ns->ctx, &idx_io);
+    ns->close(ns->ctx, &coll_io);
+    ns->close(ns->ctx, &cat_io);
+    return 0;
+}
+
+TEST(a_session_resolves_a_collection_by_name_with_no_host_language) {
+    /*
+     * The piece every host has been re-implementing: read the catalog,
+     * find the entry, work out which files the collection is made of,
+     * open each one, attach each index, recover the journal. Db.collection()
+     * in nisaba-wasm.js is that code in JavaScript, and its absence in C
+     * is why a process with no JS can apply a committed entry but cannot
+     * find the collection to apply it to.
+     *
+     * The database here is written by one set of calls and opened by
+     * another, over real files, which is the only way to catch the two
+     * disagreeing about what a collection is made of.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-session", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+    CHECK_I64(dbs_open_count(s), 0);
+
+    dc_collection *users = NULL;
+    CHECK_OK(dbs_collection(s, "users", 5, &users));
+    CHECK_FATAL(users != NULL);
+    CHECK_I64(dbs_open_count(s), 1);
+
+    /* The documents are there, which means the primary opened. */
+    {
+        const uint8_t *f; uint32_t flen;
+        bj_builder *fb = empty_filter(&f, &flen);
+        int64_t count = 0;
+        CHECK_OK(dc_count(users, f, flen, &count));
+        CHECK_I64(count, 3);
+        bj_builder_free(fb);
+    }
+
+    /* And the INDEX is attached, not merely opened: the planner picks it
+     * and names it. A file opened but never attached would pass a count
+     * and fail here, which is the whole difference between reading a plan
+     * and honouring one. */
+    {
+        doc *q = doc_new();
+        doc_str(q, "team", "core");
+        uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+        int kind = -1; uint8_t *iname = NULL; size_t iname_len = 0;
+        CHECK_OK(dc_explain(users, qbuf, qlen, &kind, &iname, &iname_len));
+        CHECK_I64(kind, 2);                    /* equality index */
+        CHECK_I64((int64_t)iname_len, 6);
+        if (iname && iname_len == 6) CHECK(memcmp(iname, "team_1", 6) == 0);
+        free(iname);
+        doc_free(q);
+    }
+
+    /* Asking twice returns the same open collection rather than opening a
+     * second copy of the same files -- which OPFS would refuse outright
+     * and POSIX would silently allow, giving one collection two views of
+     * one tree. */
+    dc_collection *again = NULL;
+    CHECK_OK(dbs_collection(s, "users", 5, &again));
+    CHECK(again == users);
+    CHECK_I64(dbs_open_count(s), 1);
+
+    /* A name the catalog does not have is its own refusal, distinct from
+     * an entry that cannot be honoured. */
+    dc_collection *missing = NULL;
+    CHECK_RC(dbs_collection(s, "nope", 4, &missing), DC_ERR_NO_COLLECTION);
+    CHECK(missing == NULL);
+    CHECK_I64(dbs_open_count(s), 1);
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
+TEST(a_collection_that_cannot_be_opened_leaves_the_session_untouched) {
+    /*
+     * All or nothing. A file set that is half there must not leave a
+     * session holding half a collection: the next attempt has to be a
+     * retry, not a second attempt on top of a first one's wreckage.
+     *
+     * The index file is what goes missing here, because it is opened
+     * AFTER the primary and the collection handle -- so a session that
+     * unwinds badly leaks exactly the two things acquired before it.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-session-fail", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    CHECK_OK(ns.remove(ns.ctx, "idx-users-team_1.bj", 19));
+
+    /* Through the checking adapter, which buys two things at once. It
+     * COUNTS, so "leaves nothing open" is asserted rather than asserted
+     * about -- a leaked handle is otherwise LeakSanitizer's to find, and
+     * macOS ASan has no LeakSanitizer at all. And it refuses any name
+     * that was not declared, so this also proves the session opens
+     * exactly what the plan named and nothing of its own invention.
+     * Four names: the catalog, the primary, the index, the journal. */
+    bj_ns counted;
+    nscheck *k = nscheck_new(&ns, &counted);
+    CHECK_FATAL(k != NULL);
+    nscheck_begin(k);
+    CHECK_OK(nscheck_declare(k, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE)));
+    CHECK_OK(nscheck_declare(k, "coll-users.bj", 13));
+    CHECK_OK(nscheck_declare(k, "idx-users-team_1.bj", 19));
+    CHECK_OK(nscheck_declare(k, "coll-users-journal.bj", 21));
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&counted, ORDER, &s) == BJ_OK);
+    CHECK_I64(nscheck_opens(k) - nscheck_closes(k), 1);   /* the catalog */
+
+    dc_collection *users = NULL;
+    CHECK_RC(dbs_collection(s, "users", 5, &users), BJ_ERR_STATE);
+    CHECK(users == NULL);
+    CHECK_I64(dbs_open_count(s), 0);
+    /* The primary was opened and the index was not: whatever the failed
+     * attempt took, it gave back, and only the catalog is still held. */
+    CHECK_I64(nscheck_opens(k) - nscheck_closes(k), 1);
+
+    /* The session is still usable afterwards -- a refusal is not a
+     * poisoned session. */
+    dc_collection *missing = NULL;
+    CHECK_RC(dbs_collection(s, "nope", 4, &missing), DC_ERR_NO_COLLECTION);
+
+    dbs_close(s);
+    CHECK_I64(nscheck_opens(k) - nscheck_closes(k), 0);   /* including the catalog */
+    if (nscheck_violations(k))
+        TAP_FAIL("session opened a name no plan declared: %s", nscheck_first_violation(k));
+    nscheck_end(k);
+    nscheck_free(k);
+    bjns_posix_free(&ns);
+    close(dirfd);
 }
 
 TEST(memory_io_is_accepted_without_a_sync_callback) {
@@ -5761,6 +5982,8 @@ int main(void) {
     RUN(catalog_plan_refuses_an_entry_it_cannot_honor);
     RUN(catalog_list_indexes_inverts_what_create_index_stored);
     RUN(posix_namespace_backs_a_real_database);
+    RUN(a_session_resolves_a_collection_by_name_with_no_host_language);
+    RUN(a_collection_that_cannot_be_opened_leaves_the_session_untouched);
     RUN(memory_io_is_accepted_without_a_sync_callback);
     RUN(current_date_rewrites_into_set);
     RUN(current_date_is_idempotent_and_passes_others_through);

@@ -94,6 +94,12 @@ void nscheck_end(nscheck *k);
 /* How many opens were served -- so a test can prove it checked anything
  * at all. A checker that never sees an open passes vacuously. */
 uint32_t nscheck_opens(const nscheck *k);
+/* Closes served. Paired with nscheck_opens, this is how a test asserts
+ * that something GAVE BACK what it opened -- an all-or-nothing failure
+ * path that unwinds badly leaks handles, and LeakSanitizer only exists
+ * on Linux, so without a counter the assertion cannot be made on a
+ * developer's machine at all. */
+uint32_t nscheck_closes(const nscheck *k);
 /* Removes seen. Never checked against the declaration: the bridge queues
  * any name at all, and bjns.h permits deferring them. */
 uint32_t nscheck_removes(const nscheck *k);

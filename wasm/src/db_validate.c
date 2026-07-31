@@ -8,6 +8,7 @@
 #include "db_update.h"
 #include "db_catalog.h"
 #include "db_wal.h"
+#include "db_session.h"
 #include "db.h"
 #include "raft_core.h"
 #include "raft_msg.h"
@@ -103,6 +104,17 @@ const char *dc_strerror(int code) {
         case DC_ERR_WAL_BAD_REQUEST:
             return "WAL: malformed write request (empty batch, or a document "
                    "request with no collection)";
+        case DC_ERR_WAL_NOT_APPLIABLE:
+            return "WAL: this command is not applied here -- creating or dropping "
+                   "a collection or index touches FILES, which belongs to whoever "
+                   "owns the namespace";
+        /* db_session.h */
+        case DC_ERR_NO_COLLECTION:
+            return "No collection of that name in this database's catalog";
+        case DC_ERR_TOO_MANY_COLLECTIONS:
+            return "Too many collections open at once in this session";
+        case DC_ERR_TOO_MANY_INDEXES:
+            return "Collection has more indexes than a session can hold open";
         /* raft_core.h / raft_msg.h / raft_node.h. These reach a host the
          * same way every other code does, and a consensus refusal that
          * prints "unknown error" is a refusal nobody can act on. */

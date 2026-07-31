@@ -24,18 +24,20 @@ a product; 4 is a feature; 5 is the coverage all of it rests on.
 
 ## Standing debts
 
-Independent of the above, and of each other. Neither is a design
-question; both are known, diagnosed and written down rather than fixed on
-the spot.
+Independent of the above. Not a design question; known, diagnosed and
+written down rather than fixed on the spot.
 
 | Brief | What it is |
 | --- | --- |
-| [browser-compaction-handle-leak.md](browser-compaction-handle-leak.md) | A real bug: compaction never closes the OPFS handles it pre-opens, so the adopt step cannot re-open its own files. Three browser tests have been failing on it. Cause identified, fix named. |
 | [wasi-locally.md](wasi-locally.md) | `--wasi` only runs on a CI runner today, so the one memory model resembling the shipped one is checked minutes-to-days after the code is written. Make it runnable on a developer machine at CI's pinned version. |
 
-Do these first if you want the ground to stop moving: the second one
-restores a check, and the first removes a permanently red suite that
-trains everyone to ignore it.
+Do this first if you want the ground to stop moving: it restores a check.
+
+The other debt — compaction leaking the OPFS handles it pre-opened, which
+kept three browser tests red — is fixed: `compact()` gives them back, and
+`test/db.exclusive-handles.test.js` now enforces the browser's
+one-handle-per-file rule in the Node suite, where that whole class of bug
+used to be invisible.
 
 ## Shared context every brief assumes
 

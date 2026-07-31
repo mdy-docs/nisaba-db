@@ -64,36 +64,16 @@ fi
 
 [ -n "$DEST" ] || DEST="$(wasi_sdk_home)/wasi-sdk-$WASI_SDK_VERSION"
 
-command -v curl >/dev/null 2>&1 || {
-  echo "error: curl is needed to fetch $URL" >&2
-  exit 1
-}
-
 echo "fetching wasi-sdk $WASI_SDK_VERSION ($PLATFORM)" >&2
 echo "  from $URL" >&2
 echo "  into $DEST" >&2
 
-# Unpack into a sibling directory and move it into place at the end, so
-# an interrupted download can never leave something that LOOKS like a
-# toolchain -- the discovery above would find it and every later build
-# would fail somewhere further in.
-TMP_TAR="$(mktemp "${TMPDIR:-/tmp}/wasi-sdk-XXXXXX.tar.gz")"
-STAGE="$DEST.partial.$$"
-cleanup() { rm -rf -- "$TMP_TAR" "$STAGE"; }
-trap cleanup EXIT
+fetch_unpack "$URL" "$DEST"
 
-curl -fL --progress-bar -o "$TMP_TAR" "$URL" >&2
-mkdir -p "$STAGE"
-tar xzf "$TMP_TAR" -C "$STAGE" --strip-components=1
-
-if [ ! -x "$STAGE/bin/clang" ] || [ ! -d "$STAGE/share/wasi-sysroot" ]; then
+if [ ! -x "$DEST/bin/clang" ] || [ ! -d "$DEST/share/wasi-sysroot" ]; then
   echo "error: $URL unpacked without a bin/clang and a share/wasi-sysroot" >&2
   exit 1
 fi
-
-rm -rf -- "$DEST"
-mkdir -p "$(dirname "$DEST")"
-mv "$STAGE" "$DEST"
 
 echo "installed wasi-sdk $WASI_SDK_VERSION at $DEST" >&2
 echo "$DEST"

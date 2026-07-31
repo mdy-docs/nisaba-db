@@ -20,11 +20,29 @@
  * WASI a path outside the preopen cannot be reached at all, so anything
  * that reaches for an absolute path fails loudly here.
  */
-import { WASI } from 'node:wasi';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
+
+// node:wasi is permanently experimental as far as this script is
+// concerned -- that is the API, and the warning it prints on every single
+// run is four lines of noise in every CI log and every local build. Drop
+// that ONE warning and keep the rest: replacing Node's default printer
+// rather than passing --disable-warning=ExperimentalWarning, which needs
+// Node >= 21.3 and would turn an old-but-working Node into a hard error
+// on an unknown flag. A deprecation or an unhandled rejection still
+// prints, because those would be about this repo's own code.
+process.removeAllListeners('warning');
+process.on('warning', (w) => {
+  if (w.name !== 'ExperimentalWarning') console.error(w.stack || String(w));
+});
+
+// Imported dynamically, and that is load-bearing: the warning fires when
+// node:wasi is EVALUATED, and a static import is hoisted above every
+// statement in this file -- including the filter above, which would then
+// be installed a moment too late to catch it.
+const { WASI } = await import('node:wasi');
 
 const wasmPath = process.argv[2];
 if (!wasmPath) {

@@ -12,11 +12,16 @@
 #            the JS suites drive the same C, but a use-after-free there is
 #            invisible.
 #   wasi:    the same C harness cross-compiled to wasm32-wasip1 and run
-#            under Node's WASI host, at the wasi-sdk this repo pins
-#            (wasm/build-common.sh, fetched by wasm/get-wasi-sdk.sh --
-#            the same two commands a developer runs, which is the point:
-#            this job used to be the only place the target could run at
-#            all). Not redundant with `native`: wasm32
+#            under TWO WASI hosts -- Node's, and wasmtime -- at the
+#            versions this repo pins (wasm/build-common.sh, fetched by
+#            wasm/get-wasi-sdk.sh and wasm/get-wasmtime.sh, the same
+#            commands a developer runs, which is the point: this job used
+#            to be the only place the target could run at all). Two hosts
+#            because preview1 is rights-based and they do not agree on
+#            what a preopened directory carries; the first run under a
+#            second host found a durability bug in the POSIX adapter that
+#            Node's had been passing over. Not redundant with `native`:
+#            wasm32
 #            has 32-bit pointers and a 1 MB stack where the native job has
 #            64-bit pointers and 8 MB, so this is the only job whose memory
 #            model resembles the one the library actually SHIPS on. It
@@ -33,12 +38,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # So a branch can be checked before it is merged or opened as a PR --
+  # `gh workflow run CI --ref <branch>`. Changes to this file are the
+  # obvious case: they cannot be tested anywhere but on a runner.
+  workflow_dispatch:
 
 jobs:
   native:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       # test/native/ drives wasm/include/db.h's dc_* API directly. No npm
@@ -52,14 +61,14 @@ jobs:
   wasi:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
       # node:wasi only -- no npm install. wasm/run-wasi.mjs imports nothing
       # but Node builtins, so this job stays as dependency-free as `native`
       # and for the same reason: it defends a boundary that npm is on the
       # wrong side of.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       # Pinned like emsdk is. A toolchain bump that changes codegen should
@@ -75,6 +84,13 @@ jobs:
       # what a developer types.
       - name: Install wasi-sdk (pinned)
         run: ./wasm/get-wasi-sdk.sh --dir /opt/wasi-sdk
+      # The second WASI host, pinned and fetched the same way. Node's host
+      # and wasmtime disagree about what rights a preopened directory
+      # carries, and the two steps below run under BOTH -- which is how
+      # that class of difference gets caught rather than shipped. Also on
+      # build-native.sh's search path, so again: no environment.
+      - name: Install wasmtime (pinned)
+        run: ./wasm/get-wasmtime.sh --dir /opt/wasmtime
       - name: C harness on wasm32-wasip1
         run: ./wasm/build-native.sh --wasi
       - name: Structures fuzz on wasm32-wasip1
@@ -83,10 +99,10 @@ jobs:
   node:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -101,10 +117,10 @@ jobs:
   browser:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm

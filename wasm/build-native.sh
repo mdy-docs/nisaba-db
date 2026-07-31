@@ -138,14 +138,37 @@ echo "built $OUT"
 
 if [ "$RUN" = 1 ]; then
   if [ "$WASI" = 1 ]; then
-    # Two calls rather than an array spread: macOS ships bash 3.2, where
-    # "${ARR[@]}" on an empty array is an unbound-variable error under
-    # `set -u` -- the same reason build-wasm.sh reads its manifests with a
-    # while-read loop instead of mapfile.
-    if [ "$FUZZ" = 1 ]; then
-      exec node --experimental-wasi-unstable-preview1 wasm/run-wasi.mjs "$OUT" "$FUZZ_ITERS" 1
+    # Positional parameters rather than an array: macOS ships bash 3.2,
+    # where "${ARR[@]}" on an empty array is an unbound-variable error
+    # under `set -u` -- the same reason build-wasm.sh reads its manifests
+    # with a while-read loop instead of mapfile. "$@" is safe when empty.
+    if [ "$FUZZ" = 1 ]; then set -- "$FUZZ_ITERS" 1; else set --; fi
+    RC=0
+
+    # Node's WASI host: always, because every runner and every developer
+    # machine already has one. See wasm/run-wasi.mjs for why this is Node
+    # and not a runtime that would have to be pinned and installed.
+    echo "run: node WASI host"
+    node --experimental-wasi-unstable-preview1 wasm/run-wasi.mjs "$OUT" "$@" || RC=1
+
+    # And wasmtime, when there is one. A second host is not a second copy
+    # of the same check: preview1 is rights-based and the two disagree
+    # about what a preopened directory carries, which is how a durability
+    # bug in the POSIX adapter stayed hidden for as long as Node was the
+    # only host this ever ran under. Optional, and it says when it skips.
+    if WASMTIME_EXE="$(find_wasmtime)"; then
+      warn_unpinned_wasmtime "$WASMTIME_EXE"
+      echo "run: wasmtime ($WASMTIME_EXE)"
+      # One preopened directory mapped to ".", created fresh and removed
+      # afterwards -- exactly what run-wasi.mjs gives the Node host, so
+      # the two runs differ in engine and in nothing else.
+      WT_SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/nisaba-wasmtime-XXXXXX")"
+      "$WASMTIME_EXE" run --dir "$WT_SCRATCH::." "$OUT" "$@" || RC=1
+      rm -rf -- "$WT_SCRATCH"
+    else
+      echo "skip: wasmtime (./wasm/get-wasmtime.sh installs the pinned one)"
     fi
-    exec node --experimental-wasi-unstable-preview1 wasm/run-wasi.mjs "$OUT"
+    exit "$RC"
   fi
   if [ "$FUZZ" = 1 ]; then exec "$OUT" "$FUZZ_ITERS" 1; fi
   exec "$OUT"

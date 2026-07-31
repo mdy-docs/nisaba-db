@@ -1,12 +1,18 @@
 wasm/lib/
-# wasm/get-wasi-sdk.sh installs beside the repository, not in it -- but
-# --dir can point anywhere, and 600 MB of toolchain must never become a
-# commit.
+# wasm/get-wasi-sdk.sh and get-wasmtime.sh install beside the repository,
+# not in it -- but --dir can point anywhere, and 600 MB of toolchain must
+# never become a commit.
 wasi-sdk-*/
+wasmtime-*/
 dist/
 .vite/
 *.o
 node_modules/
-package-lock.json
+# package-lock.json is COMMITTED, deliberately: `npm ci` and setup-node's
+# `cache: npm` both require it, and this repo pins every other toolchain
+# it uses (emsdk 5.0.7, wasi-sdk 33.0, wasmtime 47.0.2) for the same
+# reason -- a dependency bump should arrive as a commit, not as a
+# Tuesday. It was ignored here from before CI existed, which is why the
+# node and browser jobs had never once got past setup-node.
 test/__screenshots__/
 .DS_Store

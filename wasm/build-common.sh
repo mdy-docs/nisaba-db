@@ -32,17 +32,85 @@ require_submodules() {
 }
 
 # ---------------------------------------------------------------------------
-# The pinned wasi-sdk: where it is, and where it comes from.
+# The pinned toolchains: where they are, and where they come from.
 #
-# This is the ONE place the version is written down. build-native.sh
-# --wasi finds a toolchain through here, wasm/get-wasi-sdk.sh fetches one
-# through here, and CI runs that same script -- so a bump is this line,
-# and a runner and a developer's machine cannot end up on different
-# toolchains, which is the whole reason the version is pinned (a codegen
-# change should arrive as a commit, not as a Tuesday).
+# This is the ONE place each version is written down. build-native.sh
+# --wasi finds them through here, wasm/get-wasi-sdk.sh and
+# wasm/get-wasmtime.sh fetch them through here, and CI runs those same
+# scripts -- so a bump is one line, and a runner and a developer's machine
+# cannot end up on different toolchains, which is the whole reason
+# anything is pinned (a codegen change should arrive as a commit, not as a
+# Tuesday).
 # ---------------------------------------------------------------------------
 
 WASI_SDK_VERSION="33.0"
+WASMTIME_VERSION="47.0.2"
+
+# macos|linux. Fails, loudly, rather than guessing for a platform these
+# projects publish no asset for.
+host_os() {
+  case "$(uname -s)" in
+    Darwin) printf 'macos\n' ;;
+    Linux)  printf 'linux\n' ;;
+    *) echo "error: no pinned toolchain build for $(uname -s)" >&2; return 1 ;;
+  esac
+}
+
+# arm64|x86_64, canonically -- each project spells arm64 its own way, so
+# the callers below translate rather than this.
+host_arch() {
+  local arch
+  arch="$(uname -m)"
+  # uname -m says x86_64 both on real Intel silicon and in an x86_64
+  # shell running under Rosetta on an arm64 Mac; only proc_translated
+  # tells them apart, and it is absent (not 0) everywhere else.
+  if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
+    printf 'arm64\n'
+    return 0
+  fi
+  case "$arch" in
+    arm64|aarch64) printf 'arm64\n' ;;
+    x86_64|amd64)  printf 'x86_64\n' ;;
+    *) echo "error: no pinned toolchain build for $arch" >&2; return 1 ;;
+  esac
+}
+
+# Where the fetch scripts install by default: BESIDE the repository, not
+# inside it. That is where this project's other pinned toolchain (emsdk)
+# already lives, it is shared by every checkout rather than re-downloaded
+# per worktree, and a `git clean -xdf` cannot cost anyone a 600 MB
+# download. Override with $TOOLCHAIN_HOME, or per-toolchain below.
+toolchain_home() {
+  printf '%s\n' "${TOOLCHAIN_HOME:-$(dirname "$PWD")}"
+}
+
+# Download and unpack a pinned toolchain into <dest>.
+#
+# Unpacks into a staging directory and moves it into place at the end, so
+# an interrupted download can never leave something that LOOKS like a
+# toolchain -- the discovery in each script would find it and every later
+# build would fail somewhere further in. Compression is left to tar to
+# detect, which both bsdtar and GNU tar do, because the two projects
+# publish .tar.gz and .tar.xz respectively.
+#   fetch_unpack <url> <dest>
+fetch_unpack() {
+  local url="$1" dest="$2" tmp stage
+  command -v curl >/dev/null 2>&1 || { echo "error: curl is needed to fetch $url" >&2; return 1; }
+  tmp="$(mktemp "${TMPDIR:-/tmp}/toolchain-XXXXXX.tar")"
+  stage="$dest.partial.$$"
+  # shellcheck disable=SC2064 -- expand now: $tmp/$stage are this call's
+  trap "rm -rf -- '$tmp' '$stage'" EXIT
+  curl -fL --progress-bar -o "$tmp" "$url" >&2
+  mkdir -p "$stage"
+  tar xf "$tmp" -C "$stage" --strip-components=1
+  rm -rf -- "$dest"
+  mkdir -p "$(dirname "$dest")"
+  mv "$stage" "$dest"
+  rm -f -- "$tmp"
+  trap - EXIT
+}
+
+# ---- wasi-sdk ----
 
 # The release tag and the asset name spell the version differently -- tag
 # wasi-sdk-33, file wasi-sdk-33.0-<arch>-<os>.tar.gz -- so both are
@@ -53,37 +121,13 @@ wasi_sdk_url() {
     "${WASI_SDK_VERSION%%.*}" "$WASI_SDK_VERSION" "$1"
 }
 
-# The <arch>-<os> this host needs, in the release's naming. Fails, loudly,
-# rather than guessing for a platform the pin has no asset for.
+# The <arch>-<os> this host needs, in wasi-sdk's naming (arm64-macos).
 wasi_sdk_platform() {
-  local os arch
-  case "$(uname -s)" in
-    Darwin) os=macos ;;
-    Linux)  os=linux ;;
-    *) echo "error: wasi-sdk $WASI_SDK_VERSION publishes no build for $(uname -s)" >&2; return 1 ;;
-  esac
-  arch="$(uname -m)"
-  # uname -m says x86_64 both on real Intel silicon and in an x86_64
-  # shell running under Rosetta on an arm64 Mac; only proc_translated
-  # tells them apart, and it is absent (not 0) everywhere else.
-  if [ "$os" = macos ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
-    arch=arm64
-  fi
-  case "$arch" in
-    arm64|aarch64) arch=arm64 ;;
-    x86_64|amd64)  arch=x86_64 ;;
-    *) echo "error: wasi-sdk $WASI_SDK_VERSION publishes no build for $arch" >&2; return 1 ;;
-  esac
-  printf '%s-%s\n' "$arch" "$os"
+  printf '%s-%s\n' "$(host_arch)" "$(host_os)"
 }
 
-# Where get-wasi-sdk.sh installs by default: BESIDE the repository, not
-# inside it. That is where this project's other pinned toolchain (emsdk)
-# already lives, it is shared by every checkout rather than re-downloaded
-# per worktree, and a `git clean -xdf` cannot cost anyone a 200 MB
-# download. Override with $WASI_SDK_HOME.
 wasi_sdk_home() {
-  printf '%s\n' "${WASI_SDK_HOME:-$(dirname "$PWD")}"
+  printf '%s\n' "${WASI_SDK_HOME:-$(toolchain_home)}"
 }
 
 # Every place a wasi-sdk of the pinned version might be, most deliberate
@@ -153,6 +197,70 @@ wasi_sdk_missing() {
   while IFS= read -r dir; do echo "    $dir" >&2; done < <(wasi_sdk_candidates)
   echo "  fetch it:  ./wasm/get-wasi-sdk.sh" >&2
   echo "  or point at your own:  WASI_SDK=/path/to/wasi-sdk $0 --wasi" >&2
+}
+
+# ---- wasmtime ----
+#
+# The SECOND WASI host. Not redundant with Node's: preview1 is
+# rights-based, and the two hosts disagree about which rights a preopen
+# carries -- wasmtime refuses fd_sync on a directory where Node's uvwasi
+# forwards it to the real descriptor. That difference hid a durability
+# bug in the POSIX adapter for as long as Node was the only host this was
+# ever run under. One engine is one opinion.
+
+wasmtime_url() {
+  printf 'https://github.com/bytecodealliance/wasmtime/releases/download/v%s/wasmtime-v%s-%s.tar.xz\n' \
+    "$WASMTIME_VERSION" "$WASMTIME_VERSION" "$1"
+}
+
+# wasmtime spells arm64 "aarch64", where wasi-sdk spells it "arm64" --
+# the reason host_arch canonicalizes and each caller translates.
+wasmtime_platform() {
+  local arch
+  arch="$(host_arch)"
+  [ "$arch" = arm64 ] && arch=aarch64
+  printf '%s-%s\n' "$arch" "$(host_os)"
+}
+
+wasmtime_home() {
+  printf '%s\n' "${WASMTIME_HOME:-$(toolchain_home)}"
+}
+
+# Every place a wasmtime might be, most deliberate first: an explicit
+# $WASMTIME, then what get-wasmtime.sh installs, then the shared location
+# CI uses, then whatever is on PATH (a package manager's, most likely --
+# hence the version warning below).
+wasmtime_candidates() {
+  if [ -n "${WASMTIME:-}" ]; then printf '%s\n' "$WASMTIME"; fi
+  printf '%s\n' "$(wasmtime_home)/wasmtime-$WASMTIME_VERSION/wasmtime"
+  printf '%s\n' /opt/wasmtime/wasmtime
+  command -v wasmtime 2>/dev/null || true
+}
+
+# Print the first candidate that is an executable. Nonzero and silent if
+# there is none -- unlike the wasi-sdk, this one is OPTIONAL: --wasi runs
+# under Node's host either way, and a missing wasmtime costs a second
+# opinion, not the check.
+find_wasmtime() {
+  local exe
+  while IFS= read -r exe; do
+    if [ -x "$exe" ]; then printf '%s\n' "$exe"; return 0; fi
+  done < <(wasmtime_candidates)
+  return 1
+}
+
+# Say so when the wasmtime found is not the pinned one -- most likely a
+# package manager's, which moves on its own schedule. A warning, not an
+# error, for the same reason as the wasi-sdk's: a deliberate override is
+# allowed, but a version difference is the likeliest reason for a result
+# that reproduces on one machine and not the other.
+#   warn_unpinned_wasmtime <exe>
+warn_unpinned_wasmtime() {
+  local found
+  found="$("$1" --version 2>/dev/null | awk 'NR==1 {print $2}')" || return 0
+  if [ -n "$found" ] && [ "$found" != "$WASMTIME_VERSION" ]; then
+    echo "warning: $1 is wasmtime $found, not the pinned $WASMTIME_VERSION (CI runs the pin)" >&2
+  fi
 }
 
 # Sources that are the JS ABI, not logic, and so are excluded from every

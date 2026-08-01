@@ -18,11 +18,9 @@ write down why" rather than guessing on the implementer's behalf.
 | 3 | [native-composition.md](native-composition.md) | Seating several Raft groups over sockets, and deciding what is policy. Sits on top of the server; wants 1 and 2 done. |
 | 4 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
 | 5 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. Its install cases want 1 done; the rest do not wait. |
-| 6 | [http-transport.md](http-transport.md) | The server speaking HTTP instead of raw frames, so a browser can be a client of it without a translating gateway. Follows from the browser decision below; independent of 1–5. |
 
 1 and 2 are the C pushdown's remaining substance; 3 turns one server into
-a cluster; 4 is a feature; 5 is the coverage all of it rests on; 6 is
-what the browser decision below costs on the server side.
+a cluster; 4 is a feature; 5 is the coverage all of it rests on.
 
 **The database server is built**, which is why there is no brief for it:
 one process per database directory, binjson over sockets, as a

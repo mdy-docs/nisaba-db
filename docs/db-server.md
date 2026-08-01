@@ -35,6 +35,7 @@ nisaba-server --stdio                              # frames on stdin/stdout
 | `--stdio` | frames on stdin/stdout. Every target, including wasip1 |
 | `--order N` | B+ tree order the files were **written** with (default 32) |
 | `--max-clients N` | connections held at once (default and ceiling 64) |
+| `--idle-timeout N` | seconds of silence before a connection's slot is taken back (default 60; 0 disables) |
 
 `--order` is not a preference. Open a tree with the wrong one and its
 pages read as nonsense, so it has to match whatever created the files —
@@ -52,6 +53,9 @@ nothing else. No WASM module, no `ready()`, no storage provider.
 ```js
 import { connectServer } from '@mdy-docs/nisaba-db/server-client';
 
+// Pings every 20s so the server's idle timeout does not take the slot
+// back; `{ keepAliveMs: 0 }` turns that off. The timer is unref'd, so a
+// script that connects, asks and finishes still exits on its own.
 const db = await connectServer('127.0.0.1:8097');
 const users = db.collection('users');
 await users.insertOne({ name: 'Ada', team: 'core' });   // _id minted here
@@ -71,10 +75,12 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Ten operations:
+**One request object in, one response object out.** Eleven operations —
+ten about a collection, and `ping`, which is about the connection:
 
 | Request | Response |
 | --- | --- |
+| `{op:'ping'}` | `{ok:true, pong:true}` |
 | `{op:'find', coll, filter, opts:{sort,projection,skip,limit}}` | `{ok:true, docs:[...]}` |
 | `{op:'findOne', coll, filter}` | `{ok:true, found, doc}` |
 | `{op:'count', coll, filter}` | `{ok:true, n}` |
@@ -93,11 +99,13 @@ op, a missing field, no such collection, a duplicate key — comes back as
 `dc_strerror`'s text, the same sentence a native caller would get. The
 connection survives it.
 
-One refusal is about the transport rather than a request, and arrives
-before the client has asked anything: `code: -44`, sent to a connection
-that arrived when all `--max-clients` slots were taken, which is then
-closed. It is in the same shape as every other refusal, so a client reads
-it with the code it already has.
+Two refusals are about the transport rather than a request, and both are
+sent to a connection that is then closed: `code: -44` to one that arrived
+when all `--max-clients` slots were taken, and `code: -45` to one whose
+slot is being taken back after `--idle-timeout`. Both are in the same
+shape as every other refusal, so a client reads them with the code it
+already has — and both say what happened, rather than leaving a client to
+infer it from a socket that closed.
 
 **Ids stay with the caller.** `id` supplies the 12 bytes a write needs if
 it turns out to need one (an insert whose document has no `_id`, an
@@ -138,6 +146,22 @@ with no socket and no port.
   read from a client whose last answer has not gone out, so a pipelining
   client cannot make the server hold an unbounded number of answers for
   it either.
+- **A slot has to be earned.** `--idle-timeout` closes a connection that
+  has asked nothing for that long. It is aimed at the connection whose
+  peer is *gone* — a crashed client, a dropped NAT mapping, a half-open
+  socket — all of which look exactly like a quiet one to TCP, and all of
+  which would otherwise hold a slot until the process restarts.
+  `SO_KEEPALIVE` is not the answer: it defaults to hours, and the knobs
+  that shorten it are per-OS and not reliably available through
+  wasi-sockets. The timer measures **silence**, not connectedness — it is
+  reset by a request and by its answer going out, so a client dribbling
+  one byte at a time is closed like any other client that asked nothing.
+  A client that wants to stay warm sends `{op:'ping'}`.
+- **A clock is the transport's, not the engine's.** `server/main.c` reads
+  `CLOCK_MONOTONIC`; nothing below it learns what time it is, which is
+  why an insert's `_id` is still the caller's. Monotonic so that an NTP
+  correction cannot take a connection's slot away, and a clock that
+  cannot be read *stops* rather than jumping, so nothing times out.
 - **The transport frames, it does not interpret.** `server/main.c` never
   reads a field of a request or a response.
 - **Nothing is dropped in silence.** Every refusal is a distinct code
@@ -152,12 +176,10 @@ Stated here rather than discovered later.
   waiting is always looked at before one further down. Nothing starves
   while requests are small; a stream of large ones from slot 0 would make
   slot 5 wait.
-- **Ten operations.** No index management, compaction, change streams,
-  collection listing, or the `find-one-and-*` family. Each is an op in
+- **Ten data operations.** No index management, compaction, change
+  streams, collection listing, or the `find-one-and-*` family. Each is an op in
   `wasm/src/db_request.c` plus a method in the client.
 - **No cursors.** A `find` returns every match in one frame.
-- **No idle timeout.** A connection that says nothing holds its slot
-  until the client goes away.
 - **No TLS, no auth, no tenants.** Loopback only. Those belong to the
   gateway in front, not to the database
   (`docs/replicaton-roadmap.md` step 4 records that boundary).

@@ -124,6 +124,9 @@ const char *dc_strerror(int code) {
         case DC_ERR_TOO_MANY_CLIENTS:
             return "The server is already holding as many connections as it will "
                    "(--max-clients); this one is refused rather than queued";
+        case DC_ERR_IDLE_TIMEOUT:
+            return "Connection closed: it asked nothing for longer than the "
+                   "server's --idle-timeout (send {op:\"ping\"} to keep one warm)";
         case DC_ERR_REQ_MISSING_FIELD:
             return "Request is missing a field its op requires "
                    "(a write that needs an _id must carry one: ids are the caller's)";

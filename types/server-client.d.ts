@@ -62,6 +62,10 @@ export interface RemoteDb {
   readonly isOpen: boolean;
   readonly address: string;
   collection<T extends Document = Document>(name: string): RemoteCollection<T>;
+  /** The op that touches no collection: keeps a connection warm past the
+   * server's --idle-timeout. Sent automatically on a timer unless
+   * connectServer was given `keepAliveMs: 0`. */
+  ping(): Promise<true>;
   /** Send any op the wire has and read the response object as it came. */
   request(req: Document): Promise<Document>;
   close(): Promise<void>;
@@ -73,6 +77,12 @@ export interface RemoteDb {
  *
  * A held connection occupies one of the server's --max-clients slots;
  * past that, connecting still succeeds and the first call rejects with a
- * ServerError (code -44).
+ * ServerError (code -44). A connection that asks nothing is closed after
+ * the server's --idle-timeout (code -45), which `keepAliveMs` exists to
+ * prevent: it pings on that interval (20s; 0 disables), on an unref'd
+ * timer that never holds a process open.
  */
-export function connectServer(address: string | { host?: string; port: number }): Promise<RemoteDb>;
+export function connectServer(
+  address: string | { host?: string; port: number },
+  options?: { keepAliveMs?: number }
+): Promise<RemoteDb>;

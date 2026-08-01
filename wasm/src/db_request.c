@@ -33,7 +33,8 @@
  * db_wal.c keeps its OP_NAME table to itself.
  */
 typedef enum {
-    OP_FIND = 0,
+    OP_PING = 0,
+    OP_FIND,
     OP_FIND_ONE,
     OP_COUNT,
     OP_DISTINCT,
@@ -46,6 +47,7 @@ typedef enum {
 } dbs_op;
 
 static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = {
+    { "ping",       4, OP_PING        },
     { "find",       4, OP_FIND        },
     { "findOne",    7, OP_FIND_ONE    },
     { "count",      5, OP_COUNT       },
@@ -276,6 +278,25 @@ int dbs_handle(dbs *s, const uint8_t *req, size_t req_len, dbuf *out) {
         }
     }
     if (op < 0) return respond_error(out, DC_ERR_REQ_UNKNOWN_OP);
+
+    /*
+     * ping, before anything is resolved: it is the one op that is not
+     * about a collection, and its whole job is to be cheap. A client
+     * holding a connection warm sends this so the server's idle timeout
+     * (server/main.c) does not take its slot back, and it costs the
+     * database nothing -- no catalog, no tree, no file.
+     */
+    if (op == OP_PING) {
+        bj_builder *pb = bj_builder_new();
+        if (!pb) return BJ_ERR_OOM;
+        bj_begin_object(pb);
+        PUT_KEY(pb, "ok");   bj_put_bool(pb, 1);
+        PUT_KEY(pb, "pong"); bj_put_bool(pb, 1);
+        bj_end_object(pb);
+        int pe = finish(pb, out);
+        bj_builder_free(pb);
+        return pe;
+    }
 
     const uint8_t *coll; uint32_t coll_len;
     e = field_str(req, req_len, "coll", &coll, &coll_len, &found);

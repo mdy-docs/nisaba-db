@@ -77,10 +77,12 @@ extern "C" {
  * from a catalog that will not parse, because the answers differ --
  * create one, versus this one is damaged. */
 #define DC_ERR_NO_DATABASE          (-43)
-/* The server is already holding as many connections as it will. The only
- * refusal here that is about the TRANSPORT rather than about a request:
- * it is sent before the client has asked anything. */
+/* The two refusals that are about the TRANSPORT rather than about a
+ * request: the server is already holding as many connections as it will
+ * (sent before the client has asked anything), and this connection has
+ * said nothing for long enough that its slot is being taken back. */
 #define DC_ERR_TOO_MANY_CLIENTS     (-44)
+#define DC_ERR_IDLE_TIMEOUT         (-45)
 
 typedef struct dbs dbs;
 

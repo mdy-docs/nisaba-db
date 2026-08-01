@@ -35,6 +35,14 @@
  * response to no request is kept rather than discarded: it is the answer
  * to the next call.
  *
+ * A SLOT ALSO HAS TO BE EARNED. The server closes a connection that has
+ * asked nothing for --idle-timeout seconds (60 by default), because a
+ * crashed client and a dropped route look exactly like a quiet one. So
+ * this client pings on a timer -- keepAliveMs, a third of the server's
+ * default, off with 0 -- and the timer is unref'd, so it never holds a
+ * process open on its own. A CLI invocation that connects, asks and
+ * exits never sends one.
+ *
  * WHAT IS NOT HERE. The wire has ten ops (WIRE_OPS below) and this client
  * has exactly those. Indexes, compaction, change streams, listing
  * collections and the find-one-and-* family are not on the wire yet;
@@ -54,9 +62,14 @@ export { encode, decode, ObjectId, Pointer };
  * what a refusal is refusing, not to decide anything.
  */
 export const WIRE_OPS = [
+  'ping',
   'find', 'findOne', 'count', 'distinct',
   'insert', 'update', 'updateMany', 'replace', 'delete', 'deleteMany'
 ];
+
+/** Pings per idle timeout. The server's default is 60s; a third of that
+ * survives one lost ping and one slow round trip without arithmetic. */
+const DEFAULT_KEEPALIVE_MS = 20000;
 
 /**
  * A client-side sanity bound on a response frame. The server bounds
@@ -306,7 +319,7 @@ function collection(conn, name) {
  * @param {string|{host:string,port:number}} address `host:port`, or a port
  * @returns {Promise<object>} a Db-shaped handle: collection(), close()
  */
-export async function connectServer(address) {
+export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_MS } = {}) {
   const { host, port } = parseAddress(address);
   const socket = await new Promise((resolve, reject) => {
     const s = net.connect({ host, port });
@@ -321,10 +334,28 @@ export async function connectServer(address) {
   });
 
   const conn = new Connection(socket, `${host}:${port}`);
+
+  /* Keep the slot. A failed ping is not raised here -- there is nobody to
+   * raise it to -- but it kills the connection the same way any other
+   * failure does, so the next real call reports it. */
+  let keepAlive = null;
+  if (keepAliveMs > 0) {
+    keepAlive = setInterval(() => {
+      conn.request({ op: 'ping' }).catch(() => {});
+    }, keepAliveMs);
+    keepAlive.unref?.();
+  }
+
   const impl = {
     isOpen: true,
     address: `${host}:${port}`,
     collection: (name) => collection(conn, name),
+    /** The one op that touches no collection: it exists so a connection
+     * can stay warm without pretending to be a query. */
+    async ping() {
+      await conn.call({ op: 'ping' });
+      return true;
+    },
     /* The escape hatch, and the only thing here that is not shaped like
      * the in-process API: send an op the wire has and read the response
      * object as it came. A new op is usable from JavaScript the day it
@@ -332,6 +363,7 @@ export async function connectServer(address) {
     request: (req) => conn.call(req),
     async close() {
       impl.isOpen = false;
+      if (keepAlive) clearInterval(keepAlive);
       await conn.close();
     }
   };

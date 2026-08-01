@@ -800,7 +800,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
          * codes: it had text only by accident, and the wrong text. */
         DC_ERR_NO_COLLECTION, DC_ERR_TOO_MANY_COLLECTIONS, DC_ERR_TOO_MANY_INDEXES,
         DC_ERR_REQ_MALFORMED, DC_ERR_REQ_UNKNOWN_OP, DC_ERR_REQ_MISSING_FIELD,
-        DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS,
+        DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
@@ -1754,6 +1754,25 @@ TEST(a_request_is_answered_in_binjson_with_no_transport) {
 
     dbs *s = NULL;
     CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+
+    /* ---- ping: the one op with no collection in it. It exists for the
+     * server's idle timer (a client keeps its slot warm without
+     * pretending to query), so it must not touch the catalog -- and the
+     * collection field every other op requires is not required here. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("ping", NULL, NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        const uint8_t *v; size_t vlen; int f = 0;
+        CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"pong", 4, &v, &vlen, &f));
+        CHECK_I64(f, 1);
+        /* And it opened nothing to answer: no collection was named, so
+         * none was resolved. */
+        CHECK_I64(dbs_open_count(s), 0);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
 
     /* ---- count over everything. */
     {

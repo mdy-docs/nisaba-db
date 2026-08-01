@@ -179,6 +179,9 @@ describe.skipIf(!have(WASIP2) || !wasmtime)('nisaba-server: frames over TCP (was
     const gone = await call({ op: 'count', coll: 'ghosts' });
     expect(gone.ok).toBe(false);
     expect(gone.code).toBe(-37);
+
+    // The one op with no collection in it, and none required.
+    expect(await call({ op: 'ping' })).toEqual({ ok: true, pong: true });
   });
 
   it('deletes many and reports one summed result', async () => {
@@ -355,6 +358,55 @@ for (const engine of ENGINES) {
       const nowhere = spawnSync(process.execPath, ['bin/db.js', '--server', '127.0.0.1:1', 'count', 'users'], { encoding: 'utf8' });
       expect(nowhere.status).toBe(1);
       expect(nowhere.stderr).toMatch(/cannot reach a nisaba server at 127\.0\.0\.1:1/);
+    });
+  });
+
+  /*
+   * The idle timeout, at 1 second rather than the default 60 -- a timer
+   * nothing reaches is a timer nothing tests. What it is really for is
+   * the connection whose peer is GONE (a crashed client, a dropped NAT
+   * mapping), which TCP cannot tell us about and which would otherwise
+   * hold its slot until the process restarts; a client that is merely
+   * quiet is the same thing from here.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: idle connections (${engine.name})`, () => {
+    let proc;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      proc = await startServer(engine, port, ['--idle-timeout', '1']);
+      return () => { proc.kill(); };
+    });
+
+    it('takes back the slot of a connection that asks nothing, and says why', async () => {
+      // keepAliveMs: 0 -- this client is deliberately silent.
+      const quiet = await connectServer(port, { keepAliveMs: 0 });
+      expect(await quiet.collection('users').countDocuments({})).toBe(3);
+
+      await new Promise(r => setTimeout(r, 2500));
+
+      // Not a bare disconnect: the code and the sentence say what happened.
+      let err = null;
+      try { await quiet.collection('users').countDocuments({}); }
+      catch (e) { err = e; }
+      expect(err).toBeInstanceOf(ServerError);
+      expect(err.code).toBe(-45);
+      expect(err.message).toMatch(/idle-timeout/);
+      await quiet.close();
+    });
+
+    it('leaves a connection alone while it pings, which the client does on its own', async () => {
+      // 300ms against a 1s timeout: the same third-of-the-budget the
+      // default keepalive uses, scaled to a test that has to finish.
+      const warm = await connectServer(port, { keepAliveMs: 300 });
+      try {
+        await new Promise(r => setTimeout(r, 2500));
+        // Still there, still answering, three timeouts later.
+        expect(await warm.collection('users').countDocuments({})).toBe(3);
+        expect(await warm.ping()).toBe(true);
+      } finally {
+        await warm.close();
+      }
     });
   });
 

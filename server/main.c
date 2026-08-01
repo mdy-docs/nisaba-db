@@ -62,12 +62,44 @@
  * the cap is ACCEPTED and told -- {ok:false, code:-44, msg} in the shape
  * every other refusal arrives in -- rather than left in the listen
  * backlog, where it would be indistinguishable from a slow server.
+ *
+ * AND THE SLOTS COME BACK. --idle-timeout (60s; 0 disables) closes a
+ * connection that has asked nothing for that long, with code -45 first
+ * so the client learns why rather than seeing a bare disconnect. This is
+ * about DEAD peers more than rude ones: a crashed client, a dropped NAT
+ * mapping and a half-open socket all look exactly like an idle one to
+ * TCP, and without a timer they hold their slots until the process
+ * restarts. SO_KEEPALIVE is not the answer -- it defaults to hours, and
+ * the knobs that shorten it are per-OS and not reliably there through
+ * wasi-sockets.
+ *
+ * The timer measures SILENCE, not connectedness: it is reset when a
+ * request is answered and when that answer has gone out, so a client
+ * dribbling one byte at a time is closed like any other client that
+ * asked nothing. A client that wants to stay warm sends {op:"ping"},
+ * which is the one op that touches no collection.
+ *
+ * A clock, here, is legitimate: this is the transport. db.h keeps clocks
+ * out of the ENGINE, which is why an insert's id is the caller's and not
+ * C's, and nothing below this file learns what time it is. CLOCK_MONOTONIC
+ * and a timed poll() were measured on all four hosts this ships to --
+ * native, wasip1 under wasmtime and under Node's WASI host, and wasip2.
  */
+/* POSIX before any header, the same way bjio_posix.c asks for it and for
+ * the same reason: -std=c11 defines __STRICT_ANSI__, and a sysroot is
+ * entitled to hide clock_gettime/CLOCK_MONOTONIC behind that. wasi-libc's
+ * wasip2 headers do; its wasip1 headers do not, and neither does Darwin,
+ * which is exactly how this class of thing reaches CI unnoticed. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #if defined(NISABA_SOCKETS)
@@ -102,6 +134,12 @@
  * the worst case a reader has to reason about is this number times the
  * largest frame in flight. */
 #define MAX_CLIENTS 64
+
+/* Seconds of silence before a connection's slot is taken back; 0 turns
+ * the timer off. Sixty is short enough that a dead peer does not hold a
+ * slot for long and long enough that a warm client pinging on any sane
+ * interval never notices. */
+#define DEFAULT_IDLE_TIMEOUT 60
 
 /* A connection's buffers are reused between requests, but a client that
  * once sent a large frame should not hold that memory for the rest of
@@ -182,6 +220,21 @@ static int serve(dbs *s, int in_fd, int out_fd) {
 
 #if defined(NISABA_SOCKETS)
 /*
+ * Milliseconds on a monotonic clock -- not a wall clock, which can step
+ * backwards over an NTP correction and would take a connection's slot
+ * away for it. A clock that cannot be read stops instead of jumping: the
+ * last reading is returned, so nothing times out, which is the safe
+ * direction to fail in.
+ */
+static uint64_t now_ms(void) {
+    static uint64_t last = 0;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return last;
+    last = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return last;
+}
+
+/*
  * One accepted client. `in` holds the bytes of a request that has only
  * partly arrived; `out` holds the bytes of responses that have only
  * partly gone out, with out_off marking how far. Both are empty between
@@ -195,13 +248,22 @@ typedef struct {
     size_t in_len, in_cap;
     dbuf out;
     size_t out_off;
+    uint64_t quiet_since;   /* monotonic ms; the idle timer's zero */
 } conn;
 
+/* Forget what a slot held WITHOUT freeing it: for the slot a live
+ * connection has just been moved out of, whose buffers now belong to
+ * wherever it moved to. Freeing here would free them out from under it. */
+static void conn_clear(conn *c) {
+    memset(c, 0, sizeof *c);
+    c->fd = -1;
+}
+
+/* Release everything a slot owns and leave it empty. */
 static void conn_reset(conn *c) {
     free(c->in);
     dbuf_free(&c->out);
-    memset(c, 0, sizeof *c);
-    c->fd = -1;
+    conn_clear(c);
 }
 
 static void conn_close(conn *c) {
@@ -245,6 +307,7 @@ static int conn_flush(conn *c) {
     c->out.len = 0;
     c->out_off = 0;
     if (c->out.cap > IDLE_BUFFER) dbuf_free(&c->out);
+    c->quiet_since = now_ms();   /* answered: the silence starts again here */
     return 0;
 }
 
@@ -278,6 +341,7 @@ static int conn_readable(dbs *s, conn *c) {
 
         int e = dbs_handle(s, c->in, total, &c->out);
         if (e) return -1;                             /* no response could be built */
+        c->quiet_since = now_ms();                    /* it asked something */
 
         c->in_len -= total;
         memmove(c->in, c->in + total, c->in_len);
@@ -291,15 +355,15 @@ static int conn_readable(dbs *s, conn *c) {
 }
 
 /*
- * Tell a connection arriving at the cap why it is being closed, in the
- * shape every other refusal arrives in (db_session.h owns it). Best
- * effort by design: one non-blocking write and then close, because a
- * client that will not read its own refusal must not become a reason to
- * hold a slot.
+ * Tell a connection why it is being closed -- the table was full when it
+ * arrived, or it went quiet -- in the shape every other refusal arrives
+ * in (db_session.h owns it). Best effort by design: one non-blocking
+ * write and then close, because a client that will not read its own
+ * refusal must not become a reason to hold a slot.
  */
-static void refuse_and_close(int fd) {
+static void refuse_and_close(int fd, int code) {
     dbuf msg = {0};
-    if (dbs_refusal(DC_ERR_TOO_MANY_CLIENTS, &msg) == BJ_OK && msg.data) {
+    if (dbs_refusal(code, &msg) == BJ_OK && msg.data) {
         ssize_t ignored = write(fd, msg.data, msg.len);
         (void)ignored;
     }
@@ -334,7 +398,8 @@ static int listen_on(int port) {
  * client whose last answer has not gone out, so a pipelining client
  * cannot make the server hold an unbounded number of answers for it.
  */
-static int serve_forever(dbs *s, int srv, int max_clients) {
+static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
+    const uint64_t idle_ms = (uint64_t)(idle_seconds > 0 ? idle_seconds : 0) * 1000u;
     conn *cs = (conn *)calloc((size_t)max_clients, sizeof *cs);
     struct pollfd *pf = (struct pollfd *)calloc((size_t)max_clients + 1, sizeof *pf);
     if (!cs || !pf) { free(cs); free(pf); return -1; }
@@ -351,11 +416,40 @@ static int serve_forever(dbs *s, int srv, int max_clients) {
             pf[i + 1].revents = 0;
         }
 
-        int r = poll(pf, (nfds_t)(n + 1), -1);
+        /* Sleep until something happens or the earliest deadline, rather
+         * than waking on a tick to find nothing to do. No timer, no
+         * timeout: poll blocks until a socket is ready. */
+        int wait_ms = -1;
+        if (idle_ms && n > 0) {
+            uint64_t now = now_ms(), earliest = 0;
+            for (int i = 0; i < n; i++)
+                if (i == 0 || cs[i].quiet_since < earliest) earliest = cs[i].quiet_since;
+            uint64_t due = earliest + idle_ms;
+            wait_ms = due <= now ? 0 : (int)(due - now);
+        }
+
+        int r = poll(pf, (nfds_t)(n + 1), wait_ms);
         if (r < 0) {
             if (errno == EINTR) continue;
             perror("poll");
             break;
+        }
+
+        /* Whatever has gone quiet, before anything else: a slot held by a
+         * client that is not there any more is the one this exists for. */
+        if (idle_ms) {
+            uint64_t now = now_ms();
+            for (int i = n - 1; i >= 0; i--) {
+                if (now - cs[i].quiet_since < idle_ms) continue;
+                int fd = cs[i].fd;
+                cs[i].fd = -1;              /* conn_close must not close it first */
+                conn_close(&cs[i]);
+                refuse_and_close(fd, DC_ERR_IDLE_TIMEOUT);
+                cs[i] = cs[n - 1];
+                conn_clear(&cs[n - 1]);
+                n--;
+                pf[i + 1].revents = 0;      /* its slot now holds a different client */
+            }
         }
 
         /* Clients first, so a burst of connections cannot starve the
@@ -370,12 +464,8 @@ static int serve_forever(dbs *s, int srv, int max_clients) {
             else if (ev & (POLLIN | POLLHUP)) dead = conn_readable(s, &cs[i]) != 0;
             if (dead) {
                 conn_close(&cs[i]);
-                cs[i] = cs[n - 1];
-                cs[n - 1].fd = -1;
-                cs[n - 1].in = NULL;
-                cs[n - 1].in_len = cs[n - 1].in_cap = 0;
-                memset(&cs[n - 1].out, 0, sizeof cs[n - 1].out);
-                cs[n - 1].out_off = 0;
+                cs[i] = cs[n - 1];      /* the last one moves into the hole */
+                conn_clear(&cs[n - 1]); /* and its old slot owns nothing now */
                 n--;
             }
         }
@@ -385,12 +475,13 @@ static int serve_forever(dbs *s, int srv, int max_clients) {
             if (c < 0) {
                 if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) perror("accept");
             } else if (n >= max_clients) {
-                refuse_and_close(c);
+                refuse_and_close(c, DC_ERR_TOO_MANY_CLIENTS);
             } else if (set_nonblocking(c) != 0) {
                 close(c);
             } else {
                 conn_reset(&cs[n]);
                 cs[n].fd = c;
+                cs[n].quiet_since = now_ms();
                 n++;
             }
         }
@@ -406,6 +497,7 @@ static int serve_forever(dbs *s, int srv, int max_clients) {
 static void usage(const char *me) {
     fprintf(stderr,
             "usage: %s [--stdio] [--port N] [--order N] [--max-clients N]\n"
+            "           [--idle-timeout SECONDS]\n"
             "  serves the database in the preopened directory \".\"\n", me);
 }
 
@@ -413,6 +505,7 @@ int main(int argc, char **argv) {
     int use_stdio = 0;
     int port = DEFAULT_PORT;
     int max_clients = MAX_CLIENTS;
+    int idle_seconds = DEFAULT_IDLE_TIMEOUT;
     /* The order the files were WRITTEN with, which is not a preference:
      * open a tree with the wrong one and its pages read as nonsense. The
      * default is what every host in this repo creates with, so the flag
@@ -425,6 +518,10 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--order") == 0 && i + 1 < argc) {
             order = atoi(argv[++i]);
             if (order < 3) { fprintf(stderr, "--order must be at least 3\n"); return 2; }
+        }
+        else if (strcmp(argv[i], "--idle-timeout") == 0 && i + 1 < argc) {
+            idle_seconds = atoi(argv[++i]);
+            if (idle_seconds < 0) { fprintf(stderr, "--idle-timeout cannot be negative\n"); return 2; }
         }
         else if (strcmp(argv[i], "--max-clients") == 0 && i + 1 < argc) {
             max_clients = atoi(argv[++i]);
@@ -462,13 +559,15 @@ int main(int argc, char **argv) {
         if (srv < 0) { rc = 1; goto done; }
         /* The line the tests (and a person) wait for: it means bound and
          * listening, not merely started. */
-        fprintf(stderr, "nisaba: serving 127.0.0.1:%d (max %d clients)\n", port, max_clients);
+        fprintf(stderr, "nisaba: serving 127.0.0.1:%d (max %d clients, idle timeout %ds)\n",
+                port, max_clients, idle_seconds);
         fflush(stderr);
-        rc = serve_forever(s, srv, max_clients) == 0 ? 0 : 1;
+        rc = serve_forever(s, srv, max_clients, idle_seconds) == 0 ? 0 : 1;
         close(srv);
 #else
         (void)port;   /* accepted and refused, rather than not accepted */
         (void)max_clients;
+        (void)idle_seconds;
         fprintf(stderr,
                 "this build has no sockets (wasm32-wasip1 has none at all);"
                 " use --stdio\n");

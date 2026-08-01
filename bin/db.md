@@ -180,7 +180,9 @@ Open the database directly for the rest.
 invocation connects, asks, and disconnects, so a shell full of them is
 fine, and so is a long-lived client alongside them. Past the limit,
 connecting still succeeds and the first command fails with the server's
-own sentence — it is refused, not queued.
+own sentence — it is refused, not queued. A connection that asks nothing
+for `--idle-timeout` seconds (60 by default) is closed and told why,
+which no `db --server` invocation is ever around long enough to see.
 
 The client itself is `src/db-server-client.js`
 (`@mdy-docs/nisaba-db/server-client`) — a socket, the pure-JS binjson

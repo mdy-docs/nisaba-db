@@ -409,6 +409,48 @@ for (const engine of ENGINES) {
         .toEqual({ source: 'equality', index: 'team_1' });
     });
 
+    it('reads and writes one document in one request, and hands it back', async () => {
+      const jobs = db.collection('jobs');
+      await jobs.insertMany([{ name: 'a', n: 1 }, { name: 'b', n: 2 }]);
+
+      // 'before' by default -- the image the planner already had.
+      const before = await jobs.findOneAndUpdate({ name: 'a' }, { $set: { n: 10 } });
+      expect(before.n).toBe(1);
+      // ...and the write did happen.
+      expect((await jobs.findOne({ name: 'a' })).n).toBe(10);
+
+      const after = await jobs.findOneAndUpdate(
+        { name: 'a' }, { $inc: { n: 5 } }, { returnDocument: 'after' });
+      expect(after.n).toBe(15);
+      expect(after._id.toHexString()).toBe(before._id.toHexString());
+
+      expect(await jobs.findOneAndUpdate({ name: 'zz' }, { $set: { n: 0 } })).toBe(null);
+
+      // An upsert asked for 'before' answers null -- no prior state
+      // exists -- but the document is made, which 'after' can show.
+      expect(await jobs.findOneAndUpdate(
+        { name: 'new' }, { $set: { n: 99 } }, { upsert: true })).toBe(null);
+      expect((await jobs.findOne({ name: 'new' })).n).toBe(99);
+      const born = await jobs.findOneAndUpdate(
+        { name: 'newer' }, { $set: { n: 7 } }, { upsert: true, returnDocument: 'after' });
+      expect(born).toMatchObject({ name: 'newer', n: 7 });
+
+      const replaced = await jobs.findOneAndReplace(
+        { name: 'b' }, { name: 'b', n: 42 }, { returnDocument: 'after' });
+      expect(replaced.n).toBe(42);
+
+      // A delete has one image, and it is the document that is gone.
+      const deleted = await jobs.findOneAndDelete({ name: 'b' });
+      expect(deleted.n).toBe(42);
+      expect(await jobs.findOneAndDelete({ name: 'b' })).toBe(null);
+
+      // $currentDate travels the same road it does for updateOne: the
+      // rewrite is C's, the clock is this side's.
+      const dated = await jobs.findOneAndUpdate(
+        { name: 'a' }, { $currentDate: { at: true } }, { returnDocument: 'after' });
+      expect(dated.at).toBeInstanceOf(Date);
+    });
+
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
       expect(() => db.storageEstimate()).toThrow(/no db\.storageEstimate/);
       expect(() => db.collection('users').pruneExpired()).toThrow(/no collection\.pruneExpired/);

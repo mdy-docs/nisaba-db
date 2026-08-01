@@ -2586,6 +2586,209 @@ static void put_bulk_op(bj_builder *b, const char *name,
     bj_end_object(b);
 }
 
+/* {op, coll, filter, <arg key>: <arg>, returnNew?, id?} -- the
+ * find-one-and-* request shape, which `request` cannot spell. */
+static bj_builder *modify_request(const char *op, const char *coll,
+                                  const uint8_t *filter, uint32_t flen,
+                                  const char *arg_key, const uint8_t *arg, uint32_t alen,
+                                  int return_new, const uint8_t *id,
+                                  const uint8_t **out, uint32_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"op", 2);
+    bj_put_string(b, (const uint8_t *)op, (uint32_t)strlen(op));
+    bj_put_key(b, (const uint8_t *)"coll", 4);
+    bj_put_string(b, (const uint8_t *)coll, (uint32_t)strlen(coll));
+    bj_put_key(b, (const uint8_t *)"filter", 6);
+    bj_put_raw(b, filter, flen);
+    if (arg_key) {
+        bj_put_key(b, (const uint8_t *)arg_key, (uint32_t)strlen(arg_key));
+        bj_put_raw(b, arg, alen);
+    }
+    if (return_new) {
+        bj_put_key(b, (const uint8_t *)"returnNew", 9);
+        bj_put_bool(b, 1);
+    }
+    if (id) {
+        bj_put_key(b, (const uint8_t *)"upsert", 6);
+        bj_put_bool(b, 1);
+        bj_put_key(b, (const uint8_t *)"id", 2);
+        bj_put_oid(b, id);
+    }
+    bj_end_object(b);
+    size_t len = 0;
+    *out = bj_builder_data(b, &len);
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+/* A response's `doc`, as a string field of it. Returns 0 if the response
+ * carried no document (found:false) or no such field. */
+static int response_doc_str(const dbuf *res, const char *key, char *out, size_t cap) {
+    const uint8_t *d; size_t dlen; int f = 0;
+    out[0] = '\0';
+    if (obj_get_field(res->data, res->len, (const uint8_t *)"doc", 3, &d, &dlen, &f) || !f)
+        return 0;
+    return doc_get_str(d, dlen, key, out, cap);
+}
+
+TEST(find_one_and_modify_answers_with_the_document_not_a_count) {
+    /*
+     * The family exists because updateOne says how MANY documents
+     * changed, not WHICH, so reading the document back otherwise means a
+     * second query with a gap in the middle of it.
+     *
+     * Neither image costs a query here. The BEFORE image is the one the
+     * planner already read to resolve its target (dc_wal_plan_preimage,
+     * which names these three methods in its comment); the AFTER image
+     * is a read back by the id the plan resolved, which is a bpt_search.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-foam", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+    const uint64_t CLIENT = 13;
+    char got[64];
+
+    /* ---- before: the image the planner already had. */
+    {
+        doc *f = doc_new(); doc_str(f, "name", "Ada");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        doc *u = doc_new();
+        doc_begin_obj(u, "$set"); doc_str(u, "team", "kernel"); doc_end_obj(u);
+        uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = modify_request("findOneAndUpdate", "users", fb, flen,
+                                        "update", ub, ulen, 0, NULL, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_flag(&res, "found"), 1);
+        CHECK_I64(response_doc_str(&res, "team", got, sizeof got), 1);
+        CHECK(strcmp(got, "core") == 0);        /* as it was */
+        dbuf_free(&res); bj_builder_free(rb); doc_free(f); doc_free(u);
+    }
+
+    /* ---- after: read back by the id the plan resolved, so it carries
+     * the write this same request performed. */
+    {
+        doc *f = doc_new(); doc_str(f, "name", "Ada");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        doc *u = doc_new();
+        doc_begin_obj(u, "$set"); doc_str(u, "team", "ops"); doc_end_obj(u);
+        uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = modify_request("findOneAndUpdate", "users", fb, flen,
+                                        "update", ub, ulen, 1, NULL, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_flag(&res, "found"), 1);
+        CHECK_I64(response_doc_str(&res, "team", got, sizeof got), 1);
+        CHECK(strcmp(got, "ops") == 0);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(f); doc_free(u);
+    }
+
+    /* ---- nothing matched: found:false, and nothing written. */
+    {
+        doc *f = doc_new(); doc_str(f, "name", "Nobody");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        doc *u = doc_new();
+        doc_begin_obj(u, "$set"); doc_str(u, "team", "ghost"); doc_end_obj(u);
+        uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = modify_request("findOneAndUpdate", "users", fb, flen,
+                                        "update", ub, ulen, 0, NULL, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_flag(&res, "found"), 0);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(f); doc_free(u);
+
+        rb = request("count", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &cres));
+        int nf = 0;
+        CHECK_I64(response_num(&cres, "n", &nf), 3);
+        dbuf_free(&cres); bj_builder_free(rb);
+    }
+
+    /* ---- an upsert asked for `before` answers null: there is no prior
+     * state to show. The document is still made. */
+    {
+        uint8_t oid[12]; mk_oid(oid, 77);
+        doc *f = doc_new(); doc_str(f, "name", "Barbara");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        doc *u = doc_new();
+        doc_begin_obj(u, "$set"); doc_str(u, "team", "core"); doc_end_obj(u);
+        uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = modify_request("findOneAndUpdate", "users", fb, flen,
+                                        "update", ub, ulen, 0, oid, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_flag(&res, "found"), 0);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(u);
+
+        bj_builder *cb = request("count", "users", "filter", fb, flen, &req, &req_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &cres));
+        int nf = 0;
+        CHECK_I64(response_num(&cres, "n", &nf), 1);
+        dbuf_free(&cres); bj_builder_free(cb); doc_free(f);
+    }
+
+    /* ---- replace, and delete: the deleted document comes back, which
+     * is the only image a delete has. */
+    {
+        doc *f = doc_new(); doc_str(f, "name", "Grace");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        doc *r = doc_new(); doc_str(r, "name", "Grace"); doc_str(r, "team", "compilers");
+        uint32_t rlen; const uint8_t *rb_ = doc_done(r, &rlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = modify_request("findOneAndReplace", "users", fb, flen,
+                                        "doc", rb_, rlen, 1, NULL, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_flag(&res, "found"), 1);
+        CHECK_I64(response_doc_str(&res, "team", got, sizeof got), 1);
+        CHECK(strcmp(got, "compilers") == 0);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(r); doc_free(f);
+    }
+    {
+        doc *f = doc_new(); doc_str(f, "name", "Alan");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = modify_request("findOneAndDelete", "users", fb, flen,
+                                        NULL, NULL, 0, 0, NULL, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_flag(&res, "found"), 1);
+        CHECK_I64(response_doc_str(&res, "name", got, sizeof got), 1);
+        CHECK(strcmp(got, "Alan") == 0);
+        dbuf_free(&res); bj_builder_free(rb);
+
+        /* Gone, and asking again says so rather than repeating itself. */
+        rb = modify_request("findOneAndDelete", "users", fb, flen,
+                            NULL, NULL, 0, 0, NULL, &req, &req_len);
+        dbuf again = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &again));
+        CHECK_I64(response_ok(&again), 1);
+        CHECK_I64(response_flag(&again, "found"), 0);
+        dbuf_free(&again); bj_builder_free(rb); doc_free(f);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(explain_names_the_plan_the_same_way_for_every_host) {
     /*
      * dc_explain consults the very planners the queries consult, so its
@@ -7674,6 +7877,7 @@ int main(void) {
     RUN(current_date_is_resolved_with_the_callers_clock_or_refused);
     RUN(an_aggregate_pipeline_runs_whole_in_one_request);
     RUN(explain_names_the_plan_the_same_way_for_every_host);
+    RUN(find_one_and_modify_answers_with_the_document_not_a_count);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

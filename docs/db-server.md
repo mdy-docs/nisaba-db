@@ -84,8 +84,8 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Twenty-four
-operations — fifteen about a collection's documents, five about its
+**One request object in, one response object out.** Twenty-seven
+operations — eighteen about a collection's documents, five about its
 schema, two about a cursor, and two about neither: `listCollections` and
 `ping`.
 
@@ -106,6 +106,8 @@ schema, two about a cursor, and two about neither: `listCollections` and
 | `{op:'bulkWrite', coll, writes:[...], ordered, now}` | `{ok:true, result, attempted, upserted, errors}` |
 | `{op:'update'\|'updateMany', coll, filter, update, upsert, id, now}` | `{ok:true, result}` |
 | `{op:'replace', coll, filter, doc, upsert, id}` | `{ok:true, result}` |
+| `{op:'findOneAndUpdate'\|'findOneAndReplace', coll, filter, update\|doc, upsert, id, now, returnNew}` | `{ok:true, found, doc}` |
+| `{op:'findOneAndDelete', coll, filter}` | `{ok:true, found, doc}` |
 | `{op:'delete'\|'deleteMany', coll, filter}` | `{ok:true, result}` |
 | `{op:'createCollection', coll}` | `{ok:true, created}` |
 | `{op:'dropCollection', coll}` | `{ok:true, dropped}` |
@@ -211,6 +213,30 @@ resume — the same reason a sorted find cannot be batched. A stage the
 subset does not have is refused with `index` naming its position, and the
 client quotes what was at that position, because C does not format
 messages around user data.
+
+**The find-one-and-\* family answers with the document, not a count.**
+`updateOne` says how many documents changed, not which, so reading one
+back otherwise means a second query with a gap in the middle. These
+return the document itself — `returnNew` picks the image (`before` is the
+default, as in the driver), and `null` means nothing matched.
+
+Neither image costs a query. The **before** image is the one the planner
+already read to resolve its target (`dc_wal_plan_preimage`, whose comment
+names these three methods); the **after** image is a read back by the id
+the plan resolved, which is a `bpt_search` rather than a scan. A delete
+has only one image — the document is gone — so `returnNew` is not an
+error there, it is the same question.
+
+An upsert asked for `before` answers `null`: no prior state exists to
+show. MongoDB answers the same way.
+
+**No `sort`**, which is the one substantive gap against MongoDB, where
+`findOneAndUpdate(filter, update, {sort})` is the atomic work-queue
+primitive — claim the highest-priority match. Without it you claim
+whichever document the scan reaches first. The in-process API has no
+`sort` either, and a wire that sorted while the local API did not would
+be a worse divergence than the shared gap; adding it means teaching the
+planner to order matches before picking one, which is not plumbing.
 
 **`explain` answers without executing.** It reports which source the
 dispatch *would* use for a filter — `scan`, `ids`, `equality`, `text`,
@@ -378,8 +404,7 @@ Stated here rather than discovered later.
   name. There is no scheduler either: the engine runs no timers, so
   *when* to compact stays with whoever is driving
   (`docs/compaction.md`).
-- **No change streams, no `find-one-and-*` family, no
-  `findByIndex`/`pruneExpired`.** Each is an op in
+- **No change streams, no `findByIndex`/`pruneExpired`.** Each is an op in
   `wasm/src/db_request.c` plus a method in the client — except `watch`,
   which also needs frames the client did not ask for, and this protocol
   has no shape for those. `dump` and `restore` both work today.

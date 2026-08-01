@@ -159,7 +159,7 @@ For the same reason `--order` is refused with `--server`: the order the
 files were written with is the server's to know, and it takes its own
 `--order` if they were not made with the default 32.
 
-The wire carries twenty-four operations, and the CLI commands that ride
+The wire carries twenty-seven operations, and the CLI commands that ride
 on them:
 
 | Works over `--server` | |
@@ -174,18 +174,19 @@ on them:
 | `dump [coll]` | walks `collections` → `list-indexes` → a `find` cursor |
 | `restore` | header lines rebuild the indexes, documents go in batches of 500 |
 | `update-one`, `update-many`, `replace-one` | including `--upsert` |
+| `find-one-and-update`, `find-one-and-replace`, `find-one-and-delete` | the document itself, before or `--return-document after`; no `sort`, as locally |
 | `delete-one`, `delete-many` | |
 
-Everything else — `watch`, `find-by-index`, `prune-expired`, the
-`find-one-and-*` family, and `compact` with no collection named — is not
-on the wire yet, and says so rather than pretending (`aggregate` and
+Everything else — `watch`, `find-by-index`, `prune-expired`, and
+`compact` with no collection named — is not on the wire yet, and says so rather than pretending (`aggregate` and
 `explain` are on the wire but have never been CLI commands):
 
 ```
 $ db --server 8097 prune-expired events
 Error: the server has no collection.pruneExpired() -- its wire carries ping,
-find, findOne, count, distinct, aggregate, explain, insert, insertMany, update,
-updateMany, replace, delete, deleteMany, bulkWrite, getMore, closeCursor,
+find, findOne, count, distinct, aggregate, explain, insert, insertMany,
+update, updateMany, replace, delete, deleteMany, findOneAndUpdate,
+findOneAndReplace, findOneAndDelete, bulkWrite, getMore, closeCursor,
 compact, createCollection, dropCollection, createIndex, dropIndex,
 listIndexes, listCollections. Open the database directly for the rest.
 ```

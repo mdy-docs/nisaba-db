@@ -57,10 +57,10 @@
  * operations with even if it wanted to. So the list goes over whole and
  * the answer says how many members were attempted and which failed.
  *
- * WHAT IS NOT HERE. The wire has twenty-four ops (WIRE_OPS below) and
- * this client has exactly those. Change streams and the
- * find-one-and-* family are not on the wire yet; asking for one gets a
- * sentence saying so rather than a TypeError about undefined not being a
+ * WHAT IS NOT HERE. The wire has twenty-seven ops (WIRE_OPS below) and
+ * this client has exactly those. Change streams, findByIndex and
+ * pruneExpired are not on the wire yet; asking for one gets a sentence
+ * saying so rather than a TypeError about undefined not being a
  * function. Adding a method here without adding the op to db_request.c
  * would be inventing a second opinion about what the server does.
  */
@@ -78,6 +78,7 @@ export const WIRE_OPS = [
   'ping',
   'find', 'findOne', 'count', 'distinct', 'aggregate', 'explain',
   'insert', 'insertMany', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
+  'findOneAndUpdate', 'findOneAndReplace', 'findOneAndDelete',
   'bulkWrite',
   'getMore', 'closeCursor', 'compact',
   'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
@@ -570,6 +571,32 @@ function collection(conn, name) {
       return result;
     },
 
+    /*
+     * Read and write one document in one request, answering with the
+     * document itself: `returnDocument` picks the image, 'before' by
+     * default, exactly as the in-process API and the driver do. null
+     * when nothing matched -- and also for an upsert asked for 'before',
+     * because no prior state exists to return.
+     *
+     * No `sort`, for the same reason the in-process API has none: this
+     * would then be the only place in the library where you could
+     * choose WHICH matching document gets claimed.
+     */
+    async findOneAndUpdate(filter, update, options = undefined) {
+      return findAndModify('findOneAndUpdate', { filter, update }, options);
+    },
+
+    async findOneAndReplace(filter, replacement, options = undefined) {
+      return findAndModify('findOneAndReplace', { filter, doc: replacement }, options);
+    },
+
+    /** The deleted document, or null. `returnDocument` has no meaning
+     * here: the document is gone, so `before` is the only image there
+     * is. */
+    async findOneAndDelete(filter = {}) {
+      return findAndModify('findOneAndDelete', { filter }, undefined);
+    },
+
     async deleteOne(filter = {}) {
       return (await call({ op: 'delete', filter })).result;
     },
@@ -630,6 +657,19 @@ function collection(conn, name) {
    * rather than only when the update looks like it needs one: deciding
    * where $currentDate may appear is the grammar's business, not this
    * file's. */
+  /* The wire says `returnNew`, which is what C's own API calls it
+   * (dc_find_one_and_update's return_new); the driver's spelling stays
+   * on this side, where drivers live. */
+  async function findAndModify(op, fields, options) {
+    const upsert = !!options?.upsert;
+    const res = await call({
+      op, ...fields, now: Date.now(),
+      ...(options?.returnDocument === 'after' ? { returnNew: true } : {}),
+      ...(upsert ? { upsert, id: new ObjectId() } : {})
+    });
+    return res.found ? res.doc : null;
+  }
+
   async function write(op, fields, options) {
     const upsert = !!options?.upsert;
     const res = await call({

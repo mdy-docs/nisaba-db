@@ -59,7 +59,10 @@ typedef enum {
     OP_INSERT_MANY,
     OP_BULK_WRITE,
     OP_AGGREGATE,
-    OP_EXPLAIN
+    OP_EXPLAIN,
+    OP_FIND_ONE_AND_UPDATE,
+    OP_FIND_ONE_AND_REPLACE,
+    OP_FIND_ONE_AND_DELETE
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -93,6 +96,9 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("bulkWrite",        OP_BULK_WRITE),
     OP("aggregate",        OP_AGGREGATE),
     OP("explain",          OP_EXPLAIN),
+    OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE),
+    OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE),
+    OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE),
 };
 
 #undef OP
@@ -286,6 +292,21 @@ int dbs_refusal(int code, dbuf *out) {
     return respond_error(out, code);
 }
 
+/* {_id: <oid>} -- the filter that reads one document back by id, which
+ * the query layer answers with a single bpt_search rather than a scan. */
+static int id_filter(const uint8_t id[12], dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_object(b);
+    PUT_KEY(b, "_id"); bj_put_oid(b, id);
+    bj_end_object(b);
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    int e = data ? dbuf_put(out, data, len) : BJ_ERR_OOM;
+    bj_builder_free(b);
+    return e;
+}
+
 /* ---- the ops ------------------------------------------------------------ */
 
 /* Sum the per-command results a many-form produced into the single result
@@ -318,8 +339,13 @@ static void accumulate(const uint8_t *res, size_t res_len,
  * about them. */
 typedef struct {
     int64_t matched, modified, deleted, inserted, upserted;
-    int     has_upserted_id;
-    uint8_t upserted_id[12];
+    /* DC_PLAN_NOTHING / _MATCHED / _UPSERT, and the single document id
+     * the plan resolved -- which the find-one-and-* family needs to read
+     * a post-image back, and which is the upserted id when the outcome
+     * says so. One field, because they are one fact. */
+    int     outcome;
+    int     has_target_id;
+    uint8_t target_id[12];
 } write_result;
 
 /* Plan a write and apply every command it produced, reporting what
@@ -328,13 +354,28 @@ typedef struct {
 static int run_write(dc_collection *c, const char *coll, uint32_t coll_len,
                      int wreq, const uint8_t *a, uint32_t a_len,
                      const uint8_t *b, uint32_t b_len,
-                     int upsert, const uint8_t id[12], write_result *wr) {
+                     int upsert, const uint8_t id[12], write_result *wr,
+                     dbuf *preimage) {
     memset(wr, 0, sizeof *wr);
 
     dc_wal_plan *p = NULL;
     int e = dc_wal_plan_build(c, coll, coll_len, wreq, a, a_len, b, b_len,
                               upsert, id, &p);
     if (e) return e;
+
+    /* The document as it was, taken before anything is applied. The
+     * planner already had it in hand -- it is how the target was
+     * resolved -- so this costs a copy rather than a second query, which
+     * is the whole reason dc_wal_plan_preimage exists. NULL asks for
+     * nothing: every write but the find-one-and-* family ignores it. */
+    if (preimage) {
+        uint32_t plen = 0;
+        const uint8_t *img = dc_wal_plan_preimage(p, &plen);
+        if (img && plen) {
+            e = dbuf_put(preimage, img, plen);
+            if (e) { dc_wal_plan_free(p); return e; }
+        }
+    }
 
     int64_t inserted = 0;
     uint32_t n = dc_wal_plan_count(p);
@@ -357,17 +398,17 @@ static int run_write(dc_collection *c, const char *coll, uint32_t coll_len,
             inserted++;
         }
     }
+    wr->outcome = dc_wal_plan_outcome(p);
+    {
+        const uint8_t *tid = dc_wal_plan_target_id(p);
+        if (tid) { memcpy(wr->target_id, tid, 12); wr->has_target_id = 1; }
+    }
     /* An upsert is APPLIED as an insert, so the apply result says
      * "insertedId" -- but a driver counts it as an upsert and not as
      * both, and the plan is the only thing that still knows which it
      * was. */
-    if (dc_wal_plan_outcome(p) == DC_PLAN_UPSERT) {
-        const uint8_t *tid = dc_wal_plan_target_id(p);
-        wr->upserted = 1;
-        if (tid) { memcpy(wr->upserted_id, tid, 12); wr->has_upserted_id = 1; }
-    } else {
-        wr->inserted = inserted;
-    }
+    if (wr->outcome == DC_PLAN_UPSERT) wr->upserted = 1;
+    else                               wr->inserted = inserted;
 
 done:
     dbuf_free(&one);
@@ -387,7 +428,8 @@ static int render_write(const write_result *wr, dbuf *out) {
     PUT_KEY(rb, "deletedCount");  bj_put_int(rb, wr->deleted);
     PUT_KEY(rb, "insertedCount"); bj_put_int(rb, wr->inserted);
     PUT_KEY(rb, "upsertedId");
-    if (wr->has_upserted_id) bj_put_oid(rb, wr->upserted_id); else bj_put_null(rb);
+    if (wr->outcome == DC_PLAN_UPSERT && wr->has_target_id) bj_put_oid(rb, wr->target_id);
+    else bj_put_null(rb);
     bj_end_object(rb);
     size_t rlen = 0;
     const uint8_t *rdata = bj_builder_data(rb, &rlen);
@@ -401,7 +443,7 @@ static int do_write(dc_collection *c, const char *coll, uint32_t coll_len,
                     const uint8_t *b, uint32_t b_len,
                     int upsert, const uint8_t id[12], dbuf *out) {
     write_result wr;
-    int e = run_write(c, coll, coll_len, wreq, a, a_len, b, b_len, upsert, id, &wr);
+    int e = run_write(c, coll, coll_len, wreq, a, a_len, b, b_len, upsert, id, &wr, NULL);
     if (e) return e;
     return render_write(&wr, out);
 }
@@ -710,7 +752,7 @@ static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
 
         write_result wr;
         int rc = run_write(c, coll, coll_len, bw.wreq, bw.a, bw.a_len,
-                           ub, (uint32_t)ub_len, bw.upsert, bw.id, &wr);
+                           ub, (uint32_t)ub_len, bw.upsert, bw.id, &wr, NULL);
         attempted++;
         if (rc) {
             if ((e = put_error(errb, i, rc))) break;
@@ -723,10 +765,10 @@ static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
         total.modified += wr.modified;
         total.deleted  += wr.deleted;
         total.upserted += wr.upserted;
-        if (wr.has_upserted_id) {
+        if (wr.outcome == DC_PLAN_UPSERT && wr.has_target_id) {
             bj_begin_object(upb);
             PUT_KEY(upb, "index"); bj_put_int(upb, (int64_t)i);
-            PUT_KEY(upb, "id");    bj_put_oid(upb, wr.upserted_id);
+            PUT_KEY(upb, "id");    bj_put_oid(upb, wr.target_id);
             bj_end_object(upb);
             if ((e = bj_builder_error(upb))) break;
             nups++;
@@ -1188,6 +1230,80 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = cdata ? dbuf_put(&body, cdata, clen) : BJ_ERR_OOM;
             bj_builder_free(cb);
             body_key = "result";
+            break;
+        }
+        case OP_FIND_ONE_AND_UPDATE:
+        case OP_FIND_ONE_AND_REPLACE:
+        case OP_FIND_ONE_AND_DELETE: {
+            /*
+             * One document, read and written by one request, answering
+             * with the document rather than a count -- which is the
+             * whole point of the family: updateOne says how many changed,
+             * not which, so getting it back otherwise means a second
+             * query with a gap in the middle.
+             *
+             * The BEFORE image costs nothing: the planner already read
+             * the document to resolve the target, and run_write now
+             * keeps what it read. The AFTER image is one read back by
+             * the id the plan resolved -- a bpt_search, not a scan.
+             */
+            int wreq;
+            const uint8_t *arg = NULL; uint32_t arg_len = 0;
+            if (op == OP_FIND_ONE_AND_UPDATE) {
+                if (!upd) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+                const uint8_t *ub; size_t ub_len;
+                if ((e = resolve_dates(upd, upd_len, now_ms, have_now,
+                                       &dates, &ub, &ub_len))) break;
+                wreq = DC_WREQ_UPDATE_ONE;
+                arg = ub; arg_len = (uint32_t)ub_len;
+            } else if (op == OP_FIND_ONE_AND_REPLACE) {
+                if (!doc) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+                wreq = DC_WREQ_REPLACE_ONE;
+                arg = doc; arg_len = (uint32_t)doc_len;
+            } else {
+                wreq = DC_WREQ_DELETE_ONE;
+            }
+            /* An upsert that matches nothing inserts, and an insert needs
+             * the caller's 12 bytes. */
+            if (upsert && !have_id) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+
+            /* Which image to answer with. A delete has only one: the
+             * document is gone, so there is no `after` to return, and
+             * asking for one is not an error -- it is the same question. */
+            int return_new = 0;
+            if ((e = field_flag(req, req_len, "returnNew", 0, &return_new))) break;
+            if (op == OP_FIND_ONE_AND_DELETE) return_new = 0;
+
+            write_result wr;
+            dbuf pre = {0};
+            e = run_write(c, (const char *)coll, coll_len, wreq,
+                          filter, (uint32_t)filter_len, arg, arg_len,
+                          upsert, id, &wr, return_new ? NULL : &pre);
+            if (e) { dbuf_free(&pre); break; }
+
+            is_bool_found = 1;
+            body_key = "doc";
+            if (wr.outcome == DC_PLAN_NOTHING) {
+                found_doc = 0;           /* nothing matched, nothing written */
+            } else if (return_new) {
+                if (wr.has_target_id) {
+                    dbuf idf = {0};
+                    if ((e = id_filter(wr.target_id, &idf))) { dbuf_free(&idf); break; }
+                    uint8_t *d = NULL; size_t dlen = 0; int got = 0;
+                    e = dc_find_one(c, idf.data, (uint32_t)idf.len, NULL, 0, &got, &d, &dlen);
+                    dbuf_free(&idf);
+                    if (!e && got) { e = dbuf_put(&body, d, dlen); found_doc = 1; }
+                    free(d);
+                }
+            } else if (pre.len) {
+                e = dbuf_put(&body, pre.data, pre.len);
+                found_doc = 1;
+            } else {
+                /* An upsert has no prior state to show, so `before` is
+                 * null -- which is what MongoDB answers too. */
+                found_doc = 0;
+            }
+            dbuf_free(&pre);
             break;
         }
         case OP_EXPLAIN: {

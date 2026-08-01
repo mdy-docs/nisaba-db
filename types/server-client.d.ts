@@ -111,6 +111,16 @@ export interface RemoteCollection<T extends Document = Document> {
    * ServerError whose `index` names it, before any of it runs. A failure
    * while running rejects with `err.result` and `err.writeErrors`. */
   bulkWrite(operations: Document[], options?: { ordered?: boolean }): Promise<RemoteBulkWriteResult>;
+  /** The document itself rather than a count: `returnDocument` picks the
+   * image ('before' by default, as in the driver), and null means nothing
+   * matched -- or, for an upsert asked for 'before', that no prior state
+   * exists. No `sort`: the in-process API has none either. */
+  findOneAndUpdate(filter: Filter, update: Update,
+                   options?: { upsert?: boolean; returnDocument?: 'before' | 'after' }): Promise<Document | null>;
+  findOneAndReplace(filter: Filter, replacement: Document,
+                    options?: { upsert?: boolean; returnDocument?: 'before' | 'after' }): Promise<Document | null>;
+  /** The deleted document, or null. It has no 'after' image. */
+  findOneAndDelete(filter?: Filter): Promise<Document | null>;
   deleteOne(filter?: Filter): Promise<RemoteWriteResult>;
   deleteMany(filter?: Filter): Promise<RemoteWriteResult>;
   replaceOne(filter: Filter, doc: T, options?: { upsert?: boolean }): Promise<RemoteWriteResult>;

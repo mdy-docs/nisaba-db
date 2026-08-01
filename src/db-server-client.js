@@ -57,8 +57,8 @@
  * operations with even if it wanted to. So the list goes over whole and
  * the answer says how many members were attempted and which failed.
  *
- * WHAT IS NOT HERE. The wire has twenty-two ops (WIRE_OPS below) and this
- * client has exactly those. Change streams, aggregate and the
+ * WHAT IS NOT HERE. The wire has twenty-three ops (WIRE_OPS below) and
+ * this client has exactly those. Change streams and the
  * find-one-and-* family are not on the wire yet; asking for one gets a
  * sentence saying so rather than a TypeError about undefined not being a
  * function. Adding a method here without adding the op to db_request.c
@@ -76,7 +76,7 @@ export { encode, decode, ObjectId, Pointer };
  */
 export const WIRE_OPS = [
   'ping',
-  'find', 'findOne', 'count', 'distinct',
+  'find', 'findOne', 'count', 'distinct', 'aggregate',
   'insert', 'insertMany', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
   'bulkWrite',
   'getMore', 'closeCursor', 'compact',
@@ -212,10 +212,11 @@ class Connection {
       throw new Error('the server sent something that is not a response object');
     }
     if (res.ok === false) {
-      /* A refusal that names a POSITION is one about a list of
-       * operations (bulkWrite): which one of them was malformed. */
-      const at = typeof res.index === 'number' ? ` (operation ${res.index})` : '';
-      const err = new ServerError(res.code, (res.msg || `error ${res.code}`) + at);
+      /* A refusal can name a POSITION -- which member of a list of
+       * operations or of pipeline stages was wrong. It stays a number
+       * here; what to call that position, and what was at it, is known
+       * only by whoever built the list. */
+      const err = new ServerError(res.code, res.msg || `error ${res.code}`);
       if (typeof res.index === 'number') err.index = res.index;
       throw err;
     }
@@ -262,6 +263,53 @@ function guard(impl, what) {
   });
 }
 
+/**
+ * Name the stage a refusal was about, and quote it.
+ *
+ * The server reports WHICH member of a list was wrong (`index`) and
+ * nothing about its contents -- C does not format messages around user
+ * data. This side is holding the list, so it is the side that can say
+ * what was in it. Same division as the in-process aggregate, whose
+ * message this reproduces.
+ */
+function atStage(err, pipeline) {
+  if (typeof err?.index !== 'number' || err.index < 0 || err.index >= pipeline.length) return err;
+  err.message = `${err.message} (stage ${err.index}: ${JSON.stringify(pipeline[err.index])})`;
+  return err;
+}
+
+/**
+ * A cursor over a result that arrived whole, in one frame -- an unbatched
+ * find, or an aggregate. Nothing is held on the server: the "cursor" is a
+ * position in an array this side already has, which is exactly what the
+ * in-process cursor over a materialized result is too.
+ *
+ * `docs` is the promise of that array, so a caller that never asks for a
+ * document never waits for one.
+ */
+function materialized(docs) {
+  let at = 0;
+  return guard({
+    toArray: () => docs,
+    /* {value, done}, the shape the in-process cursor uses -- so a caller
+     * that pulls one document at a time reads the same either way,
+     * whichever side of a socket it is on. */
+    async next() {
+      const all = await docs;
+      return at < all.length ? { value: all[at++], done: false }
+                             : { value: undefined, done: true };
+    },
+    close: async () => {},
+    /* Shares the position with next(), the way the in-process cursor
+     * does -- iterating after pulling one document continues rather than
+     * handing that document out twice. */
+    async *[Symbol.asyncIterator]() {
+      const all = await docs;
+      while (at < all.length) yield all[at++];
+    }
+  }, 'cursor');
+}
+
 /** find's options, as db_request.c's read_opts reads them: absent is none. */
 function findOpts(options) {
   const out = {};
@@ -299,22 +347,8 @@ function collection(conn, name) {
       const batchSize = options?.batchSize > 0 ? options.batchSize : 0;
 
       if (!batchSize) {
-        const docs = call({ op: 'find', filter, ...(opts ? { opts } : {}) })
-          .then((res) => res.docs || []);
-        let at = 0;
-        return guard({
-          toArray: () => docs,
-          /* {value, done}, the shape the in-process cursor uses -- so a
-           * caller that pulls one document at a time reads the same
-           * either way, whichever side of a socket it is on. */
-          async next() {
-            const all = await docs;
-            return at < all.length ? { value: all[at++], done: false }
-                                   : { value: undefined, done: true };
-          },
-          close: async () => {},
-          async *[Symbol.asyncIterator]() { yield* await docs; }
-        }, 'cursor');
+        return materialized(call({ op: 'find', filter, ...(opts ? { opts } : {}) })
+          .then((res) => res.docs || []));
       }
 
       let id = null;          // the server's cursor id while one is open
@@ -373,6 +407,24 @@ function collection(conn, name) {
     async findOne(filter = {}) {
       const res = await call({ op: 'findOne', filter });
       return res.found ? res.doc : null;
+    },
+
+    /*
+     * The pipeline runs in C (db_agg.h), including the decision to push a
+     * leading $match into the scan so an index can serve it. This side
+     * marshals the stages in and the documents out, and knows no stage
+     * names -- which is the point: the subset is one list, in one place.
+     *
+     * One frame, no server cursor: $sort and $group need every match
+     * before the first result exists, so there is no scan left to resume.
+     */
+    aggregate(pipeline = []) {
+      if (!Array.isArray(pipeline)) throw new Error('aggregate requires a pipeline array');
+      return materialized(
+        call({ op: 'aggregate', stages: pipeline })
+          .then((res) => res.docs || [])
+          .catch((err) => { throw atStage(err, pipeline); })
+      );
     },
 
     async countDocuments(filter = {}) {
@@ -469,7 +521,13 @@ function collection(conn, name) {
 
       /* One clock reading for the whole list, so two members dating the
        * same field cannot disagree about when it was. */
-      const res = await call({ op: 'bulkWrite', writes, ordered, now: Date.now() });
+      const res = await call({ op: 'bulkWrite', writes, ordered, now: Date.now() })
+        .catch((err) => {
+          /* A malformed list names its position; this side says what
+           * that position is called, as the in-process bulkWrite does. */
+          if (typeof err?.index === 'number') err.message += ` (operation ${err.index})`;
+          throw err;
+        });
       const result = {
         acknowledged: true,
         insertedCount: res.result.insertedCount,

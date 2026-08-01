@@ -350,9 +350,49 @@ for (const engine of ENGINES) {
       await expect(db.collection('ghosts').countDocuments({})).rejects.toMatchObject({ code: -37 });
     });
 
+    it('runs a pipeline in C and pages the result from this side', async () => {
+      // Its own collection: this suite shares one server, and a pipeline
+      // asserted against documents an earlier test edits is a test of
+      // the order tests happen to run in.
+      const users = db.collection('sales');
+      await users.insertMany([
+        { name: 'Ada', team: 'core', qty: 5 }, { name: 'Grace', team: 'core', qty: 3 },
+        { name: 'Alan', team: 'research', qty: 7 }
+      ]);
+
+      const grouped = await users.aggregate([
+        { $match: { qty: { $gt: 0 } } },
+        { $group: { _id: '$team', n: { $count: {} }, total: { $sum: '$qty' } } },
+        { $sort: { n: -1 } }
+      ]).toArray();
+      expect(grouped.map(g => g._id)).toEqual(['core', 'research']);
+      expect(grouped[0].total).toBe(8);
+
+      // The result arrived whole, so the cursor is a position in an
+      // array this side holds -- and next() and for-await share it.
+      const cursor = users.aggregate([{ $sort: { name: 1 } }, { $project: { name: 1, _id: 0 } }]);
+      const first = await cursor.next();
+      expect(first.done).toBe(false);
+      const rest = [];
+      for await (const doc of cursor) rest.push(doc.name);
+      expect(rest).not.toContain(first.value.name);
+
+      // A stage this subset does not have is refused by C, which names
+      // the position; this side names what was at it.
+      let err = null;
+      try { await users.aggregate([{ $match: {} }, { $obliterate: {} }]).toArray(); }
+      catch (e) { err = e; }
+      expect(err).toBeInstanceOf(ServerError);
+      expect(err.code).toBe(-24);
+      expect(err.index).toBe(1);
+      expect(err.message).toMatch(/stage 1: \{"\$obliterate":\{\}\}/);
+      // And the sentence listing the subset is C's, not a copy here.
+      expect(err.message).toMatch(/\$match, \$sort, \$skip, \$limit, \$project, \$group, \$count/);
+    });
+
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
       expect(() => db.storageEstimate()).toThrow(/no db\.storageEstimate/);
-      expect(() => db.collection('users').aggregate([])).toThrow(/no collection\.aggregate/);
+      expect(() => db.collection('users').pruneExpired()).toThrow(/no collection\.pruneExpired/);
       // The sentence names the ops that DO exist, so the refusal is
       // actionable without reading the source.
       expect(() => db.collection('users').watch()).toThrow(WIRE_OPS.join(', '));

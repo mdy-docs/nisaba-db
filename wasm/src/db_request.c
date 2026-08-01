@@ -20,6 +20,7 @@
 
 #include "db_wal.h"
 #include "db_query.h"
+#include "db_agg.h"
 #include "db_update.h"
 #include "db_validate.h"
 #include "db_bulk.h"
@@ -56,7 +57,8 @@ typedef enum {
     OP_LIST_INDEXES,
     OP_LIST_COLLECTIONS,
     OP_INSERT_MANY,
-    OP_BULK_WRITE
+    OP_BULK_WRITE,
+    OP_AGGREGATE
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -88,6 +90,7 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("listCollections",  OP_LIST_COLLECTIONS),
     OP("insertMany",       OP_INSERT_MANY),
     OP("bulkWrite",        OP_BULK_WRITE),
+    OP("aggregate",        OP_AGGREGATE),
 };
 
 #undef OP
@@ -1183,6 +1186,39 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = cdata ? dbuf_put(&body, cdata, clen) : BJ_ERR_OOM;
             bj_builder_free(cb);
             body_key = "result";
+            break;
+        }
+        case OP_AGGREGATE: {
+            /*
+             * The whole pipeline in one call, including the decision to
+             * push a leading $match into the scan so the planner and any
+             * index can serve it -- db_agg.h owns that, as it does for
+             * every other host. Nothing here knows a stage name.
+             *
+             * One frame, no cursor. A pipeline is not a scan that can be
+             * resumed: $sort and $group need every match before the first
+             * result exists, which is the same reason a sorted find
+             * cannot be batched. The server holds the result no longer
+             * than it takes to write it out.
+             */
+            const uint8_t *stages; size_t stages_len; int have = 0;
+            if ((e = field_raw(req, req_len, "stages", &stages, &stages_len, &have))) break;
+            if (!have) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+
+            uint8_t *docs = NULL; size_t docs_len = 0;
+            int bad = -1;
+            e = dc_aggregate(c, stages, stages_len, &bad, &docs, &docs_len);
+            if (e) {
+                /* Which stage, named the way a malformed bulkWrite names
+                 * its operation: a list has positions, and the client is
+                 * holding the list. */
+                free(docs);
+                dbuf_free(&body); dbuf_free(&dates);
+                return respond_error_at(out, e, bad);
+            }
+            e = dbuf_put(&body, docs, docs_len);
+            free(docs);
+            body_key = "docs";
             break;
         }
         case OP_INSERT_MANY: {

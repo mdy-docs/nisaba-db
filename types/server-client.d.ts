@@ -81,6 +81,11 @@ export interface RemoteCollection<T extends Document = Document> {
   findOne(filter?: Filter): Promise<T | null>;
   countDocuments(filter?: Filter): Promise<number>;
   distinct(field: string, filter?: Filter): Promise<unknown[]>;
+  /** The documented subset ($match/$sort/$skip/$limit/$project/$group/
+   * $count), run whole in C. One frame, no server cursor: the returned
+   * cursor is a position in an array this side already holds. A bad
+   * stage rejects with a ServerError whose `index` names it. */
+  aggregate<R extends Document = Document>(pipeline?: Document[]): RemoteCursor<R>;
   /** The `_id` is minted client-side (C will not invent one: it needs a clock). */
   insertOne(doc: T): Promise<RemoteWriteResult & { insertedId: ObjectId }>;
   /** Every document in one round trip; ids minted client-side as above.

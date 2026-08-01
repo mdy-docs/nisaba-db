@@ -84,8 +84,8 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Twenty-two
-operations — thirteen about a collection's documents, five about its
+**One request object in, one response object out.** Twenty-three
+operations — fourteen about a collection's documents, five about its
 schema, two about a cursor, and two about neither: `listCollections` and
 `ping`.
 
@@ -99,6 +99,7 @@ schema, two about a cursor, and two about neither: `listCollections` and
 | `{op:'findOne', coll, filter}` | `{ok:true, found, doc}` |
 | `{op:'count', coll, filter}` | `{ok:true, n}` |
 | `{op:'distinct', coll, field, filter}` | `{ok:true, values:[...]}` |
+| `{op:'aggregate', coll, stages:[...]}` | `{ok:true, docs:[...]}` |
 | `{op:'insert', coll, doc, id}` | `{ok:true, result}` |
 | `{op:'insertMany', coll, docs:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
 | `{op:'bulkWrite', coll, writes:[...], ordered, now}` | `{ok:true, result, attempted, upserted, errors}` |
@@ -194,6 +195,21 @@ while any cursor is open over a tree it would rebuild
 (`DC_ERR_CURSORS_OPEN`, -49, before anything is written) — enforced in
 `dc_compact_execute` rather than left to callers, because a cursor can
 now outlive the request that made it.
+
+**A pipeline runs whole, in C.** `aggregate` hands `dc_aggregate` the
+stages and hands back what it produced — including the decision to push a
+*leading* `$match` into the underlying scan, so the planner and any index
+serve it. That decision lives with the planner it feeds
+(`wasm/include/db_agg.h`), not in a client, and the subset itself
+(`$match`, `$sort`, `$skip`, `$limit`, `$project`, `$group`, `$count`) is
+named in exactly one place.
+
+It answers in **one frame and opens no cursor**: `$sort` and `$group` need
+every match before the first result exists, so there is no scan left to
+resume — the same reason a sorted find cannot be batched. A stage the
+subset does not have is refused with `index` naming its position, and the
+client quotes what was at that position, because C does not format
+messages around user data.
 
 **A sorted find cannot be batched** (`-48`). An arbitrary sort needs
 every match before the first ordered result exists — the reason
@@ -350,8 +366,8 @@ Stated here rather than discovered later.
   name. There is no scheduler either: the engine runs no timers, so
   *when* to compact stays with whoever is driving
   (`docs/compaction.md`).
-- **No change streams, no `aggregate`, no `find-one-and-*` family, no
-  `findByIndex`/`pruneExpired`.** Each is an op in
+- **No change streams, no `find-one-and-*` family, no
+  `findByIndex`/`pruneExpired`, no `explain`.** Each is an op in
   `wasm/src/db_request.c` plus a method in the client — except `watch`,
   which also needs frames the client did not ask for, and this protocol
   has no shape for those. `dump` and `restore` both work today.

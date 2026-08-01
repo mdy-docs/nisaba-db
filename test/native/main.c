@@ -2586,6 +2586,111 @@ static void put_bulk_op(bj_builder *b, const char *name,
     bj_end_object(b);
 }
 
+TEST(an_aggregate_pipeline_runs_whole_in_one_request) {
+    /*
+     * The pipeline was already C's (db_agg.h) -- including the decision
+     * to push a leading $match into the scan so an index can serve it --
+     * so this op is marshalling and nothing else. What it must NOT do is
+     * grow a second opinion about stage names: the grammar is one list,
+     * in one place, and the only thing that crosses this seam is which
+     * stage went wrong.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-agg", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+    const uint64_t CLIENT = 7;
+
+    /* $group with $sum, then $sort: Ada 36 and Grace 45 are core, Alan 41
+     * is research, so the order proves the sort ran over the groups. */
+    {
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        bj_begin_object(ab);
+        bj_put_key(ab, (const uint8_t *)"$group", 6);
+        bj_begin_object(ab);
+        bj_put_key(ab, (const uint8_t *)"_id", 3);
+        bj_put_string(ab, (const uint8_t *)"$team", 5);
+        bj_put_key(ab, (const uint8_t *)"total", 5);
+        bj_begin_object(ab);
+        bj_put_key(ab, (const uint8_t *)"$sum", 4);
+        bj_put_string(ab, (const uint8_t *)"$age", 4);
+        bj_end_object(ab);
+        bj_end_object(ab);
+        bj_end_object(ab);
+        bj_begin_object(ab);
+        bj_put_key(ab, (const uint8_t *)"$sort", 5);
+        bj_begin_object(ab);
+        bj_put_key(ab, (const uint8_t *)"total", 5);
+        bj_put_int(ab, -1);
+        bj_end_object(ab);
+        bj_end_object(ab);
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("aggregate", "users", "stages", adata, alen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_docs(&res), 2);
+        CHECK_I64(list_num(&res, "docs", 0, "total"), 81);
+        CHECK_I64(list_num(&res, "docs", 1, "total"), 41);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab);
+    }
+
+    /* A stage this subset does not have is refused with its POSITION,
+     * the same way a malformed bulkWrite names its operation -- and the
+     * stage's CONTENTS stay with the client that sent them, because C
+     * does not format messages around user data. */
+    {
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        bj_begin_object(ab);
+        bj_put_key(ab, (const uint8_t *)"$match", 6);
+        bj_begin_object(ab); bj_end_object(ab);
+        bj_end_object(ab);
+        bj_begin_object(ab);
+        bj_put_key(ab, (const uint8_t *)"$obliterate", 11);
+        bj_begin_object(ab); bj_end_object(ab);
+        bj_end_object(ab);
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("aggregate", "users", "stages", adata, alen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_AGG_UNKNOWN_STAGE);
+        CHECK_I64(response_num(&res, "index", &f), 1);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab);
+    }
+
+    /* No pipeline at all is a missing field, not an empty one. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("aggregate", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_REQ_MISSING_FIELD);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(current_date_is_resolved_with_the_callers_clock_or_refused) {
     /*
      * $currentDate is not an operator the engine knows: upd_apply's table
@@ -7497,6 +7602,7 @@ int main(void) {
     RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);
     RUN(a_list_of_writes_is_one_request_and_reports_every_member);
     RUN(current_date_is_resolved_with_the_callers_clock_or_refused);
+    RUN(an_aggregate_pipeline_runs_whole_in_one_request);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

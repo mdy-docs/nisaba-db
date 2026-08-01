@@ -141,6 +141,11 @@ export interface RemoteCollection<T extends Document = Document> {
   /** ServerError -57 if the collection has no index of that name. */
   dropIndex(name: string): Promise<void>;
   listIndexes(): Promise<Document[]>;
+  /** Equality lookup straight through a named index, no planner: one
+   * value per indexed field, in the index's order. Rejects with -57 (no
+   * such index), -58 (not an equality index) or -59 (wrong number of
+   * values). */
+  findByIndex<R extends Document = Document>(name: string, values: unknown[]): Promise<R[]>;
 }
 
 export interface RemoteDb {

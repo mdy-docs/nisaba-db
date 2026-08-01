@@ -272,13 +272,30 @@ int dc_collection_add_geo_index(dc_collection *c, const char *name, int name_len
  * index. */
 int dc_collection_remove_index(dc_collection *c, const char *name, int name_len);
 
+/* No index of that name on this collection. Here rather than in
+ * db_session.h (where it began, beside INDEX_EXISTS) because the
+ * collection is what knows its indexes, and the lookup below has to be
+ * able to say so. */
+#define DC_ERR_NO_INDEX      (-57)
+/* The named index is the wrong KIND for the lookup asked of it: a text
+ * or geo index answers a different question and has no equality tree to
+ * range-scan. A refusal rather than a preference -- there is nothing
+ * there to scan. */
+#define DC_ERR_INDEX_KIND    (-58)
+/* As many values as the index has fields, in its order, or neither the
+ * key nor the answer means anything. */
+#define DC_ERR_INDEX_ARITY   (-59)
+
 /*
  * Every document whose indexed fields equal `values` (a binjson ARRAY of
  * scalars, same count and order as index `name`'s fields), found via an
  * O(log n + k) range scan of the index rather than a collection scan.
  * Writes a freshly malloc'd binjson ARRAY of documents through
- * *out / *out_len (caller frees). BJ_ERR_STATE if no such index or `values`
- * doesn't match its field count.
+ * *out / *out_len (caller frees).
+ *
+ * DC_ERR_NO_INDEX, DC_ERR_INDEX_KIND or DC_ERR_INDEX_ARITY for the three
+ * ways the request can be wrong. They were one BJ_ERR_STATE between them
+ * until a client on the far end of a socket had to be told which.
  */
 int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len,
                                 const uint8_t *values, uint32_t values_len,

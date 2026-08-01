@@ -471,7 +471,7 @@ describe('db: secondary indexes (milestone 2)', () => {
 
     await users.dropIndex('team_1');
     expect(await users.listIndexes()).toEqual([]);
-    await expect(users.findByIndex('team_1', ['core'])).rejects.toThrow(/Index not found/);
+    await expect(users.findByIndex('team_1', ['core'])).rejects.toThrow(/No index of that name/);
     // Dropping the index must not touch the documents.
     expect(await users.countDocuments()).toBe(1);
     await db.close();

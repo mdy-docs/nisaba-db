@@ -57,11 +57,10 @@
  * operations with even if it wanted to. So the list goes over whole and
  * the answer says how many members were attempted and which failed.
  *
- * WHAT IS NOT HERE. The wire has twenty-seven ops (WIRE_OPS below) and
- * this client has exactly those. Change streams, findByIndex and
- * pruneExpired are not on the wire yet; asking for one gets a sentence
- * saying so rather than a TypeError about undefined not being a
- * function. Adding a method here without adding the op to db_request.c
+ * WHAT IS NOT HERE. The wire has twenty-eight ops (WIRE_OPS below) and
+ * this client has exactly those. Change streams and pruneExpired are
+ * not on the wire yet; asking for one gets a sentence saying so rather
+ * than a TypeError about undefined not being a function. Adding a method here without adding the op to db_request.c
  * would be inventing a second opinion about what the server does.
  */
 import net from 'node:net';
@@ -80,7 +79,7 @@ export const WIRE_OPS = [
   'insert', 'insertMany', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
   'findOneAndUpdate', 'findOneAndReplace', 'findOneAndDelete',
   'bulkWrite',
-  'getMore', 'closeCursor', 'compact',
+  'findByIndex', 'getMore', 'closeCursor', 'compact',
   'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
   'listCollections'
 ];
@@ -637,6 +636,14 @@ function collection(conn, name) {
 
     async dropIndex(name) {
       await call({ op: 'dropIndex', index: name });
+    },
+
+    /* The lookup that names its index rather than describing what it
+     * wants: no planner, an O(log n + k) range scan. Whether that index
+     * exists and is the right kind is the collection's to say, not
+     * this side's -- it is the thing holding the indexes. */
+    async findByIndex(name, values) {
+      return (await call({ op: 'findByIndex', index: name, values })).docs || [];
     },
 
     async listIndexes() {

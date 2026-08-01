@@ -62,7 +62,8 @@ typedef enum {
     OP_EXPLAIN,
     OP_FIND_ONE_AND_UPDATE,
     OP_FIND_ONE_AND_REPLACE,
-    OP_FIND_ONE_AND_DELETE
+    OP_FIND_ONE_AND_DELETE,
+    OP_FIND_BY_INDEX
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -99,6 +100,7 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE),
     OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE),
     OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE),
+    OP("findByIndex",       OP_FIND_BY_INDEX),
 };
 
 #undef OP
@@ -1304,6 +1306,32 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                 found_doc = 0;
             }
             dbuf_free(&pre);
+            break;
+        }
+        case OP_FIND_BY_INDEX: {
+            /*
+             * The lookup that names its index instead of describing what
+             * it wants: an O(log n + k) range scan of that index, with
+             * no planner in the way. Whether the index exists, is the
+             * right kind, and was given one value per field are all the
+             * collection's to answer -- three distinct codes, because a
+             * client on the far end of a socket cannot guess which of
+             * the three it got wrong.
+             */
+            const uint8_t *ixn; uint32_t ixn_len; int have = 0;
+            if ((e = field_str(req, req_len, "index", &ixn, &ixn_len, &have))) break;
+            if (!have) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+            const uint8_t *vals; size_t vals_len; int hasv = 0;
+            if ((e = field_raw(req, req_len, "values", &vals, &vals_len, &hasv))) break;
+            if (!hasv) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+
+            uint8_t *docs = NULL; size_t docs_len = 0;
+            e = dc_collection_find_by_index(c, (const char *)ixn, (int)ixn_len,
+                                            vals, (uint32_t)vals_len, &docs, &docs_len);
+            if (e) break;
+            e = dbuf_put(&body, docs, docs_len);
+            free(docs);
+            body_key = "docs";
             break;
         }
         case OP_EXPLAIN: {

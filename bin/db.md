@@ -159,7 +159,7 @@ For the same reason `--order` is refused with `--server`: the order the
 files were written with is the server's to know, and it takes its own
 `--order` if they were not made with the default 32.
 
-The wire carries twenty-seven operations, and the CLI commands that ride
+The wire carries twenty-eight operations, and the CLI commands that ride
 on them:
 
 | Works over `--server` | |
@@ -169,6 +169,7 @@ on them:
 | `insert-many`, `bulk-write` | the whole list in one round trip, `--no-ordered` and all; the server runs the loop |
 | `compact <coll>` | one collection at a time; refused while a cursor is reading it |
 | `create-index`, `drop-index`, `list-indexes` | the server plans, builds and backfills the index |
+| `find-by-index <coll> <indexName> <values>` | equality lookup with no planner in the way |
 | `drop-collection` | |
 | `collections` | |
 | `dump [coll]` | walks `collections` → `list-indexes` → a `find` cursor |
@@ -177,8 +178,8 @@ on them:
 | `find-one-and-update`, `find-one-and-replace`, `find-one-and-delete` | the document itself, before or `--return-document after`; no `sort`, as locally |
 | `delete-one`, `delete-many` | |
 
-Everything else — `watch`, `find-by-index`, `prune-expired`, and
-`compact` with no collection named — is not on the wire yet, and says so rather than pretending (`aggregate` and
+Everything else — `watch`, `prune-expired`, and `compact` with no
+collection named — is not on the wire yet, and says so rather than pretending (`aggregate` and
 `explain` are on the wire but have never been CLI commands):
 
 ```
@@ -186,9 +187,10 @@ $ db --server 8097 prune-expired events
 Error: the server has no collection.pruneExpired() -- its wire carries ping,
 find, findOne, count, distinct, aggregate, explain, insert, insertMany,
 update, updateMany, replace, delete, deleteMany, findOneAndUpdate,
-findOneAndReplace, findOneAndDelete, bulkWrite, getMore, closeCursor,
-compact, createCollection, dropCollection, createIndex, dropIndex,
-listIndexes, listCollections. Open the database directly for the rest.
+findOneAndReplace, findOneAndDelete, bulkWrite, findByIndex, getMore,
+closeCursor, compact, createCollection, dropCollection, createIndex,
+dropIndex, listIndexes, listCollections. Open the database directly for
+the rest.
 ```
 
 **The server serves many connections, up to its `--max-clients`.** A CLI

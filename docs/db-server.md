@@ -84,8 +84,8 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Twenty-seven
-operations — eighteen about a collection's documents, five about its
+**One request object in, one response object out.** Twenty-eight
+operations — nineteen about a collection's documents, five about its
 schema, two about a cursor, and two about neither: `listCollections` and
 `ping`.
 
@@ -100,6 +100,7 @@ schema, two about a cursor, and two about neither: `listCollections` and
 | `{op:'count', coll, filter}` | `{ok:true, n}` |
 | `{op:'distinct', coll, field, filter}` | `{ok:true, values:[...]}` |
 | `{op:'aggregate', coll, stages:[...]}` | `{ok:true, docs:[...]}` |
+| `{op:'findByIndex', coll, index, values:[...]}` | `{ok:true, docs:[...]}` |
 | `{op:'explain', coll, filter}` | `{ok:true, plan:{source, index}}` |
 | `{op:'insert', coll, doc, id}` | `{ok:true, result}` |
 | `{op:'insertMany', coll, docs:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
@@ -237,6 +238,22 @@ whichever document the scan reaches first. The in-process API has no
 `sort` either, and a wire that sorted while the local API did not would
 be a worse divergence than the shared gap; adding it means teaching the
 planner to order matches before picking one, which is not plumbing.
+
+**`findByIndex` names its index instead of describing what it wants** —
+an O(log n + k) range scan of that index with no planner in the way,
+which is the escape hatch for a query the equality planner is too
+conservative to serve.
+
+There are three ways to ask it wrongly, and they were one `BJ_ERR_STATE`
+between them until this went on a wire: no index of that name (`-57`),
+the wrong *kind* of index (`-58` — a text or geo index answers a
+different question and has no equality tree to scan), and the wrong
+number of values (`-59` — one per indexed field, in the index's order).
+"-2, builder state error" is not something a client on the far end of a
+socket can act on. The in-process host used to avoid two of the three by
+checking them itself, against its own copy of the index list; the
+collection is what holds the indexes, so the collection answers now, and
+that copy is gone.
 
 **`explain` answers without executing.** It reports which source the
 dispatch *would* use for a filter — `scan`, `ids`, `equality`, `text`,
@@ -404,7 +421,7 @@ Stated here rather than discovered later.
   name. There is no scheduler either: the engine runs no timers, so
   *when* to compact stays with whoever is driving
   (`docs/compaction.md`).
-- **No change streams, no `findByIndex`/`pruneExpired`.** Each is an op in
+- **No change streams, no `pruneExpired`.** Each is an op in
   `wasm/src/db_request.c` plus a method in the client — except `watch`,
   which also needs frames the client did not ask for, and this protocol
   has no shape for those. `dump` and `restore` both work today.

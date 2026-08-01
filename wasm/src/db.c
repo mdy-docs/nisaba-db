@@ -949,13 +949,17 @@ int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len
                                 uint8_t **out, size_t *out_len) {
     *out = NULL; *out_len = 0;
     dc_index *ix = find_index(c, name, name_len);
-    if (!ix) return BJ_ERR_STATE;
+    if (!ix) return DC_ERR_NO_INDEX;
+    /* A text or geo index has no `tree` at all -- the fields below it
+     * belong to a different union of purposes -- so this is a refusal
+     * before it is a preference. */
+    if (ix->kind != DC_IDX_EQUALITY) return DC_ERR_INDEX_KIND;
 
     cur vc = { values, values_len, 0 };
     uint32_t vcount;
     int e = array_begin(&vc, &vcount);
     if (e) return e;
-    if (vcount != ix->field_count) return BJ_ERR_STATE;
+    if (vcount != ix->field_count) return DC_ERR_INDEX_ARITY;
 
     dbuf prefix; memset(&prefix, 0, sizeof(prefix));
     for (uint32_t i = 0; i < vcount && !e; i++) {

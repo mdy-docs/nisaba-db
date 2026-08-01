@@ -47,6 +47,14 @@ const char *dc_strerror(int code) {
         case DC_ERR_UNINDEXABLE_VALUE:
             return "Indexed field value cannot be key-encoded: only numbers, strings, "
                    "and Dates are indexable (no NaN, no strings containing U+0000)";
+        case DC_ERR_NO_INDEX:
+            return "No index of that name on this collection";
+        case DC_ERR_INDEX_KIND:
+            return "the index named is not an equality index "
+                   "(a text or geo index answers a different question)";
+        case DC_ERR_INDEX_ARITY:
+            return "findByIndex needs one value per indexed field, "
+                   "in the index's own order";
         /* db_validate.h */
         case DC_ERR_INVALID_COLLECTION_NAME:
             return "Invalid collection name: must be a non-empty string containing "
@@ -130,8 +138,6 @@ const char *dc_strerror(int code) {
         case DC_ERR_INDEX_EXISTS:
             return "An index of that name already exists on this collection; drop "
                    "it before creating another";
-        case DC_ERR_NO_INDEX:
-            return "No index of that name on this collection";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

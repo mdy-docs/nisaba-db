@@ -2488,10 +2488,17 @@ class Collection {
    * for $text/$near/$geoWithin, use find()/findOne() with the matching
    * filter operator instead (db.c dispatches to the right index).
    */
+  /**
+   * Direct equality lookup through a named index, bypassing the planner.
+   *
+   * No index registry check here: whether this collection has an index
+   * of that name, and whether it is the right kind, is C's to answer
+   * (DC_ERR_NO_INDEX / DC_ERR_INDEX_KIND / DC_ERR_INDEX_ARITY) -- it is
+   * the collection that holds the indexes. This side used to check both
+   * against its own `_indexes` map, which was a second opinion that
+   * could disagree with the collection it was describing.
+   */
   async findByIndex(name, values) {
-    const entry = this._indexes.get(name);
-    if (!entry) throw new Error(`Index not found: ${name}`);
-    if (entry.kind !== 'equality') throw new Error(`findByIndex requires an equality index (got kind: ${entry.kind})`);
     const M = requireModule();
     const n = allocStr(M, name);
     const valuesBytes = encode(values);

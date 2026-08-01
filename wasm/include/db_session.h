@@ -97,7 +97,9 @@ extern "C" {
  * asked every code for its text. */
 #define DC_ERR_FORMAT_NEWER         (-55)
 #define DC_ERR_INDEX_EXISTS         (-56)
-#define DC_ERR_NO_INDEX             (-57)
+/* DC_ERR_NO_INDEX (-57) began here and now lives in db.h, next to the
+ * lookup that also has to raise it: a collection is what knows its own
+ * indexes. -58 and -59 are its neighbours there. */
 
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)

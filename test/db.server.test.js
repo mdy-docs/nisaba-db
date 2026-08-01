@@ -451,6 +451,33 @@ for (const engine of ENGINES) {
       expect(dated.at).toBeInstanceOf(Date);
     });
 
+    it('looks a document up through the index it names', async () => {
+      const c = db.collection('indexed');
+      await c.insertMany([
+        { name: 'Ada', team: 'core', level: 3 },
+        { name: 'Grace', team: 'core', level: 4 },
+        { name: 'Alan', team: 'research', level: 3 }
+      ]);
+      // Before there is an index of that name, there is nothing to name.
+      await expect(c.findByIndex('team_1', ['core'])).rejects.toMatchObject({ code: -57 });
+
+      await c.createIndex({ team: 1 });
+      await c.createIndex({ team: 1, level: 1 });
+      await c.createIndex({ name: 'text' });
+
+      expect((await c.findByIndex('team_1', ['core'])).map(d => d.name).sort())
+        .toEqual(['Ada', 'Grace']);
+      expect((await c.findByIndex('team_1_level_1', ['core', 4])).map(d => d.name))
+        .toEqual(['Grace']);
+      // A value nothing has is an empty answer, not a refusal.
+      expect(await c.findByIndex('team_1', ['nobody'])).toEqual([]);
+
+      // The three ways to ask wrong, each with its own code -- they were
+      // one BJ_ERR_STATE between them until this went on a wire.
+      await expect(c.findByIndex('name_text', ['Ada'])).rejects.toMatchObject({ code: -58 });
+      await expect(c.findByIndex('team_1', ['core', 'extra'])).rejects.toMatchObject({ code: -59 });
+    });
+
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
       expect(() => db.storageEstimate()).toThrow(/no db\.storageEstimate/);
       expect(() => db.collection('users').pruneExpired()).toThrow(/no collection\.pruneExpired/);
@@ -534,12 +561,12 @@ for (const engine of ENGINES) {
     });
 
     it('refuses, from the CLI, what only a local database can do', () => {
-      // find-by-index, not `insert-many`: lists of writes are on the
+      // prune-expired, not `find-by-index`: index lookups are on the
       // wire now, and a command that IS available is no test of a
       // refusal.
-      const byIndex = cli('find-by-index', 'users', 'team_1', '["core"]');
-      expect(byIndex.status).toBe(1);
-      expect(byIndex.stderr).toMatch(/no collection\.findByIndex/);
+      const pruned = cli('prune-expired', 'users');
+      expect(pruned.status).toBe(1);
+      expect(pruned.stderr).toMatch(/no collection\.pruneExpired/);
 
       // --order is the server's, decided when it opened the directory.
       const ordered = cli('count', 'users', '--order', '64');

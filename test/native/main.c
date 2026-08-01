@@ -803,7 +803,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
         DC_ERR_NO_CURSOR, DC_ERR_TOO_MANY_CURSORS, DC_ERR_CURSOR_SORTED,
         DC_ERR_CURSORS_OPEN, DC_ERR_FORMAT_NEWER, DC_ERR_INDEX_EXISTS,
-        DC_ERR_NO_INDEX,
+        DC_ERR_NO_INDEX, DC_ERR_INDEX_KIND, DC_ERR_INDEX_ARITY,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
@@ -2630,6 +2630,153 @@ static int response_doc_str(const dbuf *res, const char *key, char *out, size_t 
     if (obj_get_field(res->data, res->len, (const uint8_t *)"doc", 3, &d, &dlen, &f) || !f)
         return 0;
     return doc_get_str(d, dlen, key, out, cap);
+}
+
+/* {op, coll, index: "<name>", values: [...]} */
+static bj_builder *index_request(const char *op, const char *coll, const char *index,
+                                 const uint8_t *values, uint32_t vlen,
+                                 const uint8_t **out, uint32_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"op", 2);
+    bj_put_string(b, (const uint8_t *)op, (uint32_t)strlen(op));
+    bj_put_key(b, (const uint8_t *)"coll", 4);
+    bj_put_string(b, (const uint8_t *)coll, (uint32_t)strlen(coll));
+    bj_put_key(b, (const uint8_t *)"index", 5);
+    bj_put_string(b, (const uint8_t *)index, (uint32_t)strlen(index));
+    if (values) {
+        bj_put_key(b, (const uint8_t *)"values", 6);
+        bj_put_raw(b, values, vlen);
+    }
+    bj_end_object(b);
+    size_t len = 0;
+    *out = bj_builder_data(b, &len);
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+TEST(find_by_index_says_which_of_the_three_ways_it_was_asked_wrong) {
+    /*
+     * findByIndex names its index instead of describing what it wants,
+     * so there are three separate ways to get it wrong -- no such index,
+     * the wrong kind of index, the wrong number of values -- and they
+     * were ONE BJ_ERR_STATE between them until this went on a wire. "-2,
+     * builder state error" is not an answer a client can act on, and the
+     * JavaScript host only avoided it by checking two of the three
+     * itself, against its own copy of the index list.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-fbi", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+    const uint64_t CLIENT = 17;
+
+    /* A text index, so there is a wrong KIND to name. */
+    {
+        doc *k = doc_new(); doc_str(k, "name", "text");
+        uint32_t klen; const uint8_t *kb = doc_done(k, &klen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("createIndex", "users", "keys", kb, klen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(k);
+    }
+
+    /* The lookup itself: build_users_db's team_1 index, two documents. */
+    {
+        bj_builder *vb = bj_builder_new();
+        bj_begin_array(vb);
+        bj_put_string(vb, (const uint8_t *)"core", 4);
+        bj_end_array(vb);
+        size_t vlen = 0; const uint8_t *vdata = bj_builder_data(vb, &vlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = index_request("findByIndex", "users", "team_1",
+                                       vdata, (uint32_t)vlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_docs(&res), 2);      /* Ada and Grace */
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(vb);
+    }
+
+    /* A value nothing has is an empty answer, not a refusal. */
+    {
+        bj_builder *vb = bj_builder_new();
+        bj_begin_array(vb);
+        bj_put_string(vb, (const uint8_t *)"nobody", 6);
+        bj_end_array(vb);
+        size_t vlen = 0; const uint8_t *vdata = bj_builder_data(vb, &vlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = index_request("findByIndex", "users", "team_1",
+                                       vdata, (uint32_t)vlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_docs(&res), 0);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(vb);
+    }
+
+    /* The three refusals, each with its own code. */
+    {
+        bj_builder *one = bj_builder_new();
+        bj_begin_array(one);
+        bj_put_string(one, (const uint8_t *)"core", 4);
+        bj_end_array(one);
+        size_t olen = 0; const uint8_t *odata = bj_builder_data(one, &olen);
+
+        bj_builder *two = bj_builder_new();
+        bj_begin_array(two);
+        bj_put_string(two, (const uint8_t *)"core", 4);
+        bj_put_string(two, (const uint8_t *)"extra", 5);
+        bj_end_array(two);
+        size_t tlen = 0; const uint8_t *tdata = bj_builder_data(two, &tlen);
+
+        struct { const char *index; const uint8_t *vals; uint32_t vlen; int want; } cases[] = {
+            { "no_such_1", odata, (uint32_t)olen, DC_ERR_NO_INDEX    },
+            { "name_text", odata, (uint32_t)olen, DC_ERR_INDEX_KIND  },
+            { "team_1",    tdata, (uint32_t)tlen, DC_ERR_INDEX_ARITY },
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            const uint8_t *req; uint32_t req_len;
+            bj_builder *rb = index_request("findByIndex", "users", cases[i].index,
+                                           cases[i].vals, cases[i].vlen, &req, &req_len);
+            dbuf res = {0};
+            CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+            CHECK_I64(response_ok(&res), 0);
+            int f = 0;
+            int64_t code = response_num(&res, "code", &f);
+            if (code != cases[i].want)
+                TAP_FAIL("case %zu (%s): code %lld, want %d",
+                         i, cases[i].index, (long long)code, cases[i].want);
+            dbuf_free(&res); bj_builder_free(rb);
+        }
+        bj_builder_free(one); bj_builder_free(two);
+    }
+
+    /* And no `values` at all is the request being incomplete, which is a
+     * different thing again from any of the three. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = index_request("findByIndex", "users", "team_1", NULL, 0,
+                                       &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_REQ_MISSING_FIELD);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
 }
 
 TEST(find_one_and_modify_answers_with_the_document_not_a_count) {
@@ -7878,6 +8025,7 @@ int main(void) {
     RUN(an_aggregate_pipeline_runs_whole_in_one_request);
     RUN(explain_names_the_plan_the_same_way_for_every_host);
     RUN(find_one_and_modify_answers_with_the_document_not_a_count);
+    RUN(find_by_index_says_which_of_the_three_ways_it_was_asked_wrong);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

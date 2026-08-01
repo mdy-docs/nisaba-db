@@ -45,26 +45,34 @@ typedef enum {
     OP_DELETE,
     OP_DELETE_MANY,
     OP_GET_MORE,
-    OP_KILL_CURSOR,
+    OP_CLOSE_CURSOR,
     OP_COMPACT
 } dbs_op;
 
+/* The length comes from the literal itself, so the two cannot disagree.
+ * They did, briefly: renaming killCursor to closeCursor left a hand-
+ * written 10 beside an eleven-character name, and an op whose length is
+ * wrong is an op that simply never matches. */
+#define OP(name, code) { name, (uint32_t)(sizeof(name) - 1), code }
+
 static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = {
-    { "ping",       4, OP_PING        },
-    { "find",       4, OP_FIND        },
-    { "findOne",    7, OP_FIND_ONE    },
-    { "count",      5, OP_COUNT       },
-    { "distinct",   8, OP_DISTINCT    },
-    { "insert",     6, OP_INSERT      },
-    { "update",     6, OP_UPDATE      },
-    { "updateMany",10, OP_UPDATE_MANY },
-    { "replace",    7, OP_REPLACE     },
-    { "delete",     6, OP_DELETE      },
-    { "deleteMany",10, OP_DELETE_MANY },
-    { "getMore",    7, OP_GET_MORE    },
-    { "killCursor",10, OP_KILL_CURSOR },
-    { "compact",    7, OP_COMPACT     },
+    OP("ping",        OP_PING),
+    OP("find",        OP_FIND),
+    OP("findOne",     OP_FIND_ONE),
+    OP("count",       OP_COUNT),
+    OP("distinct",    OP_DISTINCT),
+    OP("insert",      OP_INSERT),
+    OP("update",      OP_UPDATE),
+    OP("updateMany",  OP_UPDATE_MANY),
+    OP("replace",     OP_REPLACE),
+    OP("delete",      OP_DELETE),
+    OP("deleteMany",  OP_DELETE_MANY),
+    OP("getMore",     OP_GET_MORE),
+    OP("closeCursor", OP_CLOSE_CURSOR),
+    OP("compact",     OP_COMPACT),
 };
+
+#undef OP
 
 /* ---- reading the request ----------------------------------------------- */
 
@@ -270,7 +278,7 @@ done:
  * One batch out of an open cursor, and the id to ask for the next one --
  * or null, which is how a client learns the scan is over without a
  * second round trip to find out. A drained cursor is closed HERE rather
- * than waiting for a killCursor that a well-behaved client would have no
+ * than waiting for a closeCursor that a well-behaved client would have no
  * reason to send.
  *
  * { ok:true, docs:[...], cursor: <id> | null }
@@ -341,12 +349,12 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     }
 
     /*
-     * getMore and killCursor name a CURSOR, not a collection: the cursor
+     * getMore and closeCursor name a CURSOR, not a collection: the cursor
      * already knows which collection it is scanning, and asking a client
      * to name it again would be asking it to keep a fact the server
      * already holds -- and to be believed about it.
      */
-    if (op == OP_GET_MORE || op == OP_KILL_CURSOR) {
+    if (op == OP_GET_MORE || op == OP_CLOSE_CURSOR) {
         int64_t id = 0;
         int have = 0;
         {
@@ -361,7 +369,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
         }
         if (id <= 0) return respond_error(out, DC_ERR_NO_CURSOR);
 
-        if (op == OP_KILL_CURSOR) {
+        if (op == OP_CLOSE_CURSOR) {
             e = dbs_cursor_drop(s, client, (uint64_t)id);
             if (e) return respond_error(out, e);
             bj_builder *kb = bj_builder_new();

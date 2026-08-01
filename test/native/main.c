@@ -1899,7 +1899,7 @@ static bj_builder *opts_of(int64_t batch_size, int with_sort,
     return b;
 }
 
-/* {cursor: id} -- getMore and killCursor name a cursor, not a collection. */
+/* {cursor: id} -- getMore and closeCursor name a cursor, not a collection. */
 static bj_builder *cursor_request(const char *op, int64_t id,
                                   const uint8_t **out, uint32_t *out_len) {
     bj_builder *b = bj_builder_new();
@@ -2059,10 +2059,10 @@ TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
             dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ob);
         }
 
-        /* killCursor gives one back. */
+        /* closeCursor gives one back. */
         {
             const uint8_t *req; uint32_t req_len;
-            bj_builder *rb = cursor_request("killCursor", ids[0], &req, &req_len);
+            bj_builder *rb = cursor_request("closeCursor", ids[0], &req, &req_len);
             dbuf res = {0};
             CHECK_OK(dbs_handle(s, ALICE, req, req_len, &res));
             CHECK_I64(response_ok(&res), 1);
@@ -2173,7 +2173,7 @@ TEST(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads) {
     /* ---- kill it, and the same request goes through. */
     {
         const uint8_t *req; uint32_t req_len;
-        bj_builder *rb = cursor_request("killCursor", cursor_id, &req, &req_len);
+        bj_builder *rb = cursor_request("closeCursor", cursor_id, &req, &req_len);
         dbuf res = {0};
         CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
         CHECK_I64(response_ok(&res), 1);

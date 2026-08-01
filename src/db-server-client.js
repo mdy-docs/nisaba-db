@@ -72,7 +72,7 @@ export const WIRE_OPS = [
   'ping',
   'find', 'findOne', 'count', 'distinct',
   'insert', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
-  'getMore', 'killCursor', 'compact'
+  'getMore', 'closeCursor', 'compact'
 ];
 
 /** Pings per idle timeout. The server's default is 60s; a third of that
@@ -322,7 +322,7 @@ function collection(conn, name) {
           const dying = id;
           id = null;
           done = true;
-          await call({ op: 'killCursor', cursor: dying });
+          await call({ op: 'closeCursor', cursor: dying });
         },
         async *[Symbol.asyncIterator]() {
           try {

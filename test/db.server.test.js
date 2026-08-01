@@ -678,7 +678,7 @@ for (const engine of ENGINES) {
         // advance it.
         const next = await db.request({ op: 'getMore', cursor: opened.cursor });
         expect(next.docs).toHaveLength(5);
-        await db.request({ op: 'killCursor', cursor: opened.cursor });
+        await db.request({ op: 'closeCursor', cursor: opened.cursor });
       } finally {
         await other.close();
       }

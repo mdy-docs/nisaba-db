@@ -132,7 +132,7 @@ int dbs_open_count(const dbs *s);
  *
  * REFUSED while a cursor is scanning this collection
  * (DC_ERR_CURSORS_OPEN, before anything is written): the scan is
- * positioned inside files this replaces. Drain or kill the cursor and
+ * positioned inside files this replaces. Drain or close the cursor and
  * ask again.
  *
  * All or nothing in the way that matters: a failure before the flip
@@ -158,7 +158,7 @@ int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *ou
  * cursor is; it only has to say when a client is gone.
  *
  * That is the whole ownership rule. A cursor is released when its client
- * drains it, kills it, or disappears -- and dbs_close releases whatever
+ * drains it, closes it, or disappears -- and dbs_close releases whatever
  * is left, so no path leaks a scan.
  */
 
@@ -227,7 +227,7 @@ void dbs_close(dbs *s);
  * CURSORS BELONG TO CLIENTS. `client` is an opaque token identifying
  * whoever is asking -- a connection id, for a socket server; anything
  * unique and stable, for anyone else. It matters for exactly one thing:
- * a cursor opened by one client cannot be advanced or killed by another,
+ * a cursor opened by one client cannot be advanced or closed by another,
  * and dbs_drop_client releases the cursors of a client that has gone.
  * Everything else answers the same regardless of who asked.
  */

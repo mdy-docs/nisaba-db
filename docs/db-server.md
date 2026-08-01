@@ -62,7 +62,7 @@ await users.insertOne({ name: 'Ada', team: 'core' });   // _id minted here
 console.log(await users.find({ team: 'core' }).toArray());
 
 // A large result, paged: one batch per round trip, and the cursor closes
-// itself on the last one. `break` mid-scan kills it rather than leaving
+// itself on the last one. `break` mid-scan closes it rather than leaving
 // it held.
 for await (const doc of users.find({}, { batchSize: 500 })) {
   process.stdout.write(doc.name + '\n');
@@ -92,7 +92,7 @@ the connection:
 | `{op:'ping'}` | `{ok:true, pong:true}` |
 | `{op:'find', coll, filter, opts:{sort,projection,skip,limit,batchSize}}` | `{ok:true, docs:[...]}`, or with `batchSize`: `{ok:true, docs:[...], cursor}` |
 | `{op:'getMore', cursor, opts:{batchSize}}` | `{ok:true, docs:[...], cursor}` |
-| `{op:'killCursor', cursor}` | `{ok:true, closed:true}` |
+| `{op:'closeCursor', cursor}` | `{ok:true, closed:true}` |
 | `{op:'findOne', coll, filter}` | `{ok:true, found, doc}` |
 | `{op:'count', coll, filter}` | `{ok:true, n}` |
 | `{op:'distinct', coll, field, filter}` | `{ok:true, values:[...]}` |
@@ -107,7 +107,7 @@ insertedCount, upsertedId}`.
 **Cursors page a scan, not a result.** `batchSize` on a find opens a
 cursor: one batch comes back with an id, `getMore` asks for the next, and
 `cursor` comes back **null** on the last batch — so a drained cursor
-needs no `killCursor` and costs no round trip to discover it is finished.
+needs no `closeCursor` and costs no round trip to discover it is finished.
 What the server holds between calls is a *position in a B+ tree scan*
 (`dc_cursor_open`), not a materialised result, which is the difference
 between paging a million documents and being sent a million documents.
@@ -115,7 +115,7 @@ between paging a million documents and being sent a million documents.
 A cursor belongs to the connection that opened it: another connection
 asking for it gets `-46`, the same answer as for an id that never
 existed, because telling those apart would tell a client about somebody
-else's cursors. Cursors are released when drained, killed, when their
+else's cursors. Cursors are released when drained, closed, when their
 connection ends (however it ends), or when the server closes.
 
 **A cursor is a snapshot**, which most databases will not give you for

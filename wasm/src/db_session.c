@@ -1156,6 +1156,96 @@ int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *ou
     return BJ_OK;
 }
 
+/* The size this collection's files were right after its last
+ * compaction, as the catalog recorded it at the flip. 0 when it has
+ * never been compacted, which is what makes `factor` alone let a fresh
+ * collection through. */
+static int compacted_bytes(dbs *s, const char *name, size_t name_len, double *out) {
+    *out = 0;
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    int e = catalog_get(s, name, name_len, &entry, &entry_len, &found);
+    if (e) return e;
+    if (!found) { free(entry); return DC_ERR_NO_COLLECTION; }
+    const uint8_t *v; size_t vlen; int has = 0;
+    e = plan_raw(entry, entry_len, "compactedBytes", &v, &vlen, &has);
+    if (!e && has) {
+        cur c = { v, vlen, 0 };
+        e = read_number(&c, out);
+    }
+    free(entry);
+    return e;
+}
+
+int dbs_compact_all(dbs *s, int64_t min_bytes, double factor, int skip_busy,
+                    dbuf *out) {
+    if (!s || !out) return BJ_ERR_STATE;
+    dbuf names = {0};
+    int e = dbs_list_collections(s, &names);
+    if (e) { dbuf_free(&names); return e; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&names); return BJ_ERR_OOM; }
+    bj_begin_object(b);
+
+    cur c = { names.data, names.len, 0 };
+    uint32_t n = 0;
+    e = array_begin(&c, &n);
+    for (uint32_t i = 0; !e && i < n; i++) {
+        const uint8_t *np; uint32_t nlen;
+        if ((e = take_string(&c, &np, &nlen))) break;
+        const char *name = (const char *)np;
+
+        int skip = 0;
+        if (min_bytes > 0 || factor > 0) {
+            /* Measuring means opening: the sizes are the live files'.
+             * The in-process sweep opens each one too. */
+            dc_collection *coll = NULL;
+            if ((e = dbs_collection(s, name, nlen, &coll))) break;
+            dbs_entry *en = find_entry(s, name, nlen);
+            uint64_t now_bytes = en ? entry_bytes(en) : 0;
+            double was = 0;
+            if ((e = compacted_bytes(s, name, nlen, &was))) break;
+            double floor_bytes = (double)min_bytes;
+            if (factor > 0 && factor * was > floor_bytes) floor_bytes = factor * was;
+            if ((double)now_bytes < floor_bytes) skip = 1;
+        }
+
+        dbs_compact_stats st;
+        int rc = skip ? 0 : dbs_compact(s, name, nlen, &st);
+        /* Busy is a skip for a sweep and an error for a request that
+         * named one collection: the difference is whether anybody is
+         * waiting to hear about this particular one. */
+        if (!skip && rc == DC_ERR_CURSORS_OPEN && skip_busy) { skip = 1; rc = 0; }
+        if (rc) { e = rc; break; }
+
+        bj_put_key(b, np, nlen);
+        if (skip) {
+            bj_put_null(b);
+        } else {
+            bj_begin_object(b);
+            bj_put_key(b, (const uint8_t *)"generation", 10);
+            bj_put_int(b, st.generation);
+            bj_put_key(b, (const uint8_t *)"bytesBefore", 11);
+            bj_put_int(b, (int64_t)st.bytes_before);
+            bj_put_key(b, (const uint8_t *)"bytesAfter", 10);
+            bj_put_int(b, (int64_t)st.bytes_after);
+            bj_put_key(b, (const uint8_t *)"bytesFreed", 10);
+            bj_put_int(b, st.bytes_before > st.bytes_after
+                          ? (int64_t)(st.bytes_before - st.bytes_after) : 0);
+            bj_end_object(b);
+        }
+    }
+    dbuf_free(&names);
+    if (!e) { bj_end_object(b); e = bj_builder_error(b); }
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
 /* ---- cursors ------------------------------------------------------------
  *
  * A fixed table, refused explicitly when full, like every other table

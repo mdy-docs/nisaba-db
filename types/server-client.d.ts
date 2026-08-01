@@ -189,6 +189,12 @@ export interface RemoteDb {
   /** Remove a collection and every file it owns. False if there was no
    * such collection. */
   dropCollection(name: string): Promise<boolean>;
+  /** Compact every collection, reporting stats or null (skipped) for
+   * each. `minBytes`/`factor` make it cheap to call on a timer;
+   * `skipBusy` skips a collection being scanned instead of rejecting
+   * (-49). With no options it is unconditional. */
+  compact(options?: { minBytes?: number; factor?: number; skipBusy?: boolean }):
+    Promise<Record<string, { generation: number; bytesBefore: number; bytesAfter: number; bytesFreed: number } | null>>;
   /** Every collection in the database this server holds. */
   listCollections(): Promise<string[]>;
   /** The op that touches no collection: keeps a connection warm past the

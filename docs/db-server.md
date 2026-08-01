@@ -120,6 +120,7 @@ none of those (`listCollections` and `ping`).
 | `{op:'dropIndex', coll, index}` | `{ok:true, dropped:true}` |
 | `{op:'listIndexes', coll}` | `{ok:true, indexes:[...]}` |
 | `{op:'compact', coll}` | `{ok:true, result:{generation, bytesBefore, bytesAfter, bytesFreed}}` |
+| `{op:'compact', minBytes, factor, skipBusy}` (no `coll`) | `{ok:true, result:{[coll]: stats\|null}}` |
 
 `result` is `{acknowledged, matchedCount, modifiedCount, deletedCount,
 insertedCount, upsertedId}` for a single write, and
@@ -311,6 +312,22 @@ both. `dbs_stream_pending` is what the loop asks before blocking — added
 after an overflow notice sat undelivered until an unrelated request
 happened to wake the loop.
 
+**`compact` with no collection named is the sweep**, and it lives here
+rather than in a client loop because of its three options — two of which
+read state a client cannot see:
+
+| | |
+| --- | --- |
+| `minBytes` | a file set smaller than this is not worth rewriting |
+| `factor` | nor is one that has not grown to `factor` times its size *right after its last compaction* — a number the catalog records at the flip (`compactedBytes`), so the heuristic reads a fact rather than estimating one |
+| `skipBusy` | a collection someone is scanning is skipped (`null`) rather than refused |
+
+With none of them it is unconditional, exactly like asking for each
+collection in turn. `skipBusy` is the difference between a sweep and a
+request that named one collection: an unattended sweep wants that
+collection's turn to come round on the next pass, while a caller who
+named it wants the `-49`.
+
 **`pruneExpired` is a sweep somebody asks for, not a background
 thread.** The engine runs no timers, so *when* to expire stays with
 whoever is driving — and `now` travels with the request, for the third
@@ -496,13 +513,14 @@ Stated here rather than discovered later.
   waiting is always looked at before one further down. Nothing starves
   while requests are small; a stream of large ones from slot 0 would make
   slot 5 wait.
-- **Compaction is per collection and per request.** `listCollections`
-  makes a database-wide `compact` easy to build client-side, but the
-  in-process `Db.compact()` takes `minBytes`/`factor`/`skipBusy` and that
-  loop would not, so it would be a second, weaker thing wearing the same
-  name. There is no scheduler either: the engine runs no timers, so
-  *when* to compact stays with whoever is driving
-  (`docs/compaction.md`).
+- **No compaction scheduler.** The engine runs no timers, so *when* to
+  sweep stays with whoever is driving (`docs/compaction.md`) — which is
+  what `minBytes`/`factor` are for: they make calling it on a timer
+  cheap, because a sweep that finds nothing worth doing costs one
+  `size()` per collection.
+- **A sweep opens every collection**, and the session holds at most
+  `DBS_MAX_COLLECTIONS` (32) open at once. A database with more than
+  that refuses the sweep (`-38`) rather than half-doing it.
 - **No change-stream pipelines, no `updateDescription`, no resume
   tokens.** The same three non-goals the in-process `watch()` has
   (README). A stream watches one collection, whole events, and an

@@ -554,9 +554,11 @@ for (const engine of ENGINES) {
       // actionable without reading the source.
       expect(() => db.collection('users').estimatedDocumentCount()).toThrow(WIRE_OPS.join(', '));
       // And an op that IS on the wire, asked of the wrong thing, says
-      // that instead of listing `compact` as available while refusing
-      // compact -- which is what it used to do.
-      expect(() => db.compact()).toThrow(/compact is a collection operation/);
+      // that rather than listing it as available while refusing it --
+      // which is what this used to do for `compact`, before compact
+      // became a db method as well as a collection one.
+      expect(() => db.find({})).toThrow(/find is a collection operation/);
+      expect(() => db.watch()).toThrow(/watch is a collection operation/);
     });
   });
 
@@ -629,14 +631,10 @@ for (const engine of ENGINES) {
       expect(cli('count', 'copied').stdout.trim()).toBe(String(n + 1));
     });
 
-    it('refuses, from the CLI, what only a local database can do', () => {
-      // Not `watch` any more -- change streams are on the wire. What is
-      // left is compact with no collection named: a database-wide
-      // compaction would be a second, weaker thing wearing the name.
-      const wide = cli('compact');
-      expect(wide.status).toBe(1);
-      expect(wide.stderr).toMatch(/compact is a collection operation/);
-
+    it('refuses what the server owns, and names an address it cannot reach', () => {
+      // Nothing is left to refuse: every CLI command works over the
+      // socket now, database-wide compact included. What the server
+      // still owns is the things that are not commands at all.
       // --order is the server's, decided when it opened the directory.
       const ordered = cli('count', 'users', '--order', '64');
       expect(ordered.status).toBe(1);
@@ -946,6 +944,42 @@ for (const engine of ENGINES) {
 
       await cursor.close();
       expect((await users.compact()).generation).toBeGreaterThan(0);
+    });
+
+    it('sweeps every collection, and skips on its own terms', async () => {
+      const big = db.collection('users'), small = db.collection('quiet');
+      await small.insertOne({ n: 1 });
+      for (let r = 0; r < 4; r++) await big.updateMany({ team: 'bulk' }, { $set: { r } });
+
+      // No options: unconditional, exactly like asking for each in turn.
+      const all = await db.compact();
+      expect(Object.keys(all).sort()).toEqual(['quiet', 'users']);
+      expect(all.users.bytesFreed).toBeGreaterThan(0);
+
+      // minBytes: nothing here is a megabyte, so nothing is worth doing.
+      const none = await db.compact({ minBytes: 1_000_000 });
+      expect(none).toEqual({ users: null, quiet: null });
+
+      // factor: only what grew past twice its post-compaction size. The
+      // catalog recorded that size at the flip, which is why this side
+      // does not have to estimate it.
+      for (let r = 0; r < 6; r++) await big.updateMany({ team: 'bulk' }, { $set: { r } });
+      const grown = await db.compact({ factor: 2 });
+      expect(grown.users).not.toBe(null);
+      expect(grown.quiet).toBe(null);
+
+      // skipBusy: a collection being scanned gets its turn next sweep.
+      const cursor = big.find({}, { batchSize: 5 });
+      await cursor.nextBatch();
+      const busy = await db.compact({ skipBusy: true });
+      expect(busy.users).toBe(null);
+      expect(busy.quiet).not.toBe(null);
+      // Without it, the same sweep is refused -- which is what a caller
+      // who named one collection wants to hear.
+      await expect(db.compact()).rejects.toMatchObject({ code: -49 });
+      await cursor.close();
+
+      expect(await big.countDocuments({})).toBe(43);
     });
 
     it('leaves a database the JS implementation can still open', async () => {

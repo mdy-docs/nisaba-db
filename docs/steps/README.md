@@ -29,16 +29,40 @@ one process per database directory, binjson over sockets, as a
 `wasm/include/db_session.h` — resolving a collection by name in C — which
 is the piece 1 and 2 were both blocked on, and it is what 3 sits on top
 of. It has since grown a bounded `poll()` multiplexer with idle
-reclamation, paged cursors, creation and schema, compaction, and lists of
-writes — twenty-two operations. What it still does not do is listed
-there rather than here, because those are properties of a thing that
-exists.
+reclamation, paged cursors, creation and schema, compaction and sweeps,
+lists of writes, aggregation, and change streams — thirty-one
+operations, which is everything the in-process `Collection` and `Db`
+have except `storageEstimate` (a browser API, not a database one). What
+it still does not do is listed there rather than here, because those are
+properties of a thing that exists.
 
-**One decision is still deliberately open:** whether the browser stays a
-*host* (owning OPFS files) or becomes a *client* of a server. It is a
-product decision, not a technical one, and almost every awkward
-constraint in the C API descends from the answer. Two constraints get
-conflated when it comes up, so they are worth separating:
+**The browser question is decided: BOTH.** The browser stays a *host* —
+an OPFS-backed local database, the thing you reach for instead of
+IndexedDB — *and* gains a client for talking to a database elsewhere
+over REST/HTTP. It was posed as either/or below because one of the two
+answers would have removed a large constraint from the C API; the answer
+is that the constraint stays, and is paid for deliberately.
+
+What that costs, stated plainly: **plan/execute is permanent.** OPFS
+`getFileHandle` and `createSyncAccessHandle` both return promises and
+wasm cannot block on one, so `bj_ns.open` must stay synchronous, the
+pre-open scope table stays, and "effects cannot carry buffers" stays.
+Every host that came later — Node, native, `wasm32-wasip2` — pays a
+discipline it does not need, so that one host can exist at all. That is
+the price of a local-first database that works offline in a browser,
+which is what this library is pitched on, and it is worth paying.
+
+What it does *not* cost: the client half needs nothing from C. The
+server's own client (`src/db-server-client.js`) already demonstrates the
+shape — a socket, the pure-JS codec, no WASM, no `ready()`, thirty-one
+operations, one file. A REST/HTTP client is that file with `fetch` where
+`net.connect` is, and the gateway in front is the parent project's
+(`docs/replicaton-roadmap.md` step 4 records that boundary). The two
+halves meet at the same `Db`/`Collection` shape, which is what makes
+"both" cheap rather than two products.
+
+The separation below is still worth keeping, because the two constraints
+get conflated whenever this comes up:
 
 - **Exclusive sync access handles per file** is the multi-tab one. It
   produced `src/db-coordinator.js` (elect one tab, others RPC to it) and
@@ -55,17 +79,12 @@ conflated when it comes up, so they are worth separating:
   buffers". It would hold with exactly one tab open.
 
 So solving multi-tab differently buys the removal of one JS file and one
-discipline; it does not buy back plan/execute. What *would* simplify
-everything is making the browser a client: `src/db-remote.js` already
-exists, the parent project's gateway is already the intended deployment,
-and then every remaining host is POSIX-shaped, `bj_ns.open` is just
-`openat`, and C could own the file lifecycle end to end — which is
-precisely what 1 needs and cannot have. It costs the thing this library
-is pitched on: a local-first embedded database that works offline in a
-browser. **Do not decide it as a side effect of building something
-else.** Decide it deliberately, write down why, and if the answer is
-"keep the browser as a host", then plan/execute is the price of that
-answer and is worth paying.
+discipline; it does not buy back plan/execute. Making the browser a
+client *only* would have: every remaining host would be POSIX-shaped,
+`bj_ns.open` would be `openat`, and C could own the file lifecycle end
+to end — which is precisely what brief 1 wants and cannot have. That
+trade was refused above, so brief 1 must work within plan/execute rather
+than waiting for it to go away.
 
 ## Standing debts
 

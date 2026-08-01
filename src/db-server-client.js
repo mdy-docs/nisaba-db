@@ -905,6 +905,25 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
     async dropCollection(name) {
       return (await conn.call({ op: 'dropCollection', coll: name })).dropped;
     },
+    /*
+     * Compact every collection (docs/compaction.md), reporting
+     * { [name]: stats | null } -- null meaning skipped.
+     *
+     * The three options are the whole difference between this and a loop
+     * over collection.compact(), and two of them read state this side
+     * cannot see: `factor` compares a file set against the size the
+     * catalog recorded right after its last compaction, and `skipBusy`
+     * asks whether anyone is scanning it. So the sweep is the server's,
+     * as it is in-process.
+     */
+    async compact(options = undefined) {
+      const req = { op: 'compact' };
+      if (options?.minBytes) req.minBytes = options.minBytes;
+      if (options?.factor) req.factor = options.factor;
+      if (options?.skipBusy) req.skipBusy = true;
+      return (await conn.call(req)).result || {};
+    },
+
     /** Every collection in the database this server holds. */
     async listCollections() {
       return (await conn.call({ op: 'listCollections' })).collections || [];

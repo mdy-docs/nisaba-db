@@ -2690,6 +2690,186 @@ static int take_event(dbs *s, uint64_t client, char *type, size_t cap,
     return 1;
 }
 
+/* A sweep's verdict for one collection: 1 compacted, 0 skipped (null),
+ * -1 not mentioned at all. */
+static int sweep_verdict(const dbuf *res, const char *name) {
+    const uint8_t *r; size_t rlen; int f = 0;
+    if (obj_get_field(res->data, res->len, (const uint8_t *)"result", 6, &r, &rlen, &f) || !f)
+        return -1;
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(r, rlen, (const uint8_t *)name, (uint32_t)strlen(name),
+                      &v, &vlen, &found) || !found)
+        return -1;
+    if (vlen >= 1 && v[0] == BJ_TYPE_NULL) return 0;
+    return 1;
+}
+
+/* {op:'compact', minBytes?, factor?, skipBusy?} -- no collection named. */
+static bj_builder *sweep_request(int64_t min_bytes, double factor, int skip_busy,
+                                 const uint8_t **out, uint32_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"op", 2);
+    bj_put_string(b, (const uint8_t *)"compact", 7);
+    if (min_bytes) { bj_put_key(b, (const uint8_t *)"minBytes", 8); bj_put_int(b, min_bytes); }
+    if (factor > 0) { bj_put_key(b, (const uint8_t *)"factor", 6); bj_put_float(b, factor); }
+    if (skip_busy) { bj_put_key(b, (const uint8_t *)"skipBusy", 8); bj_put_bool(b, 1); }
+    bj_end_object(b);
+    size_t len = 0;
+    *out = bj_builder_data(b, &len);
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+TEST(a_sweep_is_not_a_loop_over_collections) {
+    /*
+     * compact with no collection named. What makes it worth having in C
+     * rather than looping in a client is the three options, two of which
+     * read state a client cannot see: `factor` compares a file set
+     * against the size the catalog recorded right after its last
+     * compaction (compactedBytes, written at the flip), and `skipBusy`
+     * asks whether anyone is scanning it.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-sweep", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 1, &s) == BJ_OK);
+    const uint64_t CLIENT = 23;
+
+    /* One collection that churns and one that does not. */
+    for (int i = 0; i < 60; i++) {
+        doc *d = doc_new();
+        uint8_t oid[12]; mk_oid(oid, (uint32_t)(i + 1));
+        doc_oid(d, "_id", oid);
+        doc_int(d, "n", i);
+        doc_str(d, "pad", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("insert", "churn", "doc", db_, dlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(d);
+    }
+    {
+        doc *d = doc_new();
+        uint8_t oid[12]; mk_oid(oid, 999);
+        doc_oid(d, "_id", oid);
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("insert", "still", "doc", db_, dlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        dbuf_free(&res); bj_builder_free(rb); doc_free(d);
+    }
+
+    /* ---- with no options at all it is unconditional, exactly like
+     * asking for each collection in turn. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = sweep_request(0, 0, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(sweep_verdict(&res, "churn"), 1);
+        CHECK_I64(sweep_verdict(&res, "still"), 1);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- minBytes: nothing here is anywhere near a megabyte. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = sweep_request(1000000, 0, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(sweep_verdict(&res, "churn"), 0);
+        CHECK_I64(sweep_verdict(&res, "still"), 0);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- factor: rewrite every document several times, and only the
+     * collection that grew past twice its post-compaction size is worth
+     * doing again. The other one has not changed at all. */
+    {
+        for (int round = 0; round < 6; round++) {
+            doc *u = doc_new();
+            doc_begin_obj(u, "$set"); doc_int(u, "round", round); doc_end_obj(u);
+            uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+            const uint8_t *req; uint32_t req_len;
+            bj_builder *rb = request("updateMany", "churn", "update", ub, ulen, &req, &req_len);
+            dbuf res = {0};
+            CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+            CHECK_I64(response_ok(&res), 1);
+            dbuf_free(&res); bj_builder_free(rb); doc_free(u);
+        }
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = sweep_request(0, 2.0, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(sweep_verdict(&res, "churn"), 1);
+        CHECK_I64(sweep_verdict(&res, "still"), 0);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- skipBusy: a collection someone is scanning gets its turn on
+     * the next sweep. Without it, the same sweep is refused outright --
+     * which is what a caller who named one collection wants to hear. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        const uint8_t *opts; uint32_t opts_len;
+        bj_builder *ob = opts_of(5, 0, &opts, &opts_len);
+        bj_builder *fb = request("find", "churn", "opts", opts, opts_len, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        int f = 0;
+        int64_t cursor_id = response_num(&res, "cursor", &f);
+        CHECK_I64(f, 1);
+        dbuf_free(&res); bj_builder_free(fb); bj_builder_free(ob);
+
+        bj_builder *rb = sweep_request(0, 0, 1, &req, &req_len);
+        dbuf sres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &sres));
+        CHECK_I64(response_ok(&sres), 1);
+        CHECK_I64(sweep_verdict(&sres, "churn"), 0);   /* busy: next time */
+        CHECK_I64(sweep_verdict(&sres, "still"), 1);
+        dbuf_free(&sres); bj_builder_free(rb);
+
+        rb = sweep_request(0, 0, 0, &req, &req_len);
+        dbuf bres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &bres));
+        CHECK_I64(response_ok(&bres), 0);
+        CHECK_I64(response_num(&bres, "code", &f), DC_ERR_CURSORS_OPEN);
+        dbuf_free(&bres); bj_builder_free(rb);
+
+        bj_builder *kb = cursor_request("closeCursor", cursor_id, &req, &req_len);
+        dbuf kres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &kres));
+        dbuf_free(&kres); bj_builder_free(kb);
+    }
+
+    /* ---- and every document is still there. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "churn", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        int f = 0;
+        CHECK_I64(response_num(&res, "n", &f), 60);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(a_watcher_is_told_what_another_client_wrote) {
     /*
      * The one thing on this wire a client does not ask for. Everything
@@ -8484,6 +8664,7 @@ int main(void) {
     RUN(find_by_index_says_which_of_the_three_ways_it_was_asked_wrong);
     RUN(prune_expired_sweeps_what_a_ttl_index_says_is_over);
     RUN(a_watcher_is_told_what_another_client_wrote);
+    RUN(a_sweep_is_not_a_loop_over_collections);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

@@ -1098,6 +1098,47 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     const uint8_t *coll; uint32_t coll_len;
     e = field_str(req, req_len, "coll", &coll, &coll_len, &found);
     if (e) return respond_error(out, DC_ERR_REQ_MALFORMED);
+    /*
+     * compact with no collection named is the SWEEP: every collection,
+     * with the three options that are the whole difference between a
+     * sweep and a loop (db_session.h). It is answered here because it is
+     * the one op whose collection is optional -- naming one asks for
+     * that one and hears about it going wrong, naming none asks for all
+     * of them and hears what each did.
+     */
+    if (!found && op == OP_COMPACT) {
+        int64_t min_bytes = 0;
+        if ((e = field_int(req, req_len, "minBytes", &min_bytes, 0)))
+            return respond_error(out, DC_ERR_REQ_MALFORMED);
+        double factor = 0;
+        {
+            const uint8_t *v; size_t vlen; int f = 0;
+            if ((e = field_raw(req, req_len, "factor", &v, &vlen, &f)))
+                return respond_error(out, DC_ERR_REQ_MALFORMED);
+            if (f) {
+                cur c = { v, vlen, 0 };
+                if (read_number(&c, &factor)) return respond_error(out, DC_ERR_REQ_MALFORMED);
+            }
+        }
+        int skip_busy = 0;
+        if ((e = field_flag(req, req_len, "skipBusy", 0, &skip_busy)))
+            return respond_error(out, DC_ERR_REQ_MALFORMED);
+
+        dbuf all = {0};
+        e = dbs_compact_all(s, min_bytes, factor, skip_busy, &all);
+        if (e) { dbuf_free(&all); return respond_error(out, e); }
+        bj_builder *ab = bj_builder_new();
+        if (!ab) { dbuf_free(&all); return BJ_ERR_OOM; }
+        bj_begin_object(ab);
+        PUT_KEY(ab, "ok"); bj_put_bool(ab, 1);
+        PUT_KEY(ab, "result");
+        if (all.len) bj_put_raw(ab, all.data, (uint32_t)all.len); else bj_put_null(ab);
+        bj_end_object(ab);
+        dbuf_free(&all);
+        int ae = finish(ab, out);
+        bj_builder_free(ab);
+        return ae;
+    }
     if (!found) return respond_error(out, DC_ERR_REQ_MISSING_FIELD);
 
     /*

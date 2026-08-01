@@ -267,6 +267,35 @@ typedef struct {
 
 int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *out);
 
+/*
+ * Compact EVERY collection, and report what each one did as a binjson
+ * OBJECT of { <name>: {generation, bytesBefore, bytesAfter} | null } --
+ * null meaning skipped, which is the shape the in-process Db.compact()
+ * returns and for the same three reasons:
+ *
+ *   min_bytes  a file set smaller than this is not worth rewriting.
+ *   factor     nor is one that has not grown to `factor` times its size
+ *              right after its last compaction. The catalog records that
+ *              size (compactedBytes, written at the flip), so the
+ *              heuristic reads a fact rather than estimating one. A
+ *              never-compacted collection only has to clear min_bytes.
+ *   skip_busy  a collection someone is scanning is skipped rather than
+ *              refused. An unattended sweep wants its turn on the next
+ *              pass, not an error; a caller who asked for one collection
+ *              by name wants the error (dbs_compact keeps it).
+ *
+ * With none of them it is unconditional, exactly like asking for each
+ * collection in turn.
+ *
+ * It is HERE rather than looped by a client because those three options
+ * are the whole difference between a sweep and a loop, and two of them
+ * read state -- the catalog's compactedBytes, and whether a tree is
+ * pinned -- that a client cannot see. A loop without them would be a
+ * second, weaker thing wearing the same name.
+ */
+int dbs_compact_all(dbs *s, int64_t min_bytes, double factor, int skip_busy,
+                    dbuf *out);
+
 /* ---- cursors ------------------------------------------------------------
  *
  * A cursor is the only thing here that outlives the request that made

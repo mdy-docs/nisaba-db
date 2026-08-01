@@ -167,7 +167,7 @@ on them:
 | `find`, `find-one`, `count`, `distinct` | reads, including `--sort`/`--skip`/`--limit`/`--project` |
 | `insert` | the `_id` is minted by this end — C will not invent one, since that needs a clock |
 | `insert-many`, `bulk-write` | the whole list in one round trip, `--no-ordered` and all; the server runs the loop |
-| `compact <coll>` | one collection at a time; refused while a cursor is reading it |
+| `compact [coll]` | one collection, or a sweep of all of them with no name given |
 | `create-index`, `drop-index`, `list-indexes` | the server plans, builds and backfills the index |
 | `find-by-index <coll> <indexName> <values>` | equality lookup with no planner in the way |
 | `prune-expired <coll>` | the TTL sweep, on this end's clock |
@@ -180,8 +180,8 @@ on them:
 | `find-one-and-update`, `find-one-and-replace`, `find-one-and-delete` | the document itself, before or `--return-document after`; no `sort`, as locally |
 | `delete-one`, `delete-many` | |
 
-The only thing left — `compact` with no collection named — is not on the
-wire, and says so rather than pretending (`aggregate` and
+Nothing is left out: every command above works over `--server`. What the
+server still owns is not a command, and says so rather than pretending (`aggregate` and
 `explain` are on the wire but have never been CLI commands):
 
 ```

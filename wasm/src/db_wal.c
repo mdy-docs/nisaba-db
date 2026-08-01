@@ -295,14 +295,33 @@ int dc_wal_plan_build(dc_collection *c, const char *coll, uint32_t coll_len,
 
     int e = BJ_OK;
     switch (req) {
-        case DC_WREQ_INSERT_ONE:
-            /* The host assigned the id before calling (db.h's top
-             * comment); dc_document_id rejects a document that has none,
-             * here rather than at apply time. */
-            e = dc_document_id(a, a_len, p->target);
-            if (!e) { p->has_target = 1;
-                      e = emit(p, DC_WAL_INSERT, coll, coll_len, NULL, a, a_len, NULL, 0); }
+        case DC_WREQ_INSERT_ONE: {
+            /*
+             * A document's identity is IN the document. The host assigned
+             * it before calling (db.h's top comment), and one that did
+             * not is refused here rather than at apply time, where there
+             * would be nobody to tell -- and on a replica, nobody at all.
+             *
+             * `default_id` is deliberately not consulted. It answers a
+             * question an insert never asks: an upsert cannot know
+             * whether it needs an id until it has matched, so it is given
+             * one in advance. An insert knows. Accepting the id from two
+             * places would mean a precedence rule between them, which is
+             * two owners for one fact.
+             *
+             * The refusal used to be dc_document_id's BJ_ERR_STATE --
+             * "builder state error", a sentence about a builder for a
+             * request that was merely incomplete, and the thing anyone
+             * hitting this actually saw.
+             */
+            int has = 0;
+            e = dc_document_id_opt(a, a_len, p->target, &has);
+            if (e) break;
+            if (!has) { e = DC_ERR_WAL_NO_ID; break; }
+            p->has_target = 1;
+            e = emit(p, DC_WAL_INSERT, coll, coll_len, NULL, a, a_len, NULL, 0);
             break;
+        }
 
         case DC_WREQ_INSERT_MANY: {
             cur cr = { a, a_len, 0 };

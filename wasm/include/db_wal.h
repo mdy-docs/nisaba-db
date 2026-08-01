@@ -86,6 +86,18 @@ extern "C" {
  * every code HAS text, which is why it never caught a code with somebody
  * else's. */
 #define DC_ERR_WAL_NOT_APPLIABLE  (-36)
+/* An insert whose document carries no `_id`. Its own code, and -62
+ * rather than a neighbour of the four above, because -37 onwards were
+ * taken by db_session.h long ago and a code that means two things
+ * reaches a caller as the wrong sentence (see the note on -36, which is
+ * that mistake).
+ *
+ * It is separate from DC_ERR_WAL_BAD_REQUEST because the two are acted
+ * on differently: a bad request is malformed, and this one is merely
+ * incomplete -- add an `_id` and send it again. It was BJ_ERR_STATE
+ * until a caller had to be told which, exactly as with -46 and the three
+ * findByIndex codes. */
+#define DC_ERR_WAL_NO_ID          (-62)
 
 /*
  * Opcodes, as they appear in a log entry's `op` field. The wire spellings
@@ -160,13 +172,21 @@ typedef struct dc_wal_plan dc_wal_plan;
 /*
  * Resolve a request into the exact commands to log, running at most one
  * query to do it. `c` may be NULL for requests that touch no documents
- * (the DDL three, and INSERT_ONE/INSERT_MANY, whose ids the host already
- * assigned). `coll` names the collection in every emitted command.
+ * (the DDL three, and INSERT_ONE/INSERT_MANY, which need no query to
+ * know what they will write). `coll` names the collection in every
+ * emitted command.
  *
  * `default_id` is the id to use if the request turns out to need one --
  * the host generates it unconditionally because whether it is needed is
  * only knowable after the match, and generating ids stays in the host
  * (db.h's top comment). An unneeded one costs 12 bytes and is discarded.
+ *
+ * Only the writes that MATCH can need it -- an upsert that matched
+ * nothing, a replace that upserted. An insert is never one of them: a
+ * document's identity is in the document, both here and for
+ * INSERT_MANY, and taking it from `default_id` as well would mean a
+ * precedence rule between the two, which is two owners for one fact.
+ * An insert whose document has no `_id` is DC_ERR_WAL_NO_ID.
  *
  * On BJ_OK the caller owns *out and must dc_wal_plan_free it, INCLUDING
  * when the outcome is DC_PLAN_NOTHING. On error *out is NULL.

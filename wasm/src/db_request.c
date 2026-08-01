@@ -1697,18 +1697,33 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                     break;
             }
             if (e) break;
-            /* An insert whose document carries no _id, or an upsert with
-             * nothing to match, needs the 12 bytes the client was asked
-             * to supply. Inventing one here would need a clock. */
-            if (!have_id && (op == OP_INSERT || upsert)) {
-                int needs = 1;
-                if (op == OP_INSERT && doc) {
-                    const uint8_t *v; size_t vlen; int f = 0;
-                    if (!obj_get_field(doc, doc_len, (const uint8_t *)"_id", 3,
-                                       &v, &vlen, &f) && f)
-                        needs = 0;
+            /*
+             * An insert's document carries its own _id -- the same rule
+             * insertMany applies to every member of its list, and for
+             * the same reason: a document's identity is in the document,
+             * and inventing one here would need a clock (db.h's top
+             * comment). `id` is NOT an alternative place to put it. It
+             * answers the other question, the one only a matching write
+             * asks: an upsert cannot know whether it needs an id until
+             * it has matched, so it is handed one in advance.
+             *
+             * Checked here so the refusal names the request's own
+             * missing field. dc_wal_plan_build refuses it too
+             * (DC_ERR_WAL_NO_ID), because it is reachable from hosts
+             * that never come through this file -- but a client that
+             * reaches this one is told in the vocabulary of the wire.
+             */
+            if (op == OP_INSERT) {
+                const uint8_t *v; size_t vlen; int f = 0;
+                if (!doc ||
+                    obj_get_field(doc, doc_len, (const uint8_t *)"_id", 3,
+                                  &v, &vlen, &f) || !f) {
+                    e = DC_ERR_REQ_MISSING_FIELD;
+                    break;
                 }
-                if (needs) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+            } else if (!have_id && upsert) {
+                e = DC_ERR_REQ_MISSING_FIELD;
+                break;
             }
             e = do_write(s, c, (const char *)coll, coll_len, wreq,
                          a, a_len, b, b_len, upsert, id, &body);

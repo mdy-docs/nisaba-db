@@ -560,6 +560,31 @@ for (const engine of ENGINES) {
       expect(() => db.find({})).toThrow(/find is a collection operation/);
       expect(() => db.watch()).toThrow(/watch is a collection operation/);
     });
+
+    it('refuses an insert whose document has no _id, and names the field', async () => {
+      // insertOne() cannot produce this -- it mints the _id into the
+      // document, as does every member of insertMany's list -- but a
+      // hand-built request can, and `id` does not stand in for it: two
+      // places for one fact would need a precedence rule between them.
+      // `id` answers the other question, the one only an upsert asks.
+      //
+      // It used to answer -2 "builder state error", from dc_document_id
+      // by way of the planner. The refusal was right; the sentence was
+      // about a builder.
+      const c = db.collection('users');
+      const before = await c.countDocuments({});
+      await expect(db.request({
+        op: 'insert', coll: 'users', doc: { name: 'Anonymous' }, id: new ObjectId()
+      })).rejects.toMatchObject({ code: -42 });
+      expect(await c.countDocuments({})).toBe(before);
+
+      // An upsert with nothing to match is the write that genuinely
+      // needs `id`, and it still works with no _id in sight.
+      const upserted = await c.updateOne(
+        { name: 'Nobody At All' }, { $set: { team: 'new' } }, { upsert: true });
+      expect(upserted.upsertedId).toBeInstanceOf(ObjectId);
+      await c.deleteOne({ _id: upserted.upsertedId });
+    });
   });
 
   describe.skipIf(!enabled)(`nisaba-server: bin/db.js as a client (${engine.name})`, () => {

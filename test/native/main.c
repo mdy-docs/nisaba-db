@@ -794,7 +794,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_RESERVED_NAME, DC_ERR_EMPTY_KEY_SPEC, DC_ERR_NON_ASCENDING_KEY,
         DC_ERR_BULK_EMPTY, DC_ERR_BULK_UNKNOWN_OP, DC_ERR_BULK_MISSING_FIELD,
         DC_ERR_WAL_UNKNOWN_OP, DC_ERR_WAL_MISSING_FIELD, DC_ERR_WAL_BAD_REQUEST,
-        DC_ERR_WAL_NOT_APPLIABLE,
+        DC_ERR_WAL_NOT_APPLIABLE, DC_ERR_WAL_NO_ID,
         /* db_session.h. NOT_APPLIABLE is here because it shared -35 with
          * DC_ERR_UNSUPPORTED_ID until these three needed the next free
          * codes: it had text only by accident, and the wrong text. */
@@ -1708,6 +1708,35 @@ static bj_builder *request(const char *op, const char *coll,
         bj_put_key(b, (const uint8_t *)key, (uint32_t)strlen(key));
         bj_put_raw(b, val, (uint32_t)val_len);
     }
+    bj_end_object(b);
+    size_t len = 0;
+    *out = bj_builder_data(b, &len);
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+/* The same, plus the `id` a client sends alongside a write: the 12 bytes
+ * an upsert falls back on. An insert is handed one here only to prove it
+ * is not consulted -- the document's own _id is the only place an
+ * insert's identity comes from. */
+static bj_builder *request_with_id(const char *op, const char *coll,
+                                   const char *key, const uint8_t *val, size_t val_len,
+                                   const uint8_t id[12],
+                                   const uint8_t **out, uint32_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"op", 2);
+    bj_put_string(b, (const uint8_t *)op, (uint32_t)strlen(op));
+    if (coll) {
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)coll, (uint32_t)strlen(coll));
+    }
+    if (key) {
+        bj_put_key(b, (const uint8_t *)key, (uint32_t)strlen(key));
+        bj_put_raw(b, val, (uint32_t)val_len);
+    }
+    bj_put_key(b, (const uint8_t *)"id", 2);
+    bj_put_oid(b, id);
     bj_end_object(b);
     size_t len = 0;
     *out = bj_builder_data(b, &len);
@@ -7540,6 +7569,98 @@ TEST(wal_plan_and_direct_upsert_insert_the_same_document) {
     fx_close(&direct); fx_close(&planned);
 }
 
+TEST(an_insert_without_an_id_says_which_field_is_missing) {
+    /*
+     * The refusal was always right; the sentence was not. An insert whose
+     * document carries no _id was dc_document_id's BJ_ERR_STATE, which
+     * reaches a client as "builder state error" -- a sentence about a
+     * builder, for a request that was merely incomplete. It now has its
+     * own code at the planner and the wire's own vocabulary above it.
+     *
+     * And `id` does not stand in for it, at either layer. That is the
+     * half db_session.h used to promise and nothing ever did: an id in
+     * two places would need a precedence rule between them, which is two
+     * owners for one fact. An upsert is different and keeps `id`,
+     * because it cannot know it needs one until it has matched.
+     */
+    uint8_t given[12]; mk_oid(given, 91);
+
+    doc *d = doc_new();
+    doc_str(d, "team", "core");            /* no _id at all */
+    uint32_t dlen; const uint8_t *dbuf_ = doc_done(d, &dlen);
+
+    /* ---- the planner: its own code, whether or not an id was offered. */
+    {
+        dc_wal_plan *p = NULL;
+        CHECK_RC(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
+                                   dbuf_, dlen, NULL, 0, 0, given, &p),
+                 DC_ERR_WAL_NO_ID);
+        CHECK(p == NULL);
+
+        p = NULL;
+        CHECK_RC(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
+                                   dbuf_, dlen, NULL, 0, 0, NULL, &p),
+                 DC_ERR_WAL_NO_ID);
+        CHECK(p == NULL);
+    }
+
+    /* ---- and the wire above it, in the wire's own vocabulary: a client
+     * that gets -42 is told to add a field, which is exactly what it has
+     * to do. */
+    {
+        char tmpl[64];
+        CHECK_FATAL(scratch_dir("nisaba-noid", tmpl, sizeof tmpl) == 0);
+        int dirfd = open(tmpl, O_RDONLY);
+        CHECK_FATAL(dirfd >= 0);
+        bj_ns ns;
+        CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+        CHECK_FATAL(build_users_db(&ns) == 0);
+        dbs *s = NULL;
+        CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request_with_id("insert", "users", "doc", dbuf_, dlen,
+                                         given, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, 1, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_REQ_MISSING_FIELD);
+        /* Nothing landed: a refusal leaves the collection as it was. */
+        dbuf_free(&res); bj_builder_free(rb);
+
+        const uint8_t *creq; uint32_t creq_len;
+        bj_builder *cb = request("count", "users", NULL, NULL, 0, &creq, &creq_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(s, 1, creq, creq_len, &cres));
+        CHECK_I64(response_num(&cres, "n", &f), 3);
+        dbuf_free(&cres); bj_builder_free(cb);
+
+        /* The same document WITH an _id is accepted, so what is being
+         * refused is the missing field and not the shape of the request. */
+        {
+            doc *ok = doc_new();
+            uint8_t own[12]; mk_oid(own, 92);
+            doc_oid(ok, "_id", own);
+            doc_str(ok, "team", "core");
+            uint32_t olen; const uint8_t *obuf = doc_done(ok, &olen);
+            const uint8_t *oreq; uint32_t oreq_len;
+            bj_builder *ob = request_with_id("insert", "users", "doc", obuf, olen,
+                                             own, &oreq, &oreq_len);
+            dbuf ores = {0};
+            CHECK_OK(dbs_handle(s, 1, oreq, oreq_len, &ores));
+            CHECK_I64(response_ok(&ores), 1);
+            dbuf_free(&ores); bj_builder_free(ob); doc_free(ok);
+        }
+
+        dbs_close(s);
+        bjns_posix_free(&ns);
+        close(dirfd);
+    }
+
+    doc_free(d);
+}
+
 TEST(wal_plan_returns_the_preimage_the_host_would_have_queried_for) {
     /* findOneAndUpdate's `returnDocument: 'before'` used to cost a
      * findOne of its own. The planner already had the matched document
@@ -7618,13 +7739,17 @@ TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
     CHECK(p == NULL);
 
     /* An insert with no _id: the host assigns ids, and one that forgot
-     * would otherwise log an entry that fails on every replica. */
+     * would otherwise log an entry that fails on every replica. The CODE
+     * is asserted, not merely "not ok" -- for years this was BJ_ERR_STATE
+     * and a client was told "builder state error", which this assertion
+     * was loose enough to allow. */
     doc *anon = doc_new();
     doc_str(anon, "name", "Anonymous");
     uint32_t anlen; const uint8_t *anbuf = doc_done(anon, &anlen);
     p = NULL;
-    CHECK(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
-                            anbuf, anlen, NULL, 0, 0, did, &p) != BJ_OK);
+    CHECK_RC(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
+                               anbuf, anlen, NULL, 0, 0, did, &p),
+             DC_ERR_WAL_NO_ID);
     CHECK(p == NULL);
 
     /* An empty insertMany. */
@@ -8613,6 +8738,7 @@ int main(void) {
     RUN(a_logged_command_is_planned_and_applied_with_no_host_language);
     RUN(upsert_uses_the_id_the_filter_pinned);
     RUN(wal_plan_and_direct_upsert_insert_the_same_document);
+    RUN(an_insert_without_an_id_says_which_field_is_missing);
     RUN(wal_plan_returns_the_preimage_the_host_would_have_queried_for);
     RUN(wal_plan_rejects_before_it_logs_rather_than_after);
     RUN(update_many_hands_back_post_images_when_asked);

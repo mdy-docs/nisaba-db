@@ -112,6 +112,10 @@ const char *dc_strerror(int code) {
         case DC_ERR_WAL_BAD_REQUEST:
             return "WAL: malformed write request (empty batch, or a document "
                    "request with no collection)";
+        case DC_ERR_WAL_NO_ID:
+            return "Insert: the document carries no _id. A document's identity "
+                   "is in the document, and generating one needs a clock, which "
+                   "this layer does not have -- the caller assigns it";
         case DC_ERR_WAL_NOT_APPLIABLE:
             return "WAL: this command is not applied here -- creating or dropping "
                    "a collection or index touches FILES, which belongs to whoever "

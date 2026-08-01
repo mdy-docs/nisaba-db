@@ -422,11 +422,20 @@ deleted after the flip. Refused with `-49` while any cursor — anyone's —
 is scanning that collection.
 
 **Ids stay with the caller, and so does the clock.** `id` supplies the 12
-bytes a write needs if it turns out to need one (an insert whose document
-has no `_id`, an upsert that matched nothing). Generating one needs a
-clock, which `wasm/include/db.h` keeps out of the engine deliberately, so
-a write that needed an id and was not given one is refused rather than
-given an id invented in C.
+bytes a write needs if it *turns out* to need one — an upsert that
+matched nothing, which is the only write whose need for an id cannot be
+known until it has run. Generating one needs a clock, which
+`wasm/include/db.h` keeps out of the engine deliberately, so a write that
+needed an id and was not given one is refused rather than given an id
+invented in C.
+
+An **insert** is not one of those writes: its document carries its own
+`_id`, exactly as every member of an `insertMany` list must, and `id` is
+not a second place to put it — two places for one fact would need a
+precedence rule between them. `{op:'insert', doc:{name:'Ada'}, id:…}` is
+`-42`, "Request is missing a field its op requires". (Until recently it
+was `-2`, "builder state error": the refusal was right and the sentence
+was about a builder.)
 
 `now` is the same bargain: milliseconds, for an update carrying
 `$currentDate`. That is not an operator the engine knows —

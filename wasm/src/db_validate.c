@@ -150,7 +150,8 @@ const char *dc_strerror(int code) {
                    "server's --idle-timeout (send {op:\"ping\"} to keep one warm)";
         case DC_ERR_REQ_MISSING_FIELD:
             return "Request is missing a field its op requires "
-                   "(a write that needs an _id must carry one: ids are the caller's)";
+                   "(a write that needs an _id or a clock reading must carry "
+                   "one: both are the caller's)";
         /* raft_core.h / raft_msg.h / raft_node.h. These reach a host the
          * same way every other code does, and a consensus refusal that
          * prints "unknown error" is a refusal nobody can act on. */

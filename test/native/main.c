@@ -2586,6 +2586,120 @@ static void put_bulk_op(bj_builder *b, const char *name,
     bj_end_object(b);
 }
 
+TEST(current_date_is_resolved_with_the_callers_clock_or_refused) {
+    /*
+     * $currentDate is not an operator the engine knows: upd_apply's table
+     * has no entry for it, deliberately, because by the time an update
+     * reaches the engine it is supposed to have been rewritten into $set
+     * against a concrete clock reading -- so that what gets written down
+     * is a date rather than a rule that would read a different clock on
+     * replay (db_wal.h).
+     *
+     * Every host of this library calls upd_resolve_current_date before
+     * proposing. This one is a host too; what it does not have is a
+     * clock, for the same reason it does not mint an _id. So the
+     * milliseconds come with the request, and an update that needs them
+     * and was not given them is refused rather than dated from thin air.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-cdate", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+    const uint64_t CLIENT = 3;
+    const int64_t NOW = 1750000000123LL;   /* a clock reading, not a clock */
+
+    /* An update carrying $currentDate and no `now` is refused, and
+     * nothing is written. */
+    {
+        doc *u = doc_new();
+        doc_begin_obj(u, "$currentDate"); doc_key(u, "at"); bj_put_bool(u->b, 1); doc_end_obj(u);
+        uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("updateMany", "users", "update", ub, ulen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_REQ_MISSING_FIELD);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(u);
+    }
+
+    /* With one, the rewrite is upd_resolve_current_date's and the date is
+     * exactly the millisecond that was sent -- which is what a filter on
+     * that value proves, and a filter on any other value would not. */
+    {
+        doc *u = doc_new();
+        doc_begin_obj(u, "$currentDate"); doc_key(u, "at"); bj_put_bool(u->b, 1); doc_end_obj(u);
+        uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"op", 2);
+        bj_put_string(b, (const uint8_t *)"updateMany", 10);
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)"users", 5);
+        bj_put_key(b, (const uint8_t *)"update", 6);
+        bj_put_raw(b, ub, ulen);
+        bj_put_key(b, (const uint8_t *)"now", 3);
+        bj_put_int(b, NOW);
+        bj_end_object(b);
+        size_t rl = 0; const uint8_t *req = bj_builder_data(b, &rl);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, (uint32_t)rl, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res); bj_builder_free(b); doc_free(u);
+
+        doc *q = doc_new();
+        doc_key(q, "at"); bj_put_date(q->b, NOW);
+        uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
+        const uint8_t *creq; uint32_t creq_len;
+        bj_builder *cb = request("count", "users", "filter", qb, qlen, &creq, &creq_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, creq, creq_len, &cres));
+        int f = 0;
+        CHECK_I64(response_num(&cres, "n", &f), 3);
+        dbuf_free(&cres); bj_builder_free(cb); doc_free(q);
+    }
+
+    /* And the collision rule stays where it was written: a field cannot
+     * be both $set and dated. Nothing here restates it. */
+    {
+        doc *u = doc_new();
+        doc_begin_obj(u, "$set"); doc_int(u, "at", 1); doc_end_obj(u);
+        doc_begin_obj(u, "$currentDate"); doc_key(u, "at"); bj_put_bool(u->b, 1); doc_end_obj(u);
+        uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"op", 2);
+        bj_put_string(b, (const uint8_t *)"updateMany", 10);
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)"users", 5);
+        bj_put_key(b, (const uint8_t *)"update", 6);
+        bj_put_raw(b, ub, ulen);
+        bj_put_key(b, (const uint8_t *)"now", 3);
+        bj_put_int(b, NOW);
+        bj_end_object(b);
+        size_t rl = 0; const uint8_t *req = bj_builder_data(b, &rl);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, (uint32_t)rl, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_CURRENT_DATE_CONFLICT);
+        dbuf_free(&res); bj_builder_free(b); doc_free(u);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(a_list_of_writes_is_one_request_and_reports_every_member) {
     /*
      * insertMany and bulkWrite are not the same operation -- one list
@@ -7382,6 +7496,7 @@ int main(void) {
     RUN(a_database_can_be_built_from_an_empty_directory);
     RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);
     RUN(a_list_of_writes_is_one_request_and_reports_every_member);
+    RUN(current_date_is_resolved_with_the_callers_clock_or_refused);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

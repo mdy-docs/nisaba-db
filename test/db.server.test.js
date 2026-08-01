@@ -318,6 +318,33 @@ for (const engine of ENGINES) {
       expect(await users.countDocuments({})).toBe(3);
     });
 
+    it('dates a field with this end clock, since C will not read one', async () => {
+      // $currentDate is not an operator the engine knows: a host rewrites
+      // it into $set against a concrete clock reading before proposing,
+      // so what gets written down is a date rather than a rule. This
+      // server is the host and has no clock, so the milliseconds travel
+      // with the request -- the same bargain as an insert's _id.
+      const users = db.collection('users');
+      const before = Date.now();
+      await users.updateOne({ name: 'Ada' }, { $currentDate: { at: true, seen: { $type: 'date' } } });
+      const ada = await users.findOne({ name: 'Ada' });
+      expect(ada.at).toBeInstanceOf(Date);
+      expect(ada.seen).toBeInstanceOf(Date);
+      expect(ada.at.getTime()).toBeGreaterThanOrEqual(before);
+      expect(ada.at.getTime()).toBeLessThanOrEqual(Date.now());
+
+      // The rules stay in C: this side sends the update as written and
+      // does not know that a field cannot be both $set and dated.
+      await expect(users.updateOne({ name: 'Ada' }, { $set: { at: 1 }, $currentDate: { at: true } }))
+        .rejects.toMatchObject({ code: -28 });
+
+      // Without the clock reading it is refused, not dated from thin air.
+      await expect(db.request({
+        op: 'update', coll: 'users', filter: { name: 'Ada' },
+        update: { $currentDate: { at: true } }
+      })).rejects.toMatchObject({ code: -42 });
+    });
+
     it('turns a refusal into an error carrying the code and the sentence', async () => {
       await expect(db.collection('ghosts').countDocuments({})).rejects.toThrow(ServerError);
       await expect(db.collection('ghosts').countDocuments({})).rejects.toMatchObject({ code: -37 });
@@ -1009,6 +1036,29 @@ for (const engine of ENGINES) {
       expect(err.result.insertedCount).toBe(0);
       expect(err.result.insertedIds).toEqual({});
       expect(await c.countDocuments({})).toBe(2);
+    });
+
+    it('dates every member of a list from one clock reading', async () => {
+      const c = db.collection('dated');
+      await c.insertMany([{ i: 1 }, { i: 2 }]);
+      await c.bulkWrite([
+        { updateOne: { filter: { i: 1 }, update: { $currentDate: { at: true } } } },
+        { updateOne: { filter: { i: 2 }, update: { $currentDate: { at: true } } } }
+      ]);
+      const [one, two] = [await c.findOne({ i: 1 }), await c.findOne({ i: 2 })];
+      expect(one.at).toBeInstanceOf(Date);
+      // Two members dating the same field agree about when it was: one
+      // reading for the request, not one per operation.
+      expect(two.at.getTime()).toBe(one.at.getTime());
+
+      // And a list that needs a clock and was sent without one is
+      // refused whole, before any of it runs -- like every other rule
+      // checked up front.
+      await expect(db.request({
+        op: 'bulkWrite', coll: 'dated',
+        writes: [{ updateOne: { filter: { i: 1 }, update: { $currentDate: { later: true } } } }]
+      })).rejects.toMatchObject({ code: -42 });
+      expect((await c.findOne({ i: 1 })).later).toBeUndefined();
     });
 
     it('leaves a database the JS implementation reads the same way', async () => {

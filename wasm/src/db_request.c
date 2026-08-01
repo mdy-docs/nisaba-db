@@ -20,6 +20,7 @@
 
 #include "db_wal.h"
 #include "db_query.h"
+#include "db_update.h"
 #include "db_validate.h"
 #include "db_bulk.h"
 #include "bjcursor.h"
@@ -150,6 +151,55 @@ static int field_id(const uint8_t *o, size_t olen, uint8_t out[12], int *found) 
     if (blen != 12 || cur_need(&c, blen)) return DC_ERR_REQ_MALFORMED;
     b = c.d + c.pos;
     memcpy(out, b, 12);
+    return BJ_OK;
+}
+
+/* The caller's clock reading, in milliseconds -- present only when the
+ * request carries a write that might need one. */
+static int field_ms(const uint8_t *o, size_t olen, int64_t *out, int *found) {
+    const uint8_t *v; size_t vlen;
+    *out = 0;
+    int e = field_raw(o, olen, "now", &v, &vlen, found);
+    if (e || !*found) return e;
+    cur c = { v, vlen, 0 };
+    double d;
+    if (read_number(&c, &d)) return DC_ERR_REQ_MALFORMED;
+    *out = (int64_t)d;
+    return BJ_OK;
+}
+
+/*
+ * Rewrite {$currentDate: {...}} into the {$set: {...}} the engine
+ * understands -- with the CALLER's clock.
+ *
+ * The rewrite is upd_resolve_current_date's: which fields, and the rule
+ * that a field already targeted by another operator cannot also be dated.
+ * Every host of this library calls it before proposing a write, so that
+ * what is written down carries a concrete date rather than a rule that
+ * would read a different clock on replay (db_wal.h). This server is a
+ * host too. What it does not have is a clock -- deliberately, which is
+ * the same reason an insert's _id comes from whoever asked -- so the
+ * milliseconds arrive with the request, and an update that needs them and
+ * was not given them is refused rather than given a time invented here.
+ *
+ * `scratch` owns the rewrite when there is one; with no $currentDate in
+ * the update, *out is the update as it arrived, unmoved and uncopied.
+ */
+static int resolve_dates(const uint8_t *upd, size_t upd_len,
+                         int64_t now_ms, int have_now, dbuf *scratch,
+                         const uint8_t **out, size_t *out_len) {
+    *out = upd; *out_len = upd_len;
+    if (!upd) return BJ_OK;
+    const uint8_t *cd; size_t cd_len; int has = 0;
+    if (obj_get_field(upd, upd_len, (const uint8_t *)"$currentDate", 12,
+                      &cd, &cd_len, &has))
+        return DC_ERR_REQ_MALFORMED;
+    if (!has) return BJ_OK;
+    if (!have_now) return DC_ERR_REQ_MISSING_FIELD;
+    scratch->len = 0;
+    int e = upd_resolve_current_date(upd, upd_len, now_ms, scratch);
+    if (e) return e;
+    *out = scratch->data; *out_len = scratch->len;
     return BJ_OK;
 }
 
@@ -497,7 +547,9 @@ static int do_insert_many(dc_collection *c, const char *coll, uint32_t coll_len,
 /* One bulk operation, read out of its spec object: which write it is and
  * what it writes with. dc_bulk_parse has already checked that the fields
  * each kind requires are there; what is checked here is the WIRE's own
- * rule -- the 12 bytes a write needs when it turns out to need one. */
+ * rules -- the 12 bytes a write needs when it turns out to need one, and
+ * the milliseconds a $currentDate needs. Both are the caller's to supply,
+ * and both are checked over the whole list before any of it runs. */
 typedef struct {
     int wreq;
     const uint8_t *a; uint32_t a_len;
@@ -506,7 +558,8 @@ typedef struct {
     uint8_t id[12];
 } bulk_write;
 
-static int read_bulk_write(int type, const uint8_t *sp, size_t sp_len, bulk_write *bw) {
+static int read_bulk_write(int type, const uint8_t *sp, size_t sp_len,
+                           int have_now, bulk_write *bw) {
     memset(bw, 0, sizeof *bw);
     const uint8_t *v; size_t vlen; int f = 0;
     int have_id = 0;
@@ -543,6 +596,17 @@ static int read_bulk_write(int type, const uint8_t *sp, size_t sp_len, bulk_writ
             /* An upsert that matches nothing inserts, and an insert needs
              * an id from whoever asked. */
             if (bw->upsert && !have_id) return DC_ERR_REQ_MISSING_FIELD;
+            /* And an update that dates a field needs a clock reading,
+             * for the same reason. The rewrite itself waits until this
+             * operation actually runs; what cannot wait is finding out
+             * that it could never have run. */
+            if (type != DC_BULK_REPLACE_ONE && !have_now) {
+                const uint8_t *cd; size_t cdlen; int has = 0;
+                if (obj_get_field(bw->b, bw->b_len, (const uint8_t *)"$currentDate", 12,
+                                  &cd, &cdlen, &has))
+                    return DC_ERR_REQ_MALFORMED;
+                if (has) return DC_ERR_REQ_MISSING_FIELD;
+            }
             return BJ_OK;
         }
         default:
@@ -589,7 +653,7 @@ static int next_spec(cur *ops, const uint8_t **sp, size_t *sp_len) {
 static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
                          const uint8_t *ops, size_t ops_len,
                          const uint8_t *types, size_t types_len,
-                         int ordered, dbuf *out) {
+                         int ordered, int64_t now_ms, int have_now, dbuf *out) {
     cur oc = { ops, ops_len, 0 }, tc = { types, types_len, 0 };
     uint32_t count = 0, tcount = 0;
     int e = array_begin(&oc, &count);
@@ -604,7 +668,7 @@ static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
         const uint8_t *sp; size_t sp_len; double d; bulk_write bw;
         if ((e = next_spec(&oc, &sp, &sp_len))) return DC_ERR_REQ_MALFORMED;
         if ((e = read_number(&tc, &d))) return e;
-        if ((e = read_bulk_write((int)d, sp, sp_len, &bw))) return e;
+        if ((e = read_bulk_write((int)d, sp, sp_len, have_now, &bw))) return e;
     }
 
     oc.pos = 0; tc.pos = 0;
@@ -622,6 +686,7 @@ static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
 
     write_result total;
     memset(&total, 0, sizeof total);
+    dbuf dates = {0};
     uint32_t attempted = 0;
     int nerr = 0, nups = 0;
 
@@ -629,11 +694,18 @@ static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
         const uint8_t *sp; size_t sp_len; double d; bulk_write bw;
         if ((e = next_spec(&oc, &sp, &sp_len))) break;
         if ((e = read_number(&tc, &d))) break;
-        if ((e = read_bulk_write((int)d, sp, sp_len, &bw))) break;
+        if ((e = read_bulk_write((int)d, sp, sp_len, have_now, &bw))) break;
+
+        /* $currentDate becomes a concrete date HERE, once per operation
+         * but from one clock reading for the whole request: two members
+         * of one bulkWrite dating the same field should not disagree
+         * about when it was. */
+        const uint8_t *ub; size_t ub_len;
+        if ((e = resolve_dates(bw.b, bw.b_len, now_ms, have_now, &dates, &ub, &ub_len))) break;
 
         write_result wr;
         int rc = run_write(c, coll, coll_len, bw.wreq, bw.a, bw.a_len,
-                           bw.b, bw.b_len, bw.upsert, bw.id, &wr);
+                           ub, (uint32_t)ub_len, bw.upsert, bw.id, &wr);
         attempted++;
         if (rc) {
             if ((e = put_error(errb, i, rc))) break;
@@ -663,6 +735,7 @@ static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
         if (!e) e = bj_builder_error(upb);
     }
     if (!e) e = respond_many(out, &total, attempted, upb, nups, errb, nerr);
+    dbuf_free(&dates);
     bj_builder_free(errb);
     bj_builder_free(upb);
     return e;
@@ -889,6 +962,10 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
         int ordered = 1;
         if ((e = field_flag(req, req_len, "ordered", 1, &ordered)))
             return respond_error(out, DC_ERR_REQ_MALFORMED);
+        int64_t bulk_now = 0;
+        int bulk_have_now = 0;
+        if ((e = field_ms(req, req_len, &bulk_now, &bulk_have_now)))
+            return respond_error(out, DC_ERR_REQ_MALFORMED);
 
         dbuf types = {0};
         int bad = -1;
@@ -920,7 +997,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
         }
         if (!e) e = do_bulk_write(bc, (const char *)coll, coll_len,
                                   writes, writes_len, types.data, types.len,
-                                  ordered, out);
+                                  ordered, bulk_now, bulk_have_now, out);
         dbuf_free(&types);
         if (e) return respond_error(out, e);
         return BJ_OK;
@@ -970,8 +1047,13 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     int upsert = 0;
     if ((e = field_flag(req, req_len, "upsert", 0, &upsert)))
         return respond_error(out, DC_ERR_REQ_MALFORMED);
+    int64_t now_ms = 0;
+    int have_now = 0;
+    if ((e = field_ms(req, req_len, &now_ms, &have_now)))
+        return respond_error(out, DC_ERR_REQ_MALFORMED);
 
     dbuf body = {0};
+    dbuf dates = {0};       /* a $currentDate rewrite, when there was one */
     const char *body_key = NULL;
     int64_t number = 0;
     int is_number = 0, is_bool_found = 0, found_doc = 0;
@@ -1007,7 +1089,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                     dbs_cursor_drop(s, client, id);
                     break;
                 }
-                dbuf_free(&body);
+                dbuf_free(&body); dbuf_free(&dates);
                 return BJ_OK;   /* respond_batch wrote the whole response */
             }
 
@@ -1112,7 +1194,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = do_insert_many(c, (const char *)coll, coll_len,
                                docs_v, docs_vlen, ordered, out);
             if (e) break;
-            dbuf_free(&body);
+            dbuf_free(&body); dbuf_free(&dates);
             return BJ_OK;   /* do_insert_many wrote the whole response */
         }
         case OP_INSERT:
@@ -1130,11 +1212,15 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                     wreq = DC_WREQ_INSERT_ONE; a = doc; a_len = (uint32_t)doc_len;
                     break;
                 case OP_UPDATE:
-                case OP_UPDATE_MANY:
+                case OP_UPDATE_MANY: {
                     if (!upd) { e = DC_ERR_REQ_MISSING_FIELD; break; }
                     wreq = (op == OP_UPDATE) ? DC_WREQ_UPDATE_ONE : DC_WREQ_UPDATE_MANY;
-                    b = upd; b_len = (uint32_t)upd_len;
+                    const uint8_t *ub; size_t ub_len;
+                    if ((e = resolve_dates(upd, upd_len, now_ms, have_now,
+                                           &dates, &ub, &ub_len))) break;
+                    b = ub; b_len = (uint32_t)ub_len;
                     break;
+                }
                 case OP_REPLACE:
                     if (!doc) { e = DC_ERR_REQ_MISSING_FIELD; break; }
                     wreq = DC_WREQ_REPLACE_ONE; b = doc; b_len = (uint32_t)doc_len;
@@ -1168,12 +1254,12 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     }
 
     if (e) {
-        dbuf_free(&body);
+        dbuf_free(&body); dbuf_free(&dates);
         return respond_error(out, e);
     }
 
     bj_builder *rb = bj_builder_new();
-    if (!rb) { dbuf_free(&body); return BJ_ERR_OOM; }
+    if (!rb) { dbuf_free(&body); dbuf_free(&dates); return BJ_ERR_OOM; }
     bj_begin_object(rb);
     PUT_KEY(rb, "ok"); bj_put_bool(rb, 1);
     if (is_number) {
@@ -1191,6 +1277,6 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     bj_end_object(rb);
     e = finish(rb, out);
     bj_builder_free(rb);
-    dbuf_free(&body);
+    dbuf_free(&body); dbuf_free(&dates);
     return e;
 }

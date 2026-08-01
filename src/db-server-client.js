@@ -467,7 +467,9 @@ function collection(conn, name) {
         return op;
       });
 
-      const res = await call({ op: 'bulkWrite', writes, ordered });
+      /* One clock reading for the whole list, so two members dating the
+       * same field cannot disagree about when it was. */
+      const res = await call({ op: 'bulkWrite', writes, ordered, now: Date.now() });
       const result = {
         acknowledged: true,
         insertedCount: res.result.insertedCount,
@@ -547,10 +549,23 @@ function collection(conn, name) {
 
   /* An upsert that matches nothing needs an id, for the same reason an
    * insert does; sending one costs a field and saves a round trip that
-   * would otherwise end in DC_ERR_REQ_MISSING_FIELD. */
+   * would otherwise end in DC_ERR_REQ_MISSING_FIELD.
+   *
+   * `now` is the same bargain for the same reason. C will not read a
+   * clock, so {$currentDate: {...}} is rewritten into a concrete $set by
+   * the server using THIS side's milliseconds -- the rule stays in C
+   * (upd_resolve_current_date, which also owns the collision check),
+   * while the clock stays with the caller, exactly as it does for the
+   * timestamp inside every _id this client mints. Sent on every update
+   * rather than only when the update looks like it needs one: deciding
+   * where $currentDate may appear is the grammar's business, not this
+   * file's. */
   async function write(op, fields, options) {
     const upsert = !!options?.upsert;
-    const res = await call({ op, ...fields, ...(upsert ? { upsert, id: new ObjectId() } : {}) });
+    const res = await call({
+      op, ...fields, now: Date.now(),
+      ...(upsert ? { upsert, id: new ObjectId() } : {})
+    });
     return res.result;
   }
 

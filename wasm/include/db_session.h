@@ -311,12 +311,15 @@ void dbs_close(dbs *s);
  * is one a log could have carried, and the result shape is the one every
  * replica computes rather than this file's opinion.
  *
- * IDS STAY WITH THE CALLER. `id` supplies the 12 bytes a write uses if it
- * turns out to need one (an insert whose document has no _id, an upsert
- * that matched nothing) -- generating them needs a clock, which db.h's
- * top comment keeps out of this layer deliberately. A write that needs
- * one and was not given one is DC_ERR_REQ_MISSING_FIELD, not an id
- * invented here.
+ * IDS STAY WITH THE CALLER, AND SO DOES THE CLOCK. `id` supplies the 12
+ * bytes a write uses if it turns out to need one (an insert whose
+ * document has no _id, an upsert that matched nothing) -- generating them
+ * needs a clock, which db.h's top comment keeps out of this layer
+ * deliberately. `now` supplies the milliseconds an update carrying
+ * $currentDate is rewritten against (upd_resolve_current_date, the same
+ * call every other host makes before proposing a write). A write that
+ * needs either and was not given it is DC_ERR_REQ_MISSING_FIELD, not a
+ * value invented here.
  *
  * CURSORS BELONG TO CLIENTS. `client` is an opaque token identifying
  * whoever is asking -- a connection id, for a socket server; anything

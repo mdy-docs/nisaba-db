@@ -101,8 +101,8 @@ schema, two about a cursor, and two about neither: `listCollections` and
 | `{op:'distinct', coll, field, filter}` | `{ok:true, values:[...]}` |
 | `{op:'insert', coll, doc, id}` | `{ok:true, result}` |
 | `{op:'insertMany', coll, docs:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
-| `{op:'bulkWrite', coll, writes:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
-| `{op:'update'\|'updateMany', coll, filter, update, upsert, id}` | `{ok:true, result}` |
+| `{op:'bulkWrite', coll, writes:[...], ordered, now}` | `{ok:true, result, attempted, upserted, errors}` |
+| `{op:'update'\|'updateMany', coll, filter, update, upsert, id, now}` | `{ok:true, result}` |
 | `{op:'replace', coll, filter, doc, upsert, id}` | `{ok:true, result}` |
 | `{op:'delete'\|'deleteMany', coll, filter}` | `{ok:true, result}` |
 | `{op:'createCollection', coll}` | `{ok:true, created}` |
@@ -152,8 +152,9 @@ list goes over whole and C runs it.
 
 **The grammar is checked before any of the list runs.** Which operation
 names exist and which fields each one needs is `dc_bulk_parse`'s
-(`db_bulk.h`), and so is the wire's own rule that a write which might
-need an `_id` was given one. A malformed list is refused entirely, with
+(`db_bulk.h`), and so are the wire's own rules — that a write which might
+need an `_id` was given one, and that one which dates a field was given a
+clock reading. A malformed list is refused entirely, with
 `index` naming the operation that was wrong — the one refusal that names
 a position, because a list of operations has positions. That ordering is
 not tidiness: an unordered run is supposed to attempt every operation,
@@ -250,12 +251,29 @@ answered from it without anyone reconnecting, and the old files are
 deleted after the flip. Refused with `-49` while any cursor — anyone's —
 is scanning that collection.
 
-**Ids stay with the caller.** `id` supplies the 12 bytes a write needs if
-it turns out to need one (an insert whose document has no `_id`, an
-upsert that matched nothing). Generating one needs a clock, which
-`wasm/include/db.h` keeps out of the engine deliberately, so a write that
-needed an id and was not given one is refused rather than given an id
-invented in C.
+**Ids stay with the caller, and so does the clock.** `id` supplies the 12
+bytes a write needs if it turns out to need one (an insert whose document
+has no `_id`, an upsert that matched nothing). Generating one needs a
+clock, which `wasm/include/db.h` keeps out of the engine deliberately, so
+a write that needed an id and was not given one is refused rather than
+given an id invented in C.
+
+`now` is the same bargain: milliseconds, for an update carrying
+`$currentDate`. That is not an operator the engine knows —
+`upd_apply`'s table has no entry for it — because a host is supposed to
+rewrite it into a concrete `$set` *before* proposing, so that what gets
+written down is a date rather than a rule that would read a different
+clock on replay (`db_wal.h`). This server is a host too, so it does that
+rewrite, with `upd_resolve_current_date` (which also owns the rule that a
+field cannot be both `$set` and dated) and with the caller's
+milliseconds. An update that needed them and was not given them is
+refused. A `bulkWrite` carries one reading for the whole list, so two
+members dating the same field cannot disagree about when it was.
+
+The date is therefore the *client's* clock, not the server's — the same
+clock already embedded in every ObjectId this client mints. A deployment
+that needs the database's own notion of now wants a gateway that stamps
+it, not a clock inside the engine.
 
 **Nothing is re-encoded on the way through.** Filters, documents and
 updates are handed to the engine as the bytes they arrived as, and
@@ -335,12 +353,6 @@ Stated here rather than discovered later.
   `wasm/src/db_request.c` plus a method in the client — except `watch`,
   which also needs frames the client did not ask for, and this protocol
   has no shape for those. `dump` and `restore` both work today.
-- **No `$currentDate` in an update over the wire.** The planner reads no
-  clock and has none to read (`db_wal.h`), so a host resolves
-  `$currentDate` into a concrete date before proposing — and this server,
-  which is the host, does not. Such an update is refused rather than
-  silently given a time, but with `-2` ("builder state error"), which
-  says nothing useful; it wants its own code and sentence.
 - **Compaction is per collection, and per request.** No `compact()`
   across a whole database (that needs collection listing), and no
   scheduler: the engine runs no timers, so *when* to compact stays with

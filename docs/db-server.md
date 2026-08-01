@@ -84,13 +84,14 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Nineteen operations —
+**One request object in, one response object out.** Twenty operations —
 eleven about a collection's documents, five about its schema, two about a
-cursor, and `ping`, which is about the connection:
+cursor, and three about neither: `listCollections`, and `ping`.
 
 | Request | Response |
 | --- | --- |
 | `{op:'ping'}` | `{ok:true, pong:true}` |
+| `{op:'listCollections'}` | `{ok:true, collections:[...]}` |
 | `{op:'find', coll, filter, opts:{sort,projection,skip,limit,batchSize}}` | `{ok:true, docs:[...]}`, or with `batchSize`: `{ok:true, docs:[...], cursor}` |
 | `{op:'getMore', cursor, opts:{batchSize}}` | `{ok:true, docs:[...], cursor}` |
 | `{op:'closeCursor', cursor}` | `{ok:true, closed:true}` |
@@ -162,6 +163,11 @@ slot is being taken back after `--idle-timeout`. Both are in the same
 shape as every other refusal, so a client reads them with the code it
 already has — and both say what happened, rather than leaving a client to
 infer it from a socket that closed.
+
+**`listCollections` names no collection**, which is the question you ask
+when you do not know what is there. The catalog's keys *are* the
+collection names — there is no list kept beside them to fall out of step
+— minus the format stamp, a reserved key no collection can be called.
 
 **It can build a database, not just serve one.** Point the server at an
 empty directory and it writes the catalog (and the format stamp) at
@@ -268,14 +274,17 @@ Stated here rather than discovered later.
   waiting is always looked at before one further down. Nothing starves
   while requests are small; a stream of large ones from slot 0 would make
   slot 5 wait.
-- **No collection listing.** `listCollections` is not on the wire, which
-  is also why there is no database-wide `compact`, and no `dump` or
-  `restore` from the CLI.
+- **No database-wide `compact`.** `listCollections` makes it possible to
+  build client-side, but the in-process `Db.compact()` takes
+  `minBytes`/`factor`/`skipBusy` and this would not, so it would be a
+  second, weaker thing wearing the same name. Compact a collection at a
+  time.
 - **No change streams, no `aggregate`, no `find-one-and-*` family, no
   `insertMany`/`bulkWrite`, no `findByIndex`/`pruneExpired`.** Each is an
   op in `wasm/src/db_request.c` plus a method in the client — except
   `watch`, which also needs frames the client did not ask for, and this
-  protocol has no shape for those.
+  protocol has no shape for those. `restore` waits on `insertMany`;
+  `dump` works today.
 - **Compaction is per collection, and per request.** No `compact()`
   across a whole database (that needs collection listing), and no
   scheduler: the engine runs no timers, so *when* to compact stays with

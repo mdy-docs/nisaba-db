@@ -168,14 +168,15 @@ The wire carries ten operations, and the CLI commands that ride on them:
 | `compact <coll>` | one collection at a time; refused while a cursor is reading it |
 | `create-index`, `drop-index`, `list-indexes` | the server plans, builds and backfills the index |
 | `drop-collection` | |
+| `collections` | |
+| `dump [coll]` | walks `collections` → `list-indexes` → a `find` cursor |
 | `update-one`, `update-many`, `replace-one` | including `--upsert` |
 | `delete-one`, `delete-many` | |
 
-Everything else — `collections`, `dump`, `restore`, `watch`,
+Everything else — `restore` (it needs `insert-many`), `watch`,
 `bulk-write`, `insert-many`, `find-by-index`, `prune-expired`, the
-`find-one-and-*` family, and `compact` with no collection named (that one
-needs `collections`) — is not on the wire yet, and says so rather than
-pretending:
+`find-one-and-*` family, and `compact` with no collection named — is not
+on the wire yet, and says so rather than pretending:
 
 ```
 $ db --server 8097 collections

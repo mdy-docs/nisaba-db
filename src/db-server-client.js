@@ -50,7 +50,7 @@
  * can use -- close() gives it back, draining gives it back, and losing
  * the connection gives it back.
  *
- * WHAT IS NOT HERE. The wire has nineteen ops (WIRE_OPS below) and this
+ * WHAT IS NOT HERE. The wire has twenty ops (WIRE_OPS below) and this
  * client has exactly those. Indexes, compaction, change streams, listing
  * collections and the find-one-and-* family are not on the wire yet;
  * asking for one gets a sentence saying so rather than a TypeError about
@@ -73,7 +73,8 @@ export const WIRE_OPS = [
   'find', 'findOne', 'count', 'distinct',
   'insert', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
   'getMore', 'closeCursor', 'compact',
-  'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes'
+  'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
+  'listCollections'
 ];
 
 /** Pings per idle timeout. The server's default is 60s; a third of that
@@ -286,8 +287,17 @@ function collection(conn, name) {
       if (!batchSize) {
         const docs = call({ op: 'find', filter, ...(opts ? { opts } : {}) })
           .then((res) => res.docs || []);
+        let at = 0;
         return guard({
           toArray: () => docs,
+          /* {value, done}, the shape the in-process cursor uses -- so a
+           * caller that pulls one document at a time reads the same
+           * either way, whichever side of a socket it is on. */
+          async next() {
+            const all = await docs;
+            return at < all.length ? { value: all[at++], done: false }
+                                   : { value: undefined, done: true };
+          },
           close: async () => {},
           async *[Symbol.asyncIterator]() { yield* await docs; }
         }, 'cursor');
@@ -308,6 +318,7 @@ function collection(conn, name) {
         return res.docs || [];
       };
 
+      let buffered = [], at = 0;
       const cursor = {
         async toArray() {
           const all = [];
@@ -317,6 +328,15 @@ function collection(conn, name) {
         /** One batch at a time, so a caller can stop without having
          * asked the server for everything. */
         async nextBatch() { return take(); },
+        /** One document at a time, buffered a batch at a time. */
+        async next() {
+          while (at >= buffered.length) {
+            if (done) return { value: undefined, done: true };
+            buffered = await take();
+            at = 0;
+          }
+          return { value: buffered[at++], done: false };
+        },
         /** Give the slot back early. Draining does it for you. */
         async close() {
           if (id === null) return;
@@ -466,6 +486,10 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
     },
     async dropCollection(name) {
       return (await conn.call({ op: 'dropCollection', coll: name })).dropped;
+    },
+    /** Every collection in the database this server holds. */
+    async listCollections() {
+      return (await conn.call({ op: 'listCollections' })).collections || [];
     },
     /** The one op that touches no collection: it exists so a connection
      * can stay warm without pretending to be a query. */

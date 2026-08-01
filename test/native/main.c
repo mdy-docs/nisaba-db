@@ -2187,6 +2187,34 @@ TEST(a_database_can_be_built_from_an_empty_directory) {
         dbuf_free(&dup); bj_builder_free(rb); doc_free(k);
     }
 
+    /* ---- what is in this database, asked without naming anything.
+     * The catalog's keys are the names, so the format stamp -- a key in
+     * that same tree -- must not appear among them. */
+    {
+        bj_builder *rb = bj_builder_new();
+        bj_begin_object(rb);
+        bj_put_key(rb, (const uint8_t *)"op", 2);
+        bj_put_string(rb, (const uint8_t *)"listCollections", 15);
+        bj_end_object(rb);
+        size_t rl = 0; const uint8_t *req = bj_builder_data(rb, &rl);
+
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, (uint32_t)rl, &res));
+        CHECK_I64(response_ok(&res), 1);
+        const uint8_t *v; size_t vlen; int f = 0;
+        CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"collections", 11,
+                               &v, &vlen, &f));
+        CHECK_I64(f, 1);
+        cur c = { v, vlen, 0 };
+        uint32_t n = 0;
+        CHECK_OK(array_begin(&c, &n));
+        CHECK_I64((int64_t)n, 2);                       /* users and notes */
+        CHECK(find_bytes(v, vlen, "users", 5) != NULL);
+        CHECK(find_bytes(v, vlen, "notes", 5) != NULL);
+        CHECK(find_bytes(v, vlen, DC_FORMAT_KEY, strlen(DC_FORMAT_KEY)) == NULL);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
     /* ---- listIndexes, in the shape a driver expects. */
     {
         const uint8_t *req; uint32_t req_len;
@@ -2257,6 +2285,27 @@ TEST(a_database_can_be_built_from_an_empty_directory) {
         int f = 0;
         CHECK_I64(response_num(&gone, "code", &f), DC_ERR_NO_COLLECTION);
         dbuf_free(&gone); bj_builder_free(rb);
+
+        /* And the listing agrees with the drop: one collection left. */
+        {
+            bj_builder *lb = bj_builder_new();
+            bj_begin_object(lb);
+            bj_put_key(lb, (const uint8_t *)"op", 2);
+            bj_put_string(lb, (const uint8_t *)"listCollections", 15);
+            bj_end_object(lb);
+            size_t ll = 0; const uint8_t *lreq = bj_builder_data(lb, &ll);
+            dbuf list = {0};
+            CHECK_OK(dbs_handle(s, CLIENT, lreq, (uint32_t)ll, &list));
+            const uint8_t *v; size_t vlen; int lf = 0;
+            CHECK_OK(obj_get_field(list.data, list.len, (const uint8_t *)"collections", 11,
+                                   &v, &vlen, &lf));
+            cur c = { v, vlen, 0 };
+            uint32_t n = 0;
+            CHECK_OK(array_begin(&c, &n));
+            CHECK_I64((int64_t)n, 1);
+            CHECK(find_bytes(v, vlen, "users", 5) == NULL);
+            dbuf_free(&list); bj_builder_free(lb);
+        }
 
         rb = request("count", "notes", NULL, NULL, 0, &req, &req_len);
         dbuf kept = {0};

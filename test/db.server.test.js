@@ -324,7 +324,7 @@ for (const engine of ENGINES) {
     });
 
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
-      expect(() => db.listCollections()).toThrow(/no db\.listCollections/);
+      expect(() => db.storageEstimate()).toThrow(/no db\.storageEstimate/);
       expect(() => db.collection('users').aggregate([])).toThrow(/no collection\.aggregate/);
       // The sentence names the ops that DO exist, so the refusal is
       // actionable without reading the source.
@@ -348,6 +348,17 @@ for (const engine of ENGINES) {
       return () => { proc.kill(); };
     });
 
+    it('lists collections, and dumps one, which listing unblocked', () => {
+      expect(cli('collections').stdout).toMatch(/^0: users$/m);
+      // dump walks listCollections -> listIndexes -> a find cursor, so
+      // it is the whole of what this step added, exercised as a user
+      // would meet it.
+      const dumped = cli('dump');
+      expect(dumped.status).toBe(0);
+      expect(dumped.stdout).toMatch(/^\{"collection":"users","indexes":\[\]\}$/m);
+      expect(dumped.stdout.split('\n').filter(l => l.includes('"doc"'))).toHaveLength(3);
+    });
+
     it('drives the same CLI commands over the socket', () => {
       expect(cli('count', 'users').stdout.trim()).toBe('3');
 
@@ -362,9 +373,11 @@ for (const engine of ENGINES) {
     });
 
     it('refuses, from the CLI, what only a local database can do', () => {
-      const listed = cli('collections');
-      expect(listed.status).toBe(1);
-      expect(listed.stderr).toMatch(/no db\.listCollections/);
+      // insert-many, not `collections`: listing is on the wire now, and
+      // a command that IS available is no test of a refusal.
+      const many = cli('insert-many', 'users', '[{"name":"Ada"}]');
+      expect(many.status).toBe(1);
+      expect(many.stderr).toMatch(/no collection\.insertMany/);
 
       // --order is the server's, decided when it opened the directory.
       const ordered = cli('count', 'users', '--order', '64');
@@ -560,6 +573,10 @@ for (const engine of ENGINES) {
       await expect(db.collection('ghosts').countDocuments({}))
         .rejects.toMatchObject({ code: -37 });
 
+      // The catalog's keys ARE the names, minus the reserved format
+      // stamp -- which is a key in that same tree and must not appear.
+      expect((await db.listCollections()).sort()).toEqual(['notes', 'users']);
+
       expect(await users.createIndex({ team: 1 })).toBe('team_1');
       expect((await users.listIndexes()).map(i => i.name)).toEqual(['team_1']);
       // Backfilled against the documents already there -- the only way
@@ -578,6 +595,7 @@ for (const engine of ENGINES) {
 
       expect(await db.dropCollection('users')).toBe(true);
       expect(await db.dropCollection('users')).toBe(false);
+      expect(await db.listCollections()).toEqual(['notes']);
       await expect(users.countDocuments({})).rejects.toMatchObject({ code: -37 });
     });
 

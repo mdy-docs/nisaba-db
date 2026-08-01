@@ -833,6 +833,44 @@ done:
     return e;
 }
 
+int dbs_list_collections(dbs *s, dbuf *out) {
+    if (!s || !out) return BJ_ERR_STATE;
+
+    /* The catalog's keys ARE the collection names -- there is no list
+     * kept beside them to fall out of step. Everything except the format
+     * stamp, which is a reserved name no collection can have
+     * (db_validate.h refuses it) and which every host filters out the
+     * same way. */
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+
+    bpt_cursor *cur_h = bpt_cursor_open(s->catalog, NULL, NULL);
+    if (!cur_h) { bj_builder_free(b); return BJ_ERR_STATE; }
+
+    for (;;) {
+        bpt_key key;
+        const uint8_t *val; size_t vlen;
+        int r = bpt_cursor_next(cur_h, &key, &val, &vlen);
+        if (r < 0) { e = r; break; }
+        if (r == 0) break;
+        if (!key.is_string) continue;          /* a catalog key is a name */
+        if (key.str_len == strlen(DC_FORMAT_KEY) &&
+            memcmp(key.str, DC_FORMAT_KEY, key.str_len) == 0) continue;
+        if ((e = bj_put_string(b, key.str, key.str_len))) break;
+    }
+    bpt_cursor_close(cur_h);
+
+    if (!e) e = bj_end_array(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        e = data ? dbuf_put(out, data, len) : BJ_ERR_OOM;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
 int dbs_list_indexes(dbs *s, const char *coll, size_t coll_len, dbuf *out) {
     if (!s || !coll || !out) return BJ_ERR_STATE;
     uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;

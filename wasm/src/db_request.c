@@ -51,7 +51,8 @@ typedef enum {
     OP_DROP_COLLECTION,
     OP_CREATE_INDEX,
     OP_DROP_INDEX,
-    OP_LIST_INDEXES
+    OP_LIST_INDEXES,
+    OP_LIST_COLLECTIONS
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -80,6 +81,7 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("createIndex",      OP_CREATE_INDEX),
     OP("dropIndex",        OP_DROP_INDEX),
     OP("listIndexes",      OP_LIST_INDEXES),
+    OP("listCollections",  OP_LIST_COLLECTIONS),
 };
 
 #undef OP
@@ -408,6 +410,28 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
         e = respond_batch(s, client, (uint64_t)id, cur_h, (uint32_t)want, out);
         if (e) return respond_error(out, e);
         return BJ_OK;
+    }
+
+    /*
+     * listCollections names no collection -- it is the question you ask
+     * when you do not know what there is -- so it is answered here,
+     * before `coll` is required, for the same reason ping is.
+     */
+    if (op == OP_LIST_COLLECTIONS) {
+        dbuf names = {0};
+        e = dbs_list_collections(s, &names);
+        if (e) { dbuf_free(&names); return respond_error(out, e); }
+        bj_builder *lb = bj_builder_new();
+        if (!lb) { dbuf_free(&names); return BJ_ERR_OOM; }
+        bj_begin_object(lb);
+        PUT_KEY(lb, "ok"); bj_put_bool(lb, 1);
+        PUT_KEY(lb, "collections");
+        if (names.len) bj_put_raw(lb, names.data, (uint32_t)names.len); else bj_put_null(lb);
+        bj_end_object(lb);
+        dbuf_free(&names);
+        int le = finish(lb, out);
+        bj_builder_free(lb);
+        return le;
     }
 
     const uint8_t *coll; uint32_t coll_len;

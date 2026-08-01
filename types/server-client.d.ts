@@ -44,6 +44,8 @@ export interface RemoteWriteResult {
 
 export interface RemoteCursor<T = Document> {
   toArray(): Promise<T[]>;
+  /** One document at a time, the shape the in-process cursor uses. */
+  next(): Promise<{ value: T; done: false } | { value: undefined; done: true }>;
   /** One batch per call; empty when the scan is done. Only meaningful
    * for a cursor opened with `batchSize`. */
   nextBatch(): Promise<T[]>;
@@ -93,6 +95,8 @@ export interface RemoteDb {
   /** Remove a collection and every file it owns. False if there was no
    * such collection. */
   dropCollection(name: string): Promise<boolean>;
+  /** Every collection in the database this server holds. */
+  listCollections(): Promise<string[]>;
   /** The op that touches no collection: keeps a connection warm past the
    * server's --idle-timeout. Sent automatically on a timer unless
    * connectServer was given `keepAliveMs: 0`. */

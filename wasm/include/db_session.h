@@ -200,6 +200,12 @@ int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
  * returns (db_catalog.h owns that projection). */
 int dbs_list_indexes(dbs *s, const char *coll, size_t coll_len, dbuf *out);
 
+/* Every collection name in the catalog, as a binjson array of strings,
+ * in the catalog's own order. The format stamp is not one of them: it
+ * is a reserved key no collection can be called, filtered here the same
+ * way every host filters it. */
+int dbs_list_collections(dbs *s, dbuf *out);
+
 /* ---- compaction ---------------------------------------------------------
  *
  * Rewrite a collection's whole file set without its append-only history

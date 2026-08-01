@@ -45,12 +45,24 @@ typedef struct {
     int            n_idx;
 } dbs_entry;
 
+/* An open cursor and who it belongs to. `id` is 0 in a free slot, and
+ * ids are never reused: a client that kept a stale id gets
+ * DC_ERR_NO_CURSOR rather than somebody else's scan. */
+typedef struct {
+    uint64_t   id;
+    uint64_t   client;
+    uint32_t   batch;                       /* the batch size it was opened with */
+    dc_cursor *cur;
+} dbs_cursor;
+
 struct dbs {
-    bj_ns     *ns;                          /* borrowed; the caller's */
-    int        order;
-    bj_io      catalog_io;
-    bpt       *catalog;
-    dbs_entry  open[DBS_MAX_COLLECTIONS];
+    bj_ns      *ns;                         /* borrowed; the caller's */
+    int         order;
+    bj_io       catalog_io;
+    bpt        *catalog;
+    dbs_entry   open[DBS_MAX_COLLECTIONS];
+    dbs_cursor  cursors[DBS_MAX_CURSORS];
+    uint64_t    next_cursor_id;             /* 1, 2, 3, ... never reused */
 };
 
 /* ---- plan reading ------------------------------------------------------ */
@@ -386,6 +398,75 @@ int dbs_collection(dbs *s, const char *name, size_t name_len, dc_collection **ou
     return BJ_OK;
 }
 
+/* ---- cursors ------------------------------------------------------------
+ *
+ * A fixed table, refused explicitly when full, like every other table
+ * here. What makes cursors different from open collections is that they
+ * have an OWNER: a collection is the session's for as long as the
+ * session lives, but a cursor belongs to whoever opened it and dies with
+ * them.
+ */
+
+int dbs_cursor_add(dbs *s, uint64_t client, dc_cursor *cur, uint32_t batch,
+                   uint64_t *id_out) {
+    if (!s || !cur || !id_out) return BJ_ERR_STATE;
+    for (int i = 0; i < DBS_MAX_CURSORS; i++) {
+        if (s->cursors[i].id) continue;
+        s->cursors[i].id     = ++s->next_cursor_id;
+        s->cursors[i].client = client;
+        s->cursors[i].batch  = batch;
+        s->cursors[i].cur    = cur;
+        *id_out = s->cursors[i].id;
+        return BJ_OK;
+    }
+    return DC_ERR_TOO_MANY_CURSORS;
+}
+
+/* A cursor is findable only by the client that opened it. "No such
+ * cursor" and "not yours" are deliberately the same answer: telling them
+ * apart would tell a client about another client's cursors. */
+static dbs_cursor *cursor_slot(dbs *s, uint64_t client, uint64_t id) {
+    if (!s || !id) return NULL;
+    for (int i = 0; i < DBS_MAX_CURSORS; i++) {
+        if (s->cursors[i].id == id && s->cursors[i].client == client)
+            return &s->cursors[i];
+    }
+    return NULL;
+}
+
+int dbs_cursor_get(dbs *s, uint64_t client, uint64_t id,
+                   dc_cursor **out, uint32_t *batch_out) {
+    dbs_cursor *slot = cursor_slot(s, client, id);
+    if (!slot) return DC_ERR_NO_CURSOR;
+    if (out) *out = slot->cur;
+    if (batch_out) *batch_out = slot->batch;
+    return BJ_OK;
+}
+
+int dbs_cursor_drop(dbs *s, uint64_t client, uint64_t id) {
+    dbs_cursor *slot = cursor_slot(s, client, id);
+    if (!slot) return DC_ERR_NO_CURSOR;
+    dc_cursor_close(slot->cur);
+    memset(slot, 0, sizeof *slot);
+    return BJ_OK;
+}
+
+void dbs_drop_client(dbs *s, uint64_t client) {
+    if (!s) return;
+    for (int i = 0; i < DBS_MAX_CURSORS; i++) {
+        if (!s->cursors[i].id || s->cursors[i].client != client) continue;
+        dc_cursor_close(s->cursors[i].cur);
+        memset(&s->cursors[i], 0, sizeof s->cursors[i]);
+    }
+}
+
+int dbs_cursor_count(const dbs *s) {
+    if (!s) return 0;
+    int n = 0;
+    for (int i = 0; i < DBS_MAX_CURSORS; i++) if (s->cursors[i].id) n++;
+    return n;
+}
+
 int dbs_open_count(const dbs *s) {
     if (!s) return 0;
     int n = 0;
@@ -395,6 +476,11 @@ int dbs_open_count(const dbs *s) {
 
 void dbs_close(dbs *s) {
     if (!s) return;
+    /* Cursors first: a scan is positioned against a tree the loop below
+     * is about to free. */
+    for (int i = 0; i < DBS_MAX_CURSORS; i++) {
+        if (s->cursors[i].id) dc_cursor_close(s->cursors[i].cur);
+    }
     for (int i = 0; i < DBS_MAX_COLLECTIONS; i++) {
         if (s->open[i].used) entry_release(s->ns, &s->open[i]);
     }

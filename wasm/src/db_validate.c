@@ -124,6 +124,16 @@ const char *dc_strerror(int code) {
         case DC_ERR_TOO_MANY_CLIENTS:
             return "The server is already holding as many connections as it will "
                    "(--max-clients); this one is refused rather than queued";
+        case DC_ERR_NO_CURSOR:
+            return "No cursor of that id belongs to this client (it was drained, "
+                   "killed, or opened by somebody else)";
+        case DC_ERR_TOO_MANY_CURSORS:
+            return "Too many cursors open at once on this server; drain or kill "
+                   "one before opening another";
+        case DC_ERR_CURSOR_SORTED:
+            return "A sorted find cannot be batched: an arbitrary sort needs every "
+                   "match before the first ordered result exists. Ask without "
+                   "batchSize, or without sort";
         case DC_ERR_IDLE_TIMEOUT:
             return "Connection closed: it asked nothing for longer than the "
                    "server's --idle-timeout (send {op:\"ping\"} to keep one warm)";

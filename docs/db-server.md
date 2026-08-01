@@ -60,6 +60,14 @@ const db = await connectServer('127.0.0.1:8097');
 const users = db.collection('users');
 await users.insertOne({ name: 'Ada', team: 'core' });   // _id minted here
 console.log(await users.find({ team: 'core' }).toArray());
+
+// A large result, paged: one batch per round trip, and the cursor closes
+// itself on the last one. `break` mid-scan kills it rather than leaving
+// it held.
+for await (const doc of users.find({}, { batchSize: 500 })) {
+  process.stdout.write(doc.name + '\n');
+}
+
 await db.close();
 ```
 
@@ -75,13 +83,16 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Eleven operations —
-ten about a collection, and `ping`, which is about the connection:
+**One request object in, one response object out.** Thirteen operations —
+ten about a collection, two about a cursor, and `ping`, which is about
+the connection:
 
 | Request | Response |
 | --- | --- |
 | `{op:'ping'}` | `{ok:true, pong:true}` |
-| `{op:'find', coll, filter, opts:{sort,projection,skip,limit}}` | `{ok:true, docs:[...]}` |
+| `{op:'find', coll, filter, opts:{sort,projection,skip,limit,batchSize}}` | `{ok:true, docs:[...]}`, or with `batchSize`: `{ok:true, docs:[...], cursor}` |
+| `{op:'getMore', cursor, opts:{batchSize}}` | `{ok:true, docs:[...], cursor}` |
+| `{op:'killCursor', cursor}` | `{ok:true, closed:true}` |
 | `{op:'findOne', coll, filter}` | `{ok:true, found, doc}` |
 | `{op:'count', coll, filter}` | `{ok:true, n}` |
 | `{op:'distinct', coll, field, filter}` | `{ok:true, values:[...]}` |
@@ -92,6 +103,27 @@ ten about a collection, and `ping`, which is about the connection:
 
 `result` is `{acknowledged, matchedCount, modifiedCount, deletedCount,
 insertedCount, upsertedId}`.
+
+**Cursors page a scan, not a result.** `batchSize` on a find opens a
+cursor: one batch comes back with an id, `getMore` asks for the next, and
+`cursor` comes back **null** on the last batch — so a drained cursor
+needs no `killCursor` and costs no round trip to discover it is finished.
+What the server holds between calls is a *position in a B+ tree scan*
+(`dc_cursor_open`), not a materialised result, which is the difference
+between paging a million documents and being sent a million documents.
+
+A cursor belongs to the connection that opened it: another connection
+asking for it gets `-46`, the same answer as for an id that never
+existed, because telling those apart would tell a client about somebody
+else's cursors. Cursors are released when drained, killed, when their
+connection ends (however it ends), or when the server closes.
+
+**A sorted find cannot be batched** (`-48`). An arbitrary sort needs
+every match before the first ordered result exists — the reason
+`dc_cursor_open` has no sort parameter, and the reason the in-process
+cursor refuses `next()` on a sorted find too. One rule, said once by each
+layer, rather than a server that quietly materialises everything and
+calls it a cursor. Ask without `batchSize`, or without `sort`.
 
 **A refusal is a response.** Anything the request gets wrong — an unknown
 op, a missing field, no such collection, a duplicate key — comes back as
@@ -171,6 +203,12 @@ with no socket and no port.
 
 Stated here rather than discovered later.
 
+- **Cursors are bounded and not timed out on their own.** Sixteen at
+  once across all clients (`DBS_MAX_CURSORS`); the seventeenth is `-47`.
+  An abandoned cursor is held until its connection ends, which the idle
+  timeout bounds but does not target.
+- **A sorted find still returns one frame.** Batching it is refused
+  rather than faked, so a large sorted result is as large as it was.
 - **No fairness between clients.** Ready connections are served in table
   order every time round the loop, so a client that always has a request
   waiting is always looked at before one further down. Nothing starves
@@ -179,7 +217,6 @@ Stated here rather than discovered later.
 - **Ten data operations.** No index management, compaction, change
   streams, collection listing, or the `find-one-and-*` family. Each is an op in
   `wasm/src/db_request.c` plus a method in the client.
-- **No cursors.** A `find` returns every match in one frame.
 - **No TLS, no auth, no tenants.** Loopback only. Those belong to the
   gateway in front, not to the database
   (`docs/replicaton-roadmap.md` step 4 records that boundary).

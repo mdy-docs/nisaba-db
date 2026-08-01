@@ -208,7 +208,8 @@ static int serve(dbs *s, int in_fd, int out_fd) {
         }
 
         dbuf res = {0};
-        int e = dbs_handle(s, req, total, &res);
+        /* --stdio is one client by construction; it takes the first id. */
+        int e = dbs_handle(s, 1, req, total, &res);
         free(req);
         if (e) { dbuf_free(&res); return -1; }   /* no response could be built */
 
@@ -244,6 +245,7 @@ static uint64_t now_ms(void) {
  */
 typedef struct {
     int fd;
+    uint64_t client;        /* never reused: cursors are owned by it */
     uint8_t *in;
     size_t in_len, in_cap;
     dbuf out;
@@ -269,6 +271,17 @@ static void conn_reset(conn *c) {
 static void conn_close(conn *c) {
     if (c->fd >= 0) close(c->fd);
     conn_reset(c);
+}
+
+/*
+ * A connection ending, however it ended -- cleanly, torn, timed out, or
+ * with the server shutting down. Its cursors go with it: the session
+ * holds them, the transport is the only thing that knows the client is
+ * gone, and a scan nobody can reach again is a scan holding a slot.
+ */
+static void conn_gone(dbs *s, conn *c) {
+    dbs_drop_client(s, c->client);
+    conn_close(c);
 }
 
 static int conn_reserve(conn *c, size_t need) {
@@ -339,7 +352,7 @@ static int conn_readable(dbs *s, conn *c) {
         if (m < 0) return -1;
         if (c->in_len < total) break;
 
-        int e = dbs_handle(s, c->in, total, &c->out);
+        int e = dbs_handle(s, c->client, c->in, total, &c->out);
         if (e) return -1;                             /* no response could be built */
         c->quiet_since = now_ms();                    /* it asked something */
 
@@ -404,7 +417,10 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
     struct pollfd *pf = (struct pollfd *)calloc((size_t)max_clients + 1, sizeof *pf);
     if (!cs || !pf) { free(cs); free(pf); return -1; }
     for (int i = 0; i < max_clients; i++) cs[i].fd = -1;
-    int n = 0;   /* live connections, kept packed at the front of cs */
+    int n = 0;              /* live connections, kept packed at the front of cs */
+    /* 1 is --stdio's, so a client id means the same thing in both
+     * transports and neither can be mistaken for "no client". */
+    uint64_t clients = 1;
 
     for (;;) {
         pf[0].fd = srv;
@@ -442,8 +458,8 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
             for (int i = n - 1; i >= 0; i--) {
                 if (now - cs[i].quiet_since < idle_ms) continue;
                 int fd = cs[i].fd;
-                cs[i].fd = -1;              /* conn_close must not close it first */
-                conn_close(&cs[i]);
+                cs[i].fd = -1;              /* conn_gone must not close it first */
+                conn_gone(s, &cs[i]);
                 refuse_and_close(fd, DC_ERR_IDLE_TIMEOUT);
                 cs[i] = cs[n - 1];
                 conn_clear(&cs[n - 1]);
@@ -463,7 +479,7 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
             else if (ev & POLLOUT) dead = conn_flush(&cs[i]) != 0;
             else if (ev & (POLLIN | POLLHUP)) dead = conn_readable(s, &cs[i]) != 0;
             if (dead) {
-                conn_close(&cs[i]);
+                conn_gone(s, &cs[i]);
                 cs[i] = cs[n - 1];      /* the last one moves into the hole */
                 conn_clear(&cs[n - 1]); /* and its old slot owns nothing now */
                 n--;
@@ -481,13 +497,14 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
             } else {
                 conn_reset(&cs[n]);
                 cs[n].fd = c;
+                cs[n].client = ++clients;   /* ids are never reused */
                 cs[n].quiet_since = now_ms();
                 n++;
             }
         }
     }
 
-    for (int i = 0; i < n; i++) conn_close(&cs[i]);
+    for (int i = 0; i < n; i++) conn_gone(s, &cs[i]);
     free(cs);
     free(pf);
     return -1;

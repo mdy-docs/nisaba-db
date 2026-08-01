@@ -60,6 +60,10 @@ extern "C" {
 /* Collections held open at once, and indexes on any one collection. */
 #define DBS_MAX_COLLECTIONS 32
 #define DBS_MAX_INDEXES     16
+/* Cursors open at once, across every client. A cursor is the only state
+ * here that outlives the request that made it, which is why it is
+ * counted, owned, and released with the client that owns it. */
+#define DBS_MAX_CURSORS     16
 
 /* No catalog entry of that name. Distinct from "the entry is unusable"
  * (DC_ERR_CATALOG_ENTRY) because a caller answers them differently: one
@@ -83,6 +87,12 @@ extern "C" {
  * said nothing for long enough that its slot is being taken back. */
 #define DC_ERR_TOO_MANY_CLIENTS     (-44)
 #define DC_ERR_IDLE_TIMEOUT         (-45)
+/* Cursors. NO_CURSOR covers "no such id" and "not yours" deliberately:
+ * a client learning which of the two it was would be learning about
+ * another client's cursors. */
+#define DC_ERR_NO_CURSOR            (-46)
+#define DC_ERR_TOO_MANY_CURSORS     (-47)
+#define DC_ERR_CURSOR_SORTED        (-48)
 
 typedef struct dbs dbs;
 
@@ -111,6 +121,37 @@ int dbs_collection(dbs *s, const char *name, size_t name_len,
 /* How many collections are currently held open -- for tests, and for a
  * server that wants to say so. */
 int dbs_open_count(const dbs *s);
+
+/* ---- cursors ------------------------------------------------------------
+ *
+ * A cursor is the only thing here that outlives the request that made
+ * it, so it needs an owner, and the owner is a CLIENT: the opaque token
+ * a transport passes to dbs_handle. The transport picks the tokens
+ * (server/main.c numbers its connections) and never has to know what a
+ * cursor is; it only has to say when a client is gone.
+ *
+ * That is the whole ownership rule. A cursor is released when its client
+ * drains it, kills it, or disappears -- and dbs_close releases whatever
+ * is left, so no path leaks a scan.
+ */
+
+/* Internal to this module (db_request.c is the only caller): put a
+ * freshly opened cursor in the table, find one back, drop one. Declared
+ * here rather than in a private header because struct dbs lives in
+ * db_session.c and these are the seam between the two files. */
+int dbs_cursor_add(dbs *s, uint64_t client, dc_cursor *cur, uint32_t batch,
+                   uint64_t *id_out);
+int dbs_cursor_get(dbs *s, uint64_t client, uint64_t id,
+                   dc_cursor **out, uint32_t *batch_out);
+int dbs_cursor_drop(dbs *s, uint64_t client, uint64_t id);
+
+/* Close every cursor `client` owns. Called by a transport when a
+ * connection ends, however it ended. Safe on a client with none. */
+void dbs_drop_client(dbs *s, uint64_t client);
+
+/* How many cursors are open, across every client -- for tests, and for
+ * a server that wants to say so. */
+int dbs_cursor_count(const dbs *s);
 
 /* Close every collection, the catalog, and the session. Safe on NULL.
  * Does not touch the namespace. */
@@ -155,8 +196,16 @@ void dbs_close(dbs *s);
  * top comment keeps out of this layer deliberately. A write that needs
  * one and was not given one is DC_ERR_REQ_MISSING_FIELD, not an id
  * invented here.
+ *
+ * CURSORS BELONG TO CLIENTS. `client` is an opaque token identifying
+ * whoever is asking -- a connection id, for a socket server; anything
+ * unique and stable, for anyone else. It matters for exactly one thing:
+ * a cursor opened by one client cannot be advanced or killed by another,
+ * and dbs_drop_client releases the cursors of a client that has gone.
+ * Everything else answers the same regardless of who asked.
  */
-int dbs_handle(dbs *s, const uint8_t *req, size_t req_len, dbuf *out);
+int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
+               dbuf *out);
 
 /*
  * Append the refusal { ok:false, code, msg } for `code`, with no request

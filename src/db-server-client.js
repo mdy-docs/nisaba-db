@@ -43,8 +43,15 @@
  * process open on its own. A CLI invocation that connects, asks and
  * exits never sends one.
  *
- * WHAT IS NOT HERE. The wire has ten ops (WIRE_OPS below) and this client
- * has exactly those. Indexes, compaction, change streams, listing
+ * A CURSOR IS THE SERVER'S, HELD FOR YOU. find({...}, {batchSize}) pages
+ * a scan instead of returning one frame: the server keeps the position,
+ * this side keeps an id, and the id comes back null when the scan ends.
+ * The table of them is bounded, so an abandoned cursor is a slot nobody
+ * can use -- close() gives it back, draining gives it back, and losing
+ * the connection gives it back.
+ *
+ * WHAT IS NOT HERE. The wire has thirteen ops (WIRE_OPS below) and this
+ * client has exactly those. Indexes, compaction, change streams, listing
  * collections and the find-one-and-* family are not on the wire yet;
  * asking for one gets a sentence saying so rather than a TypeError about
  * undefined not being a function. Adding a method here without adding the
@@ -64,7 +71,8 @@ export { encode, decode, ObjectId, Pointer };
 export const WIRE_OPS = [
   'ping',
   'find', 'findOne', 'count', 'distinct',
-  'insert', 'update', 'updateMany', 'replace', 'delete', 'deleteMany'
+  'insert', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
+  'getMore', 'killCursor'
 ];
 
 /** Pings per idle timeout. The server's default is 60s; a third of that
@@ -236,6 +244,11 @@ function findOpts(options) {
   if (options?.projection) out.projection = options.projection;
   if (options?.skip) out.skip = options.skip;
   if (options?.limit) out.limit = options.limit;
+  /* The server refuses batchSize with sort rather than materializing the
+   * result and calling it a cursor (DC_ERR_CURSOR_SORTED). Both are
+   * passed through deliberately: the refusal belongs to the layer that
+   * owns the rule, not to a second opinion here. */
+  if (options?.batchSize > 0) out.batchSize = options.batchSize;
   return Object.keys(out).length ? out : null;
 }
 
@@ -245,14 +258,72 @@ function collection(conn, name) {
   const impl = {
     collectionName: name,
 
+    /*
+     * Without a batchSize this is one request and one frame, which is
+     * what it has always been. WITH one, the server opens a cursor over
+     * the scan and hands back a batch and an id; every batch after that
+     * is a getMore, and the id comes back null when the scan is over --
+     * so a drained cursor costs no extra round trip to close.
+     *
+     * A cursor is state on a server with a bounded table of them, so a
+     * caller that stops early should close() rather than leave one held
+     * until the connection ends.
+     */
     find(filter = {}, options = undefined) {
       const opts = findOpts(options);
-      const docs = call({ op: 'find', filter, ...(opts ? { opts } : {}) })
-        .then((res) => res.docs || []);
-      return guard({
-        toArray: () => docs,
-        async *[Symbol.asyncIterator]() { yield* await docs; }
-      });
+      const batchSize = options?.batchSize > 0 ? options.batchSize : 0;
+
+      if (!batchSize) {
+        const docs = call({ op: 'find', filter, ...(opts ? { opts } : {}) })
+          .then((res) => res.docs || []);
+        return guard({
+          toArray: () => docs,
+          close: async () => {},
+          async *[Symbol.asyncIterator]() { yield* await docs; }
+        });
+      }
+
+      let id = null;          // the server's cursor id while one is open
+      let started = false;
+      let done = false;
+
+      const take = async () => {
+        if (done) return [];
+        const res = started
+          ? await call({ op: 'getMore', cursor: id })
+          : await call({ op: 'find', filter, ...(opts ? { opts } : {}) });
+        started = true;
+        id = res.cursor ?? null;
+        if (id === null) done = true;
+        return res.docs || [];
+      };
+
+      const cursor = {
+        async toArray() {
+          const all = [];
+          while (!done) all.push(...(await take()));
+          return all;
+        },
+        /** One batch at a time, so a caller can stop without having
+         * asked the server for everything. */
+        async nextBatch() { return take(); },
+        /** Give the slot back early. Draining does it for you. */
+        async close() {
+          if (id === null) return;
+          const dying = id;
+          id = null;
+          done = true;
+          await call({ op: 'killCursor', cursor: dying });
+        },
+        async *[Symbol.asyncIterator]() {
+          try {
+            while (!done) yield* await take();
+          } finally {
+            await cursor.close();   // a `break` mid-scan still gives the slot back
+          }
+        }
+      };
+      return guard(cursor);
     },
 
     async findOne(filter = {}) {

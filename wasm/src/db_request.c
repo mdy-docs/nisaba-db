@@ -43,7 +43,9 @@ typedef enum {
     OP_UPDATE_MANY,
     OP_REPLACE,
     OP_DELETE,
-    OP_DELETE_MANY
+    OP_DELETE_MANY,
+    OP_GET_MORE,
+    OP_KILL_CURSOR
 } dbs_op;
 
 static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = {
@@ -58,6 +60,8 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     { "replace",    7, OP_REPLACE     },
     { "delete",     6, OP_DELETE      },
     { "deleteMany",10, OP_DELETE_MANY },
+    { "getMore",    7, OP_GET_MORE    },
+    { "killCursor",10, OP_KILL_CURSOR },
 };
 
 /* ---- reading the request ----------------------------------------------- */
@@ -120,10 +124,12 @@ static int field_id(const uint8_t *o, size_t olen, uint8_t out[12], int *found) 
 
 /* find's options, as db_query.h wants them. Absent is "none" for every
  * one of them, which is what an empty request means. */
-static int read_opts(const uint8_t *req, size_t req_len, qry_options *qo, int *have) {
+static int read_opts(const uint8_t *req, size_t req_len, qry_options *qo, int *have,
+                     int64_t *batch_size) {
     const uint8_t *o; size_t olen; int found = 0;
     memset(qo, 0, sizeof(*qo));
     *have = 0;
+    if (batch_size) *batch_size = 0;
     int e = field_raw(req, req_len, "opts", &o, &olen, &found);
     if (e || !found) return e;
     *have = 1;
@@ -137,6 +143,7 @@ static int read_opts(const uint8_t *req, size_t req_len, qry_options *qo, int *h
     if (f) { qo->projection = v; qo->projection_len = (uint32_t)vlen; }
     if ((e = field_int(o, olen, "skip", &qo->skip, 0))) return e;
     if ((e = field_int(o, olen, "limit", &qo->limit, 0))) return e;
+    if (batch_size && (e = field_int(o, olen, "batchSize", batch_size, 0))) return e;
     return BJ_OK;
 }
 
@@ -257,9 +264,42 @@ done:
     return e;
 }
 
+/*
+ * One batch out of an open cursor, and the id to ask for the next one --
+ * or null, which is how a client learns the scan is over without a
+ * second round trip to find out. A drained cursor is closed HERE rather
+ * than waiting for a killCursor that a well-behaved client would have no
+ * reason to send.
+ *
+ * { ok:true, docs:[...], cursor: <id> | null }
+ */
+static int respond_batch(dbs *s, uint64_t client, uint64_t id, dc_cursor *cur,
+                         uint32_t batch, dbuf *out) {
+    uint8_t *docs = NULL; size_t docs_len = 0; int done = 0;
+    int e = dc_cursor_next_batch(cur, batch, &docs, &docs_len, &done);
+    if (e) return e;
+
+    if (done && id) dbs_cursor_drop(s, client, id);
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { free(docs); return BJ_ERR_OOM; }
+    bj_begin_object(b);
+    PUT_KEY(b, "ok"); bj_put_bool(b, 1);
+    PUT_KEY(b, "docs");
+    if (docs_len) bj_put_raw(b, docs, (uint32_t)docs_len); else bj_put_null(b);
+    PUT_KEY(b, "cursor");
+    if (done) bj_put_null(b); else bj_put_int(b, (int64_t)id);
+    bj_end_object(b);
+    free(docs);
+    e = finish(b, out);
+    bj_builder_free(b);
+    return e;
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
-int dbs_handle(dbs *s, const uint8_t *req, size_t req_len, dbuf *out) {
+int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
+               dbuf *out) {
     if (!s || !req || !out) return BJ_ERR_STATE;
 
     /* Everything from here to the dispatch answers with a response rather
@@ -296,6 +336,58 @@ int dbs_handle(dbs *s, const uint8_t *req, size_t req_len, dbuf *out) {
         int pe = finish(pb, out);
         bj_builder_free(pb);
         return pe;
+    }
+
+    /*
+     * getMore and killCursor name a CURSOR, not a collection: the cursor
+     * already knows which collection it is scanning, and asking a client
+     * to name it again would be asking it to keep a fact the server
+     * already holds -- and to be believed about it.
+     */
+    if (op == OP_GET_MORE || op == OP_KILL_CURSOR) {
+        int64_t id = 0;
+        int have = 0;
+        {
+            const uint8_t *v; size_t vlen;
+            if ((e = field_raw(req, req_len, "cursor", &v, &vlen, &have)))
+                return respond_error(out, DC_ERR_REQ_MALFORMED);
+            if (!have) return respond_error(out, DC_ERR_REQ_MISSING_FIELD);
+            cur c = { v, vlen, 0 };
+            double d;
+            if (read_number(&c, &d)) return respond_error(out, DC_ERR_REQ_MALFORMED);
+            id = (int64_t)d;
+        }
+        if (id <= 0) return respond_error(out, DC_ERR_NO_CURSOR);
+
+        if (op == OP_KILL_CURSOR) {
+            e = dbs_cursor_drop(s, client, (uint64_t)id);
+            if (e) return respond_error(out, e);
+            bj_builder *kb = bj_builder_new();
+            if (!kb) return BJ_ERR_OOM;
+            bj_begin_object(kb);
+            PUT_KEY(kb, "ok");     bj_put_bool(kb, 1);
+            PUT_KEY(kb, "closed"); bj_put_bool(kb, 1);
+            bj_end_object(kb);
+            int ke = finish(kb, out);
+            bj_builder_free(kb);
+            return ke;
+        }
+
+        dc_cursor *cur_h = NULL; uint32_t batch = 0;
+        e = dbs_cursor_get(s, client, (uint64_t)id, &cur_h, &batch);
+        if (e) return respond_error(out, e);
+        /* A getMore may resize the batch for this call; absent means
+         * whatever the find asked for. */
+        int64_t want = 0;
+        {
+            qry_options ignored; int had = 0;
+            if ((e = read_opts(req, req_len, &ignored, &had, &want)))
+                return respond_error(out, DC_ERR_REQ_MALFORMED);
+        }
+        if (want <= 0) want = (int64_t)batch;
+        e = respond_batch(s, client, (uint64_t)id, cur_h, (uint32_t)want, out);
+        if (e) return respond_error(out, e);
+        return BJ_OK;
     }
 
     const uint8_t *coll; uint32_t coll_len;
@@ -341,8 +433,39 @@ int dbs_handle(dbs *s, const uint8_t *req, size_t req_len, dbuf *out) {
 
     switch (op) {
         case OP_FIND: {
-            qry_options qo; int have_opts = 0;
-            if ((e = read_opts(req, req_len, &qo, &have_opts))) break;
+            qry_options qo; int have_opts = 0; int64_t batch = 0;
+            if ((e = read_opts(req, req_len, &qo, &have_opts, &batch))) break;
+
+            /*
+             * batchSize asks for a cursor. A SORTED find cannot have one:
+             * an arbitrary sort needs every match before it can emit the
+             * first ordered result, which is why dc_cursor_open has no
+             * sort parameter and why the in-process cursor
+             * (wasm/nisaba-wasm.js) refuses next() on a sorted find too.
+             * Three layers, one rule, said once each -- rather than this
+             * one quietly materialising the lot and calling it a cursor.
+             */
+            if (batch > 0) {
+                if (have_opts && qo.sort) { e = DC_ERR_CURSOR_SORTED; break; }
+                dc_cursor *cur_h = NULL;
+                e = dc_cursor_open(c, filter, (uint32_t)filter_len,
+                                   have_opts ? qo.projection : NULL,
+                                   have_opts ? qo.projection_len : 0,
+                                   have_opts ? qo.skip : 0,
+                                   have_opts ? qo.limit : 0, &cur_h);
+                if (e) break;
+                uint64_t id = 0;
+                e = dbs_cursor_add(s, client, cur_h, (uint32_t)batch, &id);
+                if (e) { dc_cursor_close(cur_h); break; }
+                e = respond_batch(s, client, id, cur_h, (uint32_t)batch, out);
+                if (e) {
+                    dbs_cursor_drop(s, client, id);
+                    break;
+                }
+                dbuf_free(&body);
+                return BJ_OK;   /* respond_batch wrote the whole response */
+            }
+
             uint8_t *docs = NULL; size_t docs_len = 0;
             e = dc_find(c, filter, (uint32_t)filter_len,
                         have_opts ? &qo : NULL, &docs, &docs_len);

@@ -801,6 +801,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_NO_COLLECTION, DC_ERR_TOO_MANY_COLLECTIONS, DC_ERR_TOO_MANY_INDEXES,
         DC_ERR_REQ_MALFORMED, DC_ERR_REQ_UNKNOWN_OP, DC_ERR_REQ_MISSING_FIELD,
         DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
+        DC_ERR_NO_CURSOR, DC_ERR_TOO_MANY_CURSORS, DC_ERR_CURSOR_SORTED,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
@@ -1763,7 +1764,7 @@ TEST(a_request_is_answered_in_binjson_with_no_transport) {
         const uint8_t *req; uint32_t req_len;
         bj_builder *rb = request("ping", NULL, NULL, NULL, 0, &req, &req_len);
         dbuf res = {0};
-        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &res));
         CHECK_I64(response_ok(&res), 1);
         const uint8_t *v; size_t vlen; int f = 0;
         CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"pong", 4, &v, &vlen, &f));
@@ -1779,7 +1780,7 @@ TEST(a_request_is_answered_in_binjson_with_no_transport) {
         const uint8_t *req; uint32_t req_len;
         bj_builder *rb = request("count", "users", NULL, NULL, 0, &req, &req_len);
         dbuf res = {0};
-        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &res));
         CHECK_I64(response_ok(&res), 1);
         int f = 0;
         CHECK_I64(response_num(&res, "n", &f), 3);
@@ -1795,7 +1796,7 @@ TEST(a_request_is_answered_in_binjson_with_no_transport) {
         const uint8_t *req; uint32_t req_len;
         bj_builder *rb = request("find", "users", "filter", qbuf, qlen, &req, &req_len);
         dbuf res = {0};
-        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &res));
         CHECK_I64(response_ok(&res), 1);
         /* `docs` is the array dc_find produced, spliced in rather than
          * rebuilt -- so it decodes as an array of the two core people. */
@@ -1826,13 +1827,13 @@ TEST(a_request_is_answered_in_binjson_with_no_transport) {
         const uint8_t *req; uint32_t req_len;
         bj_builder *rb = request("insert", "users", "doc", dbuf_, dlen, &req, &req_len);
         dbuf res = {0};
-        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &res));
         CHECK_I64(response_ok(&res), 1);
         dbuf_free(&res); bj_builder_free(rb); doc_free(d);
 
         bj_builder *cb = request("count", "users", NULL, NULL, 0, &req, &req_len);
         dbuf cres = {0};
-        CHECK_OK(dbs_handle(s, req, req_len, &cres));
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &cres));
         int f = 0;
         CHECK_I64(response_num(&cres, "n", &f), 4);
         dbuf_free(&cres); bj_builder_free(cb);
@@ -1846,7 +1847,7 @@ TEST(a_request_is_answered_in_binjson_with_no_transport) {
         const uint8_t *req; uint32_t req_len;
         bj_builder *rb = request("deleteMany", "users", "filter", qbuf, qlen, &req, &req_len);
         dbuf res = {0};
-        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &res));
         if (response_ok(&res) != 1) { int df=0; TAP_FAIL("deleteMany refused: code %lld", (long long)response_num(&res, "code", &df)); }
         CHECK_I64(response_ok(&res), 1);
         /* Three core people were there; one result says three, rather
@@ -1866,6 +1867,213 @@ TEST(a_request_is_answered_in_binjson_with_no_transport) {
             }
         }
         dbuf_free(&res); bj_builder_free(rb); doc_free(q);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
+/* An {opts:{...}} sub-object for a request: batchSize, and optionally a
+ * sort, which is the pair the cursor rules turn on. */
+static bj_builder *opts_of(int64_t batch_size, int with_sort,
+                           const uint8_t **out, uint32_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    if (batch_size) {
+        bj_put_key(b, (const uint8_t *)"batchSize", 9);
+        bj_put_int(b, batch_size);
+    }
+    if (with_sort) {
+        bj_put_key(b, (const uint8_t *)"sort", 4);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"name", 4);
+        bj_put_int(b, 1);
+        bj_end_object(b);
+    }
+    bj_end_object(b);
+    size_t len = 0;
+    *out = bj_builder_data(b, &len);
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+/* {cursor: id} -- getMore and killCursor name a cursor, not a collection. */
+static bj_builder *cursor_request(const char *op, int64_t id,
+                                  const uint8_t **out, uint32_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"op", 2);
+    bj_put_string(b, (const uint8_t *)op, (uint32_t)strlen(op));
+    bj_put_key(b, (const uint8_t *)"cursor", 6);
+    bj_put_int(b, id);
+    bj_end_object(b);
+    size_t len = 0;
+    *out = bj_builder_data(b, &len);
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+/* How many elements are in a response's `docs` array. */
+static int64_t response_docs(const dbuf *res) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(res->data, res->len, (const uint8_t *)"docs", 4, &v, &vlen, &found)
+        || !found) return -1;
+    cur c = { v, vlen, 0 };
+    uint32_t count = 0;
+    if (array_begin(&c, &count)) return -1;
+    return (int64_t)count;
+}
+
+TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
+    /*
+     * batchSize turns a find into a cursor: one batch now, an id to ask
+     * for the next. The point is that the SCAN is what is resumed, not a
+     * materialized result -- dc_cursor_open holds a position in the B+
+     * tree, so a client paging a million documents costs the server one
+     * batch of memory, not a million documents of it.
+     *
+     * Everything here runs over buffers with no socket, which is the
+     * whole reason dbs_handle takes a client id rather than reading one
+     * off a connection.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-cursor", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+
+    const uint64_t ALICE = 7, BOB = 9;   /* two clients, one session */
+    int64_t id = 0;
+
+    /* ---- three documents, two at a time. */
+    {
+        const uint8_t *opts; uint32_t opts_len;
+        bj_builder *ob = opts_of(2, 0, &opts, &opts_len);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("find", "users", "opts", opts, opts_len, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, ALICE, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_docs(&res), 2);
+        int f = 0;
+        id = response_num(&res, "cursor", &f);
+        CHECK_I64(f, 1);          /* more to come, and here is how to ask */
+        CHECK(id > 0);
+        CHECK_I64(dbs_cursor_count(s), 1);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ob);
+    }
+
+    /* ---- a cursor is not a public name: Bob cannot advance Alice's. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = cursor_request("getMore", id, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, BOB, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_NO_CURSOR);
+        CHECK_I64(dbs_cursor_count(s), 1);   /* and it is still Alice's */
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- the last document, and the cursor closes ITSELF: `cursor` comes
+     * back null, so a client learns the scan is over without a second
+     * round trip to find out. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = cursor_request("getMore", id, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, ALICE, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_docs(&res), 1);
+        int f = 0;
+        response_num(&res, "cursor", &f);
+        CHECK_I64(f, 0);                     /* null, not an id */
+        CHECK_I64(dbs_cursor_count(s), 0);   /* released, not leaked */
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- and asking again is refused rather than answered with nothing. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = cursor_request("getMore", id, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, ALICE, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_NO_CURSOR);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- a SORTED find cannot be batched, and says why. An arbitrary
+     * sort needs every match before the first ordered result exists --
+     * db.c's rule, said here rather than quietly materialized. */
+    {
+        const uint8_t *opts; uint32_t opts_len;
+        bj_builder *ob = opts_of(2, 1, &opts, &opts_len);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("find", "users", "opts", opts, opts_len, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, ALICE, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_CURSOR_SORTED);
+        CHECK_I64(dbs_cursor_count(s), 0);   /* nothing was opened to refuse it */
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ob);
+    }
+
+    /* ---- the table is bounded, and full is a sentence. */
+    {
+        int64_t ids[DBS_MAX_CURSORS];
+        for (int i = 0; i < DBS_MAX_CURSORS; i++) {
+            const uint8_t *opts; uint32_t opts_len;
+            bj_builder *ob = opts_of(1, 0, &opts, &opts_len);
+            const uint8_t *req; uint32_t req_len;
+            bj_builder *rb = request("find", "users", "opts", opts, opts_len, &req, &req_len);
+            dbuf res = {0};
+            CHECK_OK(dbs_handle(s, ALICE, req, req_len, &res));
+            CHECK_I64(response_ok(&res), 1);
+            int f = 0;
+            ids[i] = response_num(&res, "cursor", &f);
+            CHECK_I64(f, 1);
+            dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ob);
+        }
+        CHECK_I64(dbs_cursor_count(s), DBS_MAX_CURSORS);
+        {
+            const uint8_t *opts; uint32_t opts_len;
+            bj_builder *ob = opts_of(1, 0, &opts, &opts_len);
+            const uint8_t *req; uint32_t req_len;
+            bj_builder *rb = request("find", "users", "opts", opts, opts_len, &req, &req_len);
+            dbuf res = {0};
+            CHECK_OK(dbs_handle(s, ALICE, req, req_len, &res));
+            CHECK_I64(response_ok(&res), 0);
+            int f = 0;
+            CHECK_I64(response_num(&res, "code", &f), DC_ERR_TOO_MANY_CURSORS);
+            dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ob);
+        }
+
+        /* killCursor gives one back. */
+        {
+            const uint8_t *req; uint32_t req_len;
+            bj_builder *rb = cursor_request("killCursor", ids[0], &req, &req_len);
+            dbuf res = {0};
+            CHECK_OK(dbs_handle(s, ALICE, req, req_len, &res));
+            CHECK_I64(response_ok(&res), 1);
+            CHECK_I64(dbs_cursor_count(s), DBS_MAX_CURSORS - 1);
+            dbuf_free(&res); bj_builder_free(rb);
+        }
+
+        /* And a client that goes away gives back everything it held --
+         * which is the only reason an abandoned scan is not a permanent
+         * slot. The transport calls this; nothing else can know. */
+        dbs_drop_client(s, ALICE);
+        CHECK_I64(dbs_cursor_count(s), 0);
     }
 
     dbs_close(s);
@@ -1904,7 +2112,7 @@ TEST(every_way_a_request_can_be_wrong_is_answered_not_thrown) {
                                  &req, &req_len);
         dbuf res = {0};
         /* BJ_OK: the call succeeded, the request did not. */
-        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &res));
         CHECK_I64(response_ok(&res), 0);
         int f = 0;
         int64_t code = response_num(&res, "code", &f);
@@ -1936,7 +2144,7 @@ TEST(every_way_a_request_can_be_wrong_is_answered_not_thrown) {
         const uint8_t *req; uint32_t req_len;
         bj_builder *rb = request("insert", "users", "doc", dbuf_, dlen, &req, &req_len);
         dbuf res = {0};
-        CHECK_OK(dbs_handle(s, req, req_len, &res));
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &res));
         CHECK_I64(response_ok(&res), 0);
         int f = 0;
         CHECK_I64(response_num(&res, "code", &f), DC_ERR_REQ_MISSING_FIELD);
@@ -1947,7 +2155,7 @@ TEST(every_way_a_request_can_be_wrong_is_answered_not_thrown) {
     {
         static const uint8_t junk[] = { 0xff, 0x01, 0x02 };
         dbuf res = {0};
-        CHECK_OK(dbs_handle(s, junk, sizeof junk, &res));
+        CHECK_OK(dbs_handle(s, 0, junk, sizeof junk, &res));
         CHECK_I64(response_ok(&res), 0);
         dbuf_free(&res);
     }
@@ -6269,6 +6477,7 @@ int main(void) {
     RUN(bulk_grammar_accepts_every_operation_and_orders_the_codes);
     RUN(bulk_grammar_rejects_malformed_lists_and_names_the_index);
     RUN(ttl_cutoff_and_filter);
+    RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

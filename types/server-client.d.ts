@@ -27,6 +27,10 @@ export interface RemoteFindOptions {
   projection?: Document;
   skip?: number;
   limit?: number;
+  /** Page the scan instead of returning one frame. Refused together with
+   * `sort` (ServerError -48): a sort needs every match before the first
+   * ordered result exists. */
+  batchSize?: number;
 }
 
 export interface RemoteWriteResult {
@@ -40,6 +44,12 @@ export interface RemoteWriteResult {
 
 export interface RemoteCursor<T = Document> {
   toArray(): Promise<T[]>;
+  /** One batch per call; empty when the scan is done. Only meaningful
+   * for a cursor opened with `batchSize`. */
+  nextBatch(): Promise<T[]>;
+  /** Give the server's cursor slot back early. Draining, and closing the
+   * connection, both do it for you. */
+  close(): Promise<void>;
   [Symbol.asyncIterator](): AsyncIterableIterator<T>;
 }
 

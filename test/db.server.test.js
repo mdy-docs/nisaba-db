@@ -58,7 +58,7 @@ function framer(onValue) {
 
 /** A database with three people in it, written by the JS implementation --
  * so the server under test is opening somebody else's files. */
-async function seedDb() {
+async function seedDb(extra = 0) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-server-'));
   const provider = new NodeFSStorageProvider(dir);
   const db = await connect(provider);
@@ -66,6 +66,9 @@ async function seedDb() {
   await users.insertOne({ name: 'Ada', team: 'core' });
   await users.insertOne({ name: 'Grace', team: 'core' });
   await users.insertOne({ name: 'Alan', team: 'research' });
+  for (let i = 0; i < extra; i++) {
+    await users.insertOne({ name: `Extra ${i}`, team: 'bulk', n: i });
+  }
   await db.close();
   // Release the advisory lock as well as the handles: one writer per
   // database directory is the rule the server relies on too, and the
@@ -244,8 +247,8 @@ const ENGINES = [
 let portSlot = 1;
 const nextPort = () => 18000 + (portSlot++) * 1000 + (process.pid % 1000);
 
-async function startServer(engine, port, extra = []) {
-  const [cmd, args, opts] = engine.argv(await seedDb(), port, extra);
+async function startServer(engine, port, extra = [], docs = 0) {
+  const [cmd, args, opts] = engine.argv(await seedDb(docs), port, extra);
   const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${engine.name} server did not start`)), 30000);
@@ -496,6 +499,125 @@ for (const engine of ENGINES) {
         await c.close();
         await b.close();
       }
+    });
+  });
+
+  /*
+   * Cursors. 43 documents and a batch of 10, so the paging is real:
+   * four full batches, a remainder, and an id that goes null exactly
+   * once. What the server holds between calls is a POSITION in a B+ tree
+   * scan, not a materialized result -- which is the difference between
+   * paging a million documents and being sent a million documents.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: cursors (${engine.name})`, () => {
+    let proc, db;
+    const port = nextPort();
+    const TOTAL = 43;
+
+    beforeAll(async () => {
+      proc = await startServer(engine, port, [], TOTAL - 3);
+      db = await connectServer(port);
+      return async () => { await db.close(); proc.kill(); };
+    });
+
+    it('pages a scan in batches and stops without being asked twice', async () => {
+      const users = db.collection('users');
+      const cursor = users.find({}, { batchSize: 10 });
+
+      const sizes = [];
+      for (;;) {
+        const batch = await cursor.nextBatch();
+        if (!batch.length) break;
+        sizes.push(batch.length);
+      }
+      // Four tens and a three: every document once, and the last batch
+      // carried the end of the scan with it.
+      expect(sizes).toEqual([10, 10, 10, 10, 3]);
+
+      // A drained cursor is already closed on the server -- no slot left
+      // behind, and no extra round trip to discover it.
+      expect(await users.find({}, { batchSize: 10 }).toArray()).toHaveLength(TOTAL);
+    });
+
+    it('streams for-await, and a break gives the slot back', async () => {
+      const users = db.collection('users');
+      const seen = [];
+      for await (const doc of users.find({ team: 'bulk' }, { batchSize: 7 })) {
+        seen.push(doc.n);
+        if (seen.length === 12) break;       // walk away mid-scan
+      }
+      // Twelve distinct documents: a scan repeats nothing and skips
+      // nothing across a batch boundary (7 does not divide 12). Not in
+      // insertion order -- a scan is in _id order, and ObjectIds are not
+      // handed out in the order documents are written.
+      expect(seen).toHaveLength(12);
+      expect(new Set(seen).size).toBe(12);
+      expect(seen.every(n => n >= 0 && n < TOTAL - 3)).toBe(true);
+
+      // Had the abandoned cursor leaked, this would eventually fail to
+      // open one: the server's table is bounded. Twenty rounds of it.
+      for (let i = 0; i < 20; i++) {
+        const c = users.find({}, { batchSize: 1 });
+        expect(await c.nextBatch()).toHaveLength(1);
+        await c.close();
+      }
+      expect(await users.countDocuments({})).toBe(TOTAL);
+    });
+
+    it('refuses to batch a sorted find, and says why', async () => {
+      const users = db.collection('users');
+      let err = null;
+      try { await users.find({}, { sort: { name: 1 }, batchSize: 5 }).toArray(); }
+      catch (e) { err = e; }
+      expect(err).toBeInstanceOf(ServerError);
+      expect(err.code).toBe(-48);
+      expect(err.message).toMatch(/sorted find cannot be batched/);
+
+      // Sorted and whole is fine -- that is what a sorted find is.
+      const sorted = await users.find({ team: 'core' }, { sort: { name: 1 } }).toArray();
+      expect(sorted.map(d => d.name)).toEqual(['Ada', 'Grace']);
+    });
+
+    it('will not let one connection touch another connection cursor', async () => {
+      const other = await connectServer(port);
+      try {
+        // Raw, so the test holds the server's actual id -- the client
+        // keeps it to itself, and a live id is the only thing that can
+        // tell "not yours" apart from "no such cursor".
+        const opened = await db.request({ op: 'find', coll: 'users', opts: { batchSize: 5 } });
+        expect(opened.cursor).toBeGreaterThan(0);
+
+        await expect(other.request({ op: 'getMore', cursor: opened.cursor }))
+          .rejects.toMatchObject({ name: 'ServerError', code: -46 });
+
+        // Still the owner's, and still where it was: the refusal did not
+        // advance it.
+        const next = await db.request({ op: 'getMore', cursor: opened.cursor });
+        expect(next.docs).toHaveLength(5);
+        await db.request({ op: 'killCursor', cursor: opened.cursor });
+      } finally {
+        await other.close();
+      }
+    });
+
+    it('drops the cursors of a connection that goes away', async () => {
+      // Fill the server's table from a connection that then disappears.
+      const doomed = await connectServer(port);
+      for (let i = 0; i < 16; i++) {
+        const c = doomed.collection('users').find({}, { batchSize: 1 });
+        await c.nextBatch();
+      }
+      // Full: the table is 16 and this one connection is holding all of it.
+      await expect(doomed.collection('users').find({}, { batchSize: 1 }).nextBatch())
+        .rejects.toMatchObject({ code: -47 });
+
+      await doomed.close();
+      await new Promise(r => setTimeout(r, 100));
+
+      // The slots came back with the connection, without anyone asking.
+      const c = db.collection('users').find({}, { batchSize: 1 });
+      expect(await c.nextBatch()).toHaveLength(1);
+      await c.close();
     });
   });
 }

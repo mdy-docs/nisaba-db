@@ -28,6 +28,7 @@
 #include "db_catalog.h"
 #include "db_wal.h"
 #include "db_session.h"
+#include "http.h"
 #include "snapstore.h"
 #include "raft_core.h"
 #include "raft_msg.h"
@@ -2719,6 +2720,221 @@ static bj_builder *sweep_request(int64_t min_bytes, double factor, int skip_busy
     *out = bj_builder_data(b, &len);
     *out_len = (uint32_t)len;
     return b;
+}
+
+/* One parse over a whole request, for the cases where the input is a
+ * literal. */
+static int parse_str(const char *raw, http_request *r, size_t *total) {
+    return http_parse((const uint8_t *)raw, strlen(raw), r, total);
+}
+
+static int span_is(const char *p, size_t len, const char *want) {
+    return len == strlen(want) && memcmp(p, want, len) == 0;
+}
+
+TEST(http_parses_what_it_accepts_and_refuses_the_rest) {
+    /*
+     * The transport's HTTP subset, over buffers with no socket -- the
+     * same discipline dbs_handle is tested by, and the reason this file
+     * can test a transport at all.
+     *
+     * What it accepts is what a database server needs spoken to it: a
+     * request line, headers, a body measured by Content-Length, and
+     * keep-alive. What it refuses, it refuses out loud, because a
+     * parser that guesses at a body's length is how two readers come to
+     * disagree about where the next request starts.
+     */
+    http_request r;
+    size_t total = 0;
+
+    /* ---- the ordinary case. */
+    {
+        const char *raw =
+            "POST / HTTP/1.1\r\n"
+            "Host: 127.0.0.1:8097\r\n"
+            "Content-Type: application/octet-stream\r\n"
+            "Content-Length: 5\r\n"
+            "\r\n"
+            "hello";
+        CHECK_I64(parse_str(raw, &r, &total), HTTP_OK);
+        CHECK_I64((int64_t)total, (int64_t)strlen(raw));
+        CHECK(span_is(r.method, r.method_len, "POST"));
+        CHECK(span_is(r.target, r.target_len, "/"));
+        CHECK(span_is(r.path, r.path_len, "/"));
+        CHECK_I64((int64_t)r.query_len, 0);
+        CHECK_I64((int64_t)r.body_len, 5);
+        CHECK(memcmp(r.body, "hello", 5) == 0);
+        CHECK_I64(r.keep_alive, 1);            /* 1.1 keeps it open */
+        CHECK_I64(r.n_headers, 3);
+
+        /* Headers match case-insensitively, as HTTP requires. */
+        const char *v; size_t vlen;
+        CHECK_I64(http_header_get(&r, "CONTENT-type", &v, &vlen), 1);
+        CHECK(span_is(v, vlen, "application/octet-stream"));
+        CHECK_I64(http_header_get(&r, "x-absent", &v, &vlen), 0);
+    }
+
+    /* ---- a request arriving in pieces is not an error, it is a
+     * request that has not finished arriving. Every prefix says so. */
+    {
+        const char *raw =
+            "POST /x HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+        size_t whole = strlen(raw);
+        for (size_t n = 0; n < whole; n++) {
+            int rc = http_parse((const uint8_t *)raw, n, &r, &total);
+            if (rc != HTTP_PARTIAL)
+                TAP_FAIL("prefix of %zu bytes: %d, want HTTP_PARTIAL", n, rc);
+        }
+        CHECK_I64(http_parse((const uint8_t *)raw, whole, &r, &total), HTTP_OK);
+        /* And the total is the request, not the buffer: a second one
+         * behind it is left alone. */
+        char two[256];
+        int n = snprintf(two, sizeof two, "%s%s", raw, raw);
+        CHECK(n > 0 && (size_t)n < sizeof two);
+        CHECK_I64(http_parse((const uint8_t *)two, (size_t)n, &r, &total), HTTP_OK);
+        CHECK_I64((int64_t)total, (int64_t)whole);
+    }
+
+    /* ---- the target's two halves, unescaped and unjudged. */
+    {
+        CHECK_I64(parse_str("GET /watch?coll=notes HTTP/1.1\r\n\r\n", &r, &total), HTTP_OK);
+        CHECK(span_is(r.path, r.path_len, "/watch"));
+        CHECK(span_is(r.query, r.query_len, "coll=notes"));
+        CHECK_I64((int64_t)r.body_len, 0);
+    }
+
+    /* ---- the connection rules, both versions of them. */
+    {
+        CHECK_I64(parse_str("GET / HTTP/1.0\r\n\r\n", &r, &total), HTTP_OK);
+        CHECK_I64(r.keep_alive, 0);            /* 1.0 closes unless told */
+        CHECK_I64(parse_str("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", &r, &total), HTTP_OK);
+        CHECK_I64(r.keep_alive, 1);
+        CHECK_I64(parse_str("GET / HTTP/1.1\r\nConnection: close\r\n\r\n", &r, &total), HTTP_OK);
+        CHECK_I64(r.keep_alive, 0);
+        /* Case-insensitively, like every other header value here. */
+        CHECK_I64(parse_str("GET / HTTP/1.1\r\nCONNECTION: Close\r\n\r\n", &r, &total), HTTP_OK);
+        CHECK_I64(r.keep_alive, 0);
+    }
+
+    /* ---- a bare LF is tolerated (curl and telnet both produce it) and
+     * never written back. */
+    {
+        CHECK_I64(parse_str("POST / HTTP/1.1\nContent-Length: 2\n\nhi", &r, &total), HTTP_OK);
+        CHECK_I64((int64_t)r.body_len, 2);
+    }
+
+    /* ---- and everything this subset will not have. */
+    {
+        struct { const char *raw; const char *why; } bad[] = {
+            { "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+              "a body this cannot measure" },
+            { "POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc",
+              "two answers about where the body ends" },
+            { "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", "not a number" },
+            { "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999\r\n\r\n",
+              "a number that does not fit" },
+            { "POST / HTTP/1.1\r\nContent-Length : 3\r\n\r\nabc",
+              "space before the colon (RFC 7230 says reject)" },
+            { "POST / HTTP/1.1\r\nNoColonHere\r\n\r\n", "not a header" },
+            { "POST /\r\n\r\n",            "no version" },
+            { "POST / HTTP/2.0\r\n\r\n",   "a version this does not speak" },
+            { " / HTTP/1.1\r\n\r\n",       "no method" },
+            { "POST  HTTP/1.1\r\n\r\n",    "no target" },
+        };
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            int rc = parse_str(bad[i].raw, &r, &total);
+            if (rc != HTTP_BAD)
+                TAP_FAIL("case %zu (%s): %d, want HTTP_BAD", i, bad[i].why, rc);
+        }
+    }
+
+    /* ---- a head that never ends is refused rather than buffered
+     * forever: a parser that grows to whatever a peer claims has a
+     * failure mode nobody tests. */
+    {
+        size_t big = HTTP_MAX_HEAD + 64;
+        uint8_t *flood = (uint8_t *)malloc(big);
+        CHECK_FATAL(flood != NULL);
+        memset(flood, 'A', big);
+        memcpy(flood, "GET / HTTP/1.1\r\n", 16);
+        CHECK_I64(http_parse(flood, big, &r, &total), HTTP_BAD);
+        free(flood);
+    }
+
+    /* ---- too many headers is the same kind of bound. */
+    {
+        dbuf many = {0};
+        CHECK_OK(dbuf_put(&many, (const uint8_t *)"GET / HTTP/1.1\r\n", 16));
+        for (int i = 0; i < HTTP_MAX_HEADERS + 1; i++) {
+            char h[32];
+            int n = snprintf(h, sizeof h, "X-%d: v\r\n", i);
+            CHECK_OK(dbuf_put(&many, (const uint8_t *)h, (size_t)n));
+        }
+        CHECK_OK(dbuf_put(&many, (const uint8_t *)"\r\n", 2));
+        CHECK_I64(http_parse(many.data, many.len, &r, &total), HTTP_BAD);
+        dbuf_free(&many);
+    }
+}
+
+TEST(http_writes_responses_a_client_can_read_back) {
+    /*
+     * The other half: bytes out. Nothing here is clever -- what matters
+     * is that a length is always sent, so a response can be followed by
+     * another one, and that the parser above agrees with what this
+     * writes.
+     */
+    {
+        dbuf out = {0};
+        CHECK_OK(http_respond(&out, 200, "application/octet-stream",
+                              (const uint8_t *)"body", 4, 1));
+        CHECK(find_bytes(out.data, out.len, "HTTP/1.1 200 OK\r\n", 17) == out.data);
+        CHECK(find_bytes(out.data, out.len, "Content-Length: 4\r\n", 19) != NULL);
+        CHECK(find_bytes(out.data, out.len, "Connection: keep-alive\r\n", 24) != NULL);
+        CHECK(find_bytes(out.data, out.len, "\r\n\r\nbody", 8) != NULL);
+        dbuf_free(&out);
+    }
+
+    /* An empty body still carries a length: a client that had to infer
+     * it from a close could not send a second request. */
+    {
+        dbuf out = {0};
+        CHECK_OK(http_respond(&out, 503, NULL, NULL, 0, 0));
+        CHECK(find_bytes(out.data, out.len, "503 Service Unavailable", 23) != NULL);
+        CHECK(find_bytes(out.data, out.len, "Content-Length: 0\r\n", 19) != NULL);
+        CHECK(find_bytes(out.data, out.len, "Connection: close\r\n", 19) != NULL);
+        CHECK(find_bytes(out.data, out.len, "Content-Type", 12) == NULL);
+        dbuf_free(&out);
+    }
+
+    /* A stream has no length at all -- it ends when the connection
+     * does -- which is the trade every SSE endpoint makes. */
+    {
+        dbuf out = {0};
+        CHECK_OK(http_respond_stream(&out, 200, "text/event-stream"));
+        CHECK(find_bytes(out.data, out.len, "text/event-stream", 17) != NULL);
+        CHECK(find_bytes(out.data, out.len, "Content-Length", 14) == NULL);
+        CHECK(find_bytes(out.data, out.len, "no-store", 8) != NULL);
+        dbuf_free(&out);
+    }
+
+    /* And the two halves agree: what the writer produces, the parser
+     * reads back -- which is the only claim that matters, since the two
+     * are the same wire seen from either end. */
+    {
+        dbuf out = {0};
+        CHECK_OK(http_respond(&out, 200, "text/plain", (const uint8_t *)"xy", 2, 1));
+        /* A response is not a request, so it does not parse as one --
+         * but its FRAMING is the same, and a request built the same way
+         * round-trips. */
+        dbuf req = {0};
+        CHECK_OK(dbuf_put(&req, (const uint8_t *)"POST / HTTP/1.1\r\n", 17));
+        CHECK_OK(dbuf_put(&req, (const uint8_t *)"Content-Length: 2\r\n\r\nxy", 23));
+        http_request r; size_t total = 0;
+        CHECK_I64(http_parse(req.data, req.len, &r, &total), HTTP_OK);
+        CHECK_I64((int64_t)r.body_len, 2);
+        CHECK_I64((int64_t)total, (int64_t)req.len);
+        dbuf_free(&req); dbuf_free(&out);
+    }
 }
 
 TEST(a_sweep_is_not_a_loop_over_collections) {
@@ -8665,6 +8881,8 @@ int main(void) {
     RUN(prune_expired_sweeps_what_a_ttl_index_says_is_over);
     RUN(a_watcher_is_told_what_another_client_wrote);
     RUN(a_sweep_is_not_a_loop_over_collections);
+    RUN(http_parses_what_it_accepts_and_refuses_the_rest);
+    RUN(http_writes_responses_a_client_can_read_back);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

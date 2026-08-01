@@ -72,7 +72,10 @@ if [ "$FUZZ" = 1 ]; then
   OUT="${TMPDIR:-/tmp}/nisaba-native-fuzz"
   SOURCES+=(third_party/binjson-structures/test/fuzz.c)
 else
-  SOURCES+=(test/native/memfs.c test/native/nscheck.c test/native/main.c)
+  # server/http.c is the transport's HTTP subset: no main(), no sockets,
+  # nothing nisaba-specific -- so the harness links it and tests it over
+  # buffers, exactly as it tests the request grammar.
+  SOURCES+=(server/http.c test/native/memfs.c test/native/nscheck.c test/native/main.c)
 fi
 
 LIBS=()
@@ -81,6 +84,7 @@ FLAGS=(
   -Wall -Wextra -Werror
   "${INCLUDE_FLAGS[@]}"
   -Itest/native
+  -Iserver
 )
 
 if [ "$WASI" = 1 ]; then

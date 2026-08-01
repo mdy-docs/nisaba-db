@@ -124,6 +124,9 @@ const char *dc_strerror(int code) {
         case DC_ERR_TOO_MANY_CLIENTS:
             return "The server is already holding as many connections as it will "
                    "(--max-clients); this one is refused rather than queued";
+        case DC_ERR_CURSORS_OPEN:
+            return "Cannot compact a collection while a cursor is scanning it: "
+                   "compaction rewrites the files the cursor is positioned in";
         case DC_ERR_NO_CURSOR:
             return "No cursor of that id belongs to this client (it was drained, "
                    "killed, or opened by somebody else)";

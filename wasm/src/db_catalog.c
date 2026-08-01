@@ -1181,6 +1181,25 @@ int dc_compact_execute(bj_ns *ns, bpt *catalog,
     *bytes_built = 0;
     if (!ns || !ns->open || !catalog) return BJ_ERR_STATE;
 
+    /*
+     * REFUSED WHILE ANYTHING IS READING. A cursor pins the root of the
+     * tree it scans and walks nodes that mutations never overwrite --
+     * which is exactly why it survives concurrent writes and exactly why
+     * it cannot survive THIS: a compaction rebuilds the collection into
+     * fresh files and the caller deletes the old ones, so every open
+     * cursor is left pointing into bytes that are gone.
+     *
+     * Refused here, before a byte is written, rather than documented as
+     * a hazard for each caller to remember: this is the one function that
+     * can see both the trees and the intent. It is a refusal, not a wait
+     * -- there is nothing to wait on in a synchronous call, and a client
+     * that gets DC_ERR_CURSORS_OPEN can drain its cursor and ask again.
+     */
+    for (uint32_t i = 0; i < nsources; i++) {
+        if (source_kinds[i] == DC_SRC_BPT && bpt_pinned((const bpt *)sources[i]))
+            return DC_ERR_CURSORS_OPEN;
+    }
+
     const uint8_t *entry; size_t entry_len; int found = 0;
     int e = obj_get_field(plan, plan_len, (const uint8_t *)"newEntry", 8,
                           &entry, &entry_len, &found);

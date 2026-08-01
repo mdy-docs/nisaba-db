@@ -802,6 +802,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_REQ_MALFORMED, DC_ERR_REQ_UNKNOWN_OP, DC_ERR_REQ_MISSING_FIELD,
         DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
         DC_ERR_NO_CURSOR, DC_ERR_TOO_MANY_CURSORS, DC_ERR_CURSOR_SORTED,
+        DC_ERR_CURSORS_OPEN,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
@@ -3105,6 +3106,107 @@ TEST(sweep_execute_drives_a_real_namespace) {
     bjns_posix_free(&ns);
     close(dirfd);
     rmdir(tmpl);
+}
+
+TEST(compaction_refuses_while_a_cursor_is_reading_the_tree) {
+    /*
+     * The hazard db.h used to document and leave to callers: a cursor
+     * pins the root of the tree it scans and walks nodes that mutations
+     * never overwrite -- which is what makes it a snapshot, and exactly
+     * what a compaction takes away. It rebuilds the collection into
+     * fresh files and the old ones are deleted; every cursor still open
+     * is left reading bytes that are gone.
+     *
+     * So the tree counts its readers (bpt_pinned) and dc_compact_execute
+     * refuses on it, BEFORE writing anything. Enforced at the one point
+     * that can see both, rather than remembered by each caller -- which
+     * matters now that a caller can be a client on a socket that opened
+     * a cursor and went quiet.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-cur-cmp", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    bj_io cio;
+    CHECK_FATAL(ns.open(ns.ctx, "coll-users.bj", 13, BJ_NS_CREATE, &cio) == BJ_OK);
+    bpt *primary = bpt_create(&cio, ORDER);
+    CHECK_FATAL(primary != NULL);
+    dc_collection *coll = dc_collection_open(primary);
+    CHECK_FATAL(coll != NULL);
+    for (uint32_t i = 1; i <= 20; i++)
+        CHECK_OK(insert_person(coll, i, "person", "core", (int64_t)i));
+
+    bj_io kio;
+    CHECK_FATAL(ns.open(ns.ctx, "__catalog__.bj", 14, BJ_NS_CREATE, &kio) == BJ_OK);
+    bpt *catalog = bpt_create(&kio, ORDER);
+    CHECK_FATAL(catalog != NULL);
+    dbuf entry = {0};
+    CHECK_OK(dc_catalog_new_entry("users", 5, &entry));
+    {
+        bpt_key k = { .is_string = 1, .num = 0, .str = (const uint8_t *)"users", .str_len = 5 };
+        CHECK_OK(bpt_add(catalog, &k, entry.data, (uint32_t)entry.len));
+    }
+    dbuf plan = {0};
+    CHECK_OK(dc_compact_plan(entry.data, entry.len, "users", 5, &plan));
+
+    void *sources[1] = { primary };
+    int kinds[1] = { DC_SRC_BPT };
+    uint64_t built = 0;
+
+    /* An unfiltered find is a SCAN, which is the mode that holds a
+     * position in the tree; a cursor over an index or an _id lookup
+     * carries its candidates and does not. */
+    doc *q = doc_new();
+    uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
+    dc_cursor *cur1 = NULL;
+    CHECK_OK(dc_cursor_open(coll, qb, qlen, NULL, 0, 0, 0, &cur1));
+    CHECK_I64(bpt_pinned(primary), 1);
+
+    /* Read one batch, so the cursor is genuinely mid-scan rather than
+     * merely open. */
+    {
+        uint8_t *docs = NULL; size_t dlen = 0; int done = 0;
+        CHECK_OK(dc_cursor_next_batch(cur1, 5, &docs, &dlen, &done));
+        CHECK_I64(done, 0);
+        free(docs);
+    }
+
+    CHECK_RC(dc_compact_execute(&ns, catalog, "users", 5, plan.data, plan.len,
+                                sources, kinds, 1, &built),
+             DC_ERR_CURSORS_OPEN);
+    /* Refused before anything was built: the collection is untouched and
+     * the refusal costs the caller nothing to retry. */
+    CHECK_I64((int64_t)built, 0);
+
+    /* Two readers, one closed, still refused: the count is a count. */
+    dc_cursor *cur2 = NULL;
+    CHECK_OK(dc_cursor_open(coll, qb, qlen, NULL, 0, 0, 0, &cur2));
+    CHECK_I64(bpt_pinned(primary), 2);
+    dc_cursor_close(cur1);
+    CHECK_I64(bpt_pinned(primary), 1);
+    CHECK_RC(dc_compact_execute(&ns, catalog, "users", 5, plan.data, plan.len,
+                                sources, kinds, 1, &built),
+             DC_ERR_CURSORS_OPEN);
+
+    /* And with the last one gone it proceeds, which is the other half of
+     * the claim: this refuses a compaction, it does not prevent one. */
+    dc_cursor_close(cur2);
+    CHECK_I64(bpt_pinned(primary), 0);
+    CHECK_OK(dc_compact_execute(&ns, catalog, "users", 5, plan.data, plan.len,
+                                sources, kinds, 1, &built));
+    CHECK(built > 0);
+
+    doc_free(q);
+    dbuf_free(&plan); dbuf_free(&entry);
+    dc_collection_free(coll);
+    bpt_free(catalog);
+    ns.close(ns.ctx, &kio);
+    ns.close(ns.ctx, &cio);
+    bjns_posix_free(&ns);
+    close(dirfd);
 }
 
 TEST(compact_execute_builds_and_flips_over_real_files) {
@@ -6441,6 +6543,7 @@ int main(void) {
     RUN(wal_plan_returns_the_preimage_the_host_would_have_queried_for);
     RUN(wal_plan_rejects_before_it_logs_rather_than_after);
     RUN(update_many_hands_back_post_images_when_asked);
+    RUN(compaction_refuses_while_a_cursor_is_reading_the_tree);
     RUN(compact_execute_builds_and_flips_over_real_files);
     RUN(an_undeclared_open_is_caught_the_way_a_browser_catches_it);
     RUN(compaction_reclaims_space_without_the_truncate_flag);

@@ -144,9 +144,17 @@ Compaction is stop-the-world for the one collection; everyone else
 queues:
 
 - `compact()` **throws if any `find()` cursor is open** — a cursor's
-  WASM-side scan is physically positioned inside the old files (the
-  hazard `db.h` documents for `dc_cursor`), and a paused iteration can
-  be held indefinitely, so waiting for it could never be bounded.
+  WASM-side scan is physically positioned inside the old files, and a
+  paused iteration can be held indefinitely, so waiting for it could
+  never be bounded.
+
+  That check is the polite one, and it is no longer the only one. The
+  tree counts its readers (`bpt_pinned`) and `dc_compact_execute`
+  refuses with `DC_ERR_CURSORS_OPEN` before writing a byte, whatever the
+  host — which is what makes this a guarantee rather than a convention
+  that every caller has to keep. It matters because a cursor can now
+  outlive the request that opened it: the database server pages one
+  across several ([`db-server.md`](db-server.md)).
 - While a compact is in flight, **every other operation on that
   collection waits for it** and then runs against the new generation,
   and symmetrically **a compact waits for every in-flight operation to

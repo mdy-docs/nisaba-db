@@ -118,6 +118,23 @@ existed, because telling those apart would tell a client about somebody
 else's cursors. Cursors are released when drained, killed, when their
 connection ends (however it ends), or when the server closes.
 
+**A cursor is a snapshot**, which most databases will not give you for
+free. It pins the root of the B+ tree it scans and walks nodes that
+mutations never overwrite, so writes from other connections during a
+scan are simply not seen, and every document is returned exactly once —
+no missed documents, no duplicates, no read concern to ask for. MongoDB
+makes no such promise without a snapshot read concern or a transaction:
+a document can be missed or returned twice if a concurrent update moves
+it in the index being walked.
+
+The one operation that can break it is **compaction**, which rebuilds a
+collection into fresh files and deletes the old ones. That is refused
+while any cursor is open over a tree it would rebuild
+(`DC_ERR_CURSORS_OPEN`, -49, before anything is written) — enforced in
+`dc_compact_execute` rather than left to callers, because a cursor can
+now outlive the request that made it. Compaction is not on the wire yet;
+when it arrives, it arrives with that guard already underneath it.
+
 **A sorted find cannot be batched** (`-48`). An arbitrary sort needs
 every match before the first ordered result exists — the reason
 `dc_cursor_open` has no sort parameter, and the reason the in-process

@@ -391,16 +391,21 @@ int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
  * unindexed sorts in most databases carry a buffered-sort memory
  * ceiling). Callers needing a sorted result should use dc_find instead.
  *
- * Not safe across a concurrent compact() on the same collection while
- * the cursor is open -- compaction can rewrite the file the cursor's
- * underlying B+ tree scan is positioned against. Fine for the
- * within-one-request lifetime dc_find already has; a cursor meant to
- * outlive a single request (paged over multiple separate calls, as the
- * cloud service's REST cursor protocol does) needs the caller to keep
- * that window short or avoid compacting a collection with cursors open
- * against it. Not enforced at this C layer; the JS Collection.compact()
- * refuses to run while it has open cursors (wasm/nisaba-wasm.js,
- * docs/compaction.md).
+ * A SNAPSHOT, and enforced as one. A scan pins the root of the tree and
+ * walks nodes that mutations never overwrite, so concurrent inserts and
+ * deletes are simply not seen and every document is returned exactly
+ * once. Compaction is the one operation that breaks that -- it rebuilds
+ * the collection into fresh files and the old ones go away -- so it is
+ * REFUSED while any cursor is open over a tree it would rebuild:
+ * bpt_pinned() counts the readers and dc_compact_execute returns
+ * DC_ERR_CURSORS_OPEN before writing a byte.
+ *
+ * That refusal is the guarantee, not a suggestion for callers to
+ * remember, which matters now that a cursor can outlive a single request
+ * (the server pages one over several, docs/db-server.md). The JS
+ * Collection.compact() still declines earlier and more politely, with
+ * its own gate over in-flight operations (wasm/nisaba-wasm.js,
+ * docs/compaction.md); this is the floor underneath it.
  */
 typedef struct dc_cursor dc_cursor;
 

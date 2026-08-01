@@ -51,6 +51,9 @@ extern "C" {
 #define DC_ERR_CATALOG_ENTRY         (-29)
 #define DC_ERR_INDEX_OPTION_UNSUPPORTED (-30)
 #define DC_ERR_TTL_NEEDS_SINGLE_FIELD   (-31)
+/* A compaction was asked for while a cursor is scanning one of the trees
+ * it would rebuild. See dc_compact_execute. */
+#define DC_ERR_CURSORS_OPEN             (-49)
 
 /* Index kinds, as they appear in a plan. Distinct from the `kind` STRING
  * stored in the catalog, which stays a string for readability and
@@ -292,6 +295,12 @@ typedef enum { DC_SRC_BPT = 0, DC_SRC_RTREE = 1 } dc_source_kind;
  * It does NOT make the gate unnecessary. The caller still awaits before
  * (pre-opening) and after (reopening its wrappers, deleting the old
  * files), so a concurrent operation must still be kept out across those.
+ *
+ * REFUSED WHILE A CURSOR IS OPEN over any tree it would rebuild
+ * (DC_ERR_CURSORS_OPEN, before anything is written). A cursor iterates
+ * nodes that mutations never overwrite, which is what makes it a
+ * snapshot -- and a compaction is the one operation that takes those
+ * nodes away. The caller drains or closes its cursors and asks again.
  *
  * Ordering is the contract: the flip is the LAST thing this does, so a
  * failure anywhere leaves the collection fully on the old generation with

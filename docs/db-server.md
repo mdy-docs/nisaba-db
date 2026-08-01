@@ -296,6 +296,13 @@ come from:
   stopped reading would cost the server memory instead of costing itself
   its stream.
 
+**`--stdio` delivers events too, but only behind an answer.** That
+transport is one client by construction and has no poll loop — the only
+thing that ever happens is a request — so an event goes out immediately
+after the answer to whatever produced it, and a watcher that wants one
+promptly sends `ping`. The alternative would be a reader thread, and
+`server/main.c` has neither threads nor the wish for any.
+
 **And the loop does not sleep while a frame is owed.** Everything else
 here becomes deliverable because a socket did something, which is what
 `poll` waits for; an event becomes deliverable because *another* client

@@ -222,6 +222,28 @@ static int serve(dbs *s, int in_fd, int out_fd) {
         int w = write_all(out_fd, res.data, res.len);
         dbuf_free(&res);
         if (w != 0) return -1;
+
+        /*
+         * And whatever this client is owed as a watcher. There is no
+         * poll here and nothing to be woken by -- --stdio is one client
+         * by construction, so the only thing that ever happens is a
+         * request -- which means events are delivered AFTER THE NEXT
+         * REQUEST rather than as they occur. A watcher on this transport
+         * that wants them promptly sends pings; docs/db-server.md says
+         * so. The alternative would be a reader thread, and this file
+         * has neither threads nor the wish for any.
+         */
+        for (;;) {
+            dbuf frame = {0};
+            int have = 0;
+            if (dbs_stream_take(s, 1, &frame, &have) != 0 || !have) {
+                dbuf_free(&frame);
+                break;
+            }
+            w = write_all(out_fd, frame.data, frame.len);
+            dbuf_free(&frame);
+            if (w != 0) return -1;
+        }
     }
 }
 

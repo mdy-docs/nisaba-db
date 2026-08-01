@@ -78,17 +78,36 @@ async function seedDb(extra = 0) {
   return dir;
 }
 
-/** Queue of requests over one duplex pair, resolved in order. */
+/**
+ * Queue of requests over one duplex pair, resolved in order -- plus the
+ * one thing that is not an answer to any of them.
+ *
+ * Answers come back in request order, so pending resolvers are a queue
+ * and no request ids are needed. Change events are the exception: they
+ * answer nothing, so they are routed by SHAPE (an answer carries `ok`,
+ * an event carries `stream`) into `call.events` rather than being handed
+ * to whoever asked last. A client that skipped this would hand an event
+ * to a caller expecting an answer, or -- as this helper used to --
+ * silently drop it for want of anyone waiting.
+ */
 function client(write, onData) {
   const waiting = [];
+  const events = [];
   onData(framer((value) => {
+    if (value && typeof value === 'object' && value.ok === undefined &&
+        typeof value.stream === 'number') {
+      events.push(value);
+      return;
+    }
     const next = waiting.shift();
     if (next) next(value);
   }));
-  return (req) => new Promise((resolve) => {
+  const call = (req) => new Promise((resolve) => {
     waiting.push(resolve);
     write(Buffer.from(encode(req)));
   });
+  call.events = events;
+  return call;
 }
 
 describe.skipIf(!have(NATIVE))('nisaba-server: frames over a pipe (native, --stdio)', () => {
@@ -116,6 +135,30 @@ describe.skipIf(!have(NATIVE))('nisaba-server: frames over a pipe (native, --std
     expect(bad.msg).toMatch(/does not know/);
 
     expect(await call({ op: 'count', coll: 'users' })).toEqual({ ok: true, n: 3 });
+  });
+
+  it('delivers change events behind the answer that caused them', async () => {
+    // --stdio has no poll loop -- it is one client by construction, and
+    // the only thing that ever happens is a request -- so events go out
+    // immediately after the answer to whatever produced them.
+    //
+    // Its own collection: this suite shares one server and one database,
+    // and a test that writes into `users` moves the next one's counts.
+    expect(await call({ op: 'watch', coll: 'watched' })).toMatchObject({ ok: true, stream: 1 });
+    await call({ op: 'insert', coll: 'watched', doc: { _id: new ObjectId(), name: 'Watched' } });
+
+    // The answer to the ping proves the event frame ahead of it did not
+    // take the ping's place in the queue: they are told apart by shape,
+    // not by position.
+    expect(await call({ op: 'ping' })).toEqual({ ok: true, pong: true });
+    expect(call.events).toHaveLength(1);
+    const { stream, event } = call.events[0];
+    expect(stream).toBe(1);
+    expect(event.operationType).toBe('insert');
+    expect(event.ns).toEqual({ coll: 'watched' });
+    expect(event.fullDocument.name).toBe('Watched');
+
+    expect(await call({ op: 'closeStream', stream: 1 })).toEqual({ ok: true, closed: true });
   });
 
   it('writes through the WAL grammar, and the JS side sees them afterwards', async () => {
@@ -1177,17 +1220,18 @@ for (const engine of ENGINES) {
       expect(frames.shift()).toMatchObject({ ok: true });
       sock.pause();                                   // and stop reading
 
-      // MANY requests, not one: this is the transport's bound under
-      // test, not the session's. One huge insertMany would fill the
-      // session queue during a single request and overflow whatever the
-      // transport did afterwards; twenty separate writes only overflow
-      // if the loop stops handing events to a connection that is not
-      // draining them.
-      const pad = 'x'.repeat(500);
-      for (let round = 0; round < 30; round++) {
-        await other.collection('flood').insertMany(
-          Array.from({ length: 100 }, (_, i) => ({ i: round * 100 + i, pad })));
-      }
+      // One request, deliberately: the session's queue fills DURING it,
+      // before the transport gets a chance to move anything, so this
+      // asserts the session's bound without depending on how much a
+      // kernel will buffer for a socket nobody is reading. (The
+      // transport's own bound -- it stops handing events to a connection
+      // holding OUT_HIGH_WATER unsent bytes -- is what keeps that
+      // backlog from moving into an uncounted buffer instead. Reaching
+      // it end-to-end means first filling the OS buffers, which are an
+      // order of magnitude bigger on Linux than on macOS, so it is
+      // falsified by hand rather than asserted here.)
+      await other.collection('flood').insertMany(
+        Array.from({ length: 1500 }, (_, i) => ({ i })));
       await settle();
       sock.resume();
       await new Promise(r => setTimeout(r, 800));

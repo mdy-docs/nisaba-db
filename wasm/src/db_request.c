@@ -952,6 +952,38 @@ static int respond_batch(dbs *s, uint64_t client, uint64_t id, dc_cursor *cur,
     return e;
 }
 
+/*
+ * One DDL request, taken the way a write is taken: planned into the
+ * command a log would carry, then applied.
+ *
+ * The two steps look like ceremony while there is no log to put the
+ * command in, and they are not. Planning is where the command's SHAPE is
+ * decided (db_wal.c, once, for every host); applying is where its RESULT
+ * is computed (dbs_apply, once, for every replica). Doing it directly
+ * would decide both here, a second time, and the gap between this
+ * server's DDL and a replicated one would be a rewrite rather than a
+ * proposal.
+ *
+ * `index` 0: nothing is staged for DDL. An index build commits catalog
+ * and index files but not the primary tree, so a staged applied-index
+ * would not persist with it (src/db-wal.js says the same, at length).
+ */
+static int do_ddl(dbs *s, const char *coll, uint32_t coll_len, int wreq,
+                  const uint8_t *a, size_t a_len,
+                  const uint8_t *b, size_t b_len,
+                  dbuf *result) {
+    dc_wal_plan *p = NULL;
+    int e = dc_wal_plan_build(NULL, coll, coll_len, wreq,
+                              a, (uint32_t)a_len, b, (uint32_t)b_len,
+                              0, NULL, &p);
+    if (e) return e;
+    uint32_t clen = 0;
+    const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+    e = cmd ? dbs_apply(s, 0, cmd, clen, result) : BJ_ERR_STATE;
+    dc_wal_plan_free(p);
+    return e;
+}
+
 /* ---- dispatch ----------------------------------------------------------- */
 
 int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
@@ -1146,6 +1178,21 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
      * is asked precisely when there is nothing to open, and
      * dropCollection has to work whether or not the collection is
      * currently open. listIndexes only reads the catalog.
+     *
+     * DDL TAKES THE SAME ROUTE A WRITE DOES -- plan the command, then
+     * apply it -- for the reason run_write does: every mutation this
+     * server performs should be one a log could have carried. It was not
+     * true of DDL, which called dbs_* directly and left nothing a
+     * follower could be sent (docs/replicaton-roadmap.md step 4: "the
+     * single-node 'unlogged DDL is safe' argument dies with the first
+     * follower"). Nothing here writes a log yet -- when one exists, the
+     * change is to propose the command instead of applying it, in this
+     * one place, exactly as it will be for writes.
+     *
+     * createCollection is the exception, and stays direct: there is no
+     * command for it, because an insert makes a collection implicitly
+     * and THAT is logged. What does not replicate is a collection that
+     * was named and never written to, which carries nothing.
      */
     if (op == OP_CREATE_COLLECTION || op == OP_DROP_COLLECTION ||
         op == OP_LIST_INDEXES || op == OP_DROP_INDEX) {
@@ -1162,32 +1209,43 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             if (list.len) bj_put_raw(sb, list.data, (uint32_t)list.len); else bj_put_null(sb);
             bj_end_object(sb);
             dbuf_free(&list);
-        } else if (op == OP_DROP_INDEX) {
-            const uint8_t *ixn; uint32_t ixn_len; int have = 0;
-            if ((e = field_str(req, req_len, "index", &ixn, &ixn_len, &have)))
-                return respond_error(out, DC_ERR_REQ_MALFORMED);
-            if (!have) return respond_error(out, DC_ERR_REQ_MISSING_FIELD);
-            e = dbs_drop_index(s, (const char *)coll, coll_len,
-                               (const char *)ixn, ixn_len);
+        } else if (op == OP_DROP_INDEX || op == OP_DROP_COLLECTION) {
+            const uint8_t *ixn = NULL; uint32_t ixn_len = 0;
+            if (op == OP_DROP_INDEX) {
+                int have = 0;
+                if ((e = field_str(req, req_len, "index", &ixn, &ixn_len, &have)))
+                    return respond_error(out, DC_ERR_REQ_MALFORMED);
+                if (!have) return respond_error(out, DC_ERR_REQ_MISSING_FIELD);
+            }
+            dbuf res = {0};
+            e = do_ddl(s, (const char *)coll, coll_len,
+                       op == OP_DROP_INDEX ? DC_WREQ_DROP_INDEX
+                                           : DC_WREQ_DROP_COLLECTION,
+                       ixn, ixn_len, NULL, 0, &res);
+            if (e) { dbuf_free(&res); return respond_error(out, e); }
+            /* `dropped` is the applier's, spliced through: what a command
+             * DID is part of the command's meaning, and under replication
+             * every replica computes it. */
+            const uint8_t *v; size_t vlen; int f = 0;
+            e = obj_get_field(res.data, res.len, (const uint8_t *)"dropped", 7,
+                              &v, &vlen, &f);
+            if (e || !f) { dbuf_free(&res); return respond_error(out, BJ_ERR_STATE); }
+            sb = bj_builder_new();
+            if (!sb) { dbuf_free(&res); return BJ_ERR_OOM; }
+            bj_begin_object(sb);
+            PUT_KEY(sb, "ok");      bj_put_bool(sb, 1);
+            PUT_KEY(sb, "dropped"); bj_put_raw(sb, v, (uint32_t)vlen);
+            bj_end_object(sb);
+            dbuf_free(&res);
+        } else {
+            int did = 0;
+            e = dbs_create_collection(s, (const char *)coll, coll_len, &did);
             if (e) return respond_error(out, e);
             sb = bj_builder_new();
             if (!sb) return BJ_ERR_OOM;
             bj_begin_object(sb);
             PUT_KEY(sb, "ok");      bj_put_bool(sb, 1);
-            PUT_KEY(sb, "dropped"); bj_put_bool(sb, 1);
-            bj_end_object(sb);
-        } else {
-            int did = 0;
-            e = (op == OP_CREATE_COLLECTION)
-                ? dbs_create_collection(s, (const char *)coll, coll_len, &did)
-                : dbs_drop_collection(s, (const char *)coll, coll_len, &did);
-            if (e) return respond_error(out, e);
-            sb = bj_builder_new();
-            if (!sb) return BJ_ERR_OOM;
-            bj_begin_object(sb);
-            PUT_KEY(sb, "ok"); bj_put_bool(sb, 1);
-            PUT_KEY(sb, op == OP_CREATE_COLLECTION ? "created" : "dropped");
-            bj_put_bool(sb, did);
+            PUT_KEY(sb, "created"); bj_put_bool(sb, did);
             bj_end_object(sb);
         }
         int se = finish(sb, out);
@@ -1292,7 +1350,13 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     /* The three raw spans an op may need, read once. An empty filter is
      * the empty object, which is what "everything" means everywhere else
      * in this library. */
-    static const uint8_t EMPTY_OBJ[9] = { BJ_TYPE_OBJECT, 9,0,0,0, 0,0,0,0 };
+    /* `{}`: the tag, the u32 SIZE OF EVERYTHING AFTER THE FIRST FIVE
+     * BYTES (so 4 -- the count alone), then the count. It said 9 until a
+     * command carried one: nothing had ever MEASURED it, because
+     * object_begin reads the count and ignores the size, so a filter
+     * built from it worked while a value spliced into another object
+     * made its container run four bytes past its own end. */
+    static const uint8_t EMPTY_OBJ[9] = { BJ_TYPE_OBJECT, 4,0,0,0, 0,0,0,0 };
     const uint8_t *filter = EMPTY_OBJ; size_t filter_len = sizeof EMPTY_OBJ;
     const uint8_t *doc = NULL;  size_t doc_len = 0;
     const uint8_t *upd = NULL;  size_t upd_len = 0;
@@ -1407,21 +1471,26 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             if (!have) { e = DC_ERR_REQ_MISSING_FIELD; break; }
             const uint8_t *opt = NULL; size_t opt_len = 0; int has_opt = 0;
             if ((e = field_raw(req, req_len, "options", &opt, &opt_len, &has_opt))) break;
-            dbuf name = {0};
-            e = dbs_create_index(s, (const char *)coll, coll_len, keys, keys_len,
-                                 has_opt ? opt : NULL, has_opt ? opt_len : 0, &name);
-            if (e) { dbuf_free(&name); break; }
-            /* A bare string value, spliced in under `name` below -- the
-             * chosen name is the whole answer, which is what the
-             * in-process createIndex returns too. */
-            bj_builder *ib = bj_builder_new();
-            if (!ib) { dbuf_free(&name); e = BJ_ERR_OOM; break; }
-            bj_put_string(ib, name.data, (uint32_t)name.len);
-            dbuf_free(&name);
-            size_t ilen = 0;
-            const uint8_t *idata = bj_builder_data(ib, &ilen);
-            e = idata ? dbuf_put(&body, idata, ilen) : BJ_ERR_OOM;
-            bj_builder_free(ib);
+            /* Absent options are the empty object, not an absent field: a
+             * command carries what it needs to be performed anywhere, and
+             * a missing `options` would be a command a replica had to
+             * guess at. */
+            dbuf res = {0};
+            e = do_ddl(s, (const char *)coll, coll_len, DC_WREQ_CREATE_INDEX,
+                       keys, keys_len,
+                       has_opt ? opt : EMPTY_OBJ,
+                       has_opt ? opt_len : sizeof EMPTY_OBJ, &res);
+            if (e) { dbuf_free(&res); break; }
+            /* The chosen name, spliced in under `name` below -- the whole
+             * answer, and the same thing the in-process createIndex
+             * returns. It is the APPLIER's, because which name the
+             * catalog chose is part of what the command did. */
+            const uint8_t *v; size_t vlen; int f = 0;
+            e = obj_get_field(res.data, res.len, (const uint8_t *)"name", 4,
+                              &v, &vlen, &f);
+            if (!e && !f) e = BJ_ERR_STATE;
+            if (!e) e = dbuf_put(&body, v, vlen);
+            dbuf_free(&res);
             body_key = "name";
             break;
         }

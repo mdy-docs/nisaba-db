@@ -460,6 +460,38 @@ results leave as the bytes the engine produced. Writes go through
 `dc_wal_plan_build` + `dc_wal_apply` — the same path a replicated write
 takes — so every mutation this serves is one a log could have carried.
 
+**Including the DDL three.** `createIndex`, `dropIndex` and
+`dropCollection` are planned into commands and applied through
+`dbs_apply`, exactly as a write is. They used to call `dbs_*` directly,
+which left a follower nothing to be sent —
+[`docs/replicaton-roadmap.md`](replicaton-roadmap.md) step 4 names it:
+"the single-node *unlogged DDL is safe* argument dies with the first
+follower." There is no log here yet, so the command is built and applied
+in the same breath; when there is one, the change is to propose it
+instead, in one place.
+
+`createCollection` is the exception and has no command, because an
+insert makes a collection implicitly and *that* is logged. What does not
+travel is a collection that was named and never written to, which
+carries nothing.
+
+**`dbs_apply` performs a committed command of any kind.** `dc_wal_apply`
+drives the four document ops and refuses the DDL three
+(`DC_ERR_WAL_NOT_APPLIABLE`), because they make and unmake *files* —
+whoever owns the namespace has to do that, and in C that is
+`db_session.c`. So the session applies DDL itself and hands documents
+down, which is what makes a C process able to be a replica: until now it
+needed a JavaScript host for exactly three opcodes.
+
+A deterministic failure comes back as its code rather than being
+swallowed: a re-applied `createIndex` finds the index already there
+(`-56`), a re-applied `dropIndex` finds it gone (`-57`). Both are what
+convergence looks like from inside an apply loop, so both are now
+`dc_is_deterministic` — an answer, not a halt. `-37` ("no such
+collection") deliberately is not: that is either a log this replica
+cannot apply or a state that has drifted, and the ambiguity resolves
+toward stopping.
+
 Everything the server decides lives behind one function,
 `dbs_handle(dbs*, req, req_len, dbuf *out)` (`wasm/include/db_session.h`),
 which is why the protocol is tested in `test/native/main.c` over buffers

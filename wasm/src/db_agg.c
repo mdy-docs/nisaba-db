@@ -687,7 +687,13 @@ int dc_aggregate(dc_collection *c, const uint8_t *stages, size_t stages_len,
         first = 1;
     }
 
-    static const uint8_t EMPTY_FILTER[] = { BJ_TYPE_OBJECT, 0,0,0,0, 0,0,0,0 };
+    /* `{}` -- the u32 is the size of everything after the first five
+     * bytes, so 4 (the count alone) and not 0. It said 0 for as long as
+     * it has existed: a filter is read count-first and never measured,
+     * so the wrong size never surfaced. db_request.c's copy of this
+     * constant had a different wrong number, which is what two owners of
+     * one fact looks like when neither is checked. */
+    static const uint8_t EMPTY_FILTER[9] = { BJ_TYPE_OBJECT, 4,0,0,0, 0,0,0,0 };
     uint8_t *materialized = NULL; size_t materialized_len = 0;
     e = dc_find(c, pushdown ? pushdown : EMPTY_FILTER,
                 (uint32_t)(pushdown ? pushdown_len : sizeof(EMPTY_FILTER)),

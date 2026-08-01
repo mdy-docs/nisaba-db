@@ -854,7 +854,13 @@ TEST(divergence_classification_defaults_to_halting) {
         DC_ERR_AGG_PROJECT_MIXED,
         DC_ERR_BAD_CURRENT_DATE, DC_ERR_CURRENT_DATE_CONFLICT,
         DC_ERR_INDEX_OPTION_UNSUPPORTED, DC_ERR_TTL_NEEDS_SINGLE_FIELD,
-        DC_ERR_WAL_UNKNOWN_OP, DC_ERR_WAL_MISSING_FIELD, DC_ERR_WAL_BAD_REQUEST
+        DC_ERR_WAL_UNKNOWN_OP, DC_ERR_WAL_MISSING_FIELD, DC_ERR_WAL_BAD_REQUEST,
+        DC_ERR_WAL_NO_ID,
+        /* The DDL three's outcomes: a re-applied createIndex finds the
+         * index already there, a re-applied dropIndex finds it gone.
+         * That is what convergence looks like from inside an apply
+         * loop. */
+        DC_ERR_INDEX_EXISTS, DC_ERR_NO_INDEX
     };
     for (size_t i = 0; i < sizeof(deterministic) / sizeof(deterministic[0]); i++) {
         if (!dc_is_deterministic(deterministic[i]))
@@ -867,6 +873,12 @@ TEST(divergence_classification_defaults_to_halting) {
         BJ_ERR_OOM,           /* a local resource                        */
         BJ_ERR_STATE,         /* a programming error; halting finds it   */
         DC_ERR_CATALOG_ENTRY, /* THIS replica's catalog is damaged       */
+        /* Same ambiguity, same answer: a command naming a collection
+         * this replica does not have is either a log it cannot apply or
+         * a state that has drifted, and ambiguity resolves toward
+         * halting. dbs_apply's one exception is an INSERT, which makes
+         * the collection rather than asking about it. */
+        DC_ERR_NO_COLLECTION,
         BJ_ERR_EOF, BJ_ERR_UNKNOWN_TYPE, BJ_ERR_VERIFY, BJ_ERR_DEPTH,
         BJ_ERR_INT_RANGE, BJ_ERR_POINTER_RANGE, BJ_ERR_RANGE,
         BJ_OK                 /* not a failure at all                    */
@@ -2125,6 +2137,206 @@ TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
     dbs_close(s);
     bjns_posix_free(&ns);
     close(dirfd);
+}
+
+TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
+    /*
+     * The DDL three used to be the one thing this server did that left
+     * nothing behind to send anywhere. Writes went through
+     * dc_wal_plan_build and dc_wal_apply -- "every mutation this serves
+     * is one a log could have carried" -- and createIndex, dropIndex and
+     * dropCollection called dbs_* directly, so a follower would never
+     * hear about them. docs/replicaton-roadmap.md step 4 names it: the
+     * single-node "unlogged DDL is safe" argument dies with the first
+     * follower.
+     *
+     * So this is the test that says what "logged" has to mean. Two
+     * separate databases: one is asked over the wire, and the OTHER is
+     * handed nothing but the commands that produced the answer. If it
+     * ends up in the same shape, the command carries everything a
+     * replica needs; if it does not, the command is missing something no
+     * amount of transport will supply.
+     */
+    char a_dir[64], b_dir[64];
+    CHECK_FATAL(scratch_dir("nisaba-ddl-a", a_dir, sizeof a_dir) == 0);
+    CHECK_FATAL(scratch_dir("nisaba-ddl-b", b_dir, sizeof b_dir) == 0);
+    int afd = open(a_dir, O_RDONLY), bfd = open(b_dir, O_RDONLY);
+    CHECK_FATAL(afd >= 0 && bfd >= 0);
+    bj_ns ans, bns;
+    CHECK_FATAL(bjns_posix_open(afd, &ans) == BJ_OK);
+    CHECK_FATAL(bjns_posix_open(bfd, &bns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ans) == 0);
+    CHECK_FATAL(build_users_db(&bns) == 0);
+
+    dbs *leader = NULL, *replica = NULL;
+    CHECK_FATAL(dbs_open(&ans, ORDER, 0, &leader) == BJ_OK);
+    CHECK_FATAL(dbs_open(&bns, ORDER, 0, &replica) == BJ_OK);
+    const uint64_t CLIENT = 4;
+
+    /* ---- the leader is asked, the way a client asks. */
+    doc *k = doc_new();
+    doc_int(k, "name", 1);
+    uint32_t klen; const uint8_t *kb = doc_done(k, &klen);
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("createIndex", "users", "keys", kb, klen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(leader, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK(find_bytes(res.data, res.len, "name_1", 6) != NULL);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- the replica is handed the COMMAND, which is all a follower
+     * ever gets. Built here the way the leader built it, because that is
+     * the claim: this command is what the leader would have logged.
+     *
+     * Note what it does NOT need: `options` was never sent by the
+     * client, and the command carries `{}` rather than leaving the field
+     * out -- a replica must not have to guess at a field's absence. */
+    {
+        static const uint8_t EMPTY[9] = { BJ_TYPE_OBJECT, 4,0,0,0, 0,0,0,0 };
+        dc_wal_plan *p = NULL;
+        CHECK_OK(dc_wal_plan_build(NULL, "users", 5, DC_WREQ_CREATE_INDEX,
+                                   kb, klen, EMPTY, sizeof EMPTY, 0, NULL, &p));
+        uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+        dbuf res = {0};
+        CHECK_OK(dbs_apply(replica, 0, cmd, clen, &res));
+        /* The applier's result, not the wire's: which name the catalog
+         * chose is part of what the command did, and every replica
+         * computes it rather than being told. */
+        CHECK(find_bytes(res.data, res.len, "name_1", 6) != NULL);
+        dbuf_free(&res);
+
+        /* Applied twice is what a replay is, and it is a deterministic
+         * refusal rather than a second index or a silent success --
+         * which is exactly why dc_is_deterministic classifies it. */
+        dbuf again = {0};
+        CHECK_RC(dbs_apply(replica, 0, cmd, clen, &again), DC_ERR_INDEX_EXISTS);
+        CHECK_I64(dc_is_deterministic(DC_ERR_INDEX_EXISTS), 1);
+        dbuf_free(&again);
+        dc_wal_plan_free(p);
+    }
+
+    /* ---- and both databases now say the same thing about themselves. */
+    for (int side = 0; side < 2; side++) {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("listIndexes", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(side ? replica : leader, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK(find_bytes(res.data, res.len, "name_1", 6) != NULL);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- dropIndex, the same way round. */
+    {
+        /* {index: "team_1"} as a bare encoded string, spliced in the way
+         * a client's codec would produce it. */
+        bj_builder *nb = bj_builder_new();
+        bj_put_string(nb, (const uint8_t *)"name_1", 6);
+        size_t nlen = 0; const uint8_t *nval = bj_builder_data(nb, &nlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("dropIndex", "users", "index", nval, nlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(leader, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_flag(&res, "dropped"), 1);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(nb);
+
+        dc_wal_plan *p = NULL;
+        CHECK_OK(dc_wal_plan_build(NULL, "users", 5, DC_WREQ_DROP_INDEX,
+                                   (const uint8_t *)"name_1", 6, NULL, 0, 0, NULL, &p));
+        uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+        dbuf ares = {0};
+        CHECK_OK(dbs_apply(replica, 0, cmd, clen, &ares));
+        dbuf_free(&ares);
+        /* Replayed: gone is gone, deterministically. */
+        dbuf twice = {0};
+        CHECK_RC(dbs_apply(replica, 0, cmd, clen, &twice), DC_ERR_NO_INDEX);
+        dbuf_free(&twice);
+        dc_wal_plan_free(p);
+    }
+
+    /* ---- a document command needs no collection to exist first: a
+     * first insert makes one, which is what lets createCollection have
+     * no command of its own. The replica has never heard of `fresh`. */
+    {
+        uint8_t id[12]; mk_oid(id, 61);
+        doc *d = doc_new();
+        doc_oid(d, "_id", id);
+        doc_str(d, "who", "new");
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        dc_wal_plan *p = NULL;
+        CHECK_OK(dc_wal_plan_build(NULL, "fresh", 5, DC_WREQ_INSERT_ONE,
+                                   db_, dlen, NULL, 0, 0, NULL, &p));
+        uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+        dbuf res = {0};
+        CHECK_OK(dbs_apply(replica, 7, cmd, clen, &res));
+        dbuf_free(&res);
+        dc_wal_plan_free(p);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "fresh", NULL, NULL, 0, &req, &req_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(replica, CLIENT, req, req_len, &cres));
+        int f = 0;
+        CHECK_I64(response_num(&cres, "n", &f), 1);
+        dbuf_free(&cres); bj_builder_free(rb);
+        doc_free(d);
+    }
+
+    /* ---- dropCollection reports what it did, and a replay of it says
+     * "nothing to drop" rather than failing. */
+    {
+        dc_wal_plan *p = NULL;
+        CHECK_OK(dc_wal_plan_build(NULL, "fresh", 5, DC_WREQ_DROP_COLLECTION,
+                                   NULL, 0, NULL, 0, 0, NULL, &p));
+        uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+        dbuf res = {0};
+        CHECK_OK(dbs_apply(replica, 0, cmd, clen, &res));
+        {
+            const uint8_t *v; size_t vlen; int f = 0;
+            CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"dropped", 7,
+                                   &v, &vlen, &f));
+            CHECK_I64(f, 1);
+            cur c = { v, vlen, 0 }; int b = 0;
+            CHECK_OK(read_bool(&c, &b));
+            CHECK_I64(b, 1);
+        }
+        dbuf_free(&res);
+        dbuf again = {0};
+        CHECK_OK(dbs_apply(replica, 0, cmd, clen, &again));
+        {
+            const uint8_t *v; size_t vlen; int f = 0;
+            CHECK_OK(obj_get_field(again.data, again.len, (const uint8_t *)"dropped", 7,
+                                   &v, &vlen, &f));
+            cur c = { v, vlen, 0 }; int b = 1;
+            CHECK_OK(read_bool(&c, &b));
+            CHECK_I64(b, 0);        /* there was nothing left to drop */
+        }
+        dbuf_free(&again);
+        dc_wal_plan_free(p);
+    }
+
+    /* ---- and a command this build cannot execute is REFUSED, not
+     * skipped: the difference between a node that stops and one that has
+     * quietly diverged from its peers. */
+    {
+        doc *bad = doc_new();
+        doc_str(bad, "c", "users");
+        doc_str(bad, "op", "reticulate");
+        uint32_t bl; const uint8_t *bcmd = doc_done(bad, &bl);
+        dbuf res = {0};
+        CHECK_RC(dbs_apply(replica, 0, bcmd, bl, &res), DC_ERR_WAL_UNKNOWN_OP);
+        dbuf_free(&res);
+        doc_free(bad);
+    }
+
+    doc_free(k);
+    dbs_close(replica); dbs_close(leader);
+    bjns_posix_free(&bns); bjns_posix_free(&ans);
+    close(bfd); close(afd);
 }
 
 TEST(a_database_can_be_built_from_an_empty_directory) {
@@ -8780,6 +8992,7 @@ int main(void) {
     RUN(bulk_grammar_rejects_malformed_lists_and_names_the_index);
     RUN(ttl_cutoff_and_filter);
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
+    RUN(ddl_is_a_command_a_second_database_can_be_caught_up_by);
     RUN(a_database_can_be_built_from_an_empty_directory);
     RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);
     RUN(a_list_of_writes_is_one_request_and_reports_every_member);

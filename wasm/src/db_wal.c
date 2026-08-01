@@ -480,6 +480,54 @@ static const uint8_t *field(const uint8_t *buf, uint32_t len, const char *k, siz
     return vp;
 }
 
+/*
+ * The payload of a DDL command, for whoever performs it. dc_wal_parse
+ * has already established the fields are there, so these read.
+ *
+ * They exist so that a DDL command's SHAPE stays defined in this file,
+ * beside emit(), rather than being known again wherever it is
+ * performed -- which in C is db_session.c, the only thing that owns a
+ * namespace and can therefore make and unmake files.
+ */
+int dc_wal_index_spec(const uint8_t *cmd, uint32_t len,
+                      const uint8_t **keys, uint32_t *keys_len,
+                      const uint8_t **options, uint32_t *options_len) {
+    if (!cmd || !keys || !keys_len || !options || !options_len)
+        return BJ_ERR_STATE;
+    int op = -1; const uint8_t *coll; uint32_t coll_len;
+    int e = dc_wal_parse(cmd, len, &op, &coll, &coll_len);
+    if (e) return e;
+    if (op != DC_WAL_CREATE_INDEX) return DC_ERR_WAL_MISSING_FIELD;
+
+    size_t klen = 0, olen = 0;
+    const uint8_t *k = field(cmd, len, "keys", &klen);
+    const uint8_t *o = field(cmd, len, "options", &olen);
+    if (!k || !o) return DC_ERR_WAL_MISSING_FIELD;
+    *keys = k; *keys_len = (uint32_t)klen;
+    *options = o; *options_len = (uint32_t)olen;
+    return BJ_OK;
+}
+
+int dc_wal_index_name(const uint8_t *cmd, uint32_t len,
+                      const uint8_t **name, uint32_t *name_len) {
+    if (!cmd || !name || !name_len) return BJ_ERR_STATE;
+    int op = -1; const uint8_t *coll; uint32_t coll_len;
+    int e = dc_wal_parse(cmd, len, &op, &coll, &coll_len);
+    if (e) return e;
+    if (op != DC_WAL_DROP_INDEX) return DC_ERR_WAL_MISSING_FIELD;
+
+    size_t vlen = 0;
+    const uint8_t *v = field(cmd, len, "name", &vlen);
+    /* A STRING: tag, u32 length, bytes -- the same shape dc_wal_parse
+     * reads `op` and `c` as. */
+    if (!v || vlen < 5 || v[0] != BJ_TYPE_STRING) return DC_ERR_WAL_MISSING_FIELD;
+    uint32_t n = rdu32(v + 1);
+    if ((size_t)n + 5 != vlen) return DC_ERR_WAL_MISSING_FIELD;
+    *name = v + 5;
+    *name_len = n;
+    return BJ_OK;
+}
+
 /* `{ _id: <oid> }` -- the only filter apply ever runs against, and it is
  * a point lookup rather than a query. */
 static int id_filter(const uint8_t id[12], dbuf *out) {

@@ -392,6 +392,48 @@ int dbs_stream_count(const dbs *s);
  * a server that wants to say so. */
 int dbs_cursor_count(const dbs *s);
 
+/* ---- applying a committed command ---------------------------------------
+ *
+ * dc_wal_apply (db_wal.h) performs the four DOCUMENT commands against an
+ * already-open collection. It refuses the DDL three with
+ * DC_ERR_WAL_NOT_APPLIABLE, because they make and unmake FILES -- which
+ * belongs to whoever owns the namespace, and in C that is this file.
+ *
+ * This is the other half. Give it any command and it performs it: it
+ * resolves the collection by name and hands a document command on, and
+ * it performs a DDL one itself. That completes "a committed entry no
+ * longer needs a host to be applied" -- until now it needed one for
+ * exactly three opcodes, which is three too many for a C process that
+ * wants to be a replica.
+ *
+ * `index` is staged with a document command's mutation, atomically
+ * (dc_wal_apply's contract). DDL does not stage one and ignores it: an
+ * index build commits catalog and index files but not the primary tree,
+ * so a staged value would not persist with it anyway. Their replay is
+ * bounded by the next snapshot's log compaction instead.
+ *
+ * `result` receives what applying the command produced, in the shape a
+ * driver caller gets back -- dc_wal_apply's four for documents, and:
+ *
+ *   createIndex     -> { name }        the name the catalog chose
+ *   dropIndex       -> { dropped }     always true; a missing one is a code
+ *   dropCollection  -> { dropped }     false if there was nothing to drop
+ *
+ * A FIRST INSERT MAKES THE COLLECTION, here as on the wire. That is what
+ * makes it safe for createCollection to have no command of its own: a
+ * collection reaches a replica with its first document, and an empty
+ * collection that was only ever named has nothing to carry.
+ *
+ * A DETERMINISTIC FAILURE IS RETURNED, NOT SWALLOWED -- a duplicate id,
+ * a unique-index collision, an index that already exists. Every replica
+ * applying the same prefix reaches the same verdict, so the apply pump
+ * is what decides whether such a code is an answer for the client or a
+ * halt (dc_is_deterministic, db_validate.h). Hiding it here would take
+ * that decision away from the one layer that can make it.
+ */
+int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
+              dbuf *result);
+
 /* Close every collection, the catalog, and the session. Safe on NULL.
  * Does not touch the namespace. */
 void dbs_close(dbs *s);

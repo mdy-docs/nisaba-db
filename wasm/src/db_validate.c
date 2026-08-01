@@ -220,6 +220,21 @@ int dc_is_deterministic(int code) {
         case DC_ERR_WAL_UNKNOWN_OP:
         case DC_ERR_WAL_MISSING_FIELD:
         case DC_ERR_WAL_BAD_REQUEST:
+        case DC_ERR_WAL_NO_ID:
+        /* The DDL three, whose outcomes are facts about the catalog a
+         * replica reached by applying the same prefix. A re-applied
+         * createIndex finds the index already there; a re-applied
+         * dropIndex finds it gone. Both are what CONVERGENCE looks like
+         * from inside an apply loop, so an apply pump treats them the
+         * way it treats a duplicate _id: an answer, not a halt.
+         *
+         * DC_ERR_NO_COLLECTION is deliberately NOT here. It is the same
+         * ambiguity DC_ERR_CATALOG_ENTRY has -- a command naming a
+         * collection this replica does not have is either a log it
+         * cannot apply or a state that has drifted -- and this
+         * classification resolves ambiguity toward halting. */
+        case DC_ERR_INDEX_EXISTS:
+        case DC_ERR_NO_INDEX:
             return 1;
 
         /* Deliberately NOT deterministic, and each for its own reason:

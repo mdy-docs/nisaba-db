@@ -8,6 +8,7 @@
  */
 #include "db_session.h"
 #include "db_ttl.h"
+#include "db_wal.h"   /* the command grammar: this file performs the DDL three */
 
 #include "db_catalog.h"
 #include "db_names.h"
@@ -1477,6 +1478,112 @@ int dbs_open_count(const dbs *s) {
     int n = 0;
     for (int i = 0; i < DBS_MAX_COLLECTIONS; i++) if (s->open[i].used) n++;
     return n;
+}
+
+/* ---- applying a committed command --------------------------------------
+ *
+ * See db_session.h. Everything above this line is asked for by a client;
+ * this is asked for by a LOG, and the difference matters in one place:
+ * a client's request may be refused for being wrong, and a committed
+ * command has already been agreed on. It is performed, and whatever
+ * performing it produced -- including a failure every replica shares --
+ * is reported rather than judged.
+ */
+
+/* { <key>: <bool> } -- the whole result of a drop. */
+static int flag_result(dbuf *out, const char *key, int value) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)key, (uint32_t)strlen(key));
+    if (!e) e = bj_put_bool(b, value);
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t n; const uint8_t *d = bj_builder_data(b, &n);
+        if (!d) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_put(out, d, n);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+/* { name: "<the name the catalog chose>" } -- the whole result of an
+ * index build, and the same thing the in-process createIndex returns. */
+static int name_result(dbuf *out, const dbuf *name) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"name", 4);
+    if (!e) e = bj_put_string(b, name->data, (uint32_t)name->len);
+    if (!e) e = bj_end_object(b);
+    if (!e) {
+        size_t n; const uint8_t *d = bj_builder_data(b, &n);
+        if (!d) e = bj_builder_error(b) ? bj_builder_error(b) : BJ_ERR_STATE;
+        else e = dbuf_put(out, d, n);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
+              dbuf *result) {
+    if (!s || !cmd || !result) return BJ_ERR_STATE;
+
+    /* Parsed against the grammar first, so a command naming an op this
+     * build cannot execute is REFUSED rather than skipped -- the
+     * difference between a node that stops and one that has quietly
+     * diverged from its peers. */
+    int op = -1;
+    const uint8_t *coll = NULL; uint32_t coll_len = 0;
+    int e = dc_wal_parse(cmd, len, &op, &coll, &coll_len);
+    if (e) return e;
+
+    if (op == DC_WAL_DROP_COLLECTION) {
+        int dropped = 0;
+        e = dbs_drop_collection(s, (const char *)coll, coll_len, &dropped);
+        if (e) return e;
+        return flag_result(result, "dropped", dropped);
+    }
+
+    if (op == DC_WAL_CREATE_INDEX) {
+        const uint8_t *keys = NULL, *options = NULL;
+        uint32_t keys_len = 0, options_len = 0;
+        e = dc_wal_index_spec(cmd, len, &keys, &keys_len, &options, &options_len);
+        if (e) return e;
+        dbuf name = {0};
+        e = dbs_create_index(s, (const char *)coll, coll_len,
+                             keys, keys_len, options, options_len, &name);
+        if (!e) e = name_result(result, &name);
+        dbuf_free(&name);
+        return e;
+    }
+
+    if (op == DC_WAL_DROP_INDEX) {
+        const uint8_t *name = NULL; uint32_t name_len = 0;
+        e = dc_wal_index_name(cmd, len, &name, &name_len);
+        if (e) return e;
+        e = dbs_drop_index(s, (const char *)coll, coll_len,
+                           (const char *)name, name_len);
+        if (e) return e;
+        return flag_result(result, "dropped", 1);
+    }
+
+    dc_collection *c = NULL;
+    e = dbs_collection(s, (const char *)coll, coll_len, &c);
+    /* A first insert makes the collection, the way it does on the wire
+     * and in every host of this library -- which is what lets
+     * createCollection have no command of its own. Only an insert: any
+     * other command naming a collection that is not here is a replica
+     * whose state does not match the log it is applying, and that is a
+     * thing to stop on rather than to paper over. */
+    if (e == DC_ERR_NO_COLLECTION && op == DC_WAL_INSERT) {
+        int made = 0;
+        e = dbs_create_collection(s, (const char *)coll, coll_len, &made);
+        if (!e) e = dbs_collection(s, (const char *)coll, coll_len, &c);
+    }
+    if (e) return e;
+
+    return dc_wal_apply(c, index, cmd, len, result);
 }
 
 void dbs_close(dbs *s) {

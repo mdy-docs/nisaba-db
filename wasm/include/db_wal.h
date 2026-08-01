@@ -252,9 +252,26 @@ int dc_wal_parse(const uint8_t *buf, uint32_t len,
 /*
  * Does dc_wal_apply drive this opcode? The four document ops, yes; the
  * DDL three, no -- they make and unmake files, which is the namespace
- * owner's job, not this layer's.
+ * owner's job, not this layer's. In C that owner is db_session.h, whose
+ * dbs_apply performs a command of any kind by routing the document ones
+ * here and the DDL three to itself.
  */
 int dc_wal_is_document(int op);
+
+/*
+ * What a DDL command says, as spans into `cmd` (valid as long as it is).
+ * For whoever performs it -- these exist so that a command's shape stays
+ * defined in db_wal.c beside the code that WRITES it, rather than being
+ * known a second time wherever it is read.
+ *
+ * DC_ERR_WAL_MISSING_FIELD if `cmd` is not that kind of command, or is
+ * one that has lost a field it needs.
+ */
+int dc_wal_index_spec(const uint8_t *cmd, uint32_t len,
+                      const uint8_t **keys, uint32_t *keys_len,
+                      const uint8_t **options, uint32_t *options_len);
+int dc_wal_index_name(const uint8_t *cmd, uint32_t len,
+                      const uint8_t **name, uint32_t *name_len);
 
 /*
  * Apply one logged command to `c`, an ALREADY-OPEN collection for the

@@ -3201,10 +3201,14 @@ TEST(compaction_refuses_while_a_cursor_is_reading_the_tree) {
 
     doc_free(q);
     dbuf_free(&plan); dbuf_free(&entry);
+    /* dc_collection_free releases the collection and its indexes, not the
+     * primary tree it was handed -- and a tree BORROWS its io, so the
+     * order is tree first, io after. */
     dc_collection_free(coll);
+    bpt_free(primary);
     bpt_free(catalog);
-    ns.close(ns.ctx, &kio);
-    ns.close(ns.ctx, &cio);
+    CHECK_OK(ns.close(ns.ctx, &cio));
+    CHECK_OK(ns.close(ns.ctx, &kio));
     bjns_posix_free(&ns);
     close(dirfd);
 }

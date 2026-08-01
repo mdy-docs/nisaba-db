@@ -146,6 +146,10 @@ export interface RemoteCollection<T extends Document = Document> {
    * such index), -58 (not an equality index) or -59 (wrong number of
    * values). */
   findByIndex<R extends Document = Document>(name: string, values: unknown[]): Promise<R[]>;
+  /** Delete every document past a TTL index's cutoff, using this side's
+   * clock; resolves with how many went. 0 when the collection has no TTL
+   * index. There is no scheduler: call it when you want a sweep. */
+  pruneExpired(): Promise<number>;
 }
 
 export interface RemoteDb {

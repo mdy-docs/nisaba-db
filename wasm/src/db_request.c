@@ -63,7 +63,8 @@ typedef enum {
     OP_FIND_ONE_AND_UPDATE,
     OP_FIND_ONE_AND_REPLACE,
     OP_FIND_ONE_AND_DELETE,
-    OP_FIND_BY_INDEX
+    OP_FIND_BY_INDEX,
+    OP_PRUNE_EXPIRED
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -101,6 +102,7 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE),
     OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE),
     OP("findByIndex",       OP_FIND_BY_INDEX),
+    OP("pruneExpired",      OP_PRUNE_EXPIRED),
 };
 
 #undef OP
@@ -1306,6 +1308,43 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                 found_doc = 0;
             }
             dbuf_free(&pre);
+            break;
+        }
+        case OP_PRUNE_EXPIRED: {
+            /*
+             * The TTL sweep. Expiry is not a background thread here --
+             * the engine runs no timers and reads no clock -- so it is a
+             * sweep somebody asks for, with their own `now`.
+             *
+             * Which indexes expire what, and the cutoff arithmetic, are
+             * dbs_ttl_filters' (db_ttl.h owns the policy, the session
+             * owns the catalog that knows the indexes). What is left
+             * here is what every host does differently: the deleting,
+             * which goes through the same plan/apply path as any other
+             * write, so a swept document is one a log could have carried.
+             */
+            if (!have_now) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+            dbuf filters = {0};
+            if ((e = dbs_ttl_filters(s, (const char *)coll, coll_len, now_ms, &filters))) {
+                dbuf_free(&filters);
+                break;
+            }
+            cur fc = { filters.data, filters.len, 0 };
+            uint32_t nf = 0;
+            e = array_begin(&fc, &nf);
+            int64_t deleted = 0;
+            for (uint32_t i = 0; !e && i < nf; i++) {
+                size_t start = fc.pos;
+                if ((e = skip_value(&fc))) break;
+                write_result wr;
+                e = run_write(c, (const char *)coll, coll_len, DC_WREQ_DELETE_MANY,
+                              filters.data + start, (uint32_t)(fc.pos - start),
+                              NULL, 0, 0, id, &wr, NULL);
+                if (!e) deleted += wr.deleted;
+            }
+            dbuf_free(&filters);
+            if (e) break;
+            number = deleted; is_number = 1; body_key = "deletedCount";
             break;
         }
         case OP_FIND_BY_INDEX: {

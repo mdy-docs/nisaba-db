@@ -202,6 +202,25 @@ int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
  * returns (db_catalog.h owns that projection). */
 int dbs_list_indexes(dbs *s, const char *coll, size_t coll_len, dbuf *out);
 
+/*
+ * Every TTL sweep this collection is owed: one filter per equality index
+ * carrying expireAfterSeconds, as a binjson ARRAY of OBJECTs, each ready
+ * to be handed to a deleteMany.
+ *
+ * db_ttl.h predicted this: "the index registry is still JS, so the loop
+ * is too. When index metadata moves into the C catalog, this becomes a
+ * single call and the loop goes with it." The catalog is here, so this
+ * is that call. What it deliberately does NOT do is the deleting -- the
+ * two hosts differ in what they do with a filter (delete it directly, or
+ * log a delete command first), and that difference is theirs.
+ *
+ * `now_ms` is the CALLER's clock reading, for the third time in this
+ * header and for the same reason: nothing below this line knows what
+ * time it is. An empty array means no TTL index, which is not an error.
+ */
+int dbs_ttl_filters(dbs *s, const char *coll, size_t coll_len,
+                    int64_t now_ms, dbuf *out);
+
 /* Every collection name in the catalog, as a binjson array of strings,
  * in the catalog's own order. The format stamp is not one of them: it
  * is a reserved key no collection can be called, filtered here the same

@@ -7,6 +7,7 @@
  * here decides what a collection is made of.
  */
 #include "db_session.h"
+#include "db_ttl.h"
 
 #include "db_catalog.h"
 #include "db_names.h"
@@ -866,6 +867,77 @@ int dbs_list_collections(dbs *s, dbuf *out) {
         size_t len = 0;
         const uint8_t *data = bj_builder_data(b, &len);
         e = data ? dbuf_put(out, data, len) : BJ_ERR_OOM;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+int dbs_ttl_filters(dbs *s, const char *coll, size_t coll_len,
+                    int64_t now_ms, dbuf *out) {
+    if (!s || !coll || !out) return BJ_ERR_STATE;
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    int e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_NO_COLLECTION;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { free(entry); return BJ_ERR_OOM; }
+    bj_begin_array(b);
+
+    const uint8_t *idxs; size_t idxs_len; int has = 0;
+    e = plan_raw(entry, entry_len, "indexes", &idxs, &idxs_len, &has);
+    if (!e && has && idxs_len >= 1 && idxs[0] == BJ_TYPE_ARRAY) {
+        cur c = { idxs, idxs_len, 0 };
+        uint32_t n = 0;
+        e = array_begin(&c, &n);
+        for (uint32_t i = 0; !e && i < n; i++) {
+            size_t start = c.pos;
+            if ((e = skip_value(&c))) break;
+            const uint8_t *def = idxs + start;
+            size_t def_len = c.pos - start;
+
+            /* expireAfterSeconds is the whole test, and nothing here
+             * looks at the index's KIND: db_catalog.h refuses that
+             * option on anything but a single-field equality index at
+             * creation, so a def carrying it is one by construction.
+             * Asking anyway would mean this file deciding what "text"
+             * means for a second time -- and a stored entry spells kind
+             * as a STRING while an open plan spells it as an int, which
+             * is exactly the sort of second opinion that gets one of the
+             * two wrong. A def without it is skipped in silence: a
+             * collection with no TTL index is owed no sweep. */
+            const uint8_t *v; size_t vlen; int hs = 0;
+            if ((e = plan_raw(def, def_len, "expireAfterSeconds", &v, &vlen, &hs))) break;
+            if (!hs) continue;
+            double secs = 0;
+            { cur nc = { v, vlen, 0 }; if ((e = read_number(&nc, &secs))) break; }
+
+            /* A TTL index is single-field (db_catalog.h enforces it at
+             * creation), so the field is fields[0]. */
+            const uint8_t *fields; size_t fields_len; int hf = 0;
+            if ((e = plan_raw(def, def_len, "fields", &fields, &fields_len, &hf))) break;
+            if (!hf) { e = DC_ERR_CATALOG_ENTRY; break; }
+            cur fc = { fields, fields_len, 0 };
+            uint32_t fn = 0;
+            if ((e = array_begin(&fc, &fn))) break;
+            if (fn < 1) { e = DC_ERR_CATALOG_ENTRY; break; }
+            const uint8_t *fp; uint32_t flen;
+            if ((e = take_string(&fc, &fp, &flen))) break;
+
+            int64_t cutoff = 0;
+            if ((e = dc_ttl_cutoff_ms(now_ms, secs, &cutoff))) break;
+            dbuf one = {0};
+            e = dc_ttl_filter(&one, (const char *)fp, flen, cutoff);
+            if (!e) e = bj_put_raw(b, one.data, (uint32_t)one.len);
+            dbuf_free(&one);
+        }
+    }
+    free(entry);
+    if (!e) { bj_end_array(b); e = bj_builder_error(b); }
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
     }
     bj_builder_free(b);
     return e;

@@ -2655,6 +2655,176 @@ static bj_builder *index_request(const char *op, const char *coll, const char *i
     return b;
 }
 
+TEST(prune_expired_sweeps_what_a_ttl_index_says_is_over) {
+    /*
+     * Expiry is not a background thread: the engine runs no timers and
+     * reads no clock, so a TTL sweep is something a host asks for, with
+     * its own `now`. db_ttl.h predicted this call ("when index metadata
+     * moves into the C catalog, this becomes a single call and the loop
+     * goes with it") -- the catalog is here now, so the loop is too.
+     *
+     * The clock being a parameter is also what makes this testable at
+     * all: `now` is a fixed number below, so the sweep is reproducible
+     * rather than a race against the wall.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-ttl", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 1, &s) == BJ_OK);
+    const uint64_t CLIENT = 19;
+    const int64_t NOW = 1750000000000LL;
+    const int64_t HOUR = 3600000LL;
+
+    /* Four events: two past an hour old, one fresh, one with no date at
+     * all -- which a sparse index tolerates and a sweep must not touch. */
+    {
+        const int64_t ages[] = { 2 * HOUR, HOUR + 60000, 60000 };
+        for (int i = 0; i < 3; i++) {
+            doc *d = doc_new();
+            uint8_t oid[12]; mk_oid(oid, (uint32_t)(i + 1));
+            doc_oid(d, "_id", oid);
+            doc_int(d, "n", i);
+            doc_key(d, "at"); bj_put_date(d->b, NOW - ages[i]);
+            uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+            const uint8_t *req; uint32_t req_len;
+            bj_builder *rb = request("insert", "events", "doc", db_, dlen, &req, &req_len);
+            dbuf res = {0};
+            CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+            CHECK_I64(response_ok(&res), 1);
+            dbuf_free(&res); bj_builder_free(rb); doc_free(d);
+        }
+        doc *d = doc_new();
+        uint8_t oid[12]; mk_oid(oid, 9);
+        doc_oid(d, "_id", oid);
+        doc_int(d, "n", 9);
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("insert", "events", "doc", db_, dlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        dbuf_free(&res); bj_builder_free(rb); doc_free(d);
+    }
+
+    /* No TTL index yet: a sweep is owed nothing, which is an answer of
+     * zero rather than a refusal. */
+    {
+        dbuf filters = {0};
+        CHECK_OK(dbs_ttl_filters(s, "events", 6, NOW, &filters));
+        CHECK_I64(arr_count(filters.data, filters.len), 0);
+        dbuf_free(&filters);
+    }
+
+    /* A TTL index over `at`, sparse so the dateless document is legal. */
+    {
+        doc *k = doc_new(); doc_int(k, "at", 1);
+        uint32_t klen; const uint8_t *kb = doc_done(k, &klen);
+        doc *o = doc_new();
+        doc_int(o, "expireAfterSeconds", 3600);
+        doc_key(o, "sparse"); bj_put_bool(o->b, 1);
+        uint32_t olen; const uint8_t *ob = doc_done(o, &olen);
+
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"op", 2);
+        bj_put_string(b, (const uint8_t *)"createIndex", 11);
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)"events", 6);
+        bj_put_key(b, (const uint8_t *)"keys", 4);
+        bj_put_raw(b, kb, klen);
+        bj_put_key(b, (const uint8_t *)"options", 7);
+        bj_put_raw(b, ob, olen);
+        bj_end_object(b);
+        size_t rl = 0; const uint8_t *req = bj_builder_data(b, &rl);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, (uint32_t)rl, &res));
+        if (response_ok(&res) != 1) {
+            int f = 0;
+            TAP_FAIL("createIndex refused: %lld", (long long)response_num(&res, "code", &f));
+        }
+        dbuf_free(&res); bj_builder_free(b); doc_free(k); doc_free(o);
+    }
+
+    /* One filter now, and it is the one db_ttl.h describes. */
+    {
+        dbuf filters = {0};
+        CHECK_OK(dbs_ttl_filters(s, "events", 6, NOW, &filters));
+        CHECK_I64(arr_count(filters.data, filters.len), 1);
+        dbuf_free(&filters);
+    }
+
+    /* The sweep itself, through the wire, with the caller's clock. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"op", 2);
+        bj_put_string(b, (const uint8_t *)"pruneExpired", 12);
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)"events", 6);
+        bj_put_key(b, (const uint8_t *)"now", 3);
+        bj_put_int(b, NOW);
+        bj_end_object(b);
+        size_t rl = 0; const uint8_t *req = bj_builder_data(b, &rl);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, (uint32_t)rl, &res));
+        if (response_ok(&res) != 1) {
+            int f = 0;
+            TAP_FAIL("pruneExpired refused: %lld", (long long)response_num(&res, "code", &f));
+        }
+        int f = 0;
+        CHECK_I64(response_num(&res, "deletedCount", &f), 2);
+        dbuf_free(&res); bj_builder_free(b);
+    }
+
+    /* The fresh document and the dateless one are still there, and a
+     * second sweep at the same instant finds nothing left to do. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "events", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        int f = 0;
+        CHECK_I64(response_num(&res, "n", &f), 2);
+        dbuf_free(&res); bj_builder_free(rb);
+
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"op", 2);
+        bj_put_string(b, (const uint8_t *)"pruneExpired", 12);
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)"events", 6);
+        bj_put_key(b, (const uint8_t *)"now", 3);
+        bj_put_int(b, NOW);
+        bj_end_object(b);
+        size_t rl = 0; const uint8_t *r2 = bj_builder_data(b, &rl);
+        dbuf again = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, r2, (uint32_t)rl, &again));
+        CHECK_I64(response_num(&again, "deletedCount", &f), 0);
+        dbuf_free(&again); bj_builder_free(b);
+    }
+
+    /* A sweep with no clock reading is refused rather than dated from
+     * thin air -- the same rule $currentDate answers to. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("pruneExpired", "events", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_REQ_MISSING_FIELD);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(find_by_index_says_which_of_the_three_ways_it_was_asked_wrong) {
     /*
      * findByIndex names its index instead of describing what it wants,
@@ -8026,6 +8196,7 @@ int main(void) {
     RUN(explain_names_the_plan_the_same_way_for_every_host);
     RUN(find_one_and_modify_answers_with_the_document_not_a_count);
     RUN(find_by_index_says_which_of_the_three_ways_it_was_asked_wrong);
+    RUN(prune_expired_sweeps_what_a_ttl_index_says_is_over);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

@@ -79,6 +79,12 @@ typedef enum {
  *                  unique, sparse,
  *                  partialFilterExpression?, expireAfterSeconds? } ] }
  *
+ * `kind` is a STRING here ("equality" / "text" / "geo") and an INT in
+ * dc_catalog_open_plan's output, which is a different document for a
+ * different reader. Read a stored entry with the plan's convention and
+ * you get BJ_ERR_UNKNOWN_TYPE, which is how this note came to be
+ * written.
+ *
  * `files` is in ATTACH order, which for a text index is exactly the order
  * dc_collection_attach_text_index takes its three trees. That ordering is
  * the plan's job: a host that had to know it would be reimplementing part

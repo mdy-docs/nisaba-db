@@ -57,9 +57,10 @@
  * operations with even if it wanted to. So the list goes over whole and
  * the answer says how many members were attempted and which failed.
  *
- * WHAT IS NOT HERE. The wire has twenty-eight ops (WIRE_OPS below) and
- * this client has exactly those. Change streams and pruneExpired are
- * not on the wire yet; asking for one gets a sentence saying so rather
+ * WHAT IS NOT HERE. The wire has twenty-nine ops (WIRE_OPS below) and
+ * this client has exactly those. Change streams are not on it -- they
+ * need frames a client did not ask for, and this protocol has no shape
+ * for those -- so asking for watch() gets a sentence saying so rather
  * than a TypeError about undefined not being a function. Adding a method here without adding the op to db_request.c
  * would be inventing a second opinion about what the server does.
  */
@@ -79,7 +80,7 @@ export const WIRE_OPS = [
   'insert', 'insertMany', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
   'findOneAndUpdate', 'findOneAndReplace', 'findOneAndDelete',
   'bulkWrite',
-  'findByIndex', 'getMore', 'closeCursor', 'compact',
+  'findByIndex', 'pruneExpired', 'getMore', 'closeCursor', 'compact',
   'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
   'listCollections'
 ];
@@ -644,6 +645,15 @@ function collection(conn, name) {
      * this side's -- it is the thing holding the indexes. */
     async findByIndex(name, values) {
       return (await call({ op: 'findByIndex', index: name, values })).docs || [];
+    },
+
+    /* Delete every document past a TTL index's cutoff. Expiry is a
+     * sweep somebody asks for, not a background thread: the engine runs
+     * no timers, so WHEN to prune stays with whoever is driving -- and
+     * the clock reading travels with the request, as it does for
+     * $currentDate and for every _id this client mints. */
+    async pruneExpired() {
+      return (await call({ op: 'pruneExpired', now: Date.now() })).deletedCount;
     },
 
     async listIndexes() {

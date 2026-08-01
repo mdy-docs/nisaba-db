@@ -84,8 +84,8 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Twenty-eight
-operations — nineteen about a collection's documents, five about its
+**One request object in, one response object out.** Twenty-nine
+operations — twenty about a collection's documents, five about its
 schema, two about a cursor, and two about neither: `listCollections` and
 `ping`.
 
@@ -101,6 +101,7 @@ schema, two about a cursor, and two about neither: `listCollections` and
 | `{op:'distinct', coll, field, filter}` | `{ok:true, values:[...]}` |
 | `{op:'aggregate', coll, stages:[...]}` | `{ok:true, docs:[...]}` |
 | `{op:'findByIndex', coll, index, values:[...]}` | `{ok:true, docs:[...]}` |
+| `{op:'pruneExpired', coll, now}` | `{ok:true, deletedCount}` |
 | `{op:'explain', coll, filter}` | `{ok:true, plan:{source, index}}` |
 | `{op:'insert', coll, doc, id}` | `{ok:true, result}` |
 | `{op:'insertMany', coll, docs:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
@@ -238,6 +239,16 @@ whichever document the scan reaches first. The in-process API has no
 `sort` either, and a wire that sorted while the local API did not would
 be a worse divergence than the shared gap; adding it means teaching the
 planner to order matches before picking one, which is not plumbing.
+
+**`pruneExpired` is a sweep somebody asks for, not a background
+thread.** The engine runs no timers, so *when* to expire stays with
+whoever is driving — and `now` travels with the request, for the third
+time and the same reason as `_id` and `$currentDate`. Which indexes
+expire what, and the cutoff arithmetic, are `db_ttl.h`'s and the
+session's; the deleting goes through the same plan/apply path as any
+other write, so a swept document is one a log could have carried. A
+collection with no TTL index is owed nothing, which is `0` rather than a
+refusal.
 
 **`findByIndex` names its index instead of describing what it wants** —
 an O(log n + k) range scan of that index with no planner in the way,
@@ -421,10 +432,10 @@ Stated here rather than discovered later.
   name. There is no scheduler either: the engine runs no timers, so
   *when* to compact stays with whoever is driving
   (`docs/compaction.md`).
-- **No change streams, no `pruneExpired`.** Each is an op in
-  `wasm/src/db_request.c` plus a method in the client — except `watch`,
-  which also needs frames the client did not ask for, and this protocol
-  has no shape for those. `dump` and `restore` both work today.
+- **No change streams.** `watch` is the one method left that cannot be
+  an op: it needs frames the client did not ask for, and this protocol
+  has no shape for those. Everything else the in-process `Collection`
+  has is here.
 - **No TLS, no auth, no tenants.** Loopback only. Those belong to the
   gateway in front, not to the database
   (`docs/replicaton-roadmap.md` step 4 records that boundary).

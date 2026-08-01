@@ -478,9 +478,34 @@ for (const engine of ENGINES) {
       await expect(c.findByIndex('team_1', ['core', 'extra'])).rejects.toMatchObject({ code: -59 });
     });
 
+    it('sweeps what a TTL index says is over, on this side clock', async () => {
+      const c = db.collection('events');
+      const now = Date.now();
+      await c.insertMany([
+        { tag: 'ancient', at: new Date(now - 7200e3) },
+        { tag: 'old', at: new Date(now - 3700e3) },
+        { tag: 'fresh', at: new Date(now - 60e3) },
+        { tag: 'nodate' }                       // sparse tolerates it
+      ]);
+      // No TTL index: a sweep is owed nothing, which is zero rather than
+      // a refusal.
+      expect(await c.pruneExpired()).toBe(0);
+
+      await c.createIndex({ at: 1 }, { expireAfterSeconds: 3600, sparse: true });
+      expect(await c.pruneExpired()).toBe(2);
+      expect((await c.find({}).toArray()).map(d => d.tag).sort()).toEqual(['fresh', 'nodate']);
+      // Idempotent at the same instant: nothing else has expired yet.
+      expect(await c.pruneExpired()).toBe(0);
+
+      // The clock travels with the request, as it does for $currentDate:
+      // asking without one is refused rather than dated from thin air.
+      await expect(db.request({ op: 'pruneExpired', coll: 'events' }))
+        .rejects.toMatchObject({ code: -42 });
+    });
+
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
       expect(() => db.storageEstimate()).toThrow(/no db\.storageEstimate/);
-      expect(() => db.collection('users').pruneExpired()).toThrow(/no collection\.pruneExpired/);
+      expect(() => db.collection('users').watch()).toThrow(/no collection\.watch/);
       // The sentence names the ops that DO exist, so the refusal is
       // actionable without reading the source.
       expect(() => db.collection('users').watch()).toThrow(WIRE_OPS.join(', '));
@@ -561,12 +586,12 @@ for (const engine of ENGINES) {
     });
 
     it('refuses, from the CLI, what only a local database can do', () => {
-      // prune-expired, not `find-by-index`: index lookups are on the
-      // wire now, and a command that IS available is no test of a
-      // refusal.
-      const pruned = cli('prune-expired', 'users');
-      expect(pruned.status).toBe(1);
-      expect(pruned.stderr).toMatch(/no collection\.pruneExpired/);
+      // `watch`, not `prune-expired`: TTL sweeps are on the wire now.
+      // What is left is the one command that cannot be an op at all --
+      // it needs frames the client did not ask for.
+      const watched = cli('watch', 'users');
+      expect(watched.status).toBe(1);
+      expect(watched.stderr).toMatch(/no collection\.watch/);
 
       // --order is the server's, decided when it opened the directory.
       const ordered = cli('count', 'users', '--order', '64');

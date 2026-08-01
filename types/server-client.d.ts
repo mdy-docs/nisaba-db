@@ -3,9 +3,9 @@
  * for the database server (server/main.c), over a TCP socket.
  *
  * Deliberately NOT the full Collection type from ./nisaba.js: the wire
- * carries ten operations and this carries the same ten. A method the
- * server has no op for throws a sentence saying so, and giving it a type
- * here would promise otherwise.
+ * carries a fixed set of operations and this carries the same set. A
+ * method the server has no op for throws a sentence saying so, and giving
+ * it a type here would promise otherwise.
  */
 import type { Document, Filter, Update, ObjectId } from './nisaba.js';
 
@@ -14,9 +14,12 @@ export { encode, decode, ObjectId, Pointer } from './nisaba.js';
 /** The op names the wire carries; wasm/src/db_request.c owns the list. */
 export const WIRE_OPS: readonly string[];
 
-/** A refusal from the server: `code` is the DC_ERR_* it answered with. */
+/** A refusal from the server: `code` is the DC_ERR_* it answered with.
+ * `index` is present only when the refusal names a position in a list of
+ * operations (a malformed bulkWrite). */
 export class ServerError extends Error {
   readonly code: number;
+  readonly index?: number;
 }
 
 export function parseAddress(address: string | { host?: string; port: number }):
@@ -55,6 +58,23 @@ export interface RemoteCursor<T = Document> {
   [Symbol.asyncIterator](): AsyncIterableIterator<T>;
 }
 
+export interface RemoteInsertManyResult {
+  acknowledged: boolean;
+  insertedCount: number;
+  insertedIds: Record<number, ObjectId>;
+}
+
+export interface RemoteBulkWriteResult {
+  acknowledged: boolean;
+  insertedCount: number;
+  matchedCount: number;
+  modifiedCount: number;
+  deletedCount: number;
+  upsertedCount: number;
+  insertedIds: Record<number, ObjectId>;
+  upsertedIds: Record<number, ObjectId>;
+}
+
 export interface RemoteCollection<T extends Document = Document> {
   readonly collectionName: string;
   find(filter?: Filter, options?: RemoteFindOptions): RemoteCursor<T>;
@@ -63,6 +83,16 @@ export interface RemoteCollection<T extends Document = Document> {
   distinct(field: string, filter?: Filter): Promise<unknown[]>;
   /** The `_id` is minted client-side (C will not invent one: it needs a clock). */
   insertOne(doc: T): Promise<RemoteWriteResult & { insertedId: ObjectId }>;
+  /** Every document in one round trip; ids minted client-side as above.
+   * `ordered` (default true) stops at the first failing document. A
+   * failure rejects with the ServerError for that document, carrying what
+   * did land as `err.result`. */
+  insertMany(docs: T[], options?: { ordered?: boolean }): Promise<RemoteInsertManyResult>;
+  /** A list of writes in one round trip. The grammar is the server's
+   * (db_bulk.h): a malformed operation rejects the whole list with a
+   * ServerError whose `index` names it, before any of it runs. A failure
+   * while running rejects with `err.result` and `err.writeErrors`. */
+  bulkWrite(operations: Document[], options?: { ordered?: boolean }): Promise<RemoteBulkWriteResult>;
   deleteOne(filter?: Filter): Promise<RemoteWriteResult>;
   deleteMany(filter?: Filter): Promise<RemoteWriteResult>;
   replaceOne(filter: Filter, doc: T, options?: { upsert?: boolean }): Promise<RemoteWriteResult>;

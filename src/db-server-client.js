@@ -50,13 +50,19 @@
  * can use -- close() gives it back, draining gives it back, and losing
  * the connection gives it back.
  *
- * WHAT IS NOT HERE. The wire has twenty ops (WIRE_OPS below) and this
- * client has exactly those. Indexes, compaction, change streams, listing
- * collections and the find-one-and-* family are not on the wire yet;
- * asking for one gets a sentence saying so rather than a TypeError about
- * undefined not being a function. Adding a method here without adding the
- * op to db_request.c would be inventing a second opinion about what the
- * server does.
+ * A LIST OF WRITES IS ONE ROUND TRIP, AND THE LOOP IS THE SERVER'S.
+ * insertMany and bulkWrite are looped in JavaScript when the engine is in
+ * the same process (db_bulk.h says why); over a socket that same loop is
+ * N round trips, and this side has no dc_bulk_parse to check a list of
+ * operations with even if it wanted to. So the list goes over whole and
+ * the answer says how many members were attempted and which failed.
+ *
+ * WHAT IS NOT HERE. The wire has twenty-two ops (WIRE_OPS below) and this
+ * client has exactly those. Change streams, aggregate and the
+ * find-one-and-* family are not on the wire yet; asking for one gets a
+ * sentence saying so rather than a TypeError about undefined not being a
+ * function. Adding a method here without adding the op to db_request.c
+ * would be inventing a second opinion about what the server does.
  */
 import net from 'node:net';
 import { encode, decode, ObjectId, Pointer } from '../third_party/binjson/js/binjson.js';
@@ -71,7 +77,8 @@ export { encode, decode, ObjectId, Pointer };
 export const WIRE_OPS = [
   'ping',
   'find', 'findOne', 'count', 'distinct',
-  'insert', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
+  'insert', 'insertMany', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
+  'bulkWrite',
   'getMore', 'closeCursor', 'compact',
   'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
   'listCollections'
@@ -204,7 +211,14 @@ class Connection {
     if (!res || typeof res !== 'object') {
       throw new Error('the server sent something that is not a response object');
     }
-    if (res.ok === false) throw new ServerError(res.code, res.msg || `error ${res.code}`);
+    if (res.ok === false) {
+      /* A refusal that names a POSITION is one about a list of
+       * operations (bulkWrite): which one of them was malformed. */
+      const at = typeof res.index === 'number' ? ` (operation ${res.index})` : '';
+      const err = new ServerError(res.code, (res.msg || `error ${res.code}`) + at);
+      if (typeof res.index === 'number') err.index = res.index;
+      throw err;
+    }
     return res;
   }
 
@@ -376,6 +390,112 @@ function collection(conn, name) {
       const _id = doc?._id ?? new ObjectId();
       const res = await call({ op: 'insert', doc: { _id, ...doc }, id: _id });
       return { ...res.result, insertedId: _id };
+    },
+
+    /*
+     * Every document in one frame, and the loop that inserts them is the
+     * server's. `ordered` (default true) stops at the first failing
+     * document; false attempts every one regardless.
+     *
+     * The contract is the in-process one: throw at the first failed
+     * document, carrying what DID land as `err.result`. The server says
+     * how many documents it attempted -- with ordered:true "never tried"
+     * and "tried and succeeded" are different answers -- and which of
+     * them failed. The ids are already known here, because this side
+     * minted them.
+     */
+    async insertMany(docs, { ordered = true } = {}) {
+      if (!Array.isArray(docs) || docs.length === 0) {
+        throw new Error('insertMany requires a non-empty array of documents');
+      }
+      const ids = docs.map((doc) => doc?._id ?? new ObjectId());
+      const res = await call({
+        op: 'insertMany',
+        docs: docs.map((doc, i) => ({ _id: ids[i], ...doc })),
+        ordered
+      });
+      const failed = new Map((res.errors || []).map((w) => [w.index, w]));
+      const insertedIds = {};
+      let insertedCount = 0;
+      for (let i = 0; i < res.attempted; i++) {
+        const bad = failed.get(i);
+        if (!bad) {
+          insertedIds[i] = ids[i];
+          insertedCount++;
+          continue;
+        }
+        const err = new ServerError(bad.code, `${bad.msg} (insertMany, document ${i})`);
+        err.result = { acknowledged: true, insertedCount, insertedIds };
+        throw err;
+      }
+      return { acknowledged: true, insertedCount, insertedIds };
+    },
+
+    /*
+     * A list of writes of six kinds, in one frame. The GRAMMAR -- which
+     * operation names exist and which fields each needs -- is C's
+     * (db_bulk.h), checked over the whole list before any of it runs, so
+     * nothing here validates it: a client that had its own opinion about
+     * what a bulkWrite may contain would be a second one.
+     *
+     * What this side does own is the ids, as everywhere else: an
+     * insertOne's document gets one, and so does any operation that might
+     * upsert.
+     */
+    async bulkWrite(operations, { ordered = true } = {}) {
+      if (!Array.isArray(operations) || operations.length === 0) {
+        throw new Error('bulkWrite requires a non-empty array of operations');
+      }
+      const ids = [];
+      const writes = operations.map((op) => {
+        const [name, spec] = Object.entries(op ?? {})[0] ?? [];
+        if (!name || spec === null || typeof spec !== 'object') {
+          ids.push(null);
+          return op;              // malformed: the server says so, not us
+        }
+        if (name === 'insertOne') {
+          const _id = spec.document?._id ?? new ObjectId();
+          ids.push(_id);
+          return { insertOne: { ...spec, document: { _id, ...spec.document } } };
+        }
+        if (spec.upsert) {
+          const id = new ObjectId();
+          ids.push(id);
+          return { [name]: { ...spec, id } };
+        }
+        ids.push(null);
+        return op;
+      });
+
+      const res = await call({ op: 'bulkWrite', writes, ordered });
+      const result = {
+        acknowledged: true,
+        insertedCount: res.result.insertedCount,
+        matchedCount: res.result.matchedCount,
+        modifiedCount: res.result.modifiedCount,
+        deletedCount: res.result.deletedCount,
+        upsertedCount: res.result.upsertedCount,
+        insertedIds: {},
+        upsertedIds: {}
+      };
+      const errors = res.errors || [];
+      const failed = new Set(errors.map((w) => w.index));
+      for (let i = 0; i < res.attempted; i++) {
+        if (failed.has(i) || ids[i] === null) continue;
+        if (Object.keys(operations[i])[0] === 'insertOne') result.insertedIds[i] = ids[i];
+      }
+      /* An upserted id is the SERVER's answer, not this side's guess: an
+       * upsert whose filter named an _id uses that one. */
+      for (const u of res.upserted || []) result.upsertedIds[u.index] = u.id;
+
+      if (errors.length) {
+        const err = new Error(`bulkWrite: ${errors.length} operation(s) failed ` +
+          `(first at index ${errors[0].index}: ${errors[0].msg})`);
+        err.result = result;
+        err.writeErrors = errors.map((w) => ({ index: w.index, error: new ServerError(w.code, w.msg) }));
+        throw err;
+      }
+      return result;
     },
 
     async deleteOne(filter = {}) {

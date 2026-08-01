@@ -84,9 +84,10 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Twenty operations —
-eleven about a collection's documents, five about its schema, two about a
-cursor, and three about neither: `listCollections`, and `ping`.
+**One request object in, one response object out.** Twenty-two
+operations — thirteen about a collection's documents, five about its
+schema, two about a cursor, and two about neither: `listCollections` and
+`ping`.
 
 | Request | Response |
 | --- | --- |
@@ -99,6 +100,8 @@ cursor, and three about neither: `listCollections`, and `ping`.
 | `{op:'count', coll, filter}` | `{ok:true, n}` |
 | `{op:'distinct', coll, field, filter}` | `{ok:true, values:[...]}` |
 | `{op:'insert', coll, doc, id}` | `{ok:true, result}` |
+| `{op:'insertMany', coll, docs:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
+| `{op:'bulkWrite', coll, writes:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
 | `{op:'update'\|'updateMany', coll, filter, update, upsert, id}` | `{ok:true, result}` |
 | `{op:'replace', coll, filter, doc, upsert, id}` | `{ok:true, result}` |
 | `{op:'delete'\|'deleteMany', coll, filter}` | `{ok:true, result}` |
@@ -110,7 +113,56 @@ cursor, and three about neither: `listCollections`, and `ping`.
 | `{op:'compact', coll}` | `{ok:true, result:{generation, bytesBefore, bytesAfter, bytesFreed}}` |
 
 `result` is `{acknowledged, matchedCount, modifiedCount, deletedCount,
-insertedCount, upsertedId}`.
+insertedCount, upsertedId}` for a single write, and
+`{acknowledged, insertedCount, matchedCount, modifiedCount, deletedCount,
+upsertedCount}` for a list of them. An upsert is counted once, as an
+upsert: it is *applied* as an insert, and only the plan still knows which
+it was.
+
+**A list of writes is one round trip, and one loop — the server's.**
+`insertMany` and `bulkWrite` are not the same operation. One list holds
+documents and goes through a single `DC_WREQ_INSERT_MANY` plan; the other
+holds writes of six different kinds, each planned and applied on its own.
+What they share is how they can go wrong, so they answer in the same
+shape:
+
+```js
+{ ok: true,
+  result:    { acknowledged, insertedCount, matchedCount, modifiedCount,
+               deletedCount, upsertedCount },
+  attempted: 2,                                  // how many of the list ran
+  upserted:  [ {index, id} ] | null,
+  errors:    [ {index, code, msg} ] | null }
+```
+
+**A failed member is a result, not a refusal**, which is what makes
+`ordered` mean anything: `false` attempts every member regardless of
+earlier failures, `true` stops at the first. `attempted` is the one fact
+a client cannot derive — with `ordered:true` "never tried" and "tried and
+succeeded" are different answers — and everything attempted but not named
+in `errors` succeeded. Inserted ids are absent and upserted ids are
+present because an insert's id was chosen by whoever asked, while an
+upsert's was resolved here.
+
+In a host that shares a process with the engine, that loop is JavaScript's
+(`wasm/include/db_bulk.h` says why, and it stays true there). Over a
+socket the same loop would be N round trips — and a client with no engine
+in it has no `dc_bulk_parse` to check a list of operations with. So the
+list goes over whole and C runs it.
+
+**The grammar is checked before any of the list runs.** Which operation
+names exist and which fields each one needs is `dc_bulk_parse`'s
+(`db_bulk.h`), and so is the wire's own rule that a write which might
+need an `_id` was given one. A malformed list is refused entirely, with
+`index` naming the operation that was wrong — the one refusal that names
+a position, because a list of operations has positions. That ordering is
+not tidiness: an unordered run is supposed to attempt every operation,
+which it cannot do if operation seven is malformed in a way that only
+surfaces once one through six have already landed.
+
+A `bulkWrite` that inserts makes a missing collection, exactly as an
+`insert` does; a `bulkWrite` of nothing but deletes and updates does not,
+exactly as a `find` does not.
 
 **Cursors page a scan, not a result.** `batchSize` on a find opens a
 cursor: one batch comes back with an id, `getMore` asks for the next, and
@@ -140,8 +192,7 @@ collection into fresh files and deletes the old ones. That is refused
 while any cursor is open over a tree it would rebuild
 (`DC_ERR_CURSORS_OPEN`, -49, before anything is written) — enforced in
 `dc_compact_execute` rather than left to callers, because a cursor can
-now outlive the request that made it. Compaction is not on the wire yet;
-when it arrives, it arrives with that guard already underneath it.
+now outlive the request that made it.
 
 **A sorted find cannot be batched** (`-48`). An arbitrary sort needs
 every match before the first ordered result exists — the reason
@@ -280,11 +331,16 @@ Stated here rather than discovered later.
   second, weaker thing wearing the same name. Compact a collection at a
   time.
 - **No change streams, no `aggregate`, no `find-one-and-*` family, no
-  `insertMany`/`bulkWrite`, no `findByIndex`/`pruneExpired`.** Each is an
-  op in `wasm/src/db_request.c` plus a method in the client — except
-  `watch`, which also needs frames the client did not ask for, and this
-  protocol has no shape for those. `restore` waits on `insertMany`;
-  `dump` works today.
+  `findByIndex`/`pruneExpired`.** Each is an op in
+  `wasm/src/db_request.c` plus a method in the client — except `watch`,
+  which also needs frames the client did not ask for, and this protocol
+  has no shape for those. `dump` and `restore` both work today.
+- **No `$currentDate` in an update over the wire.** The planner reads no
+  clock and has none to read (`db_wal.h`), so a host resolves
+  `$currentDate` into a concrete date before proposing — and this server,
+  which is the host, does not. Such an update is refused rather than
+  silently given a time, but with `-2` ("builder state error"), which
+  says nothing useful; it wants its own code and sentence.
 - **Compaction is per collection, and per request.** No `compact()`
   across a whole database (that needs collection listing), and no
   scheduler: the engine runs no timers, so *when* to compact stays with

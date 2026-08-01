@@ -287,6 +287,16 @@ void dbs_close(dbs *s);
  *   { op: "insert", coll: "users", doc: {...}, id: <12 bytes> }
  *      -> { ok: true, result: { acknowledged: true, insertedId: ... } }
  *
+ * A LIST OF WRITES ANSWERS IN ONE SHAPE. insertMany (`docs`) and
+ * bulkWrite (`writes`) are different operations -- one list holds
+ * documents, the other holds writes of six kinds -- but they fail the
+ * same way, so both answer { ok, result, attempted, upserted, errors }.
+ * A failed member is a RESULT, not a refusal, which is what makes
+ * `ordered` mean anything; `attempted` says how much of the list ran,
+ * because "never tried" and "tried and succeeded" are different answers
+ * and nothing else in the response tells them apart. A malformed list is
+ * refused whole, with `index` naming the operation that was wrong.
+ *
  * A REFUSAL IS A RESPONSE. Anything the request itself gets wrong -- an
  * unknown op, a missing field, no such collection, a duplicate key --
  * comes back as { ok: false, code: <DC_ERR_*>, msg: <dc_strerror text> }

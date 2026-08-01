@@ -372,12 +372,46 @@ for (const engine of ENGINES) {
       expect(cli('count', 'users').stdout.trim()).toBe('4');
     });
 
+    it('restores a dump into the server, which insertMany unblocked', () => {
+      // dump out, restore back into a collection of another name: the
+      // round trip the CLI could not complete until a list of documents
+      // was one request.
+      const n = Number(cli('count', 'users').stdout.trim());
+      const dumped = cli('dump', 'users');
+      expect(dumped.status).toBe(0);
+      const renamed = dumped.stdout
+        .split('\n').filter(Boolean)
+        .map((l) => JSON.stringify({ ...JSON.parse(l), collection: 'copied' }))
+        .join('\n');
+
+      const restored = spawnSync(process.execPath, [
+        'bin/db.js', '--server', `127.0.0.1:${port}`, 'restore'
+      ], { encoding: 'utf8', input: renamed });
+      expect(restored.status).toBe(0);
+      expect(restored.stdout).toMatch(
+        new RegExp(`Restored ${n} document\\(s\\) across 1 collection\\(s\\)\\.`));
+      expect(cli('count', 'copied').stdout.trim()).toBe(String(n));
+
+      // insert-many is over the same wire, and a list is one frame.
+      const many = cli('insert-many', 'copied', '[{"name":"Ada2"},{"name":"Grace2"}]');
+      expect(many.status).toBe(0);
+      expect(many.stdout).toMatch(/Inserted 2 document\(s\)\./);
+      expect(cli('count', 'copied').stdout.trim()).toBe(String(n + 2));
+
+      // And a bulk-write, whose grammar is refused by the server rather
+      // than by anything in this process.
+      const bulk = cli('bulk-write', 'copied', '[{"deleteOne":{"filter":{"name":"Ada2"}}}]');
+      expect(bulk.status).toBe(0);
+      expect(cli('count', 'copied').stdout.trim()).toBe(String(n + 1));
+    });
+
     it('refuses, from the CLI, what only a local database can do', () => {
-      // insert-many, not `collections`: listing is on the wire now, and
-      // a command that IS available is no test of a refusal.
-      const many = cli('insert-many', 'users', '[{"name":"Ada"}]');
-      expect(many.status).toBe(1);
-      expect(many.stderr).toMatch(/no collection\.insertMany/);
+      // find-by-index, not `insert-many`: lists of writes are on the
+      // wire now, and a command that IS available is no test of a
+      // refusal.
+      const byIndex = cli('find-by-index', 'users', 'team_1', '["core"]');
+      expect(byIndex.status).toBe(1);
+      expect(byIndex.stderr).toMatch(/no collection\.findByIndex/);
 
       // --order is the server's, decided when it opened the directory.
       const ordered = cli('count', 'users', '--order', '64');
@@ -825,6 +859,171 @@ for (const engine of ENGINES) {
       const c = db.collection('users').find({}, { batchSize: 1 });
       expect(await c.nextBatch()).toHaveLength(1);
       await c.close();
+    });
+  });
+
+  /*
+   * Lists of writes. insertMany and bulkWrite are different operations --
+   * one list holds documents, the other holds writes of six kinds -- but
+   * they are one round trip each and they fail the same way, which is
+   * the part a socket makes matter. The engine-side rules are pinned in
+   * test/native/main.c; what is checked here is that a client with no
+   * engine in it reconstructs the same results and the same throws the
+   * in-process driver produces.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: lists of writes (${engine.name})`, () => {
+    let proc, db, dir;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      ({ proc, dir } = await startServer(engine, port));
+      db = await connectServer(port);
+      return async () => { await db.close(); proc.kill(); };
+    });
+
+    it('inserts a whole array in one round trip, ids and all', async () => {
+      const c = db.collection('teams');   // nobody made this: an insert does
+      const { acknowledged, insertedCount, insertedIds } =
+        await c.insertMany([{ n: 1 }, { n: 2 }, { n: 3 }]);
+      expect(acknowledged).toBe(true);
+      expect(insertedCount).toBe(3);
+      expect(Object.keys(insertedIds)).toEqual(['0', '1', '2']);
+      expect(insertedIds[0]).toBeInstanceOf(ObjectId);
+
+      // The ids in the result are the ids in the database: this side
+      // minted them and the server wrote exactly those.
+      const found = await c.findOne({ _id: insertedIds[2] });
+      expect(found.n).toBe(3);
+      expect(await c.countDocuments({})).toBe(3);
+    });
+
+    it('stops where ordered says to, and reports what landed', async () => {
+      const c = db.collection('ordered');
+      const dupe = new ObjectId();
+
+      let err = null;
+      try { await c.insertMany([{ _id: dupe, i: 0 }, { _id: dupe, i: 1 }, { i: 2 }]); }
+      catch (e) { err = e; }
+      expect(err).toBeInstanceOf(ServerError);
+      expect(err.code).toBe(-10);                       // duplicate _id
+      expect(err.message).toMatch(/insertMany, document 1/);
+      // The partial result is the driver's contract: what DID land.
+      expect(err.result).toMatchObject({ acknowledged: true, insertedCount: 1 });
+      // And the third document was never attempted, because the first
+      // failure ended the run.
+      expect(await c.countDocuments({})).toBe(1);
+
+      // Unordered attempts every document; the throw still names the
+      // first failure, exactly as the in-process insertMany does.
+      const other = new ObjectId();
+      err = null;
+      try {
+        await c.insertMany([{ _id: other, i: 3 }, { _id: other, i: 4 }, { i: 5 }],
+                           { ordered: false });
+      } catch (e) { err = e; }
+      expect(err.code).toBe(-10);
+      expect(await c.countDocuments({})).toBe(3);       // 3 and 5 both landed
+    });
+
+    it('runs six kinds of write in one frame and sums what they did', async () => {
+      const c = db.collection('users');
+      const result = await c.bulkWrite([
+        { insertOne: { document: { name: 'Edsger', team: 'core' } } },
+        { updateOne: { filter: { name: 'Ada' }, update: { $set: { onCall: true } } } },
+        { updateMany: { filter: { team: 'core' }, update: { $set: { seen: 1 } } } },
+        { deleteOne: { filter: { name: 'Alan' } } },
+        { replaceOne: { filter: { name: 'Grace' }, replacement: { name: 'Grace', team: 'core' } } },
+        { updateOne: { filter: { name: 'Nobody' }, update: { $set: { team: 'new' } }, upsert: true } }
+      ]);
+
+      expect(result.insertedCount).toBe(1);
+      expect(result.deletedCount).toBe(1);
+      expect(result.upsertedCount).toBe(1);
+      expect(result.matchedCount).toBeGreaterThanOrEqual(4);
+      expect(result.insertedIds[0]).toBeInstanceOf(ObjectId);
+      // The upserted id is the SERVER's answer, not a guess from here.
+      expect(result.upsertedIds[5]).toBeInstanceOf(ObjectId);
+      expect(result.insertedIds[5]).toBeUndefined();     // upserted, not inserted
+
+      expect((await c.findOne({ name: 'Ada' })).onCall).toBe(true);
+      expect(await c.findOne({ name: 'Alan' })).toBe(null);
+      expect((await c.findOne({ _id: result.upsertedIds[5] })).team).toBe('new');
+    });
+
+    it('refuses a malformed list whole, naming the operation that was wrong', async () => {
+      const c = db.collection('users');
+      const before = await c.countDocuments({});
+
+      let err = null;
+      try {
+        await c.bulkWrite([
+          { insertOne: { document: { name: 'Never' } } },
+          { obliterateOne: { filter: {} } }
+        ]);
+      } catch (e) { err = e; }
+      expect(err).toBeInstanceOf(ServerError);
+      expect(err.code).toBe(-21);
+      expect(err.index).toBe(1);
+      expect(err.message).toMatch(/\(operation 1\)/);
+
+      // Nothing ran. That is the whole reason the grammar is checked
+      // before the list is: an unordered run must be able to attempt
+      // every operation.
+      expect(await c.countDocuments({})).toBe(before);
+      expect(await c.findOne({ name: 'Never' })).toBe(null);
+    });
+
+    it('carries a partial failure the way the in-process bulkWrite does', async () => {
+      const c = db.collection('partial');
+      const dupe = new ObjectId();
+      await c.insertOne({ _id: dupe, keep: true });
+
+      let err = null;
+      try {
+        await c.bulkWrite([
+          { insertOne: { document: { _id: dupe, i: 1 } } },
+          { insertOne: { document: { i: 2 } } }
+        ], { ordered: false });
+      } catch (e) { err = e; }
+
+      expect(err.message).toMatch(/bulkWrite: 1 operation\(s\) failed \(first at index 0/);
+      expect(err.writeErrors).toHaveLength(1);
+      expect(err.writeErrors[0].index).toBe(0);
+      expect(err.writeErrors[0].error).toBeInstanceOf(ServerError);
+      expect(err.result.insertedCount).toBe(1);         // the second one landed
+      expect(err.result.insertedIds[1]).toBeInstanceOf(ObjectId);
+      expect(await c.countDocuments({})).toBe(2);
+
+      // Ordered, the same list stops at the failure -- and the insert
+      // that never ran is not in insertedIds. This is what `attempted`
+      // is for: without it a client would report an id for an operation
+      // the server never reached.
+      err = null;
+      try {
+        await c.bulkWrite([
+          { insertOne: { document: { _id: dupe, i: 3 } } },
+          { insertOne: { document: { i: 4 } } }
+        ]);
+      } catch (e) { err = e; }
+      expect(err.writeErrors).toHaveLength(1);
+      expect(err.result.insertedCount).toBe(0);
+      expect(err.result.insertedIds).toEqual({});
+      expect(await c.countDocuments({})).toBe(2);
+    });
+
+    it('leaves a database the JS implementation reads the same way', async () => {
+      await db.close();
+      proc.kill();
+      await new Promise(r => proc.once('exit', r));
+
+      const provider = new NodeFSStorageProvider(dir);
+      const jsDb = await connect(provider);
+      expect(await (await jsDb.collection('teams')).countDocuments({})).toBe(3);
+      expect(await (await jsDb.collection('ordered')).countDocuments({})).toBe(3);
+      const users = await jsDb.collection('users');
+      expect((await users.findOne({ name: 'Edsger' })).team).toBe('core');
+      await jsDb.close();
+      await provider.close();
     });
   });
 }

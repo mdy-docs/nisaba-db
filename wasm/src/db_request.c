@@ -21,6 +21,7 @@
 #include "db_wal.h"
 #include "db_query.h"
 #include "db_validate.h"
+#include "db_bulk.h"
 #include "bjcursor.h"
 #include "binjson.h"
 
@@ -52,7 +53,9 @@ typedef enum {
     OP_CREATE_INDEX,
     OP_DROP_INDEX,
     OP_LIST_INDEXES,
-    OP_LIST_COLLECTIONS
+    OP_LIST_COLLECTIONS,
+    OP_INSERT_MANY,
+    OP_BULK_WRITE
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -82,6 +85,8 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("dropIndex",        OP_DROP_INDEX),
     OP("listIndexes",      OP_LIST_INDEXES),
     OP("listCollections",  OP_LIST_COLLECTIONS),
+    OP("insertMany",       OP_INSERT_MANY),
+    OP("bulkWrite",        OP_BULK_WRITE),
 };
 
 #undef OP
@@ -117,9 +122,13 @@ static int field_int(const uint8_t *o, size_t olen, const char *key,
     return BJ_OK;
 }
 
-static int field_flag(const uint8_t *o, size_t olen, const char *key, int *out) {
+/* `dflt` is what absent means, and it is not always false: `upsert` is off
+ * unless asked for, `ordered` is on unless turned off -- the same defaults
+ * the driver methods have, so a client that omits a field gets what
+ * omitting it means everywhere else. */
+static int field_flag(const uint8_t *o, size_t olen, const char *key, int dflt, int *out) {
     const uint8_t *v; size_t vlen; int found = 0;
-    *out = 0;
+    *out = dflt;
     int e = field_raw(o, olen, key, &v, &vlen, &found);
     if (e || !found) return e;
     cur c = { v, vlen, 0 };
@@ -196,6 +205,27 @@ static int respond_error(dbuf *out, int code) {
     return e;
 }
 
+/* The same refusal, naming a POSITION in a list of operations: which one
+ * of a bulkWrite's writes was malformed. The extra field is additive --
+ * a client reading {ok:false, code, msg} reads this one unchanged -- and
+ * it exists because "operation 7 has no filter" is the whole content of
+ * the answer, and a client cannot work out which 7 was from the code. */
+static int respond_error_at(dbuf *out, int code, int index) {
+    if (index < 0) return respond_error(out, code);
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    const char *msg = dc_strerror(code);
+    bj_begin_object(b);
+    PUT_KEY(b, "ok");    bj_put_bool(b, 0);
+    PUT_KEY(b, "code");  bj_put_int(b, code);
+    PUT_KEY(b, "msg");   bj_put_string(b, (const uint8_t *)msg, (uint32_t)strlen(msg));
+    PUT_KEY(b, "index"); bj_put_int(b, index);
+    bj_end_object(b);
+    int e = finish(b, out);
+    bj_builder_free(b);
+    return e;
+}
+
 int dbs_refusal(int code, dbuf *out) {
     if (!out) return BJ_ERR_STATE;
     return respond_error(out, code);
@@ -227,19 +257,31 @@ static void accumulate(const uint8_t *res, size_t res_len,
     }
 }
 
-/* Plan a write, apply every command it produced, and answer with one
- * result. Errors are the caller's to turn into a response. */
-static int do_write(dc_collection *c, const char *coll, uint32_t coll_len,
-                    int wreq, const uint8_t *a, uint32_t a_len,
-                    const uint8_t *b, uint32_t b_len,
-                    int upsert, const uint8_t id[12], dbuf *out) {
+/* What one write did, in the terms every result is built from. A list of
+ * writes adds its members into one of these, which is what makes
+ * bulkWrite's totals the sum of its parts rather than a second opinion
+ * about them. */
+typedef struct {
+    int64_t matched, modified, deleted, inserted, upserted;
+    int     has_upserted_id;
+    uint8_t upserted_id[12];
+} write_result;
+
+/* Plan a write and apply every command it produced, reporting what
+ * happened through *wr. Errors are the caller's to turn into a response:
+ * a refusal for a single write, one entry in `errors` inside a list. */
+static int run_write(dc_collection *c, const char *coll, uint32_t coll_len,
+                     int wreq, const uint8_t *a, uint32_t a_len,
+                     const uint8_t *b, uint32_t b_len,
+                     int upsert, const uint8_t id[12], write_result *wr) {
+    memset(wr, 0, sizeof *wr);
+
     dc_wal_plan *p = NULL;
     int e = dc_wal_plan_build(c, coll, coll_len, wreq, a, a_len, b, b_len,
                               upsert, id, &p);
     if (e) return e;
 
-    int64_t matched = 0, modified = 0, deleted = 0, inserted = 0;
-    const uint8_t *inserted_id = NULL;
+    int64_t inserted = 0;
     uint32_t n = dc_wal_plan_count(p);
     dbuf one = {0};
 
@@ -253,36 +295,376 @@ static int do_write(dc_collection *c, const char *coll, uint32_t coll_len,
          * it committed at, and dc_wal_apply stages it with the mutation. */
         e = dc_wal_apply(c, 0, cmd, clen, &one);
         if (e) goto done;
-        accumulate(one.data, one.len, &matched, &modified, &deleted);
+        accumulate(one.data, one.len, &wr->matched, &wr->modified, &wr->deleted);
         const uint8_t *v; size_t vlen; int found = 0;
         if (!obj_get_field(one.data, one.len, (const uint8_t *)"insertedId", 10,
                            &v, &vlen, &found) && found) {
             inserted++;
         }
     }
-    if (dc_wal_plan_outcome(p) == DC_PLAN_UPSERT) inserted_id = dc_wal_plan_target_id(p);
-
-    {
-        bj_builder *rb = bj_builder_new();
-        if (!rb) { e = BJ_ERR_OOM; goto done; }
-        bj_begin_object(rb);
-        PUT_KEY(rb, "acknowledged"); bj_put_bool(rb, 1);
-        PUT_KEY(rb, "matchedCount");  bj_put_int(rb, matched);
-        PUT_KEY(rb, "modifiedCount"); bj_put_int(rb, modified);
-        PUT_KEY(rb, "deletedCount");  bj_put_int(rb, deleted);
-        PUT_KEY(rb, "insertedCount"); bj_put_int(rb, inserted);
-        PUT_KEY(rb, "upsertedId");
-        if (inserted_id) bj_put_oid(rb, inserted_id); else bj_put_null(rb);
-        bj_end_object(rb);
-        size_t rlen = 0;
-        const uint8_t *rdata = bj_builder_data(rb, &rlen);
-        e = rdata ? dbuf_put(out, rdata, rlen) : BJ_ERR_OOM;
-        bj_builder_free(rb);
+    /* An upsert is APPLIED as an insert, so the apply result says
+     * "insertedId" -- but a driver counts it as an upsert and not as
+     * both, and the plan is the only thing that still knows which it
+     * was. */
+    if (dc_wal_plan_outcome(p) == DC_PLAN_UPSERT) {
+        const uint8_t *tid = dc_wal_plan_target_id(p);
+        wr->upserted = 1;
+        if (tid) { memcpy(wr->upserted_id, tid, 12); wr->has_upserted_id = 1; }
+    } else {
+        wr->inserted = inserted;
     }
 
 done:
     dbuf_free(&one);
     dc_wal_plan_free(p);
+    return e;
+}
+
+/* One write's result, in the shape a single-document driver method
+ * returns. */
+static int render_write(const write_result *wr, dbuf *out) {
+    bj_builder *rb = bj_builder_new();
+    if (!rb) return BJ_ERR_OOM;
+    bj_begin_object(rb);
+    PUT_KEY(rb, "acknowledged"); bj_put_bool(rb, 1);
+    PUT_KEY(rb, "matchedCount");  bj_put_int(rb, wr->matched);
+    PUT_KEY(rb, "modifiedCount"); bj_put_int(rb, wr->modified);
+    PUT_KEY(rb, "deletedCount");  bj_put_int(rb, wr->deleted);
+    PUT_KEY(rb, "insertedCount"); bj_put_int(rb, wr->inserted);
+    PUT_KEY(rb, "upsertedId");
+    if (wr->has_upserted_id) bj_put_oid(rb, wr->upserted_id); else bj_put_null(rb);
+    bj_end_object(rb);
+    size_t rlen = 0;
+    const uint8_t *rdata = bj_builder_data(rb, &rlen);
+    int e = rdata ? dbuf_put(out, rdata, rlen) : BJ_ERR_OOM;
+    bj_builder_free(rb);
+    return e;
+}
+
+static int do_write(dc_collection *c, const char *coll, uint32_t coll_len,
+                    int wreq, const uint8_t *a, uint32_t a_len,
+                    const uint8_t *b, uint32_t b_len,
+                    int upsert, const uint8_t id[12], dbuf *out) {
+    write_result wr;
+    int e = run_write(c, coll, coll_len, wreq, a, a_len, b, b_len, upsert, id, &wr);
+    if (e) return e;
+    return render_write(&wr, out);
+}
+
+/* ---- lists of writes ----------------------------------------------------
+ *
+ * insertMany and bulkWrite. They are not the same operation -- one list
+ * holds documents and the other holds writes of six different kinds --
+ * but they fail the same way, so they answer in the same shape.
+ *
+ * A FAILED MEMBER IS A RESULT, NOT A REFUSAL. That is what makes
+ * `ordered` mean anything: false attempts every member regardless of
+ * earlier failures, true stops at the first. The response says how many
+ * were ATTEMPTED, because with ordered:true "never tried" and "tried and
+ * succeeded" are different answers and nothing else in the response tells
+ * them apart. Which of the attempted ones succeeded is then everything
+ * not named in `errors`.
+ *
+ * Inserted ids are not returned and upserted ids are: an insert's id was
+ * chosen by whoever asked and is already known to them, while an upsert's
+ * was resolved here (from the filter, if the filter named one).
+ */
+
+/* One {index, code, msg} in the errors array. The text is dc_strerror's,
+ * the same sentence a refusal carries -- a client with no engine in it
+ * has no error table and should not grow one. */
+static int put_error(bj_builder *b, uint32_t index, int code) {
+    const char *msg = dc_strerror(code);
+    bj_begin_object(b);
+    PUT_KEY(b, "index"); bj_put_int(b, (int64_t)index);
+    PUT_KEY(b, "code");  bj_put_int(b, code);
+    PUT_KEY(b, "msg");   bj_put_string(b, (const uint8_t *)msg, (uint32_t)strlen(msg));
+    bj_end_object(b);
+    return bj_builder_error(b);
+}
+
+/* Splice a finished builder's ARRAY in under `key`, or null when it holds
+ * nothing -- the same "absent means none" the rest of the wire uses. */
+static int put_list(bj_builder *rb, const char *key, bj_builder *list, int count) {
+    bj_put_key(rb, (const uint8_t *)key, (uint32_t)strlen(key));
+    if (!count) return bj_put_null(rb);
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(list, &len);
+    if (!data) return BJ_ERR_STATE;
+    return bj_put_raw(rb, data, (uint32_t)len);
+}
+
+static int respond_many(dbuf *out, const write_result *t, uint32_t attempted,
+                        bj_builder *upserted, int nupserted,
+                        bj_builder *errors, int nerrors) {
+    bj_builder *rb = bj_builder_new();
+    if (!rb) return BJ_ERR_OOM;
+    bj_begin_object(rb);
+    PUT_KEY(rb, "ok"); bj_put_bool(rb, 1);
+    PUT_KEY(rb, "result");
+    bj_begin_object(rb);
+    PUT_KEY(rb, "acknowledged");  bj_put_bool(rb, 1);
+    PUT_KEY(rb, "insertedCount"); bj_put_int(rb, t->inserted);
+    PUT_KEY(rb, "matchedCount");  bj_put_int(rb, t->matched);
+    PUT_KEY(rb, "modifiedCount"); bj_put_int(rb, t->modified);
+    PUT_KEY(rb, "deletedCount");  bj_put_int(rb, t->deleted);
+    PUT_KEY(rb, "upsertedCount"); bj_put_int(rb, t->upserted);
+    bj_end_object(rb);
+    PUT_KEY(rb, "attempted"); bj_put_int(rb, (int64_t)attempted);
+    int e = put_list(rb, "upserted", upserted, nupserted);
+    if (!e) e = put_list(rb, "errors", errors, nerrors);
+    bj_end_object(rb);
+    if (!e) e = finish(rb, out);
+    bj_builder_free(rb);
+    return e;
+}
+
+/*
+ * insertMany: ONE plan, one command per document, applied in document
+ * order -- so a command's position IS its document's, and a failure is
+ * named by index without this loop and the planner having to agree about
+ * anything else.
+ *
+ * Every document must already carry its own _id, and all of them are
+ * checked before any of them runs. C will not invent an id (that needs a
+ * clock, which db.h keeps out of this layer), and the check has to happen
+ * up front for db_bulk.h's reason: an unordered run must be able to
+ * attempt every document, which it cannot do if document seven is
+ * unusable in a way that only surfaces once one through six have landed.
+ */
+static int do_insert_many(dc_collection *c, const char *coll, uint32_t coll_len,
+                          const uint8_t *docs, size_t docs_len, int ordered,
+                          dbuf *out) {
+    static const uint8_t NO_ID[12] = {0};   /* INSERT_MANY needs no default */
+
+    cur scan = { docs, docs_len, 0 };
+    uint32_t count = 0;
+    int e = array_begin(&scan, &count);
+    if (e) return DC_ERR_REQ_MALFORMED;
+    if (count == 0) return DC_ERR_BULK_EMPTY;
+
+    for (uint32_t i = 0; i < count; i++) {
+        size_t start = scan.pos;
+        if (skip_value(&scan)) return DC_ERR_REQ_MALFORMED;
+        const uint8_t *v; size_t vlen; int f = 0;
+        if (obj_get_field(docs + start, scan.pos - start,
+                          (const uint8_t *)"_id", 3, &v, &vlen, &f) || !f)
+            return DC_ERR_REQ_MISSING_FIELD;
+    }
+
+    dc_wal_plan *p = NULL;
+    e = dc_wal_plan_build(c, coll, coll_len, DC_WREQ_INSERT_MANY,
+                          docs, (uint32_t)docs_len, NULL, 0, 0, NO_ID, &p);
+    if (e) return e;
+
+    bj_builder *errb = bj_builder_new();
+    if (!errb) { dc_wal_plan_free(p); return BJ_ERR_OOM; }
+    bj_begin_array(errb);
+
+    write_result total;
+    memset(&total, 0, sizeof total);
+    uint32_t attempted = 0, n = dc_wal_plan_count(p);
+    int nerr = 0;
+    dbuf one = {0};
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t clen = 0;
+        const uint8_t *cmd = dc_wal_plan_cmd(p, i, &clen);
+        if (!cmd) { e = BJ_ERR_STATE; break; }
+        one.len = 0;
+        int rc = dc_wal_apply(c, 0, cmd, clen, &one);
+        attempted++;
+        if (rc) {
+            if ((e = put_error(errb, i, rc))) break;
+            nerr++;
+            if (ordered) break;
+            continue;
+        }
+        total.inserted++;
+    }
+    dbuf_free(&one);
+    dc_wal_plan_free(p);
+
+    if (!e) {
+        bj_end_array(errb);
+        e = bj_builder_error(errb);
+    }
+    if (!e) e = respond_many(out, &total, attempted, NULL, 0, errb, nerr);
+    bj_builder_free(errb);
+    return e;
+}
+
+/* One bulk operation, read out of its spec object: which write it is and
+ * what it writes with. dc_bulk_parse has already checked that the fields
+ * each kind requires are there; what is checked here is the WIRE's own
+ * rule -- the 12 bytes a write needs when it turns out to need one. */
+typedef struct {
+    int wreq;
+    const uint8_t *a; uint32_t a_len;
+    const uint8_t *b; uint32_t b_len;
+    int upsert;
+    uint8_t id[12];
+} bulk_write;
+
+static int read_bulk_write(int type, const uint8_t *sp, size_t sp_len, bulk_write *bw) {
+    memset(bw, 0, sizeof *bw);
+    const uint8_t *v; size_t vlen; int f = 0;
+    int have_id = 0;
+
+    if (field_flag(sp, sp_len, "upsert", 0, &bw->upsert)) return DC_ERR_REQ_MALFORMED;
+    if (field_id(sp, sp_len, bw->id, &have_id)) return DC_ERR_REQ_MALFORMED;
+
+    switch (type) {
+        case DC_BULK_INSERT_ONE: {
+            if (field_raw(sp, sp_len, "document", &v, &vlen, &f) || !f)
+                return DC_ERR_REQ_MALFORMED;
+            const uint8_t *iv; size_t ilen; int has = 0;
+            if (obj_get_field(v, vlen, (const uint8_t *)"_id", 3, &iv, &ilen, &has) || !has)
+                return DC_ERR_REQ_MISSING_FIELD;
+            bw->wreq = DC_WREQ_INSERT_ONE;
+            bw->a = v; bw->a_len = (uint32_t)vlen;
+            bw->upsert = 0;
+            return BJ_OK;
+        }
+        case DC_BULK_UPDATE_ONE:
+        case DC_BULK_UPDATE_MANY:
+        case DC_BULK_REPLACE_ONE: {
+            const char *second = (type == DC_BULK_REPLACE_ONE) ? "replacement" : "update";
+            if (field_raw(sp, sp_len, "filter", &v, &vlen, &f) || !f)
+                return DC_ERR_REQ_MALFORMED;
+            bw->a = v; bw->a_len = (uint32_t)vlen;
+            f = 0;
+            if (field_raw(sp, sp_len, second, &v, &vlen, &f) || !f)
+                return DC_ERR_REQ_MALFORMED;
+            bw->b = v; bw->b_len = (uint32_t)vlen;
+            bw->wreq = (type == DC_BULK_UPDATE_ONE)  ? DC_WREQ_UPDATE_ONE
+                     : (type == DC_BULK_UPDATE_MANY) ? DC_WREQ_UPDATE_MANY
+                                                     : DC_WREQ_REPLACE_ONE;
+            /* An upsert that matches nothing inserts, and an insert needs
+             * an id from whoever asked. */
+            if (bw->upsert && !have_id) return DC_ERR_REQ_MISSING_FIELD;
+            return BJ_OK;
+        }
+        default:
+            if (field_raw(sp, sp_len, "filter", &v, &vlen, &f) || !f)
+                return DC_ERR_REQ_MALFORMED;
+            bw->a = v; bw->a_len = (uint32_t)vlen;
+            bw->wreq = (type == DC_BULK_DELETE_ONE) ? DC_WREQ_DELETE_ONE
+                                                    : DC_WREQ_DELETE_MANY;
+            bw->upsert = 0;
+            return BJ_OK;
+    }
+}
+
+/* Walk to the next {name: spec} of the operations array and hand back the
+ * SPEC. The name was matched by dc_bulk_parse, which is why nothing here
+ * looks at it -- one owner for the grammar. */
+static int next_spec(cur *ops, const uint8_t **sp, size_t *sp_len) {
+    size_t start = ops->pos;
+    int e = skip_value(ops);
+    if (e) return e;
+    const uint8_t *entry = ops->d + start;
+    cur in = { entry, ops->pos - start, 0 };
+    uint32_t nkeys;
+    const uint8_t *kp; uint32_t klen;
+    if ((e = object_begin(&in, &nkeys))) return e;
+    if ((e = take_key(&in, &kp, &klen))) return e;
+    size_t at = in.pos;
+    if ((e = skip_value(&in))) return e;
+    *sp = entry + at;
+    *sp_len = in.pos - at;
+    return BJ_OK;
+}
+
+/*
+ * bulkWrite: a list of writes of six different kinds, run here rather
+ * than looped by the client. In a host that shares a process with the
+ * engine that loop is JavaScript's job (db_bulk.h says so, and it stays
+ * true there); over a socket the same loop is N round trips, and a client
+ * with no engine in it has no dc_bulk_parse to check the list with
+ * either.
+ *
+ * `types` is that parse's output: one code per operation, in order.
+ */
+static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
+                         const uint8_t *ops, size_t ops_len,
+                         const uint8_t *types, size_t types_len,
+                         int ordered, dbuf *out) {
+    cur oc = { ops, ops_len, 0 }, tc = { types, types_len, 0 };
+    uint32_t count = 0, tcount = 0;
+    int e = array_begin(&oc, &count);
+    if (!e) e = array_begin(&tc, &tcount);
+    if (e) return e;
+    if (count != tcount) return BJ_ERR_STATE;   /* one type per operation */
+
+    /* Pass one: the wire's id rule over the whole list, before any of it
+     * runs -- the same up-front discipline dc_bulk_parse applies to the
+     * grammar, and for the same reason. */
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *sp; size_t sp_len; double d; bulk_write bw;
+        if ((e = next_spec(&oc, &sp, &sp_len))) return DC_ERR_REQ_MALFORMED;
+        if ((e = read_number(&tc, &d))) return e;
+        if ((e = read_bulk_write((int)d, sp, sp_len, &bw))) return e;
+    }
+
+    oc.pos = 0; tc.pos = 0;
+    if ((e = array_begin(&oc, &count))) return e;
+    if ((e = array_begin(&tc, &tcount))) return e;
+
+    bj_builder *errb = bj_builder_new();
+    bj_builder *upb  = bj_builder_new();
+    if (!errb || !upb) {
+        bj_builder_free(errb); bj_builder_free(upb);
+        return BJ_ERR_OOM;
+    }
+    bj_begin_array(errb);
+    bj_begin_array(upb);
+
+    write_result total;
+    memset(&total, 0, sizeof total);
+    uint32_t attempted = 0;
+    int nerr = 0, nups = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const uint8_t *sp; size_t sp_len; double d; bulk_write bw;
+        if ((e = next_spec(&oc, &sp, &sp_len))) break;
+        if ((e = read_number(&tc, &d))) break;
+        if ((e = read_bulk_write((int)d, sp, sp_len, &bw))) break;
+
+        write_result wr;
+        int rc = run_write(c, coll, coll_len, bw.wreq, bw.a, bw.a_len,
+                           bw.b, bw.b_len, bw.upsert, bw.id, &wr);
+        attempted++;
+        if (rc) {
+            if ((e = put_error(errb, i, rc))) break;
+            nerr++;
+            if (ordered) break;
+            continue;
+        }
+        total.inserted += wr.inserted;
+        total.matched  += wr.matched;
+        total.modified += wr.modified;
+        total.deleted  += wr.deleted;
+        total.upserted += wr.upserted;
+        if (wr.has_upserted_id) {
+            bj_begin_object(upb);
+            PUT_KEY(upb, "index"); bj_put_int(upb, (int64_t)i);
+            PUT_KEY(upb, "id");    bj_put_oid(upb, wr.upserted_id);
+            bj_end_object(upb);
+            if ((e = bj_builder_error(upb))) break;
+            nups++;
+        }
+    }
+
+    if (!e) {
+        bj_end_array(errb);
+        bj_end_array(upb);
+        e = bj_builder_error(errb);
+        if (!e) e = bj_builder_error(upb);
+    }
+    if (!e) e = respond_many(out, &total, attempted, upb, nups, errb, nerr);
+    bj_builder_free(errb);
+    bj_builder_free(upb);
     return e;
 }
 
@@ -493,6 +875,57 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
         return se;
     }
 
+    /*
+     * bulkWrite parses BEFORE it resolves, which is why it is here rather
+     * than in the switch below. The parse is what says whether this list
+     * inserts anything, and that is what decides whether a name with no
+     * collection behind it should get one.
+     */
+    if (op == OP_BULK_WRITE) {
+        const uint8_t *writes; size_t writes_len; int have = 0;
+        if ((e = field_raw(req, req_len, "writes", &writes, &writes_len, &have)))
+            return respond_error(out, DC_ERR_REQ_MALFORMED);
+        if (!have) return respond_error(out, DC_ERR_REQ_MISSING_FIELD);
+        int ordered = 1;
+        if ((e = field_flag(req, req_len, "ordered", 1, &ordered)))
+            return respond_error(out, DC_ERR_REQ_MALFORMED);
+
+        dbuf types = {0};
+        int bad = -1;
+        e = dc_bulk_parse(writes, writes_len, &types, &bad);
+        if (e) { dbuf_free(&types); return respond_error_at(out, e, bad); }
+
+        /* Does this list insert? Only then does a missing collection get
+         * made -- a bulkWrite of nothing but deletes against a name that
+         * does not exist is a typo, exactly as a find of one is. */
+        int inserts = 0;
+        {
+            cur tc = { types.data, types.len, 0 };
+            uint32_t n = 0;
+            if (!array_begin(&tc, &n)) {
+                for (uint32_t i = 0; i < n; i++) {
+                    double d;
+                    if (read_number(&tc, &d)) break;
+                    if ((int)d == DC_BULK_INSERT_ONE) { inserts = 1; break; }
+                }
+            }
+        }
+
+        dc_collection *bc = NULL;
+        e = dbs_collection(s, (const char *)coll, coll_len, &bc);
+        if (e == DC_ERR_NO_COLLECTION && inserts) {
+            int made = 0;
+            e = dbs_create_collection(s, (const char *)coll, coll_len, &made);
+            if (!e) e = dbs_collection(s, (const char *)coll, coll_len, &bc);
+        }
+        if (!e) e = do_bulk_write(bc, (const char *)coll, coll_len,
+                                  writes, writes_len, types.data, types.len,
+                                  ordered, out);
+        dbuf_free(&types);
+        if (e) return respond_error(out, e);
+        return BJ_OK;
+    }
+
     dc_collection *c = NULL;
     e = dbs_collection(s, (const char *)coll, coll_len, &c);
     /*
@@ -503,7 +936,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
      * collection" is more useful than answering nothing from a
      * collection this just created on their behalf.
      */
-    if (e == DC_ERR_NO_COLLECTION && op == OP_INSERT) {
+    if (e == DC_ERR_NO_COLLECTION && (op == OP_INSERT || op == OP_INSERT_MANY)) {
         int made = 0;
         int ce = dbs_create_collection(s, (const char *)coll, coll_len, &made);
         if (ce) return respond_error(out, ce);
@@ -535,7 +968,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     if ((e = field_id(req, req_len, id, &have_id)))
         return respond_error(out, DC_ERR_REQ_MALFORMED);
     int upsert = 0;
-    if ((e = field_flag(req, req_len, "upsert", &upsert)))
+    if ((e = field_flag(req, req_len, "upsert", 0, &upsert)))
         return respond_error(out, DC_ERR_REQ_MALFORMED);
 
     dbuf body = {0};
@@ -669,6 +1102,18 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             bj_builder_free(cb);
             body_key = "result";
             break;
+        }
+        case OP_INSERT_MANY: {
+            const uint8_t *docs_v; size_t docs_vlen; int have = 0;
+            if ((e = field_raw(req, req_len, "docs", &docs_v, &docs_vlen, &have))) break;
+            if (!have) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+            int ordered = 1;
+            if ((e = field_flag(req, req_len, "ordered", 1, &ordered))) break;
+            e = do_insert_many(c, (const char *)coll, coll_len,
+                               docs_v, docs_vlen, ordered, out);
+            if (e) break;
+            dbuf_free(&body);
+            return BJ_OK;   /* do_insert_many wrote the whole response */
         }
         case OP_INSERT:
         case OP_UPDATE:

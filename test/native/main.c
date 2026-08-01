@@ -2493,6 +2493,389 @@ TEST(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads) {
     close(dirfd);
 }
 
+/* {op, coll, docs|writes: <array>, ordered: <bool>} -- the request shape
+ * a list of writes needs, which `request` above cannot spell. */
+static bj_builder *list_request(const char *op, const char *coll, const char *key,
+                                const uint8_t *val, size_t val_len, int ordered,
+                                const uint8_t **out, uint32_t *out_len) {
+    bj_builder *b = bj_builder_new();
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"op", 2);
+    bj_put_string(b, (const uint8_t *)op, (uint32_t)strlen(op));
+    bj_put_key(b, (const uint8_t *)"coll", 4);
+    bj_put_string(b, (const uint8_t *)coll, (uint32_t)strlen(coll));
+    bj_put_key(b, (const uint8_t *)key, (uint32_t)strlen(key));
+    bj_put_raw(b, val, (uint32_t)val_len);
+    bj_put_key(b, (const uint8_t *)"ordered", 7);
+    bj_put_bool(b, ordered);
+    bj_end_object(b);
+    size_t len = 0;
+    *out = bj_builder_data(b, &len);
+    *out_len = (uint32_t)len;
+    return b;
+}
+
+/* A numeric field of the nested `result` object: insertedCount and its
+ * siblings live there, not at the top of the response. */
+static int64_t result_num(const dbuf *res, const char *key) {
+    const uint8_t *r; size_t rlen; int f = 0;
+    if (obj_get_field(res->data, res->len, (const uint8_t *)"result", 6, &r, &rlen, &f) || !f)
+        return -1;
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(r, rlen, (const uint8_t *)key, (uint32_t)strlen(key),
+                      &v, &vlen, &found) || !found)
+        return -1;
+    cur c = { v, vlen, 0 };
+    double d = 0;
+    if (read_number(&c, &d)) return -1;
+    return (int64_t)d;
+}
+
+/* How many entries in a list response's `errors` / `upserted`. Absent is
+ * a null rather than an empty array, and both mean none. */
+static long list_count(const dbuf *res, const char *list) {
+    const uint8_t *v; size_t vlen; int f = 0;
+    if (obj_get_field(res->data, res->len, (const uint8_t *)list,
+                      (uint32_t)strlen(list), &v, &vlen, &f) || !f) return -1;
+    if (vlen >= 1 && v[0] == BJ_TYPE_NULL) return 0;
+    return arr_count(v, vlen);
+}
+
+/* A numeric field of the i-th entry of one of those arrays. */
+static int64_t list_num(const dbuf *res, const char *list, int i, const char *key) {
+    const uint8_t *v; size_t vlen; int f = 0;
+    if (obj_get_field(res->data, res->len, (const uint8_t *)list,
+                      (uint32_t)strlen(list), &v, &vlen, &f) || !f) return -1;
+    cur c = { v, vlen, 0 };
+    uint32_t n = 0;
+    if (array_begin(&c, &n) || (uint32_t)i >= n) return -1;
+    for (int k = 0; k < i; k++) if (skip_value(&c)) return -1;
+    size_t start = c.pos;
+    if (skip_value(&c)) return -1;
+    const uint8_t *fv; size_t flen; int found = 0;
+    if (obj_get_field(v + start, c.pos - start, (const uint8_t *)key,
+                      (uint32_t)strlen(key), &fv, &flen, &found) || !found) return -1;
+    cur ec = { fv, flen, 0 };
+    double d = 0;
+    if (read_number(&ec, &d)) return -1;
+    return (int64_t)d;
+}
+
+/* One {<name>: {<field>: <raw value>}} operation for a bulkWrite list,
+ * with an optional second field -- the shape db_bulk.h defines. */
+static void put_bulk_op(bj_builder *b, const char *name,
+                        const char *k1, const uint8_t *v1, uint32_t n1,
+                        const char *k2, const uint8_t *v2, uint32_t n2,
+                        const uint8_t *upsert_id) {
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)name, (uint32_t)strlen(name));
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)k1, (uint32_t)strlen(k1));
+    bj_put_raw(b, v1, n1);
+    if (k2) {
+        bj_put_key(b, (const uint8_t *)k2, (uint32_t)strlen(k2));
+        bj_put_raw(b, v2, n2);
+    }
+    if (upsert_id) {
+        bj_put_key(b, (const uint8_t *)"upsert", 6);
+        bj_put_bool(b, 1);
+        bj_put_key(b, (const uint8_t *)"id", 2);
+        bj_put_oid(b, upsert_id);
+    }
+    bj_end_object(b);
+    bj_end_object(b);
+}
+
+TEST(a_list_of_writes_is_one_request_and_reports_every_member) {
+    /*
+     * insertMany and bulkWrite are not the same operation -- one list
+     * holds documents and the other holds writes of six different kinds
+     * -- but they fail the same way, so they answer in the same shape.
+     *
+     * A FAILED MEMBER IS A RESULT, NOT A REFUSAL, which is what makes
+     * `ordered` mean anything. And `attempted` is the one fact a client
+     * cannot derive for itself: with ordered:true the run stops at the
+     * first failure, and "never tried" is a different answer from "tried
+     * and succeeded".
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-many", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 1, &s) == BJ_OK);
+    const uint64_t CLIENT = 9;
+
+    /* ---- three documents, one frame, into a collection nobody made:
+     * a list of inserts is still an insert. `ordered` is absent here, so
+     * this also pins its default -- true, as it is in the driver. */
+    {
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        for (int i = 0; i < 3; i++) {
+            doc *d = doc_new();
+            uint8_t oid[12]; mk_oid(oid, (uint32_t)(i + 1));
+            doc_oid(d, "_id", oid);
+            doc_int(d, "i", i);
+            uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+            bj_put_raw(ab, db_, dlen);
+            doc_free(d);
+        }
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("insertMany", "people", "docs", adata, alen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(result_num(&res, "insertedCount"), 3);
+        int f = 0;
+        CHECK_I64(response_num(&res, "attempted", &f), 3);
+        CHECK_I64(list_count(&res, "errors"), 0);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab);
+    }
+
+    /* ---- a duplicate in the middle, twice: ordered stops at it,
+     * unordered attempts what comes after. The difference is visible in
+     * `attempted` and nowhere else. */
+    for (int ordered = 1; ordered >= 0; ordered--) {
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        for (int i = 0; i < 3; i++) {
+            doc *d = doc_new();
+            uint8_t oid[12];
+            /* index 1 collides with what the first insertMany wrote */
+            mk_oid(oid, i == 1 ? 1u : (uint32_t)(100 + ordered * 10 + i));
+            doc_oid(d, "_id", oid);
+            doc_int(d, "i", i);
+            uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+            bj_put_raw(ab, db_, dlen);
+            doc_free(d);
+        }
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = list_request("insertMany", "people", "docs", adata, alen,
+                                      ordered, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        int f = 0;
+        CHECK_I64(response_num(&res, "attempted", &f), ordered ? 2 : 3);
+        CHECK_I64(result_num(&res, "insertedCount"), ordered ? 1 : 2);
+        CHECK_I64(list_count(&res, "errors"), 1);
+        CHECK_I64(list_num(&res, "errors", 0, "index"), 1);
+        CHECK_I64(list_num(&res, "errors", 0, "code"), DC_ERR_DUPLICATE);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab);
+    }
+
+    /* ---- a document with no _id is the CLIENT's mistake, so it is a
+     * refusal rather than one entry in `errors` -- and it is caught
+     * before any of the list runs, which an unordered run depends on. */
+    {
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        {
+            doc *d = doc_new();
+            uint8_t oid[12]; mk_oid(oid, 900);
+            doc_oid(d, "_id", oid);
+            uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+            bj_put_raw(ab, db_, dlen);
+            doc_free(d);
+            d = doc_new();
+            doc_str(d, "name", "no id here");
+            db_ = doc_done(d, &dlen);
+            bj_put_raw(ab, db_, dlen);
+            doc_free(d);
+        }
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = list_request("insertMany", "people", "docs", adata, alen,
+                                      0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_REQ_MISSING_FIELD);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab);
+
+        /* Nothing ran: the first document of that list is not there. */
+        doc *q = doc_new();
+        uint8_t oid[12]; mk_oid(oid, 900);
+        doc_oid(q, "_id", oid);
+        uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
+        bj_builder *cb = request("count", "people", "filter", qb, qlen, &req, &req_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &cres));
+        CHECK_I64(response_num(&cres, "n", &f), 0);
+        dbuf_free(&cres); bj_builder_free(cb); doc_free(q);
+    }
+
+    /* ---- bulkWrite: six kinds of write in one list, and the totals are
+     * the sum of what each did. */
+    {
+        uint8_t new_id[12]; mk_oid(new_id, 500);
+        uint8_t ups_id[12]; mk_oid(ups_id, 501);
+
+        doc *ins = doc_new();
+        doc_oid(ins, "_id", new_id);
+        doc_int(ins, "i", 50);
+        uint32_t ins_len; const uint8_t *ins_b = doc_done(ins, &ins_len);
+
+        doc *f0 = doc_new(); doc_int(f0, "i", 0);
+        uint32_t f0_len; const uint8_t *f0_b = doc_done(f0, &f0_len);
+        doc *u0 = doc_new();
+        doc_begin_obj(u0, "$set"); doc_str(u0, "tag", "touched"); doc_end_obj(u0);
+        uint32_t u0_len; const uint8_t *u0_b = doc_done(u0, &u0_len);
+
+        doc *f2 = doc_new(); doc_int(f2, "i", 2);
+        uint32_t f2_len; const uint8_t *f2_b = doc_done(f2, &f2_len);
+
+        doc *fx = doc_new(); doc_int(fx, "i", 4242);
+        uint32_t fx_len; const uint8_t *fx_b = doc_done(fx, &fx_len);
+        doc *ux = doc_new();
+        doc_begin_obj(ux, "$set"); doc_str(ux, "tag", "made"); doc_end_obj(ux);
+        uint32_t ux_len; const uint8_t *ux_b = doc_done(ux, &ux_len);
+
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        put_bulk_op(ab, "insertOne", "document", ins_b, ins_len, NULL, NULL, 0, NULL);
+        put_bulk_op(ab, "updateOne", "filter", f0_b, f0_len, "update", u0_b, u0_len, NULL);
+        put_bulk_op(ab, "deleteOne", "filter", f2_b, f2_len, NULL, NULL, 0, NULL);
+        put_bulk_op(ab, "updateOne", "filter", fx_b, fx_len, "update", ux_b, ux_len, ups_id);
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = list_request("bulkWrite", "people", "writes", adata, alen,
+                                      1, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        int f = 0;
+        CHECK_I64(response_num(&res, "attempted", &f), 4);
+        CHECK_I64(list_count(&res, "errors"), 0);
+        CHECK_I64(result_num(&res, "insertedCount"), 1);
+        CHECK_I64(result_num(&res, "matchedCount"), 1);
+        CHECK_I64(result_num(&res, "modifiedCount"), 1);
+        CHECK_I64(result_num(&res, "deletedCount"), 1);
+        /* An upsert is counted ONCE, as an upsert -- it is applied as an
+         * insert, and only the plan still knows which it was. */
+        CHECK_I64(result_num(&res, "upsertedCount"), 1);
+        CHECK_I64(list_count(&res, "upserted"), 1);
+        CHECK_I64(list_num(&res, "upserted", 0, "index"), 3);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab);
+        doc_free(ins); doc_free(f0); doc_free(u0); doc_free(f2);
+        doc_free(fx); doc_free(ux);
+    }
+
+    /* ---- an operation nobody has heard of is refused with the POSITION
+     * of the one that was wrong, and nothing in the list runs -- the
+     * whole point of validating the grammar up front (db_bulk.h). */
+    {
+        uint8_t id[12]; mk_oid(id, 600);
+        doc *ok = doc_new();
+        doc_oid(ok, "_id", id);
+        uint32_t ok_len; const uint8_t *ok_b = doc_done(ok, &ok_len);
+        doc *filter = doc_new(); doc_int(filter, "i", 0);
+        uint32_t fl_len; const uint8_t *fl_b = doc_done(filter, &fl_len);
+
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        put_bulk_op(ab, "insertOne", "document", ok_b, ok_len, NULL, NULL, 0, NULL);
+        put_bulk_op(ab, "obliterateOne", "filter", fl_b, fl_len, NULL, NULL, 0, NULL);
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = list_request("bulkWrite", "people", "writes", adata, alen,
+                                      0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_BULK_UNKNOWN_OP);
+        CHECK_I64(response_num(&res, "index", &f), 1);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab);
+
+        /* The insertOne at index 0 did not run. */
+        doc *q = doc_new();
+        doc_oid(q, "_id", id);
+        uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
+        bj_builder *cb = request("count", "people", "filter", qb, qlen, &req, &req_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &cres));
+        CHECK_I64(response_num(&cres, "n", &f), 0);
+        dbuf_free(&cres); bj_builder_free(cb); doc_free(q);
+        doc_free(ok); doc_free(filter);
+    }
+
+    /* ---- a list with no insert in it does not make a collection: a
+     * bulkWrite of deletes against a name that is not there is a typo,
+     * exactly as a find of one is. */
+    {
+        doc *filter = doc_new(); doc_int(filter, "i", 0);
+        uint32_t fl_len; const uint8_t *fl_b = doc_done(filter, &fl_len);
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        put_bulk_op(ab, "deleteMany", "filter", fl_b, fl_len, NULL, NULL, 0, NULL);
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = list_request("bulkWrite", "ghosts", "writes", adata, alen,
+                                      1, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_NO_COLLECTION);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab); doc_free(filter);
+    }
+
+    /* ---- but a list that DOES insert makes one, exactly as a single
+     * insert does. */
+    {
+        uint8_t id[12]; mk_oid(id, 700);
+        doc *d = doc_new();
+        doc_oid(d, "_id", id);
+        doc_int(d, "i", 700);
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        bj_builder *ab = bj_builder_new();
+        bj_begin_array(ab);
+        put_bulk_op(ab, "insertOne", "document", db_, dlen, NULL, NULL, 0, NULL);
+        bj_end_array(ab);
+        size_t alen = 0; const uint8_t *adata = bj_builder_data(ab, &alen);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = list_request("bulkWrite", "arrivals", "writes", adata, alen,
+                                      1, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(result_num(&res, "insertedCount"), 1);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ab); doc_free(d);
+
+        bj_builder *cb = request("count", "arrivals", NULL, NULL, 0, &req, &req_len);
+        dbuf cres = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &cres));
+        int f = 0;
+        CHECK_I64(response_num(&cres, "n", &f), 1);
+        dbuf_free(&cres); bj_builder_free(cb);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(every_way_a_request_can_be_wrong_is_answered_not_thrown) {
     /*
      * A refusal is a RESPONSE. The client asked a question; it is owed a
@@ -6998,6 +7381,7 @@ int main(void) {
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
     RUN(a_database_can_be_built_from_an_empty_directory);
     RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);
+    RUN(a_list_of_writes_is_one_request_and_reports_every_member);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

@@ -159,30 +159,34 @@ For the same reason `--order` is refused with `--server`: the order the
 files were written with is the server's to know, and it takes its own
 `--order` if they were not made with the default 32.
 
-The wire carries ten operations, and the CLI commands that ride on them:
+The wire carries twenty-two operations, and the CLI commands that ride on
+them:
 
 | Works over `--server` | |
 | --- | --- |
 | `find`, `find-one`, `count`, `distinct` | reads, including `--sort`/`--skip`/`--limit`/`--project` |
 | `insert` | the `_id` is minted by this end — C will not invent one, since that needs a clock |
+| `insert-many`, `bulk-write` | the whole list in one round trip, `--no-ordered` and all; the server runs the loop |
 | `compact <coll>` | one collection at a time; refused while a cursor is reading it |
 | `create-index`, `drop-index`, `list-indexes` | the server plans, builds and backfills the index |
 | `drop-collection` | |
 | `collections` | |
 | `dump [coll]` | walks `collections` → `list-indexes` → a `find` cursor |
+| `restore` | header lines rebuild the indexes, documents go in batches of 500 |
 | `update-one`, `update-many`, `replace-one` | including `--upsert` |
 | `delete-one`, `delete-many` | |
 
-Everything else — `restore` (it needs `insert-many`), `watch`,
-`bulk-write`, `insert-many`, `find-by-index`, `prune-expired`, the
+Everything else — `watch`, `find-by-index`, `prune-expired`, the
 `find-one-and-*` family, and `compact` with no collection named — is not
 on the wire yet, and says so rather than pretending:
 
 ```
-$ db --server 8097 collections
-Error: the server has no listCollections() -- its wire carries find, findOne,
-count, distinct, insert, update, updateMany, replace, delete, deleteMany.
-Open the database directly for the rest.
+$ db --server 8097 prune-expired events
+Error: the server has no collection.pruneExpired() -- its wire carries ping,
+find, findOne, count, distinct, insert, insertMany, update, updateMany,
+replace, delete, deleteMany, bulkWrite, getMore, closeCursor, compact,
+createCollection, dropCollection, createIndex, dropIndex, listIndexes,
+listCollections. Open the database directly for the rest.
 ```
 
 **The server serves many connections, up to its `--max-clients`.** A CLI

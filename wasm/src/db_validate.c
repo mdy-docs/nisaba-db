@@ -124,6 +124,14 @@ const char *dc_strerror(int code) {
         case DC_ERR_TOO_MANY_CLIENTS:
             return "The server is already holding as many connections as it will "
                    "(--max-clients); this one is refused rather than queued";
+        case DC_ERR_FORMAT_NEWER:
+            return "Database format is newer than this build understands; upgrade "
+                   "nisaba to open it (docs/format-compatibility.md)";
+        case DC_ERR_INDEX_EXISTS:
+            return "An index of that name already exists on this collection; drop "
+                   "it before creating another";
+        case DC_ERR_NO_INDEX:
+            return "No index of that name on this collection";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

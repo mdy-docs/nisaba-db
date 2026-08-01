@@ -46,7 +46,12 @@ typedef enum {
     OP_DELETE_MANY,
     OP_GET_MORE,
     OP_CLOSE_CURSOR,
-    OP_COMPACT
+    OP_COMPACT,
+    OP_CREATE_COLLECTION,
+    OP_DROP_COLLECTION,
+    OP_CREATE_INDEX,
+    OP_DROP_INDEX,
+    OP_LIST_INDEXES
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -70,6 +75,11 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("getMore",     OP_GET_MORE),
     OP("closeCursor", OP_CLOSE_CURSOR),
     OP("compact",     OP_COMPACT),
+    OP("createCollection", OP_CREATE_COLLECTION),
+    OP("dropCollection",   OP_DROP_COLLECTION),
+    OP("createIndex",      OP_CREATE_INDEX),
+    OP("dropIndex",        OP_DROP_INDEX),
+    OP("listIndexes",      OP_LIST_INDEXES),
 };
 
 #undef OP
@@ -405,8 +415,76 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     if (e) return respond_error(out, DC_ERR_REQ_MALFORMED);
     if (!found) return respond_error(out, DC_ERR_REQ_MISSING_FIELD);
 
+    /*
+     * Making and unmaking, before anything is resolved: createCollection
+     * is asked precisely when there is nothing to open, and
+     * dropCollection has to work whether or not the collection is
+     * currently open. listIndexes only reads the catalog.
+     */
+    if (op == OP_CREATE_COLLECTION || op == OP_DROP_COLLECTION ||
+        op == OP_LIST_INDEXES || op == OP_DROP_INDEX) {
+        bj_builder *sb = NULL;
+        if (op == OP_LIST_INDEXES) {
+            dbuf list = {0};
+            e = dbs_list_indexes(s, (const char *)coll, coll_len, &list);
+            if (e) { dbuf_free(&list); return respond_error(out, e); }
+            sb = bj_builder_new();
+            if (!sb) { dbuf_free(&list); return BJ_ERR_OOM; }
+            bj_begin_object(sb);
+            PUT_KEY(sb, "ok"); bj_put_bool(sb, 1);
+            PUT_KEY(sb, "indexes");
+            if (list.len) bj_put_raw(sb, list.data, (uint32_t)list.len); else bj_put_null(sb);
+            bj_end_object(sb);
+            dbuf_free(&list);
+        } else if (op == OP_DROP_INDEX) {
+            const uint8_t *ixn; uint32_t ixn_len; int have = 0;
+            if ((e = field_str(req, req_len, "index", &ixn, &ixn_len, &have)))
+                return respond_error(out, DC_ERR_REQ_MALFORMED);
+            if (!have) return respond_error(out, DC_ERR_REQ_MISSING_FIELD);
+            e = dbs_drop_index(s, (const char *)coll, coll_len,
+                               (const char *)ixn, ixn_len);
+            if (e) return respond_error(out, e);
+            sb = bj_builder_new();
+            if (!sb) return BJ_ERR_OOM;
+            bj_begin_object(sb);
+            PUT_KEY(sb, "ok");      bj_put_bool(sb, 1);
+            PUT_KEY(sb, "dropped"); bj_put_bool(sb, 1);
+            bj_end_object(sb);
+        } else {
+            int did = 0;
+            e = (op == OP_CREATE_COLLECTION)
+                ? dbs_create_collection(s, (const char *)coll, coll_len, &did)
+                : dbs_drop_collection(s, (const char *)coll, coll_len, &did);
+            if (e) return respond_error(out, e);
+            sb = bj_builder_new();
+            if (!sb) return BJ_ERR_OOM;
+            bj_begin_object(sb);
+            PUT_KEY(sb, "ok"); bj_put_bool(sb, 1);
+            PUT_KEY(sb, op == OP_CREATE_COLLECTION ? "created" : "dropped");
+            bj_put_bool(sb, did);
+            bj_end_object(sb);
+        }
+        int se = finish(sb, out);
+        bj_builder_free(sb);
+        return se;
+    }
+
     dc_collection *c = NULL;
     e = dbs_collection(s, (const char *)coll, coll_len, &c);
+    /*
+     * A first insert makes the collection, the way it does in every host
+     * of this library and in the database this is shaped after. Only an
+     * insert: a count or a find of a name that does not exist is far
+     * more likely to be a typo than an intention, and answering "no such
+     * collection" is more useful than answering nothing from a
+     * collection this just created on their behalf.
+     */
+    if (e == DC_ERR_NO_COLLECTION && op == OP_INSERT) {
+        int made = 0;
+        int ce = dbs_create_collection(s, (const char *)coll, coll_len, &made);
+        if (ce) return respond_error(out, ce);
+        e = dbs_collection(s, (const char *)coll, coll_len, &c);
+    }
     if (e) return respond_error(out, e);
 
     /* The three raw spans an op may need, read once. An empty filter is
@@ -514,6 +592,30 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = dbuf_put(&body, vals, vals_len);
             free(vals);
             body_key = "values";
+            break;
+        }
+        case OP_CREATE_INDEX: {
+            const uint8_t *keys; size_t keys_len; int have = 0;
+            if ((e = field_raw(req, req_len, "keys", &keys, &keys_len, &have))) break;
+            if (!have) { e = DC_ERR_REQ_MISSING_FIELD; break; }
+            const uint8_t *opt = NULL; size_t opt_len = 0; int has_opt = 0;
+            if ((e = field_raw(req, req_len, "options", &opt, &opt_len, &has_opt))) break;
+            dbuf name = {0};
+            e = dbs_create_index(s, (const char *)coll, coll_len, keys, keys_len,
+                                 has_opt ? opt : NULL, has_opt ? opt_len : 0, &name);
+            if (e) { dbuf_free(&name); break; }
+            /* A bare string value, spliced in under `name` below -- the
+             * chosen name is the whole answer, which is what the
+             * in-process createIndex returns too. */
+            bj_builder *ib = bj_builder_new();
+            if (!ib) { dbuf_free(&name); e = BJ_ERR_OOM; break; }
+            bj_put_string(ib, name.data, (uint32_t)name.len);
+            dbuf_free(&name);
+            size_t ilen = 0;
+            const uint8_t *idata = bj_builder_data(ib, &ilen);
+            e = idata ? dbuf_put(&body, idata, ilen) : BJ_ERR_OOM;
+            bj_builder_free(ib);
+            body_key = "name";
             break;
         }
         case OP_COMPACT: {

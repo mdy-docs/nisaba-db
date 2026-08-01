@@ -560,7 +560,11 @@ int main(int argc, char **argv) {
     }
 
     dbs *s = NULL;
-    int e = dbs_open(&ns, order, &s);
+    /* create: a directory the operator pointed this at becomes a
+     * database. Refusing to start because a fresh directory has no
+     * catalog would make "serve this directory" a two-step operation
+     * with a different tool for the first step. */
+    int e = dbs_open(&ns, order, 1, &s);
     if (e != BJ_OK) {
         fprintf(stderr, "cannot open the database: %s\n", dc_strerror(e));
         bjns_posix_free(&ns);

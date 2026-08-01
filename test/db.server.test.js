@@ -25,6 +25,7 @@ import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
 import { connect, ObjectId } from '../src/db.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
 import { connectServer, ServerError, WIRE_OPS } from '../src/db-server-client.js';
+import { BPlusTree } from '../wasm/nisaba-wasm.js';
 
 await ready();
 
@@ -248,7 +249,12 @@ let portSlot = 1;
 const nextPort = () => 18000 + (portSlot++) * 1000 + (process.pid % 1000);
 
 async function startServer(engine, port, extra = [], docs = 0) {
-  const dir = await seedDb(docs);
+  // docs < 0: an EMPTY directory -- no catalog, no collection, nothing.
+  // The server makes the database itself, which is the whole point of
+  // the suite that asks for it.
+  const dir = docs < 0
+    ? fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-empty-'))
+    : await seedDb(docs);
   const [cmd, args, opts] = engine.argv(dir, port, extra);
   const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
   // The directory comes back too: a test that wants to read the files
@@ -319,7 +325,7 @@ for (const engine of ENGINES) {
 
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
       expect(() => db.listCollections()).toThrow(/no db\.listCollections/);
-      expect(() => db.collection('users').createIndex({ team: 1 })).toThrow(/no collection\.createIndex/);
+      expect(() => db.collection('users').aggregate([])).toThrow(/no collection\.aggregate/);
       // The sentence names the ops that DO exist, so the refusal is
       // actionable without reading the source.
       expect(() => db.collection('users').watch()).toThrow(WIRE_OPS.join(', '));
@@ -507,6 +513,105 @@ for (const engine of ENGINES) {
         await c.close();
         await b.close();
       }
+    });
+  });
+
+  /*
+   * From nothing. Every other suite here hands the server a database
+   * the JavaScript implementation wrote; this one hands it an empty
+   * directory and asks it to build one -- catalog, collections,
+   * documents, an index -- and then checks that what came out is a
+   * database the JavaScript implementation can open.
+   *
+   * That round trip is the claim: two implementations, one format,
+   * either of them able to create what the other reads.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: from an empty directory (${engine.name})`, () => {
+    let proc, db, dir;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      ({ proc, dir } = await startServer(engine, port, [], -1));
+      db = await connectServer(port);
+      return async () => { if (db.isOpen) await db.close(); proc.kill(); };
+    });
+
+    it('makes a database, a collection, documents and an index', async () => {
+      // The directory had no catalog: starting the server made one.
+      expect(fs.existsSync(path.join(dir, '__catalog__.bj'))).toBe(true);
+
+      expect(await db.createCollection('users')).toBe(true);
+      expect(await db.createCollection('users')).toBe(false);   // idempotent
+
+      const users = db.collection('users');
+      expect(await users.countDocuments({})).toBe(0);
+
+      await users.insertOne({ name: 'Ada', team: 'core' });
+      await users.insertOne({ name: 'Grace', team: 'core' });
+      await users.insertOne({ name: 'Alan', team: 'research' });
+
+      // A collection nobody created: an insert makes one, the way it
+      // does in every other host of this library.
+      await db.collection('notes').insertOne({ body: 'from nothing' });
+      expect(await db.collection('notes').countDocuments({})).toBe(1);
+
+      // ...but a READ of a name that does not exist is a typo far more
+      // often than an intention, and says so.
+      await expect(db.collection('ghosts').countDocuments({}))
+        .rejects.toMatchObject({ code: -37 });
+
+      expect(await users.createIndex({ team: 1 })).toBe('team_1');
+      expect((await users.listIndexes()).map(i => i.name)).toEqual(['team_1']);
+      // Backfilled against the documents already there -- the only way
+      // an index over a non-empty collection can answer correctly.
+      expect(await users.countDocuments({ team: 'core' })).toBe(2);
+      await expect(users.createIndex({ team: 1 })).rejects.toMatchObject({ code: -56 });
+    });
+
+    it('drops what it made, and refuses a name it does not have', async () => {
+      const users = db.collection('users');
+      await users.dropIndex('team_1');
+      expect(await users.listIndexes()).toEqual([]);
+      await expect(users.dropIndex('team_1')).rejects.toMatchObject({ code: -57 });
+      // The documents are untouched by an index going away.
+      expect(await users.countDocuments({ team: 'core' })).toBe(2);
+
+      expect(await db.dropCollection('users')).toBe(true);
+      expect(await db.dropCollection('users')).toBe(false);
+      await expect(users.countDocuments({})).rejects.toMatchObject({ code: -37 });
+    });
+
+    it('leaves a database the JS implementation opens as its own', async () => {
+      await db.collection('notes').createIndex({ body: 1 });
+      await db.close();
+      proc.kill();
+      await new Promise(r => proc.once('exit', r));
+
+      const provider = new NodeFSStorageProvider(dir);
+
+      // The format stamp first, straight out of the catalog: a database
+      // is one format however many implementations write it, and this is
+      // the only field whose absence a future version could not
+      // interpret. Nothing else in this suite would notice if C stopped
+      // writing it -- JS reads an unstamped database as version 1 -- so
+      // it is asserted here rather than assumed.
+      const catalog = new BPlusTree(await provider.openFile('__catalog__.bj', { create: false }), 32);
+      await catalog.open();
+      expect(catalog.search('__format__')).toEqual({ v: 1 });
+      await catalog.close();
+
+      const jsDb = await connect(provider);
+      // Every collection the server made, and only those: `users` was
+      // dropped in the test above.
+      expect((await jsDb.listCollections()).sort()).toEqual(['notes']);
+      const notes = await jsDb.collection('notes');
+      expect(await notes.countDocuments({})).toBe(1);
+      expect((await notes.findOne({}))?.body).toBe('from nothing');
+      // Including the index, with the name C chose and the key spec it
+      // reconstructed -- one naming convention, two implementations.
+      expect((await notes.listIndexes()).map(i => i.name)).toEqual(['body_1']);
+      await jsDb.close();
+      await provider.close();
     });
   });
 

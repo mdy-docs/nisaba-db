@@ -152,6 +152,9 @@ db --server 8097 find users '{"team":"core"}' --sort '{"name":1}'
 There is **no `<name>`**: the server was pointed at one directory when it
 started and serves that one for its lifetime (one process per database
 directory — the same one-writer rule the advisory lock enforces locally).
+That directory may be **empty**: the server writes the catalog at
+startup, and an `insert` into a collection that does not exist creates
+it, so a database can be built from nothing over the wire.
 For the same reason `--order` is refused with `--server`: the order the
 files were written with is the server's to know, and it takes its own
 `--order` if they were not made with the default 32.
@@ -163,13 +166,16 @@ The wire carries ten operations, and the CLI commands that ride on them:
 | `find`, `find-one`, `count`, `distinct` | reads, including `--sort`/`--skip`/`--limit`/`--project` |
 | `insert` | the `_id` is minted by this end — C will not invent one, since that needs a clock |
 | `compact <coll>` | one collection at a time; refused while a cursor is reading it |
+| `create-index`, `drop-index`, `list-indexes` | the server plans, builds and backfills the index |
+| `drop-collection` | |
 | `update-one`, `update-many`, `replace-one` | including `--upsert` |
 | `delete-one`, `delete-many` | |
 
-Everything else — `collections`, `create-index`, `dump`, `restore`,
-`watch`, `bulk-write`, `insert-many`, the `find-one-and-*` family, and
-`compact` with no collection named (that one needs `collections`) — is
-not on the wire yet, and says so rather than pretending:
+Everything else — `collections`, `dump`, `restore`, `watch`,
+`bulk-write`, `insert-many`, `find-by-index`, `prune-expired`, the
+`find-one-and-*` family, and `compact` with no collection named (that one
+needs `collections`) — is not on the wire yet, and says so rather than
+pretending:
 
 ```
 $ db --server 8097 collections

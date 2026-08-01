@@ -90,6 +90,15 @@ extern "C" {
 /* Cursors. NO_CURSOR covers "no such id" and "not yours" deliberately:
  * a client learning which of the two it was would be learning about
  * another client's cursors. */
+/* Creation and schema. -55 and up: -50..-54 are the consensus layer's
+ * (raft_core.h, raft_msg.h, raft_node.h), and a code that means two
+ * things reaches a client as the wrong sentence -- which is exactly how
+ * DC_ERR_UNSUPPORTED_ID and WAL_NOT_APPLIABLE shared -35 until a test
+ * asked every code for its text. */
+#define DC_ERR_FORMAT_NEWER         (-55)
+#define DC_ERR_INDEX_EXISTS         (-56)
+#define DC_ERR_NO_INDEX             (-57)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)
@@ -99,10 +108,21 @@ typedef struct dbs dbs;
 /*
  * Open the database in `ns` -- its catalog, and nothing else yet.
  * `order` is the B+ tree order to open trees with (the host's choice,
- * matching whatever wrote them). BJ_ERR_STATE if there is no catalog:
- * this opens databases, it does not make them.
+ * matching whatever wrote them).
+ *
+ * `create` decides what an empty directory means. With it, a directory
+ * with no catalog gets one (and the format stamp that goes with it),
+ * which is how a server starting on an empty directory ends up serving a
+ * database rather than refusing to start. Without it, no catalog is
+ * DC_ERR_NO_DATABASE and nothing is written -- for a caller that means
+ * to open an existing database and would rather hear that it is not
+ * there than quietly make one.
+ *
+ * The format stamp is checked either way: a database written by a newer
+ * build is refused (DC_ERR_FORMAT_NEWER) rather than opened and
+ * misread. See docs/format-compatibility.md.
  */
-int dbs_open(bj_ns *ns, int order, dbs **out);
+int dbs_open(bj_ns *ns, int order, int create, dbs **out);
 
 /*
  * Resolve `name` to an open collection, opening it on first use and
@@ -121,6 +141,64 @@ int dbs_collection(dbs *s, const char *name, size_t name_len,
 /* How many collections are currently held open -- for tests, and for a
  * server that wants to say so. */
 int dbs_open_count(const dbs *s);
+
+/* ---- creation and schema ------------------------------------------------
+ *
+ * The other half of a database: making one. Everything above this line
+ * opens what a catalog names; these write the catalog.
+ *
+ * They are here rather than in db.c for the same reason the open path is:
+ * a collection is a SET of files that must be created, attached and
+ * recorded together, and the only thing that can do all three is
+ * whatever owns the namespace. C has always known the schema (the plan
+ * functions in db_catalog.h decide names, kinds and options); what it
+ * has never had is the host choreography around them, which is why a
+ * server could serve a database it did not write and could not write
+ * one of its own.
+ *
+ * ALL OR NOTHING, in the direction that matters: a failure part-way
+ * leaves the CATALOG unchanged, so an interrupted create leaves files
+ * nothing references -- an orphan the sweep collects -- rather than an
+ * entry pointing at something half-built.
+ */
+
+/* Create the collection if the catalog has no entry for it: the entry,
+ * its primary file, and nothing else (journal, generation and indexes
+ * are added as they are earned). *created says whether this call made
+ * it, so a caller can tell "made" from "already there" -- both are
+ * success. */
+int dbs_create_collection(dbs *s, const char *name, size_t name_len, int *created);
+
+/* Remove the collection's catalog entry and delete every file it claims
+ * -- the same file list the orphan sweep computes, from the same C, so
+ * the two cannot disagree about what a collection is made of. *dropped
+ * is 0 if there was no such collection, which is not an error. */
+int dbs_drop_collection(dbs *s, const char *name, size_t name_len, int *dropped);
+
+/* Create an index over an existing collection: plan it (kind, name,
+ * files -- db_catalog.h decides all three), create exactly those files,
+ * backfill it against every document already there, and record the
+ * definition in the catalog entry. The chosen name is appended to
+ * `name_out`.
+ *
+ * A failed backfill (a missing field, an unindexable value, a duplicate
+ * on a unique index) leaves the collection without the index and the
+ * catalog untouched -- the files it made are deleted here rather than
+ * left for the sweep, because unlike a crash this path knows they are
+ * garbage. */
+int dbs_create_index(dbs *s, const char *coll, size_t coll_len,
+                     const uint8_t *keys, size_t keys_len,
+                     const uint8_t *options, size_t options_len,
+                     dbuf *name_out);
+
+/* Drop an index by name: out of the catalog entry first, then its files.
+ * DC_ERR_NO_INDEX if the collection has no index of that name. */
+int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
+                   const char *name, size_t name_len);
+
+/* The collection's indexes, in the shape a MongoDB driver's listIndexes
+ * returns (db_catalog.h owns that projection). */
+int dbs_list_indexes(dbs *s, const char *coll, size_t coll_len, dbuf *out);
 
 /* ---- compaction ---------------------------------------------------------
  *

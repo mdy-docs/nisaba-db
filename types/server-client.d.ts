@@ -69,12 +69,30 @@ export interface RemoteCollection<T extends Document = Document> {
   /** Rewrite this collection's files without their append-only history.
    * Refused (ServerError -49) while any cursor is open over it. */
   compact(): Promise<{ generation: number; bytesBefore: number; bytesAfter: number; bytesFreed: number }>;
+  /** Plans, creates, backfills and records the index; resolves with the
+   * name the server chose (ServerError -56 if that name is taken). */
+  createIndex(keys: Record<string, 1 | 'text' | '2dsphere'>, options?: {
+    name?: string;
+    unique?: boolean;
+    sparse?: boolean;
+    partialFilterExpression?: Filter;
+    expireAfterSeconds?: number;
+  }): Promise<string>;
+  /** ServerError -57 if the collection has no index of that name. */
+  dropIndex(name: string): Promise<void>;
+  listIndexes(): Promise<Document[]>;
 }
 
 export interface RemoteDb {
   readonly isOpen: boolean;
   readonly address: string;
   collection<T extends Document = Document>(name: string): RemoteCollection<T>;
+  /** Make an empty collection. Resolves false if it already existed --
+   * both are success. An insert into a missing collection makes one too. */
+  createCollection(name: string): Promise<boolean>;
+  /** Remove a collection and every file it owns. False if there was no
+   * such collection. */
+  dropCollection(name: string): Promise<boolean>;
   /** The op that touches no collection: keeps a connection warm past the
    * server's --idle-timeout. Sent automatically on a timer unless
    * connectServer was given `keepAliveMs: 0`. */

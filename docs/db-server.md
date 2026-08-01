@@ -26,6 +26,7 @@ wasmtime run -S inherit-network --dir ~/.nisaba/mydb::. \
   wasm/lib/nisaba-server-wasip2.wasm --port 8097
 
 cd ~/.nisaba/mydb && nisaba-server --port 8097     # or natively
+cd /tmp/brand-new && nisaba-server --port 8097     # an empty directory becomes a database
 nisaba-server --stdio                              # frames on stdin/stdout
 ```
 
@@ -83,9 +84,9 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Thirteen operations —
-ten about a collection, two about a cursor, and `ping`, which is about
-the connection:
+**One request object in, one response object out.** Nineteen operations —
+eleven about a collection's documents, five about its schema, two about a
+cursor, and `ping`, which is about the connection:
 
 | Request | Response |
 | --- | --- |
@@ -100,6 +101,12 @@ the connection:
 | `{op:'update'\|'updateMany', coll, filter, update, upsert, id}` | `{ok:true, result}` |
 | `{op:'replace', coll, filter, doc, upsert, id}` | `{ok:true, result}` |
 | `{op:'delete'\|'deleteMany', coll, filter}` | `{ok:true, result}` |
+| `{op:'createCollection', coll}` | `{ok:true, created}` |
+| `{op:'dropCollection', coll}` | `{ok:true, dropped}` |
+| `{op:'createIndex', coll, keys, options}` | `{ok:true, name}` |
+| `{op:'dropIndex', coll, index}` | `{ok:true, dropped:true}` |
+| `{op:'listIndexes', coll}` | `{ok:true, indexes:[...]}` |
+| `{op:'compact', coll}` | `{ok:true, result:{generation, bytesBefore, bytesAfter, bytesFreed}}` |
 
 `result` is `{acknowledged, matchedCount, modifiedCount, deletedCount,
 insertedCount, upsertedId}`.
@@ -155,6 +162,36 @@ slot is being taken back after `--idle-timeout`. Both are in the same
 shape as every other refusal, so a client reads them with the code it
 already has — and both say what happened, rather than leaving a client to
 infer it from a socket that closed.
+
+**It can build a database, not just serve one.** Point the server at an
+empty directory and it writes the catalog (and the format stamp) at
+startup; `createCollection` makes a collection, and an `insert` into a
+name that does not exist makes one too — the way it does in every other
+host of this library, and in the database this is shaped after. A *read*
+of a name that does not exist is refused (`-37`) rather than answered out
+of a collection created on the reader's behalf: at that point it is far
+more likely to be a typo than an intention.
+
+`createIndex` plans the index — kind, name, files, all three decided by
+`db_catalog.h`, as they are for every host — creates exactly those files,
+**backfills it against every document already there**, and records the
+definition in the catalog entry. A failed build (a missing field, an
+unindexable value, a duplicate on a `unique` index) leaves the collection
+without the index and the catalog untouched.
+
+**Compaction is a request like any other.** `compact` rewrites a
+collection's whole file set without its append-only history and adopts
+the result — plan, stream, flip, reopen, delete — in one call
+([`compaction.md`](compaction.md)). The browser needs an awaited
+pre-open pass between the plan and the execute because OPFS opens are
+promises; here `ns->open` really opens, so the two calls sit next to each
+other with nothing between them. That difference, and only that
+difference, is what the plan/execute split buys.
+
+The session reopens the new generation for itself, so the next request is
+answered from it without anyone reconnecting, and the old files are
+deleted after the flip. Refused with `-49` while any cursor — anyone's —
+is scanning that collection.
 
 **Ids stay with the caller.** `id` supplies the 12 bytes a write needs if
 it turns out to need one (an insert whose document has no `_id`, an
@@ -231,9 +268,14 @@ Stated here rather than discovered later.
   waiting is always looked at before one further down. Nothing starves
   while requests are small; a stream of large ones from slot 0 would make
   slot 5 wait.
-- **Eleven collection operations.** No index management, change streams,
-  collection listing, or the `find-one-and-*` family. Each is an op in
-  `wasm/src/db_request.c` plus a method in the client.
+- **No collection listing.** `listCollections` is not on the wire, which
+  is also why there is no database-wide `compact`, and no `dump` or
+  `restore` from the CLI.
+- **No change streams, no `aggregate`, no `find-one-and-*` family, no
+  `insertMany`/`bulkWrite`, no `findByIndex`/`pruneExpired`.** Each is an
+  op in `wasm/src/db_request.c` plus a method in the client — except
+  `watch`, which also needs frames the client did not ask for, and this
+  protocol has no shape for those.
 - **Compaction is per collection, and per request.** No `compact()`
   across a whole database (that needs collection listing), and no
   scheduler: the engine runs no timers, so *when* to compact stays with

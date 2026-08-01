@@ -10,6 +10,7 @@
 
 #include "db_catalog.h"
 #include "db_names.h"
+#include "db_validate.h"
 #include "bjcursor.h"
 #include "bplustree.h"
 #include "rtree.h"
@@ -346,7 +347,51 @@ done:
 
 /* ---- public ------------------------------------------------------------ */
 
-int dbs_open(bj_ns *ns, int order, dbs **out) {
+/* The format stamp, checked and (when creating) written -- the same
+ * gate Db.open() applies in JavaScript, against the same key and the
+ * same {v} shape, because a database is only one format however many
+ * hosts read it. A database with no stamp predates the stamp and is
+ * version 1 by definition. */
+static int check_format(dbs *s, int create) {
+    bpt_key key = { .is_string = 1, .num = 0,
+                    .str = (const uint8_t *)DC_FORMAT_KEY,
+                    .str_len = (uint32_t)strlen(DC_FORMAT_KEY) };
+    int found = 0;
+    const uint8_t *vp = NULL; size_t vlen = 0;
+    int e = bpt_search(s->catalog, &key, &found, &vp, &vlen);
+    if (e) return e;
+
+    int64_t v = DC_FORMAT_VERSION;
+    if (found) {
+        const uint8_t *nv; size_t nvlen; int f = 0;
+        if ((e = obj_get_field(vp, vlen, (const uint8_t *)"v", 1, &nv, &nvlen, &f))) return e;
+        if (f) {
+            cur c = { nv, nvlen, 0 };
+            double d = 0;
+            if ((e = read_number(&c, &d))) return e;
+            v = (int64_t)d;
+        }
+        /* Newer than this build understands: refused, not opened and
+         * misread. There is no way to know what a field this build has
+         * never seen means. */
+        if (v > DC_FORMAT_VERSION) return DC_ERR_FORMAT_NEWER;
+    }
+    if (!create || (found && v == DC_FORMAT_VERSION)) return BJ_OK;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"v", 1);
+    bj_put_int(b, DC_FORMAT_VERSION);
+    bj_end_object(b);
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    e = data ? bpt_add(s->catalog, &key, data, (uint32_t)len) : BJ_ERR_OOM;
+    bj_builder_free(b);
+    return e;
+}
+
+int dbs_open(bj_ns *ns, int order, int create, dbs **out) {
     if (!ns || !ns->open || !ns->close || !out) return BJ_ERR_STATE;
     *out = NULL;
 
@@ -359,15 +404,27 @@ int dbs_open(bj_ns *ns, int order, dbs **out) {
      * something a caller can act on ("make one"), where BJ_ERR_STATE
      * reaches a user as "builder state error" and helps nobody. */
     int e = ns->open(ns->ctx, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE),
-                     0, &s->catalog_io);
+                     create ? BJ_NS_CREATE : 0, &s->catalog_io);
     if (e) { free(s); return DC_ERR_NO_DATABASE; }
 
-    s->catalog = bpt_open(&s->catalog_io);
+    /* An empty file is a directory that has just become a database: the
+     * catalog tree is written here, not found. Anything else is opened,
+     * which is also the check that it IS a catalog. */
+    s->catalog = s->catalog_io.size(s->catalog_io.ctx) == 0
+                 ? bpt_create(&s->catalog_io, order)
+                 : bpt_open(&s->catalog_io);
     if (!s->catalog) {
         ns->close(ns->ctx, &s->catalog_io);
         free(s);
         return BJ_ERR_STATE;
     }
+    if ((e = check_format(s, create))) {
+        bpt_free(s->catalog);
+        ns->close(ns->ctx, &s->catalog_io);
+        free(s);
+        return e;   /* *out stays NULL: nothing was opened */
+    }
+
     *out = s;
     return BJ_OK;
 }
@@ -412,6 +469,379 @@ int dbs_collection(dbs *s, const char *name, size_t name_len, dc_collection **ou
 
     *out = s->open[slot].coll;
     return BJ_OK;
+}
+
+/* ---- creation and schema ------------------------------------------------
+ *
+ * See db_session.h. Every one of these writes the catalog, and every one
+ * of them writes it LAST: the files are made first, so a failure leaves
+ * garbage nothing references rather than an entry pointing at something
+ * that is not there. The one exception is dropping, where the entry goes
+ * first for exactly the same reason -- an unreferenced file is an
+ * orphan, a referenced missing one is a broken database.
+ */
+
+static dbs_entry *find_entry(dbs *s, const char *name, size_t name_len);
+
+/* The catalog entry for `name`, copied out of the tree's own buffer
+ * (which dies on that tree's next operation, and these all perform
+ * several). */
+static int catalog_get(dbs *s, const char *name, size_t name_len,
+                       uint8_t **entry, size_t *entry_len, int *found) {
+    bpt_key key = { .is_string = 1, .num = 0,
+                    .str = (const uint8_t *)name, .str_len = (uint32_t)name_len };
+    const uint8_t *vp = NULL; size_t vlen = 0;
+    *entry = NULL; *entry_len = 0;
+    int e = bpt_search(s->catalog, &key, found, &vp, &vlen);
+    if (e || !*found) return e;
+    return dbuf_dup(vp, vlen, entry, entry_len);
+}
+
+static int catalog_put(dbs *s, const char *name, size_t name_len,
+                       const uint8_t *entry, size_t entry_len) {
+    bpt_key key = { .is_string = 1, .num = 0,
+                    .str = (const uint8_t *)name, .str_len = (uint32_t)name_len };
+    return bpt_add(s->catalog, &key, entry, (uint32_t)entry_len);
+}
+
+/* Create one file, empty, replacing anything already there: a leftover
+ * from an interrupted attempt is garbage, and building on top of it
+ * would be building on an unknown. */
+static int make_file(dbs *s, const uint8_t *name, uint32_t name_len, bj_io *io) {
+    return s->ns->open(s->ns->ctx, (const char *)name, name_len,
+                       BJ_NS_CREATE | BJ_NS_TRUNC, io);
+}
+
+/* Delete every name in a binjson array of strings. Best effort: what
+ * survives is an orphan, which the catalog already does not reference. */
+static void remove_all(dbs *s, const uint8_t *files, size_t files_len) {
+    uint32_t n = 0;
+    if (arr_len(files, files_len, &n)) return;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *fv; size_t fvlen;
+        if (arr_at(files, files_len, i, &fv, &fvlen)) return;
+        cur c = { fv, fvlen, 0 };
+        const uint8_t *fname; uint32_t fname_len;
+        if (take_string(&c, &fname, &fname_len)) continue;
+        s->ns->remove(s->ns->ctx, (const char *)fname, fname_len);
+    }
+}
+
+int dbs_create_collection(dbs *s, const char *name, size_t name_len, int *created) {
+    if (!s || !name || !created) return BJ_ERR_STATE;
+    *created = 0;
+
+    /* The same name rules every host applies, from the file that owns
+     * them -- including the reserved format stamp. */
+    int e = dc_check_collection_name(name, name_len);
+    if (e) return e;
+
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    if ((e = catalog_get(s, name, name_len, &entry, &entry_len, &found))) return e;
+    if (found) { free(entry); return BJ_OK; }   /* already there is success */
+
+    dbuf fresh = {0};
+    if ((e = dc_catalog_new_entry(name, name_len, &fresh))) { dbuf_free(&fresh); return e; }
+
+    /* The primary file, named by the entry rather than by this function:
+     * the naming scheme has one owner (db_names.h, through the entry). */
+    const uint8_t *fp; uint32_t flen; int f = 0;
+    if ((e = plan_str(fresh.data, fresh.len, "file", &fp, &flen, &f))) { dbuf_free(&fresh); return e; }
+    if (!f) { dbuf_free(&fresh); return DC_ERR_CATALOG_ENTRY; }
+
+    bj_io io;
+    if ((e = make_file(s, fp, flen, &io))) { dbuf_free(&fresh); return e; }
+    bpt *tree = bpt_create(&io, s->order);
+    if (!tree) {
+        s->ns->close(s->ns->ctx, &io);
+        s->ns->remove(s->ns->ctx, (const char *)fp, flen);
+        dbuf_free(&fresh);
+        return BJ_ERR_STATE;
+    }
+    /* Written and closed: the collection is opened the ordinary way, by
+     * dbs_collection, from the catalog -- one open path, not two. */
+    bpt_free(tree);
+    s->ns->close(s->ns->ctx, &io);
+
+    e = catalog_put(s, name, name_len, fresh.data, fresh.len);
+    dbuf_free(&fresh);
+    if (e) { s->ns->remove(s->ns->ctx, (const char *)fp, flen); return e; }
+
+    *created = 1;
+    return BJ_OK;
+}
+
+int dbs_drop_collection(dbs *s, const char *name, size_t name_len, int *dropped) {
+    if (!s || !name || !dropped) return BJ_ERR_STATE;
+    *dropped = 0;
+
+    int e = dc_check_collection_name(name, name_len);
+    if (e) return e;
+
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    if ((e = catalog_get(s, name, name_len, &entry, &entry_len, &found))) return e;
+    if (!found) return BJ_OK;   /* nothing to drop is not a failure */
+
+    /* Cursors first: a scan positioned in files about to be unlinked
+     * would read bytes that are gone -- the same hazard compaction
+     * refuses on, except that here there is nothing to preserve. */
+    for (int i = 0; i < DBS_MAX_CURSORS; i++) {
+        if (!s->cursors[i].id) continue;
+        dc_cursor_close(s->cursors[i].cur);
+        memset(&s->cursors[i], 0, sizeof s->cursors[i]);
+    }
+
+    dbs_entry *en = find_entry(s, name, name_len);
+    if (en) entry_release(s->ns, en);
+
+    /* Which files an entry claims is the sweep's question too, answered
+     * by the same C: a kind this missed would be an orphan on every
+     * drop, and one the sweep missed would be deleted from under a live
+     * collection. */
+    dbuf files = {0};
+    e = dc_collection_files(entry, entry_len, name, name_len, &files);
+    free(entry);
+    if (e) { dbuf_free(&files); return e; }
+
+    bpt_key key = { .is_string = 1, .num = 0,
+                    .str = (const uint8_t *)name, .str_len = (uint32_t)name_len };
+    e = bpt_delete(s->catalog, &key);
+    if (e) { dbuf_free(&files); return e; }
+
+    remove_all(s, files.data, files.len);
+    dbuf_free(&files);
+    *dropped = 1;
+    return BJ_OK;
+}
+
+/*
+ * Create the files a planned index names, attach it (which BACKFILLS it
+ * against every document already in the collection -- db.h) and record
+ * the definition. Split out because the three kinds differ only in
+ * which attach call takes which handles.
+ */
+static int build_index(dbs *s, dbs_entry *en, const uint8_t *def, size_t def_len) {
+    int found = 0;
+    const uint8_t *name; uint32_t name_len;
+    int e = plan_str(def, def_len, "name", &name, &name_len, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_CATALOG_ENTRY;
+
+    int kind = DC_INDEX_EQUALITY;
+    if ((e = plan_int(def, def_len, "kind", &kind, &found))) return e;
+
+    const uint8_t *files; size_t files_len;
+    if ((e = plan_raw(def, def_len, "files", &files, &files_len, &found))) return e;
+    if (!found) return DC_ERR_CATALOG_ENTRY;
+    uint32_t n_files = 0;
+    if ((e = arr_len(files, files_len, &n_files))) return e;
+    if (n_files == 0 || n_files > DBS_MAX_INDEX_FILES) return DC_ERR_CATALOG_ENTRY;
+
+    bj_io io[DBS_MAX_INDEX_FILES];
+    bpt *tree[DBS_MAX_INDEX_FILES] = { NULL, NULL, NULL };
+    rtree *rt = NULL;
+    uint32_t made = 0;
+
+    for (uint32_t i = 0; i < n_files; i++) {
+        const uint8_t *fv; size_t fvlen;
+        if ((e = arr_at(files, files_len, i, &fv, &fvlen))) goto fail;
+        cur fc = { fv, fvlen, 0 };
+        const uint8_t *fname; uint32_t fname_len;
+        if ((e = take_string(&fc, &fname, &fname_len))) goto fail;
+        if ((e = make_file(s, fname, fname_len, &io[i]))) goto fail;
+        made = i + 1;
+    }
+
+    if (kind == DC_INDEX_GEO) {
+        rt = rtree_create(&io[0], s->order);
+        if (!rt) { e = BJ_ERR_STATE; goto fail; }
+        const uint8_t *field; uint32_t field_len;
+        if ((e = plan_str(def, def_len, "field", &field, &field_len, &found))) goto fail;
+        if (!found) { e = DC_ERR_CATALOG_ENTRY; goto fail; }
+        e = dc_collection_add_geo_index(en->coll, (const char *)name, (int)name_len,
+                                        rt, (const char *)field, (int)field_len);
+        if (e) goto fail;
+    } else if (kind == DC_INDEX_TEXT) {
+        if (n_files != DBS_MAX_INDEX_FILES) { e = DC_ERR_CATALOG_ENTRY; goto fail; }
+        for (uint32_t i = 0; i < n_files; i++) {
+            tree[i] = bpt_create(&io[i], s->order);
+            if (!tree[i]) { e = BJ_ERR_STATE; goto fail; }
+        }
+        const uint8_t *field; uint32_t field_len;
+        if ((e = plan_str(def, def_len, "field", &field, &field_len, &found))) goto fail;
+        if (!found) { e = DC_ERR_CATALOG_ENTRY; goto fail; }
+        e = dc_collection_add_text_index(en->coll, (const char *)name, (int)name_len,
+                                         tree[0], tree[1], tree[2],
+                                         (const char *)field, (int)field_len);
+        if (e) goto fail;
+    } else {
+        tree[0] = bpt_create(&io[0], s->order);
+        if (!tree[0]) { e = BJ_ERR_STATE; goto fail; }
+        const uint8_t *fields; size_t fields_len;
+        if ((e = plan_raw(def, def_len, "fields", &fields, &fields_len, &found))) goto fail;
+        if (!found) { e = DC_ERR_CATALOG_ENTRY; goto fail; }
+        int uniq = 0, sparse = 0;
+        if ((e = plan_flag(def, def_len, "unique", &uniq))) goto fail;
+        if ((e = plan_flag(def, def_len, "sparse", &sparse))) goto fail;
+        const uint8_t *pfe = NULL; size_t pfe_len = 0; int has_pfe = 0;
+        if ((e = plan_raw(def, def_len, "partialFilterExpression", &pfe, &pfe_len, &has_pfe))) goto fail;
+        e = dc_collection_add_index(en->coll, (const char *)name, (int)name_len,
+                                    tree[0], fields, (uint32_t)fields_len,
+                                    uniq, sparse,
+                                    has_pfe ? pfe : NULL, has_pfe ? (uint32_t)pfe_len : 0);
+        if (e) goto fail;
+    }
+
+    /* Attached and backfilled. The handles belong to the session's entry
+     * now, so the ordinary close path releases them. */
+    {
+        dbs_index *ix = &en->idx[en->n_idx];
+        memset(ix, 0, sizeof(*ix));
+        ix->kind = kind;
+        ix->n_files = (int)n_files;
+        ix->name = (char *)malloc(name_len ? name_len : 1);
+        if (!ix->name) { e = BJ_ERR_OOM; goto fail; }
+        memcpy(ix->name, name, name_len);
+        ix->name_len = name_len;
+        for (uint32_t i = 0; i < n_files; i++) { ix->io[i] = io[i]; ix->tree[i] = tree[i]; }
+        ix->rt = rt;
+        en->n_idx++;
+    }
+    return BJ_OK;
+
+fail:
+    /* Nothing was recorded, so the files this made are garbage THIS call
+     * knows about -- deleted here rather than left for a sweep. */
+    for (uint32_t i = 0; i < n_files; i++) if (tree[i]) bpt_free(tree[i]);
+    if (rt) rtree_free(rt);
+    for (uint32_t i = 0; i < made; i++) s->ns->close(s->ns->ctx, &io[i]);
+    remove_all(s, files, files_len);
+    return e;
+}
+
+int dbs_create_index(dbs *s, const char *coll, size_t coll_len,
+                     const uint8_t *keys, size_t keys_len,
+                     const uint8_t *options, size_t options_len,
+                     dbuf *name_out) {
+    if (!s || !coll || !keys || !name_out) return BJ_ERR_STATE;
+
+    dc_collection *c = NULL;
+    int e = dbs_collection(s, coll, coll_len, &c);
+    if (e) return e;
+    dbs_entry *en = find_entry(s, coll, coll_len);
+    if (!en) return BJ_ERR_STATE;
+    if (en->n_idx >= DBS_MAX_INDEXES) return DC_ERR_TOO_MANY_INDEXES;
+
+    /* C decides what kind of index this is, what it is called and which
+     * files it needs -- all of it pure, all of it before anything
+     * exists. This function creates exactly what the plan named. */
+    dbuf plan = {0};
+    if ((e = dc_index_create_plan(keys, keys_len, options, options_len,
+                                  coll, coll_len, &plan))) {
+        dbuf_free(&plan);
+        return e;
+    }
+
+    int found = 0;
+    const uint8_t *name; uint32_t name_len;
+    if ((e = plan_str(plan.data, plan.len, "name", &name, &name_len, &found))) {
+        dbuf_free(&plan); return e;
+    }
+    if (!found) { dbuf_free(&plan); return DC_ERR_CATALOG_ENTRY; }
+
+    for (int i = 0; i < en->n_idx; i++) {
+        if (en->idx[i].name_len == name_len &&
+            memcmp(en->idx[i].name, name, name_len) == 0) {
+            dbuf_free(&plan);
+            return DC_ERR_INDEX_EXISTS;
+        }
+    }
+
+    if ((e = build_index(s, en, plan.data, plan.len))) { dbuf_free(&plan); return e; }
+
+    /* Built and attached; now recorded. The plan IS the stored shape's
+     * input, so one definition flows create -> catalog -> open rather
+     * than being rebuilt by whoever writes it down. */
+    uint8_t *entry = NULL; size_t entry_len = 0;
+    if ((e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found))) return e;
+    if (!found) { free(entry); return DC_ERR_NO_COLLECTION; }
+
+    dbuf updated = {0};
+    e = dc_catalog_put_index(entry, entry_len, plan.data, plan.len, &updated);
+    free(entry);
+    if (!e) e = catalog_put(s, coll, coll_len, updated.data, updated.len);
+    dbuf_free(&updated);
+    if (!e) e = dbuf_put(name_out, name, name_len);
+    dbuf_free(&plan);
+    return e;
+}
+
+int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
+                   const char *name, size_t name_len) {
+    if (!s || !coll || !name) return BJ_ERR_STATE;
+
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    int e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_NO_COLLECTION;
+
+    /* Find the definition before it is gone: its files are named there
+     * and nowhere else. */
+    dbuf files = {0};
+    {
+        const uint8_t *indexes; size_t indexes_len; int has = 0;
+        if ((e = plan_raw(entry, entry_len, "indexes", &indexes, &indexes_len, &has))) goto done;
+        uint32_t n = 0;
+        if (has && (e = arr_len(indexes, indexes_len, &n))) goto done;
+        int seen = 0;
+        for (uint32_t i = 0; has && i < n; i++) {
+            const uint8_t *def; size_t def_len;
+            if ((e = arr_at(indexes, indexes_len, i, &def, &def_len))) goto done;
+            const uint8_t *dn; uint32_t dn_len; int f = 0;
+            if ((e = plan_str(def, def_len, "name", &dn, &dn_len, &f))) goto done;
+            if (!f || dn_len != name_len || memcmp(dn, name, name_len) != 0) continue;
+            seen = 1;
+            const uint8_t *fl; size_t fl_len; int hf = 0;
+            if ((e = plan_raw(def, def_len, "files", &fl, &fl_len, &hf))) goto done;
+            if (hf) e = dbuf_put(&files, fl, fl_len);
+            break;
+        }
+        if (!seen) { e = DC_ERR_NO_INDEX; goto done; }
+    }
+
+    /* The entry first: while it names the index, the files are live. */
+    {
+        dbuf updated = {0};
+        e = dc_catalog_drop_index(entry, entry_len, name, name_len, &updated);
+        if (!e) e = catalog_put(s, coll, coll_len, updated.data, updated.len);
+        dbuf_free(&updated);
+        if (e) goto done;
+    }
+
+    /* Then the open handles, then the files. Reopened lazily: the next
+     * request that wants this collection gets it from the catalog, which
+     * no longer mentions the index. */
+    {
+        dbs_entry *en = find_entry(s, coll, coll_len);
+        if (en) entry_release(s->ns, en);
+    }
+    if (files.len) remove_all(s, files.data, files.len);
+
+done:
+    dbuf_free(&files);
+    free(entry);
+    return e;
+}
+
+int dbs_list_indexes(dbs *s, const char *coll, size_t coll_len, dbuf *out) {
+    if (!s || !coll || !out) return BJ_ERR_STATE;
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    int e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_NO_COLLECTION;
+    e = dc_catalog_list_indexes(entry, entry_len, out);
+    free(entry);
+    return e;
 }
 
 /* ---- compaction ---------------------------------------------------------

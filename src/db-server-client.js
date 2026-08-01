@@ -50,7 +50,7 @@
  * can use -- close() gives it back, draining gives it back, and losing
  * the connection gives it back.
  *
- * WHAT IS NOT HERE. The wire has fourteen ops (WIRE_OPS below) and this
+ * WHAT IS NOT HERE. The wire has nineteen ops (WIRE_OPS below) and this
  * client has exactly those. Indexes, compaction, change streams, listing
  * collections and the find-one-and-* family are not on the wire yet;
  * asking for one gets a sentence saying so rather than a TypeError about
@@ -72,7 +72,8 @@ export const WIRE_OPS = [
   'ping',
   'find', 'findOne', 'count', 'distinct',
   'insert', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
-  'getMore', 'closeCursor', 'compact'
+  'getMore', 'closeCursor', 'compact',
+  'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes'
 ];
 
 /** Pings per idle timeout. The server's default is 60s; a third of that
@@ -385,6 +386,22 @@ function collection(conn, name) {
      */
     async compact() {
       return (await call({ op: 'compact' })).result;
+    },
+
+    /* ---- schema. The collection this names need not exist yet: that is
+     * what createCollection is for, and an insert makes one anyway. */
+    async createIndex(keys, options = undefined) {
+      const req = { op: 'createIndex', keys };
+      if (options && Object.keys(options).length) req.options = options;
+      return (await call(req)).name;
+    },
+
+    async dropIndex(name) {
+      await call({ op: 'dropIndex', index: name });
+    },
+
+    async listIndexes() {
+      return (await call({ op: 'listIndexes' })).indexes || [];
     }
   };
 
@@ -440,6 +457,16 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
     isOpen: true,
     address: `${host}:${port}`,
     collection: (name) => collection(conn, name),
+    /** Make a collection with no documents in it. Idempotent: an
+     * existing one answers `false` and is left alone. An insert creates
+     * one too, so this is for the empty-collection case and for saying
+     * when it happened. */
+    async createCollection(name) {
+      return (await conn.call({ op: 'createCollection', coll: name })).created;
+    },
+    async dropCollection(name) {
+      return (await conn.call({ op: 'dropCollection', coll: name })).dropped;
+    },
     /** The one op that touches no collection: it exists so a connection
      * can stay warm without pretending to be a query. */
     async ping() {

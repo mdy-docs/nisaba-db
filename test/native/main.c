@@ -802,7 +802,8 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_REQ_MALFORMED, DC_ERR_REQ_UNKNOWN_OP, DC_ERR_REQ_MISSING_FIELD,
         DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
         DC_ERR_NO_CURSOR, DC_ERR_TOO_MANY_CURSORS, DC_ERR_CURSOR_SORTED,
-        DC_ERR_CURSORS_OPEN,
+        DC_ERR_CURSORS_OPEN, DC_ERR_FORMAT_NEWER, DC_ERR_INDEX_EXISTS,
+        DC_ERR_NO_INDEX,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
@@ -1569,7 +1570,7 @@ TEST(a_session_resolves_a_collection_by_name_with_no_host_language) {
     CHECK_FATAL(build_users_db(&ns) == 0);
 
     dbs *s = NULL;
-    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
     CHECK_I64(dbs_open_count(s), 0);
 
     dc_collection *users = NULL;
@@ -1662,7 +1663,7 @@ TEST(a_collection_that_cannot_be_opened_leaves_the_session_untouched) {
     CHECK_OK(nscheck_declare(k, "coll-users-journal.bj", 21));
 
     dbs *s = NULL;
-    CHECK_FATAL(dbs_open(&counted, ORDER, &s) == BJ_OK);
+    CHECK_FATAL(dbs_open(&counted, ORDER, 0, &s) == BJ_OK);
     CHECK_I64(nscheck_opens(k) - nscheck_closes(k), 1);   /* the catalog */
 
     dc_collection *users = NULL;
@@ -1724,6 +1725,20 @@ static int response_ok(const dbuf *res) {
     return ok;
 }
 
+/* A boolean field of a response -- `created`, `dropped`, `found`. -1 if
+ * it is absent or is not a bool, which is a failure a caller wants to
+ * see rather than a silent 0. */
+static int response_flag(const dbuf *res, const char *key) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(res->data, res->len, (const uint8_t *)key,
+                      (uint32_t)strlen(key), &v, &vlen, &found) || !found)
+        return -1;
+    cur c = { v, vlen, 0 };
+    int flag = 0;
+    if (read_bool(&c, &flag)) return -1;
+    return flag;
+}
+
 /* Read a numeric field out of a response (or its nested `result`). */
 static int64_t response_num(const dbuf *res, const char *key, int *found_out) {
     const uint8_t *v; size_t vlen; int found = 0;
@@ -1755,7 +1770,7 @@ TEST(a_request_is_answered_in_binjson_with_no_transport) {
     CHECK_FATAL(build_users_db(&ns) == 0);
 
     dbs *s = NULL;
-    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
 
     /* ---- ping: the one op with no collection in it. It exists for the
      * server's idle timer (a client keeps its slot warm without
@@ -1947,7 +1962,7 @@ TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
     CHECK_FATAL(build_users_db(&ns) == 0);
 
     dbs *s = NULL;
-    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
 
     const uint64_t ALICE = 7, BOB = 9;   /* two clients, one session */
     int64_t id = 0;
@@ -2082,6 +2097,197 @@ TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
     close(dirfd);
 }
 
+TEST(a_database_can_be_built_from_an_empty_directory) {
+    /*
+     * The other half of "the engine is C": until now this layer could
+     * open a database somebody else had written and could not write one.
+     * Every schema decision was already here (db_catalog.h names files,
+     * kinds and options); what was missing was the choreography around
+     * it -- create the files, attach, backfill, record.
+     *
+     * So: an empty directory, and a whole database built through
+     * dbs_handle. Nothing in this test knows a file name.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-fresh", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    /* Without `create`, an empty directory is not a database and says
+     * so rather than quietly becoming one. */
+    dbs *refused = NULL;
+    CHECK_RC(dbs_open(&ns, ORDER, 0, &refused), DC_ERR_NO_DATABASE);
+    CHECK(refused == NULL);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 1, &s) == BJ_OK);
+    const uint64_t CLIENT = 5;
+
+    /* ---- a collection, made and made again. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("createCollection", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_flag(&res, "created"), 1);
+        dbuf_free(&res); bj_builder_free(rb);
+
+        /* Idempotent: already there is success, and says it made nothing. */
+        rb = request("createCollection", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf again = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &again));
+        CHECK_I64(response_ok(&again), 1);
+        CHECK_I64(response_flag(&again, "created"), 0);
+        dbuf_free(&again); bj_builder_free(rb);
+    }
+
+    /* ---- documents, and a collection nobody created: an insert makes
+     * one, the way it does in every other host of this library. */
+    for (int i = 0; i < 4; i++) {
+        doc *d = doc_new();
+        uint8_t oid[12] = { 0 };
+        oid[11] = (uint8_t)(i + 1);
+        doc_oid(d, "_id", oid);
+        doc_str(d, "name", i < 2 ? "core person" : "other person");
+        doc_str(d, "team", i < 2 ? "core" : "research");
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("insert", i < 3 ? "users" : "notes", "doc", db_, dlen,
+                                 &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(d);
+    }
+
+    /* ---- an index, planned and backfilled against what is already there. */
+    {
+        doc *k = doc_new();
+        doc_int(k, "team", 1);
+        uint32_t klen; const uint8_t *kb = doc_done(k, &klen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("createIndex", "users", "keys", kb, klen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        /* The name is C's to choose, and it chose the driver's. */
+        CHECK(find_bytes(res.data, res.len, "team_1", 6) != NULL);
+        dbuf_free(&res); bj_builder_free(rb);
+
+        /* And a second one of the same shape is refused by name. */
+        rb = request("createIndex", "users", "keys", kb, klen, &req, &req_len);
+        dbuf dup = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &dup));
+        CHECK_I64(response_ok(&dup), 0);
+        int f = 0;
+        CHECK_I64(response_num(&dup, "code", &f), DC_ERR_INDEX_EXISTS);
+        dbuf_free(&dup); bj_builder_free(rb); doc_free(k);
+    }
+
+    /* ---- listIndexes, in the shape a driver expects. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("listIndexes", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK(find_bytes(res.data, res.len, "team_1", 6) != NULL);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- the index serves a query, which is the only proof that the
+     * backfill happened. */
+    {
+        doc *q = doc_new();
+        doc_str(q, "team", "core");
+        uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "users", "filter", qb, qlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        int f = 0;
+        CHECK_I64(response_num(&res, "n", &f), 2);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(q);
+    }
+
+    /* ---- dropped by name, and refused twice. */
+    {
+        bj_builder *rb = bj_builder_new();
+        bj_begin_object(rb);
+        bj_put_key(rb, (const uint8_t *)"op", 2);
+        bj_put_string(rb, (const uint8_t *)"dropIndex", 9);
+        bj_put_key(rb, (const uint8_t *)"coll", 4);
+        bj_put_string(rb, (const uint8_t *)"users", 5);
+        bj_put_key(rb, (const uint8_t *)"index", 5);
+        bj_put_string(rb, (const uint8_t *)"team_1", 6);
+        bj_end_object(rb);
+        size_t rl = 0; const uint8_t *req = bj_builder_data(rb, &rl);
+
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, (uint32_t)rl, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res);
+
+        dbuf twice = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, (uint32_t)rl, &twice));
+        CHECK_I64(response_ok(&twice), 0);
+        int f = 0;
+        CHECK_I64(response_num(&twice, "code", &f), DC_ERR_NO_INDEX);
+        dbuf_free(&twice); bj_builder_free(rb);
+    }
+
+    /* ---- a collection dropped is gone from the catalog, and the other
+     * one is untouched. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("dropCollection", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_flag(&res, "dropped"), 1);
+        dbuf_free(&res); bj_builder_free(rb);
+
+        rb = request("count", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf gone = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &gone));
+        CHECK_I64(response_ok(&gone), 0);
+        int f = 0;
+        CHECK_I64(response_num(&gone, "code", &f), DC_ERR_NO_COLLECTION);
+        dbuf_free(&gone); bj_builder_free(rb);
+
+        rb = request("count", "notes", NULL, NULL, 0, &req, &req_len);
+        dbuf kept = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &kept));
+        f = 0;
+        CHECK_I64(response_num(&kept, "n", &f), 1);
+        dbuf_free(&kept); bj_builder_free(rb);
+    }
+
+    dbs_close(s);
+
+    /* ---- and what it wrote is a database: reopened WITHOUT create,
+     * which is the check that the catalog and the format stamp are real
+     * rather than something this session was holding in memory. */
+    {
+        dbs *reopened = NULL;
+        CHECK_FATAL(dbs_open(&ns, ORDER, 0, &reopened) == BJ_OK);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "notes", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(reopened, CLIENT, req, req_len, &res));
+        int f = 0;
+        CHECK_I64(response_num(&res, "n", &f), 1);
+        dbuf_free(&res); bj_builder_free(rb);
+        dbs_close(reopened);
+    }
+
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads) {
     /*
      * Compaction as a REQUEST: the same plan/stream/flip/reopen/delete
@@ -2102,7 +2308,7 @@ TEST(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads) {
     CHECK_FATAL(build_users_db(&ns) == 0);
 
     dbs *s = NULL;
-    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
     const uint64_t CLIENT = 3;
 
     /* Churn: every document replaced, so the append-only file holds far
@@ -2253,7 +2459,7 @@ TEST(every_way_a_request_can_be_wrong_is_answered_not_thrown) {
     CHECK_FATAL(build_users_db(&ns) == 0);
 
     dbs *s = NULL;
-    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
 
     struct { const char *op; const char *coll; const char *key; int want; } cases[] = {
         { "explodinate", "users", NULL,  DC_ERR_REQ_UNKNOWN_OP    },
@@ -6741,6 +6947,7 @@ int main(void) {
     RUN(bulk_grammar_rejects_malformed_lists_and_names_the_index);
     RUN(ttl_cutoff_and_filter);
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
+    RUN(a_database_can_be_built_from_an_empty_directory);
     RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);

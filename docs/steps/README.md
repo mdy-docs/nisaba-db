@@ -28,9 +28,11 @@ one process per database directory, binjson over sockets, as a
 [`docs/db-server.md`](../db-server.md). It delivered
 `wasm/include/db_session.h` — resolving a collection by name in C — which
 is the piece 1 and 2 were both blocked on, and it is what 3 sits on top
-of. What it does not do yet (one connection at a time, ten operations, no
-cursors) is listed there rather than here, because those are properties
-of a thing that exists.
+of. It has since grown a bounded `poll()` multiplexer with idle
+reclamation, paged cursors, creation and schema, compaction, and lists of
+writes — twenty-two operations. What it still does not do is listed
+there rather than here, because those are properties of a thing that
+exists.
 
 **One decision is still deliberately open:** whether the browser stays a
 *host* (owning OPFS files) or becomes a *client* of a server. It is a

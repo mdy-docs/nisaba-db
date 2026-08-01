@@ -343,20 +343,18 @@ Stated here rather than discovered later.
   waiting is always looked at before one further down. Nothing starves
   while requests are small; a stream of large ones from slot 0 would make
   slot 5 wait.
-- **No database-wide `compact`.** `listCollections` makes it possible to
-  build client-side, but the in-process `Db.compact()` takes
-  `minBytes`/`factor`/`skipBusy` and this would not, so it would be a
-  second, weaker thing wearing the same name. Compact a collection at a
-  time.
+- **Compaction is per collection and per request.** `listCollections`
+  makes a database-wide `compact` easy to build client-side, but the
+  in-process `Db.compact()` takes `minBytes`/`factor`/`skipBusy` and that
+  loop would not, so it would be a second, weaker thing wearing the same
+  name. There is no scheduler either: the engine runs no timers, so
+  *when* to compact stays with whoever is driving
+  (`docs/compaction.md`).
 - **No change streams, no `aggregate`, no `find-one-and-*` family, no
   `findByIndex`/`pruneExpired`.** Each is an op in
   `wasm/src/db_request.c` plus a method in the client — except `watch`,
   which also needs frames the client did not ask for, and this protocol
   has no shape for those. `dump` and `restore` both work today.
-- **Compaction is per collection, and per request.** No `compact()`
-  across a whole database (that needs collection listing), and no
-  scheduler: the engine runs no timers, so *when* to compact stays with
-  whoever is driving (`docs/compaction.md`).
 - **No TLS, no auth, no tenants.** Loopback only. Those belong to the
   gateway in front, not to the database
   (`docs/replicaton-roadmap.md` step 4 records that boundary).

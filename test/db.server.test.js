@@ -24,7 +24,7 @@ import path from 'node:path';
 import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
 import { connect, ObjectId } from '../src/db.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
-import { connectServer, ServerError, WIRE_OPS } from '../src/db-server-client.js';
+import { connectServer, ServerError, WIRE_OPS, ChangeStreamOverflowError } from '../src/db-server-client.js';
 import { BPlusTree } from '../wasm/nisaba-wasm.js';
 
 await ready();
@@ -505,10 +505,11 @@ for (const engine of ENGINES) {
 
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
       expect(() => db.storageEstimate()).toThrow(/no db\.storageEstimate/);
-      expect(() => db.collection('users').watch()).toThrow(/no collection\.watch/);
+      expect(() => db.collection('users').estimatedDocumentCount())
+        .toThrow(/no collection\.estimatedDocumentCount/);
       // The sentence names the ops that DO exist, so the refusal is
       // actionable without reading the source.
-      expect(() => db.collection('users').watch()).toThrow(WIRE_OPS.join(', '));
+      expect(() => db.collection('users').estimatedDocumentCount()).toThrow(WIRE_OPS.join(', '));
       // And an op that IS on the wire, asked of the wrong thing, says
       // that instead of listing `compact` as available while refusing
       // compact -- which is what it used to do.
@@ -586,12 +587,12 @@ for (const engine of ENGINES) {
     });
 
     it('refuses, from the CLI, what only a local database can do', () => {
-      // `watch`, not `prune-expired`: TTL sweeps are on the wire now.
-      // What is left is the one command that cannot be an op at all --
-      // it needs frames the client did not ask for.
-      const watched = cli('watch', 'users');
-      expect(watched.status).toBe(1);
-      expect(watched.stderr).toMatch(/no collection\.watch/);
+      // Not `watch` any more -- change streams are on the wire. What is
+      // left is compact with no collection named: a database-wide
+      // compaction would be a second, weaker thing wearing the name.
+      const wide = cli('compact');
+      expect(wide.status).toBe(1);
+      expect(wide.stderr).toMatch(/compact is a collection operation/);
 
       // --order is the server's, decided when it opened the directory.
       const ordered = cli('count', 'users', '--order', '64');
@@ -1039,6 +1040,196 @@ for (const engine of ENGINES) {
       const c = db.collection('users').find({}, { batchSize: 1 });
       expect(await c.nextBatch()).toHaveLength(1);
       await c.close();
+    });
+  });
+
+  /*
+   * Change streams: the only frames on this wire that answer nothing.
+   * What matters here and cannot be checked in C is the ROUTING -- that
+   * a client tells an event from an answer by shape, that events and
+   * answers interleave on one socket without either being mistaken for
+   * the other, and that a watcher hears about writes it did not make.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: change streams (${engine.name})`, () => {
+    let proc, db, other;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      ({ proc } = await startServer(engine, port));
+      db = await connectServer(port);
+      other = await connectServer(port);
+      return async () => { await db.close(); await other.close(); proc.kill(); };
+    });
+
+    /** Wait for the watcher to have been registered server-side. */
+    const settle = () => new Promise(r => setTimeout(r, 120));
+
+    it('tells a watcher what another connection wrote', async () => {
+      const seen = [];
+      const stream = db.collection('notes').watch();
+      stream.on('change', (c) => seen.push(`${c.operationType}:${c.fullDocument?.body ?? ''}`));
+      await settle();
+
+      const w = other.collection('notes');   // a different connection
+      await w.insertOne({ body: 'first' });
+      await w.updateOne({ body: 'first' }, { $set: { body: 'edited' } });
+      await w.replaceOne({ body: 'edited' }, { body: 'replaced' });
+      await w.deleteOne({ body: 'replaced' });
+      await settle();
+
+      // An update names its changes, not its outcome, so the event
+      // carries the document as it now is -- read back by the id the
+      // command named.
+      expect(seen).toEqual([
+        'insert:first', 'update:edited', 'replace:replaced', 'delete:'
+      ]);
+      await stream.close();
+    });
+
+    it('carries the collection, and only that collection', async () => {
+      const stream = db.collection('watched').watch();
+      await settle();
+      await other.collection('watched').insertOne({ n: 1 });
+      await other.collection('ignored').insertOne({ n: 2 });
+      await settle();
+
+      const first = await stream.next();
+      expect(first.value.ns).toEqual({ coll: 'watched' });
+      expect(first.value.operationType).toBe('insert');
+      // The other collection's write is not in the queue behind it.
+      const race = await Promise.race([
+        stream.next().then(() => 'another'),
+        new Promise(r => setTimeout(() => r('nothing else'), 200))
+      ]);
+      expect(race).toBe('nothing else');
+      await stream.close();
+    });
+
+    it('keeps answers and events apart on one socket', async () => {
+      const stream = db.collection('mixed').watch();
+      const seen = [];
+      stream.on('change', (c) => seen.push(c.operationType));
+      await settle();
+
+      // Ordinary requests down the same connection, interleaved with
+      // events caused by the other one. Every answer must still be the
+      // answer to its own question.
+      await other.collection('mixed').insertMany([{ i: 1 }, { i: 2 }, { i: 3 }]);
+      expect(await db.collection('mixed').countDocuments({})).toBe(3);
+      await other.collection('mixed').deleteMany({ i: { $lt: 3 } });
+      expect(await db.collection('mixed').countDocuments({})).toBe(1);
+      expect(await db.collection('mixed').distinct('i')).toEqual([3]);
+      await settle();
+
+      expect(seen).toEqual(['insert', 'insert', 'insert', 'delete', 'delete']);
+      await stream.close();
+    });
+
+    it('watches a collection that does not exist yet', async () => {
+      // The insert that creates it is the event a watcher most wants.
+      const stream = db.collection('unborn').watch();
+      await settle();
+      await other.collection('unborn').insertOne({ hello: 'world' });
+      const { value } = await stream.next();
+      expect(value.operationType).toBe('insert');
+      expect(value.fullDocument.hello).toBe('world');
+      await stream.close();
+    });
+
+    it('stops when closed, and when its connection goes', async () => {
+      const stream = db.collection('stopping').watch();
+      await settle();
+      await stream.close();
+      await other.collection('stopping').insertOne({ n: 1 });
+      await settle();
+      expect(await stream.next()).toEqual({ value: undefined, done: true });
+
+      // A stream is its connection's: losing one ends the other.
+      const doomed = await connectServer(port);
+      const orphan = doomed.collection('stopping').watch();
+      await settle();
+      const pending = orphan.next();
+      await doomed.close();
+      await expect(pending).rejects.toThrow(/closed/);
+    });
+
+    it('gives up on a consumer that stopped reading, and says so', async () => {
+      // A raw socket, so it can stop reading -- which the client never
+      // does. The server holds a bounded queue per stream and closes the
+      // stream rather than growing it, which is the in-process contract
+      // too (there are no resume tokens to offer instead).
+      const sock = net.connect(port, '127.0.0.1');
+      await new Promise(r => sock.once('connect', r));
+      const frames = [];
+      let buf = Buffer.alloc(0);
+      sock.on('data', (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        for (;;) {
+          if (buf.length < 5) return;
+          const total = buf.readUInt32LE(1) + 5;
+          if (buf.length < total) return;
+          frames.push(decode(buf.subarray(0, total)));
+          buf = buf.subarray(total);
+        }
+      });
+      sock.write(Buffer.from(encode({ op: 'watch', coll: 'flood' })));
+      await settle();
+      expect(frames.shift()).toMatchObject({ ok: true });
+      sock.pause();                                   // and stop reading
+
+      // MANY requests, not one: this is the transport's bound under
+      // test, not the session's. One huge insertMany would fill the
+      // session queue during a single request and overflow whatever the
+      // transport did afterwards; twenty separate writes only overflow
+      // if the loop stops handing events to a connection that is not
+      // draining them.
+      const pad = 'x'.repeat(500);
+      for (let round = 0; round < 30; round++) {
+        await other.collection('flood').insertMany(
+          Array.from({ length: 100 }, (_, i) => ({ i: round * 100 + i, pad })));
+      }
+      await settle();
+      sock.resume();
+      await new Promise(r => setTimeout(r, 800));
+
+      const overflow = frames.find(f => f.overflow !== undefined);
+      expect(overflow).toBeDefined();
+      expect(overflow.overflow).toBe(true);   // a flag: any count would be a lie
+      // Everything it managed to hold came first, in order.
+      expect(frames.indexOf(overflow)).toBeGreaterThan(100);
+      sock.destroy();
+    });
+
+    it('surfaces an overflow to the real client as a thrown error', async () => {
+      // The client never stops reading of its own accord, so something
+      // else must stop it: spawnSync blocks this event loop outright
+      // while a separate process does the writing. Nothing is read off
+      // the socket for the duration, which is exactly the condition the
+      // server's bound exists for.
+      const stream = db.collection('blocked').watch();
+      await settle();
+      const docs = JSON.stringify(Array.from({ length: 1500 }, (_, i) => ({ i })));
+      const wrote = spawnSync(process.execPath, [
+        'bin/db.js', '--server', `127.0.0.1:${port}`, 'insert-many', 'blocked', docs
+      ], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+      expect(wrote.status).toBe(0);
+
+      // What it managed to hold arrives first -- those events are still
+      // true -- and then the news that the rest is gone.
+      let delivered = 0;
+      let err = null;
+      try {
+        for (let i = 0; i < 2000; i++) {
+          const { done } = await stream.next();
+          if (done) break;
+          delivered++;
+        }
+      } catch (e) { err = e; }
+
+      expect(err).toBeInstanceOf(ChangeStreamOverflowError);
+      expect(err.message).toMatch(/watch\(\) again and re-read/);
+      expect(delivered).toBeGreaterThan(100);
+      expect(delivered).toBeLessThan(1500);   // it did lose some
     });
   });
 

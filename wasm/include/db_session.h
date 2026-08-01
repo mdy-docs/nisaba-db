@@ -64,6 +64,14 @@ extern "C" {
  * here that outlives the request that made it, which is why it is
  * counted, owned, and released with the client that owns it. */
 #define DBS_MAX_CURSORS     16
+/* Change streams open at once, and what one will hold for a consumer
+ * that has stopped reading. Both bounds exist for the same reason every
+ * other table here is bounded, and the byte bound exists because an
+ * event carries a DOCUMENT: counting events alone would bound the wrong
+ * thing on a collection of large ones. */
+#define DBS_MAX_STREAMS     16
+#define DBS_STREAM_EVENTS   256
+#define DBS_STREAM_BYTES    (1u * 1024u * 1024u)
 
 /* No catalog entry of that name. Distinct from "the entry is unusable"
  * (DC_ERR_CATALOG_ENTRY) because a caller answers them differently: one
@@ -100,6 +108,11 @@ extern "C" {
 /* DC_ERR_NO_INDEX (-57) began here and now lives in db.h, next to the
  * lookup that also has to raise it: a collection is what knows its own
  * indexes. -58 and -59 are its neighbours there. */
+
+/* A change stream id that is not this client's. Same conflation as
+ * DC_ERR_NO_CURSOR, and for the same reason. */
+#define DC_ERR_NO_STREAM            (-60)
+#define DC_ERR_TOO_MANY_STREAMS     (-61)
 
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
@@ -277,9 +290,74 @@ int dbs_cursor_get(dbs *s, uint64_t client, uint64_t id,
                    dc_cursor **out, uint32_t *batch_out);
 int dbs_cursor_drop(dbs *s, uint64_t client, uint64_t id);
 
-/* Close every cursor `client` owns. Called by a transport when a
- * connection ends, however it ended. Safe on a client with none. */
+/* Close every cursor AND every change stream `client` owns. Called by a
+ * transport when a connection ends, however it ended. Safe on a client
+ * with none. */
 void dbs_drop_client(dbs *s, uint64_t client);
+
+/* ---- change streams -----------------------------------------------------
+ *
+ * The one thing here that a client does not ask for: a frame it did not
+ * request, carrying something another client did.
+ *
+ * Events are produced where writes are performed (db_request.c's
+ * run_write), from the command and its result -- the same derivation
+ * every other host makes, because a logged command already names the one
+ * document it touched. Nothing new is asked of the engine.
+ *
+ * A stream belongs to a CLIENT, like a cursor, and dies with it. What it
+ * does not do is wait: dbs_emit appends to whatever streams are watching
+ * and returns, so a write is never slowed by a consumer, and the
+ * transport hands out what has accumulated whenever it next looks.
+ *
+ * BOUNDED, AND IT SAYS WHEN. A consumer that stops reading fills its
+ * queue; at DBS_STREAM_EVENTS events or DBS_STREAM_BYTES bytes the stream
+ * OVERFLOWS -- it stops collecting, says so once, and closes. That is the in-process contract too (wasm/nisaba-wasm.js's
+ * ChangeStream): there are no resume tokens, so an overflowed consumer
+ * re-watches and re-reads current state, and a stream that grew without
+ * limit or dropped events in silence would be worse than either.
+ */
+
+/* Start watching `coll`. The id is the client's handle to it, unique for
+ * the session's lifetime and never reused. */
+int dbs_watch(dbs *s, uint64_t client, const char *coll, size_t coll_len,
+              uint64_t *id_out);
+
+/* Stop. DC_ERR_NO_STREAM if that id is not this client's -- the same
+ * conflation of "no such" and "not yours" cursors make, for the same
+ * reason. */
+int dbs_close_stream(dbs *s, uint64_t client, uint64_t id);
+
+/* Is anyone watching this collection? A write asks first, because
+ * building an event nobody wants costs a read per document. */
+int dbs_watched(const dbs *s, const char *coll, size_t coll_len);
+
+/* Append one already-encoded event OBJECT to every stream watching
+ * `coll`. Never fails a write: a stream that cannot take it overflows,
+ * which is that stream's problem and not the writer's. */
+void dbs_emit(dbs *s, const char *coll, size_t coll_len,
+              const uint8_t *event, size_t len);
+
+/*
+ * The next frame owed to `client`, appended to `out`, with *have set to
+ * 1 if there was one. Called by a transport with nothing to say about
+ * what it is carrying -- the frame is built here, in the shape
+ * db_request.c answers in, so the wire has one owner.
+ *
+ *   { stream: <id>, event: {...} }        one change
+ *   { stream: <id>, overflow: true }      events were lost; it is gone
+ */
+int dbs_stream_take(dbs *s, uint64_t client, dbuf *out, int *have);
+
+/* Is any client owed a frame right now? A transport that sleeps until a
+ * socket is ready must ask this before sleeping: a change event is the
+ * one thing here that becomes deliverable without anybody sending
+ * anything, so a loop that waits for traffic would sit on it. */
+int dbs_stream_pending(const dbs *s);
+
+/* How many streams are open, across every client -- for tests, and for a
+ * server that wants to say so. */
+int dbs_stream_count(const dbs *s);
 
 /* How many cursors are open, across every client -- for tests, and for
  * a server that wants to say so. */
@@ -295,7 +373,9 @@ void dbs_close(dbs *s);
  * Perform one request and append one response, both binjson objects.
  *
  * This is everything the server DECIDES. A transport reads a request,
- * calls this, and writes the response; it never reads a field of either,
+ * calls this, and writes the response -- and, since change streams, also
+ * asks dbs_stream_take for frames nobody requested. It never reads a
+ * field of any of them,
  * for the same reason the Raft transport has never read a field of a
  * message. Sockets today, a preopened listener, a wasi:http gateway or a
  * native binary tomorrow -- all the same function, which is also why the

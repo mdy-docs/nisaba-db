@@ -138,6 +138,11 @@ const char *dc_strerror(int code) {
         case DC_ERR_INDEX_EXISTS:
             return "An index of that name already exists on this collection; drop "
                    "it before creating another";
+        case DC_ERR_NO_STREAM:
+            return "No change stream of that id belongs to this client "
+                   "(it was closed, it overflowed, or it was never yours)";
+        case DC_ERR_TOO_MANY_STREAMS:
+            return "Too many change streams open at once on this server";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

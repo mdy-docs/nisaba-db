@@ -85,6 +85,26 @@ export interface RemoteBulkWriteResult {
   upsertedIds: Record<number, ObjectId>;
 }
 
+/** A change event, the shape an in-process watcher gets. */
+export interface RemoteChangeEvent {
+  ns: { coll: string };
+  operationType: 'insert' | 'update' | 'replace' | 'delete';
+  documentKey: { _id: ObjectId };
+  /** Absent on a delete. */
+  fullDocument?: Document;
+}
+
+/** The server stopped holding events for a stream and closed it. */
+export class ChangeStreamOverflowError extends Error {}
+
+export interface RemoteChangeStream extends AsyncIterable<RemoteChangeEvent> {
+  on(event: 'change', cb: (change: RemoteChangeEvent) => void): this;
+  off(event: 'change', cb: (change: RemoteChangeEvent) => void): this;
+  next(): Promise<{ value: RemoteChangeEvent; done: false } | { value: undefined; done: true }>;
+  /** Give the server's stream slot back. Losing the connection does it too. */
+  close(): Promise<void>;
+}
+
 export interface RemoteCollection<T extends Document = Document> {
   readonly collectionName: string;
   find(filter?: Filter, options?: RemoteFindOptions): RemoteCursor<T>;
@@ -150,6 +170,13 @@ export interface RemoteCollection<T extends Document = Document> {
    * clock; resolves with how many went. 0 when the collection has no TTL
    * index. There is no scheduler: call it when you want a sweep. */
   pruneExpired(): Promise<number>;
+  /** A live feed of this collection's changes, pushed by the server as
+   * any client writes. Synchronous, like the in-process watch(), so it
+   * can be iterated directly. Costs one of the server's bounded stream
+   * slots until closed; a consumer that falls far enough behind is cut
+   * off with a ChangeStreamOverflowError (there are no resume tokens:
+   * watch again and re-read). */
+  watch(): RemoteChangeStream;
 }
 
 export interface RemoteDb {

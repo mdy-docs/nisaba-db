@@ -57,11 +57,18 @@
  * operations with even if it wanted to. So the list goes over whole and
  * the answer says how many members were attempted and which failed.
  *
- * WHAT IS NOT HERE. The wire has twenty-nine ops (WIRE_OPS below) and
- * this client has exactly those. Change streams are not on it -- they
- * need frames a client did not ask for, and this protocol has no shape
- * for those -- so asking for watch() gets a sentence saying so rather
- * than a TypeError about undefined not being a function. Adding a method here without adding the op to db_request.c
+ * A FRAME IS AN ANSWER OR AN EVENT. Every frame used to be an answer, in
+ * request order, which is why there are no request ids on this wire and
+ * none are needed. watch() adds the other kind: a frame the server sends
+ * because somebody ELSE wrote something. They are told apart by shape --
+ * an answer carries `ok`, an event carries `stream` -- and a client that
+ * never watches never sees one, so the old sentence still holds for it
+ * word for word.
+ *
+ * WHAT IS NOT HERE. The wire has thirty-one ops (WIRE_OPS below) and this
+ * client has exactly those. Asking for anything else gets a sentence
+ * saying so rather than a TypeError about undefined not being a
+ * function. Adding a method here without adding the op to db_request.c
  * would be inventing a second opinion about what the server does.
  */
 import net from 'node:net';
@@ -80,7 +87,8 @@ export const WIRE_OPS = [
   'insert', 'insertMany', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
   'findOneAndUpdate', 'findOneAndReplace', 'findOneAndDelete',
   'bulkWrite',
-  'findByIndex', 'pruneExpired', 'getMore', 'closeCursor', 'compact',
+  'findByIndex', 'pruneExpired', 'watch', 'closeStream',
+  'getMore', 'closeCursor', 'compact',
   'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
   'listCollections'
 ];
@@ -105,6 +113,86 @@ export class ServerError extends Error {
     this.name = 'ServerError';
     this.code = code;
   }
+}
+
+/**
+ * A change stream fell too far behind and the server closed it. There
+ * are no resume tokens (a documented non-goal), so the remedy is the
+ * in-process one: watch again and re-read current state.
+ */
+export class ChangeStreamOverflowError extends Error {
+  constructor() {
+    super('change stream overflow: the server stopped holding events for this ' +
+          'stream and closed it -- consume faster, or watch() again and re-read ' +
+          'current state');
+    this.name = 'ChangeStreamOverflowError';
+  }
+}
+
+/**
+ * The consumer end of a change stream: an EventEmitter-lite
+ * (.on('change', cb)) and an async iterator -- the dual API the
+ * in-process ChangeStream has, and the real driver's.
+ *
+ * Nothing is bounded here, deliberately. The bound that matters is the
+ * SERVER's: it is the side holding events for a consumer that stopped
+ * reading, and it is the side that has to stop. By the time an event
+ * reaches here it has already crossed the socket.
+ */
+class RemoteChangeStream {
+  constructor(close) {
+    this._listeners = new Set();
+    this._queue = [];
+    this._waiting = [];
+    this._closed = false;
+    this._error = null;
+    this._close = close;
+  }
+
+  on(event, cb) {
+    if (event !== 'change') throw new Error(`unknown change-stream event: ${event}`);
+    this._listeners.add(cb);
+    return this;
+  }
+
+  off(event, cb) { this._listeners.delete(cb); return this; }
+
+  /** @internal a frame arrived for this stream */
+  _emit(change) {
+    if (this._closed) return;
+    for (const cb of this._listeners) cb(change);
+    if (this._waiting.length) { this._waiting.shift().resolve({ value: change, done: false }); return; }
+    this._queue.push(change);
+  }
+
+  /** @internal the server gave up on us, or the connection did */
+  _fail(err) {
+    if (this._closed) return;
+    this._error = err;
+    this._closed = true;
+    const waiting = this._waiting;
+    this._waiting = [];
+    for (const w of waiting) w.reject(err);
+  }
+
+  async next() {
+    if (this._queue.length) return { value: this._queue.shift(), done: false };
+    if (this._error) throw this._error;
+    if (this._closed) return { value: undefined, done: true };
+    return new Promise((resolve, reject) => this._waiting.push({ resolve, reject }));
+  }
+
+  async close() {
+    if (this._closed) return;
+    this._closed = true;
+    const waiting = this._waiting;
+    this._waiting = [];
+    for (const w of waiting) w.resolve({ value: undefined, done: true });
+    await this._close();
+  }
+
+  [Symbol.asyncIterator]() { return this; }
+  async return() { await this.close(); return { value: undefined, done: true }; }
 }
 
 /** `host:port`, `[::1]:port`, `:port` or a bare port. */
@@ -144,6 +232,7 @@ class Connection {
     this._buf = Buffer.alloc(0);
     this._dead = null;      // the Error every later call fails with
     this._closing = false;  // our own close(), so EOF is not a surprise
+    this._streams = new Map();   // stream id -> RemoteChangeStream
 
     socket.on('data', (chunk) => this._onData(chunk));
     socket.on('error', (err) => this._die(err));
@@ -157,7 +246,16 @@ class Connection {
     const waiting = this._pending;
     this._pending = [];
     for (const p of waiting) p.reject(this._dead);
+    /* A watcher is owed the news too: its events came down this socket,
+     * and there will be no more of them. */
+    const streams = [...this._streams.values()];
+    this._streams.clear();
+    for (const st of streams) st._fail(this._dead);
   }
+
+  /** @internal register a stream so its frames can find it */
+  _watching(id, stream) { this._streams.set(id, stream); }
+  _unwatching(id) { this._streams.delete(id); }
 
   _onData(chunk) {
     this._buf = this._buf.length ? Buffer.concat([this._buf, chunk]) : chunk;
@@ -171,6 +269,28 @@ class Connection {
       if (this._buf.length < total) return;
       const frame = new Uint8Array(this._buf.subarray(0, total)); // copy out of the pool
       this._buf = this._buf.subarray(total);
+      /*
+       * A frame is an ANSWER or an EVENT, told apart by shape: an answer
+       * carries `ok`, an event carries `stream`. Events are not queued
+       * against pending requests -- they answer nothing -- so this test
+       * comes first, before the queue is touched at all.
+       */
+      let routed = null;
+      try { routed = decode(frame); } catch { /* handled below */ }
+      if (routed && typeof routed === 'object' && routed.ok === undefined &&
+          typeof routed.stream === 'number') {
+        const st = this._streams.get(routed.stream);
+        if (st) {
+          if (routed.overflow !== undefined) {
+            this._streams.delete(routed.stream);
+            st._fail(new ChangeStreamOverflowError());
+          } else {
+            st._emit(routed.event);
+          }
+        }
+        continue;   // never an answer to anything
+      }
+
       const p = this._pending.shift();
       if (!p) {
         /* A response nobody asked for. If it is a refusal, it is the
@@ -178,22 +298,18 @@ class Connection {
          * we ever got to ask -- its connection table is full. Anything
          * else means framing is gone, and so is the connection. */
         this._socket.destroy();
-        let unsolicited = null;
-        try { unsolicited = decode(frame); } catch { /* not even a value */ }
-        if (unsolicited && unsolicited.ok === false) {
-          return this._die(new ServerError(unsolicited.code, unsolicited.msg));
+        if (routed && routed.ok === false) {
+          return this._die(new ServerError(routed.code, routed.msg));
         }
         return this._die(new Error('the server sent a response to no request'));
       }
-      let value;
-      try {
-        value = decode(frame);
-      } catch (err) {
+      if (routed === null) {
+        const err = new Error('the server sent a frame that is not a value');
         this._socket.destroy();
         p.reject(err);
         return this._die(err);
       }
-      p.resolve(value);
+      p.resolve(routed);
     }
   }
 
@@ -645,6 +761,46 @@ function collection(conn, name) {
      * this side's -- it is the thing holding the indexes. */
     async findByIndex(name, values) {
       return (await call({ op: 'findByIndex', index: name, values })).docs || [];
+    },
+
+    /*
+     * A live feed of this collection's changes, over the same socket.
+     *
+     * The stream costs one of the server's bounded slots and one queue
+     * on it, so close() it when done -- losing the connection does it
+     * for you, and so does falling far enough behind that the server
+     * gives up (ChangeStreamOverflowError, which has no resume token to
+     * offer: watch again and re-read).
+     *
+     * The collection need not exist yet. Watching one before its first
+     * insert is the case a change stream is most useful for, and the
+     * insert that creates it is an event like any other.
+     */
+    watch() {
+      let id = null;
+      let closed = false;
+      /* Synchronous, like the in-process watch(): a caller writes
+       * `for await (const c of coll.watch())` and a promise there is not
+       * iterable. The subscribe is a round trip, so the stream exists
+       * first and learns its id a moment later -- which changes nothing
+       * on the wire, since the server sends nothing until it has one. */
+      const stream = new RemoteChangeStream(async () => {
+        closed = true;
+        await pending;
+        if (id === null) return;
+        conn._unwatching(id);
+        /* Best effort: a connection already gone has released it. */
+        try { await conn.call({ op: 'closeStream', stream: id }); } catch { /* closed either way */ }
+      });
+      const pending = call({ op: 'watch' }).then((res) => {
+        id = res.stream;
+        if (closed) {          // closed before the id arrived: give the slot back
+          conn.call({ op: 'closeStream', stream: id }).catch(() => {});
+          return;
+        }
+        conn._watching(id, stream);
+      }).catch((err) => stream._fail(err));
+      return stream;
     },
 
     /* Delete every document past a TTL index's cutoff. Expiry is a

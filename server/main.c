@@ -127,6 +127,12 @@
  * tests. */
 #define FRAME_MAX (16u * 1024u * 1024u)
 
+/* How many unsent bytes a connection may be holding before the loop
+ * stops handing it change events. Not a limit on a RESPONSE -- a client
+ * that asked for a million documents gets them -- but on how far ahead
+ * of a slow reader the push side will run. */
+#define OUT_HIGH_WATER (64u * 1024u)
+
 #define DEFAULT_PORT 8097
 
 /* Connections held at once. The ceiling AND the default: --max-clients
@@ -436,7 +442,17 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
          * than waking on a tick to find nothing to do. No timer, no
          * timeout: poll blocks until a socket is ready. */
         int wait_ms = -1;
-        if (idle_ms && n > 0) {
+        /*
+         * Except when somebody is owed a change event. Everything else
+         * here becomes deliverable because a socket did something, which
+         * is what poll waits for; an event becomes deliverable because
+         * ANOTHER client wrote, and the connection it is owed to may be
+         * silent, backed up, or both. Sleeping on that is how an
+         * overflow notice sits undelivered until an unrelated request
+         * happens to wake the loop.
+         */
+        if (dbs_stream_pending(s)) wait_ms = 0;
+        else if (idle_ms && n > 0) {
             uint64_t now = now_ms(), earliest = 0;
             for (int i = 0; i < n; i++)
                 if (i == 0 || cs[i].quiet_since < earliest) earliest = cs[i].quiet_since;
@@ -482,6 +498,48 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
                 conn_gone(s, &cs[i]);
                 cs[i] = cs[n - 1];      /* the last one moves into the hole */
                 conn_clear(&cs[n - 1]); /* and its old slot owns nothing now */
+                n--;
+            }
+        }
+
+        /*
+         * Frames nobody asked for: the change events other clients'
+         * writes produced this pass. Appended to whatever each
+         * connection already owes, so the ordinary flush carries them
+         * out -- the transport still writes bytes it has not read.
+         *
+         * After the request loop, so an event caused by a write reaches
+         * every watcher on the same pass that performed it. A connection
+         * whose buffer is already growing is one whose peer has stopped
+         * reading; the session's per-stream bound is what stops that
+         * becoming this process's problem, and it says so (-60, on the
+         * stream, when it overflows).
+         */
+        for (int i = n - 1; i >= 0; i--) {
+            int any = 0;
+            for (;;) {
+                /* Stop filling a connection that is not draining. This
+                 * is what makes the SESSION's per-stream bound the real
+                 * one: without it the backlog would simply move here
+                 * instead, into a buffer nothing counts, and a consumer
+                 * that stopped reading would cost this process memory
+                 * rather than costing itself its stream. */
+                if (cs[i].out.len - cs[i].out_off >= OUT_HIGH_WATER) break;
+                int have = 0;
+                if (dbs_stream_take(s, cs[i].client, &cs[i].out, &have) != 0) break;
+                if (!have) break;
+                any = 1;
+            }
+            /* Written now rather than left for the next POLLOUT: poll
+             * sleeps until a socket is ready or a connection goes idle,
+             * and an event nobody is waiting on would sit there for the
+             * whole idle timeout. Backwards, and reaping the same way,
+             * because a failed write is a connection that has gone. */
+            if (!any) continue;
+            if (conn_flush(&cs[i]) != 0) {
+                conn_gone(s, &cs[i]);
+                cs[i] = cs[n - 1];
+                conn_clear(&cs[n - 1]);
                 n--;
             }
         }

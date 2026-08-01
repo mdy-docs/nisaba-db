@@ -802,6 +802,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_REQ_MALFORMED, DC_ERR_REQ_UNKNOWN_OP, DC_ERR_REQ_MISSING_FIELD,
         DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
         DC_ERR_NO_CURSOR, DC_ERR_TOO_MANY_CURSORS, DC_ERR_CURSOR_SORTED,
+        DC_ERR_NO_STREAM, DC_ERR_TOO_MANY_STREAMS,
         DC_ERR_CURSORS_OPEN, DC_ERR_FORMAT_NEWER, DC_ERR_INDEX_EXISTS,
         DC_ERR_NO_INDEX, DC_ERR_INDEX_KIND, DC_ERR_INDEX_ARITY,
         /* The consensus layer's refusals reach a host the same way, and
@@ -2653,6 +2654,291 @@ static bj_builder *index_request(const char *op, const char *coll, const char *i
     *out = bj_builder_data(b, &len);
     *out_len = (uint32_t)len;
     return b;
+}
+
+/* One {stream, event} frame, or none. The event's operationType goes in
+ * `type`; *has_doc says whether it carried a fullDocument. */
+static int take_event(dbs *s, uint64_t client, char *type, size_t cap,
+                      int *has_doc, int *overflow, int64_t *stream_id) {
+    dbuf frame = {0};
+    int have = 0;
+    type[0] = '\0'; *has_doc = 0; *overflow = 0; *stream_id = 0;
+    if (dbs_stream_take(s, client, &frame, &have) != BJ_OK) { dbuf_free(&frame); return -1; }
+    if (!have) { dbuf_free(&frame); return 0; }
+
+    int f = 0;
+    *stream_id = response_num(&frame, "stream", &f);
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (!obj_get_field(frame.data, frame.len, (const uint8_t *)"overflow", 8,
+                       &v, &vlen, &found) && found) {
+        cur c = { v, vlen, 0 };
+        int flag = 0;
+        read_bool(&c, &flag);
+        *overflow = flag;
+        dbuf_free(&frame);
+        return 1;
+    }
+    found = 0;
+    if (obj_get_field(frame.data, frame.len, (const uint8_t *)"event", 5,
+                      &v, &vlen, &found) || !found) { dbuf_free(&frame); return -1; }
+    doc_get_str(v, vlen, "operationType", type, cap);
+    int hd = 0;
+    const uint8_t *dv; size_t dvlen;
+    if (!obj_get_field(v, vlen, (const uint8_t *)"fullDocument", 12, &dv, &dvlen, &hd))
+        *has_doc = hd;
+    dbuf_free(&frame);
+    return 1;
+}
+
+TEST(a_watcher_is_told_what_another_client_wrote) {
+    /*
+     * The one thing on this wire a client does not ask for. Everything
+     * else here is a question and its answer; a change event is a frame
+     * the server sends because somebody ELSE wrote something.
+     *
+     * It costs the engine nothing new: a logged command already names
+     * the one document it touched, because the planner expanded the
+     * many-forms into one command each before any of this ran. So the
+     * event is built from the command and its result -- the derivation
+     * every other host of this library makes.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-watch", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+    const uint64_t WATCHER = 1, WRITER = 2;
+    char type[32]; int has_doc = 0, overflow = 0; int64_t sid = 0;
+
+    /* ---- watching resolves nothing: a collection that does not exist
+     * yet is the case a change stream is most useful for. */
+    int64_t stream = 0;
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("watch", "later", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, WATCHER, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        int f = 0;
+        stream = response_num(&res, "stream", &f);
+        CHECK_I64(f, 1);
+        CHECK(stream > 0);
+        dbuf_free(&res); bj_builder_free(rb);
+        CHECK_I64(dbs_stream_count(s), 1);
+
+        /* The insert that CREATES the collection is an event like any
+         * other. */
+        doc *d = doc_new();
+        uint8_t oid[12]; mk_oid(oid, 40);
+        doc_oid(d, "_id", oid);
+        doc_str(d, "body", "the first");
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        rb = request("insert", "later", "doc", db_, dlen, &req, &req_len);
+        dbuf ires = {0};
+        CHECK_OK(dbs_handle(s, WRITER, req, req_len, &ires));
+        CHECK_I64(response_ok(&ires), 1);
+        dbuf_free(&ires); bj_builder_free(rb); doc_free(d);
+
+        CHECK_I64(take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid), 1);
+        CHECK(strcmp(type, "insert") == 0);
+        CHECK_I64(has_doc, 1);
+        CHECK_I64(sid, stream);
+        /* And exactly one: an event is not delivered twice. */
+        CHECK_I64(take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid), 0);
+    }
+
+    /* ---- a write to a collection nobody is watching says nothing. */
+    {
+        doc *d = doc_new();
+        uint8_t oid[12]; mk_oid(oid, 41);
+        doc_oid(d, "_id", oid);
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("insert", "users", "doc", db_, dlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, WRITER, req, req_len, &res));
+        dbuf_free(&res); bj_builder_free(rb); doc_free(d);
+        CHECK_I64(take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid), 0);
+    }
+
+    /* ---- update, replace, delete: the kinds, and what each carries. */
+    {
+        doc *f = doc_new(); doc_str(f, "body", "the first");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        doc *u = doc_new();
+        doc_begin_obj(u, "$set"); doc_str(u, "body", "edited"); doc_end_obj(u);
+        uint32_t ulen; const uint8_t *ub = doc_done(u, &ulen);
+        const uint8_t *req;
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"op", 2);
+        bj_put_string(b, (const uint8_t *)"update", 6);
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)"later", 5);
+        bj_put_key(b, (const uint8_t *)"filter", 6);
+        bj_put_raw(b, fb, flen);
+        bj_put_key(b, (const uint8_t *)"update", 6);
+        bj_put_raw(b, ub, ulen);
+        bj_end_object(b);
+        size_t rl = 0; req = bj_builder_data(b, &rl);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, WRITER, req, (uint32_t)rl, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res); bj_builder_free(b); doc_free(f); doc_free(u);
+
+        /* An update names its CHANGES, so the post-image was read back:
+         * without that a watcher would learn that something changed and
+         * not what it now is. */
+        CHECK_I64(take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid), 1);
+        CHECK(strcmp(type, "update") == 0);
+        CHECK_I64(has_doc, 1);
+
+        doc *f2 = doc_new(); doc_str(f2, "body", "edited");
+        uint32_t f2len; const uint8_t *f2b = doc_done(f2, &f2len);
+        bj_builder *db2 = bj_builder_new();
+        bj_begin_object(db2);
+        bj_put_key(db2, (const uint8_t *)"op", 2);
+        bj_put_string(db2, (const uint8_t *)"delete", 6);
+        bj_put_key(db2, (const uint8_t *)"coll", 4);
+        bj_put_string(db2, (const uint8_t *)"later", 5);
+        bj_put_key(db2, (const uint8_t *)"filter", 6);
+        bj_put_raw(db2, f2b, f2len);
+        bj_end_object(db2);
+        size_t dl = 0; const uint8_t *dreq = bj_builder_data(db2, &dl);
+        dbuf dres = {0};
+        CHECK_OK(dbs_handle(s, WRITER, dreq, (uint32_t)dl, &dres));
+        dbuf_free(&dres); bj_builder_free(db2); doc_free(f2);
+
+        CHECK_I64(take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid), 1);
+        CHECK(strcmp(type, "delete") == 0);
+        CHECK_I64(has_doc, 0);      /* there is no document to carry */
+    }
+
+    /* ---- a delete that matched nothing is not an event. */
+    {
+        doc *f = doc_new(); doc_str(f, "body", "never existed");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("delete", "later", "filter", fb, flen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, WRITER, req, req_len, &res));
+        dbuf_free(&res); bj_builder_free(rb); doc_free(f);
+        CHECK_I64(take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid), 0);
+    }
+
+    /* ---- closed, and then silent. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"op", 2);
+        bj_put_string(b, (const uint8_t *)"closeStream", 11);
+        bj_put_key(b, (const uint8_t *)"stream", 6);
+        bj_put_int(b, stream);
+        bj_end_object(b);
+        size_t rl = 0; const uint8_t *req = bj_builder_data(b, &rl);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, WATCHER, req, (uint32_t)rl, &res));
+        CHECK_I64(response_ok(&res), 1);
+        CHECK_I64(response_flag(&res, "closed"), 1);
+        dbuf_free(&res);
+        CHECK_I64(dbs_stream_count(s), 0);
+
+        /* Twice is a refusal, not a second success -- and the same
+         * refusal another client's id would get. The request bytes are
+         * the builder's, so it outlives both uses. */
+        dbuf again = {0};
+        CHECK_OK(dbs_handle(s, WATCHER, req, (uint32_t)rl, &again));
+        CHECK_I64(response_ok(&again), 0);
+        int f = 0;
+        CHECK_I64(response_num(&again, "code", &f), DC_ERR_NO_STREAM);
+        dbuf_free(&again); bj_builder_free(b);
+
+        doc *d = doc_new();
+        uint8_t oid[12]; mk_oid(oid, 42);
+        doc_oid(d, "_id", oid);
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        const uint8_t *ireq; uint32_t ilen;
+        bj_builder *rb = request("insert", "later", "doc", db_, dlen, &ireq, &ilen);
+        dbuf ires = {0};
+        CHECK_OK(dbs_handle(s, WRITER, ireq, ilen, &ires));
+        dbuf_free(&ires); bj_builder_free(rb); doc_free(d);
+        CHECK_I64(take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid), 0);
+    }
+
+    /* ---- a consumer that stops reading loses its stream rather than
+     * costing the server unbounded memory. Nobody takes anything here,
+     * so the queue fills and the stream says so once and goes. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("watch", "flood", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, WATCHER, req, req_len, &res));
+        int f = 0;
+        int64_t id = response_num(&res, "stream", &f);
+        dbuf_free(&res); bj_builder_free(rb);
+
+        for (int i = 0; i < DBS_STREAM_EVENTS + 20; i++) {
+            doc *d = doc_new();
+            uint8_t oid[12]; mk_oid(oid, (uint32_t)(1000 + i));
+            doc_oid(d, "_id", oid);
+            doc_int(d, "n", i);
+            uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+            const uint8_t *ireq; uint32_t ilen;
+            bj_builder *ib = request("insert", "flood", "doc", db_, dlen, &ireq, &ilen);
+            dbuf ires = {0};
+            CHECK_OK(dbs_handle(s, WRITER, ireq, ilen, &ires));
+            dbuf_free(&ires); bj_builder_free(ib); doc_free(d);
+        }
+
+        /* Everything it managed to hold, in order, and then the news. */
+        int events = 0;
+        for (;;) {
+            int r = take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid);
+            CHECK_I64(r, 1);
+            if (overflow) break;
+            CHECK_I64(sid, id);
+            events++;
+            if (events > DBS_STREAM_EVENTS + 1) { TAP_FAIL("queue never overflowed%s", ""); break; }
+        }
+        CHECK_I64(events, DBS_STREAM_EVENTS);
+        /* Said once: the stream is gone, not merely quiet. */
+        CHECK_I64(dbs_stream_count(s), 0);
+        CHECK_I64(take_event(s, WATCHER, type, sizeof type, &has_doc, &overflow, &sid), 0);
+    }
+
+    /* ---- the table is bounded, and refuses in the shape everything
+     * else here refuses in. */
+    {
+        for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+            const uint8_t *req; uint32_t req_len;
+            bj_builder *rb = request("watch", "users", NULL, NULL, 0, &req, &req_len);
+            dbuf res = {0};
+            CHECK_OK(dbs_handle(s, WATCHER, req, req_len, &res));
+            CHECK_I64(response_ok(&res), 1);
+            dbuf_free(&res); bj_builder_free(rb);
+        }
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("watch", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, WATCHER, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_TOO_MANY_STREAMS);
+        dbuf_free(&res); bj_builder_free(rb);
+
+        /* And they all go when their client does, like cursors. */
+        dbs_drop_client(s, WATCHER);
+        CHECK_I64(dbs_stream_count(s), 0);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
 }
 
 TEST(prune_expired_sweeps_what_a_ttl_index_says_is_over) {
@@ -8197,6 +8483,7 @@ int main(void) {
     RUN(find_one_and_modify_answers_with_the_document_not_a_count);
     RUN(find_by_index_says_which_of_the_three_ways_it_was_asked_wrong);
     RUN(prune_expired_sweeps_what_a_ttl_index_says_is_over);
+    RUN(a_watcher_is_told_what_another_client_wrote);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

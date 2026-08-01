@@ -59,6 +59,27 @@ typedef struct {
     dc_cursor *cur;
 } dbs_cursor;
 
+/* A change stream and who it belongs to. `queue` holds already-encoded
+ * event objects back to back -- the transport splices them into frames
+ * without decoding one, the same way every other result crosses this
+ * layer.
+ *
+ * `overflowed` is a flag and not a count, deliberately: once a stream
+ * overflows nothing more is BUILT for it (dbs_watched stops naming it),
+ * so any count would be "however many happened before the transport
+ * next looked" -- a number that means something different depending on
+ * timing. The consumer's remedy does not vary with it either: there are
+ * no resume tokens, so it re-watches and re-reads. */
+typedef struct {
+    uint64_t id;
+    uint64_t client;
+    char    *coll;                          /* owned copy */
+    size_t   coll_len;
+    dbuf     queue;
+    uint32_t count;
+    int      overflowed;
+} dbs_stream;
+
 struct dbs {
     bj_ns      *ns;                         /* borrowed; the caller's */
     int         order;
@@ -67,6 +88,8 @@ struct dbs {
     dbs_entry   open[DBS_MAX_COLLECTIONS];
     dbs_cursor  cursors[DBS_MAX_CURSORS];
     uint64_t    next_cursor_id;             /* 1, 2, 3, ... never reused */
+    dbs_stream  streams[DBS_MAX_STREAMS];
+    uint64_t    next_stream_id;
 };
 
 /* ---- plan reading ------------------------------------------------------ */
@@ -1157,6 +1180,14 @@ int dbs_cursor_add(dbs *s, uint64_t client, dc_cursor *cur, uint32_t batch,
     return DC_ERR_TOO_MANY_CURSORS;
 }
 
+/* Everything a stream owns, given back. Its slot is free afterwards and
+ * its id is never reused. */
+static void stream_release(dbs_stream *st) {
+    free(st->coll);
+    dbuf_free(&st->queue);
+    memset(st, 0, sizeof *st);
+}
+
 /* A cursor is findable only by the client that opened it. "No such
  * cursor" and "not yours" are deliberately the same answer: telling them
  * apart would tell a client about another client's cursors. */
@@ -1193,6 +1224,155 @@ void dbs_drop_client(dbs *s, uint64_t client) {
         dc_cursor_close(s->cursors[i].cur);
         memset(&s->cursors[i], 0, sizeof s->cursors[i]);
     }
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        if (!s->streams[i].id || s->streams[i].client != client) continue;
+        stream_release(&s->streams[i]);
+    }
+}
+
+/* ---- change streams -----------------------------------------------------
+ *
+ * See db_session.h. A stream is a cursor's twin in every way that
+ * matters -- a bounded table, an owner, a death with its client -- and
+ * its opposite in one: a cursor is pulled, and this is pushed.
+ */
+
+int dbs_watch(dbs *s, uint64_t client, const char *coll, size_t coll_len,
+              uint64_t *id_out) {
+    if (!s || !coll || !id_out) return BJ_ERR_STATE;
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        dbs_stream *st = &s->streams[i];
+        if (st->id) continue;
+        st->coll = (char *)malloc(coll_len ? coll_len : 1);
+        if (!st->coll) return BJ_ERR_OOM;
+        memcpy(st->coll, coll, coll_len);
+        st->coll_len = coll_len;
+        st->id       = ++s->next_stream_id;
+        st->client   = client;
+        st->count      = 0;
+        st->overflowed = 0;
+        *id_out = st->id;
+        return BJ_OK;
+    }
+    return DC_ERR_TOO_MANY_STREAMS;
+}
+
+int dbs_close_stream(dbs *s, uint64_t client, uint64_t id) {
+    if (!s || !id) return DC_ERR_NO_STREAM;
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        dbs_stream *st = &s->streams[i];
+        if (st->id != id || st->client != client) continue;
+        stream_release(st);
+        return BJ_OK;
+    }
+    return DC_ERR_NO_STREAM;
+}
+
+int dbs_watched(const dbs *s, const char *coll, size_t coll_len) {
+    if (!s || !coll) return 0;
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        const dbs_stream *st = &s->streams[i];
+        if (st->id && !st->overflowed && st->coll_len == coll_len &&
+            memcmp(st->coll, coll, coll_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+void dbs_emit(dbs *s, const char *coll, size_t coll_len,
+              const uint8_t *event, size_t len) {
+    if (!s || !coll || !event || !len) return;
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        dbs_stream *st = &s->streams[i];
+        if (!st->id || st->overflowed) continue;
+        if (st->coll_len != coll_len || memcmp(st->coll, coll, coll_len) != 0) continue;
+        /* Full, or would be. The event is not queued and never will be:
+         * from here the stream owes its consumer one sentence saying so,
+         * and nothing else. */
+        if (st->count >= DBS_STREAM_EVENTS ||
+            st->queue.len + len > DBS_STREAM_BYTES ||
+            dbuf_put(&st->queue, event, len) != BJ_OK) {
+            st->overflowed = 1;
+            continue;
+        }
+        st->count++;
+    }
+}
+
+int dbs_stream_take(dbs *s, uint64_t client, dbuf *out, int *have) {
+    if (!s || !out || !have) return BJ_ERR_STATE;
+    *have = 0;
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        dbs_stream *st = &s->streams[i];
+        if (!st->id || st->client != client) continue;
+
+        /* Queued events first, even on an overflowed stream: what was
+         * collected before it filled is still true, and the consumer is
+         * owed it before the news that the rest is gone. */
+        if (st->count) {
+            cur c = { st->queue.data, st->queue.len, 0 };
+            size_t start = c.pos;
+            int e = skip_value(&c);
+            if (e) { stream_release(st); return e; }
+            bj_builder *b = bj_builder_new();
+            if (!b) return BJ_ERR_OOM;
+            bj_begin_object(b);
+            bj_put_key(b, (const uint8_t *)"stream", 6);
+            bj_put_int(b, (int64_t)st->id);
+            bj_put_key(b, (const uint8_t *)"event", 5);
+            bj_put_raw(b, st->queue.data + start, (uint32_t)(c.pos - start));
+            bj_end_object(b);
+            size_t len = 0;
+            const uint8_t *data = bj_builder_data(b, &len);
+            e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
+            bj_builder_free(b);
+            if (e) return e;
+            /* Consumed: shift the rest down. A queue that is normally
+             * empty or short does not earn a ring buffer. */
+            memmove(st->queue.data, st->queue.data + c.pos, st->queue.len - c.pos);
+            st->queue.len -= c.pos;
+            st->count--;
+            *have = 1;
+            return BJ_OK;
+        }
+
+        if (st->overflowed) {
+            uint64_t id = st->id;
+            stream_release(st);          /* said once, then gone */
+            bj_builder *b = bj_builder_new();
+            if (!b) return BJ_ERR_OOM;
+            bj_begin_object(b);
+            bj_put_key(b, (const uint8_t *)"stream", 6);
+            bj_put_int(b, (int64_t)id);
+            bj_put_key(b, (const uint8_t *)"overflow", 8);
+            bj_put_bool(b, 1);
+            bj_end_object(b);
+            size_t len = 0;
+            const uint8_t *data = bj_builder_data(b, &len);
+            int e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
+            bj_builder_free(b);
+            if (e) return e;
+            *have = 1;
+            return BJ_OK;
+        }
+    }
+    return BJ_OK;
+}
+
+int dbs_stream_pending(const dbs *s) {
+    if (!s) return 0;
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        const dbs_stream *st = &s->streams[i];
+        if (st->id && (st->count || st->overflowed)) return 1;
+    }
+    return 0;
+}
+
+int dbs_stream_count(const dbs *s) {
+    int n = 0;
+    if (!s) return 0;
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) if (s->streams[i].id) n++;
+    return n;
 }
 
 int dbs_cursor_count(const dbs *s) {
@@ -1215,6 +1395,11 @@ void dbs_close(dbs *s) {
      * is about to free. */
     for (int i = 0; i < DBS_MAX_CURSORS; i++) {
         if (s->cursors[i].id) dc_cursor_close(s->cursors[i].cur);
+    }
+    /* And every stream: whatever it was still holding for a consumer
+     * goes with the session that was holding it. */
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        if (s->streams[i].id) stream_release(&s->streams[i]);
     }
     for (int i = 0; i < DBS_MAX_COLLECTIONS; i++) {
         if (s->open[i].used) entry_release(s->ns, &s->open[i]);

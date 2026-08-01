@@ -64,7 +64,9 @@ typedef enum {
     OP_FIND_ONE_AND_REPLACE,
     OP_FIND_ONE_AND_DELETE,
     OP_FIND_BY_INDEX,
-    OP_PRUNE_EXPIRED
+    OP_PRUNE_EXPIRED,
+    OP_WATCH,
+    OP_CLOSE_STREAM
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -103,6 +105,8 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE),
     OP("findByIndex",       OP_FIND_BY_INDEX),
     OP("pruneExpired",      OP_PRUNE_EXPIRED),
+    OP("watch",             OP_WATCH),
+    OP("closeStream",       OP_CLOSE_STREAM),
 };
 
 #undef OP
@@ -337,6 +341,117 @@ static void accumulate(const uint8_t *res, size_t res_len,
     }
 }
 
+/*
+ * One change event, from the command that caused it and the result of
+ * applying it.
+ *
+ * This is where a change stream comes from, and it costs almost nothing
+ * because a LOGGED COMMAND already names the one document it touched:
+ * the planner expanded updateMany into one command per matched document
+ * before any of this ran. The derivation is the one every other host of
+ * this library makes (wasm/nisaba-wasm.js's _applyCommand), including
+ * the one read it cannot avoid -- an update names its CHANGES, not its
+ * outcome, so the document has to be read back to say what it now is.
+ * That read is a bpt_search by _id, and it happens only while somebody
+ * is watching.
+ *
+ * An upsert reaches here as a plain insert, because that is what the
+ * planner wrote down; a watcher sees `insert`, which is what happened.
+ */
+static int emit_change(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
+                       const uint8_t *cmd, uint32_t cmd_len,
+                       const uint8_t *result, size_t result_len) {
+    int op = 0;
+    const uint8_t *cname; uint32_t cname_len;
+    int e = dc_wal_parse(cmd, cmd_len, &op, &cname, &cname_len);
+    if (e) return e;
+
+    /* Nothing happened, nothing to say: a delete that removed no
+     * document, an update whose target had already gone. */
+    static const struct { const char *key; } NIL = { NULL };
+    (void)NIL;
+    int64_t n = 0;
+    {
+        static const char *COUNTS[] = { "deletedCount", "matchedCount" };
+        for (size_t i = 0; i < sizeof(COUNTS) / sizeof(COUNTS[0]); i++) {
+            const uint8_t *v; size_t vlen; int f = 0;
+            if (obj_get_field(result, result_len, (const uint8_t *)COUNTS[i],
+                              (uint32_t)strlen(COUNTS[i]), &v, &vlen, &f) || !f) continue;
+            cur rc = { v, vlen, 0 };
+            double d = 0;
+            if (!read_number(&rc, &d)) n += (int64_t)d;
+        }
+        /* An insert reports neither count; it reports an id. */
+        if (op != DC_WAL_INSERT && n == 0) return BJ_OK;
+    }
+
+    const uint8_t *doc = NULL; size_t doc_len = 0; int has_doc = 0;
+    if ((e = field_raw(cmd, cmd_len, "doc", &doc, &doc_len, &has_doc))) return e;
+
+    uint8_t id[12];
+    int has_id = 0;
+    if (op == DC_WAL_INSERT) {
+        if (!has_doc) return BJ_ERR_STATE;
+        e = dc_document_id(doc, doc_len, id);
+        if (e) return e;
+        has_id = 1;
+    } else {
+        const uint8_t *v; size_t vlen; int f = 0;
+        if ((e = field_raw(cmd, cmd_len, "id", &v, &vlen, &f))) return e;
+        if (!f || vlen != 13 || v[0] != BJ_TYPE_OID) return BJ_ERR_STATE;
+        memcpy(id, v + 1, 12);
+        has_id = 1;
+    }
+    (void)has_id;
+
+    /* An update's post-image, read back by the id the command names. */
+    dbuf after = {0};
+    if (op == DC_WAL_UPDATE) {
+        dbuf idf = {0};
+        if ((e = id_filter(id, &idf))) { dbuf_free(&idf); return e; }
+        uint8_t *d = NULL; size_t dlen = 0; int got = 0;
+        e = dc_find_one(c, idf.data, (uint32_t)idf.len, NULL, 0, &got, &d, &dlen);
+        dbuf_free(&idf);
+        if (!e && got) e = dbuf_put(&after, d, dlen);
+        free(d);
+        if (e) { dbuf_free(&after); return e; }
+    }
+
+    static const char *const TYPE[] = { "insert", "update", "replace", "delete" };
+    const char *type = (op >= 0 && op <= DC_WAL_DELETE) ? TYPE[op] : NULL;
+    if (!type) { dbuf_free(&after); return BJ_OK; }   /* DDL: not a document change */
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&after); return BJ_ERR_OOM; }
+    bj_begin_object(b);
+    /* `ns` first, then the event: the shape an in-process watcher gets
+     * (wasm/nisaba-wasm.js's _emitChange), so a consumer reads the same
+     * object whichever side of a socket it is on. */
+    PUT_KEY(b, "ns");
+    bj_begin_object(b);
+    PUT_KEY(b, "coll"); bj_put_string(b, (const uint8_t *)coll, coll_len);
+    bj_end_object(b);
+    PUT_KEY(b, "operationType");
+    bj_put_string(b, (const uint8_t *)type, (uint32_t)strlen(type));
+    PUT_KEY(b, "documentKey");
+    bj_begin_object(b);
+    PUT_KEY(b, "_id"); bj_put_oid(b, id);
+    bj_end_object(b);
+    if (op == DC_WAL_INSERT || op == DC_WAL_REPLACE) {
+        PUT_KEY(b, "fullDocument"); bj_put_raw(b, doc, (uint32_t)doc_len);
+    } else if (op == DC_WAL_UPDATE && after.len) {
+        PUT_KEY(b, "fullDocument"); bj_put_raw(b, after.data, (uint32_t)after.len);
+    }
+    bj_end_object(b);
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    if (data) dbs_emit(s, coll, coll_len, data, len);
+    e = data ? BJ_OK : BJ_ERR_STATE;
+    bj_builder_free(b);
+    dbuf_free(&after);
+    return e;
+}
+
 /* What one write did, in the terms every result is built from. A list of
  * writes adds its members into one of these, which is what makes
  * bulkWrite's totals the sum of its parts rather than a second opinion
@@ -355,7 +470,7 @@ typedef struct {
 /* Plan a write and apply every command it produced, reporting what
  * happened through *wr. Errors are the caller's to turn into a response:
  * a refusal for a single write, one entry in `errors` inside a list. */
-static int run_write(dc_collection *c, const char *coll, uint32_t coll_len,
+static int run_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
                      int wreq, const uint8_t *a, uint32_t a_len,
                      const uint8_t *b, uint32_t b_len,
                      int upsert, const uint8_t id[12], write_result *wr,
@@ -383,6 +498,7 @@ static int run_write(dc_collection *c, const char *coll, uint32_t coll_len,
 
     int64_t inserted = 0;
     uint32_t n = dc_wal_plan_count(p);
+    const int watching = dbs_watched(s, coll, coll_len);
     dbuf one = {0};
 
     for (uint32_t i = 0; i < n; i++) {
@@ -400,6 +516,13 @@ static int run_write(dc_collection *c, const char *coll, uint32_t coll_len,
         if (!obj_get_field(one.data, one.len, (const uint8_t *)"insertedId", 10,
                            &v, &vlen, &found) && found) {
             inserted++;
+        }
+        /* Told after the write committed, and only if somebody asked to
+         * be told: a stream is an observer, never a participant, so it
+         * cannot fail the write it is watching. */
+        if (watching) {
+            int ee = emit_change(s, c, coll, coll_len, cmd, clen, one.data, one.len);
+            if (ee) { e = ee; goto done; }
         }
     }
     wr->outcome = dc_wal_plan_outcome(p);
@@ -442,12 +565,12 @@ static int render_write(const write_result *wr, dbuf *out) {
     return e;
 }
 
-static int do_write(dc_collection *c, const char *coll, uint32_t coll_len,
+static int do_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
                     int wreq, const uint8_t *a, uint32_t a_len,
                     const uint8_t *b, uint32_t b_len,
                     int upsert, const uint8_t id[12], dbuf *out) {
     write_result wr;
-    int e = run_write(c, coll, coll_len, wreq, a, a_len, b, b_len, upsert, id, &wr, NULL);
+    int e = run_write(s, c, coll, coll_len, wreq, a, a_len, b, b_len, upsert, id, &wr, NULL);
     if (e) return e;
     return render_write(&wr, out);
 }
@@ -533,7 +656,7 @@ static int respond_many(dbuf *out, const write_result *t, uint32_t attempted,
  * attempt every document, which it cannot do if document seven is
  * unusable in a way that only surfaces once one through six have landed.
  */
-static int do_insert_many(dc_collection *c, const char *coll, uint32_t coll_len,
+static int do_insert_many(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
                           const uint8_t *docs, size_t docs_len, int ordered,
                           dbuf *out) {
     static const uint8_t NO_ID[12] = {0};   /* INSERT_MANY needs no default */
@@ -564,6 +687,7 @@ static int do_insert_many(dc_collection *c, const char *coll, uint32_t coll_len,
 
     write_result total;
     memset(&total, 0, sizeof total);
+    const int watching = dbs_watched(s, coll, coll_len);
     uint32_t attempted = 0, n = dc_wal_plan_count(p);
     int nerr = 0;
     dbuf one = {0};
@@ -574,6 +698,10 @@ static int do_insert_many(dc_collection *c, const char *coll, uint32_t coll_len,
         if (!cmd) { e = BJ_ERR_STATE; break; }
         one.len = 0;
         int rc = dc_wal_apply(c, 0, cmd, clen, &one);
+        if (!rc && watching) {
+            int ee = emit_change(s, c, coll, coll_len, cmd, clen, one.data, one.len);
+            if (ee) { e = ee; break; }
+        }
         attempted++;
         if (rc) {
             if ((e = put_error(errb, i, rc))) break;
@@ -701,7 +829,7 @@ static int next_spec(cur *ops, const uint8_t **sp, size_t *sp_len) {
  *
  * `types` is that parse's output: one code per operation, in order.
  */
-static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
+static int do_bulk_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
                          const uint8_t *ops, size_t ops_len,
                          const uint8_t *types, size_t types_len,
                          int ordered, int64_t now_ms, int have_now, dbuf *out) {
@@ -755,7 +883,7 @@ static int do_bulk_write(dc_collection *c, const char *coll, uint32_t coll_len,
         if ((e = resolve_dates(bw.b, bw.b_len, now_ms, have_now, &dates, &ub, &ub_len))) break;
 
         write_result wr;
-        int rc = run_write(c, coll, coll_len, bw.wreq, bw.a, bw.a_len,
+        int rc = run_write(s, c, coll, coll_len, bw.wreq, bw.a, bw.a_len,
                            ub, (uint32_t)ub_len, bw.upsert, bw.id, &wr, NULL);
         attempted++;
         if (rc) {
@@ -919,6 +1047,33 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     }
 
     /*
+     * closeStream names a STREAM, and like a cursor's id that is all it
+     * needs to name: the stream already knows which collection it
+     * watches.
+     */
+    if (op == OP_CLOSE_STREAM) {
+        int64_t id = 0;
+        const uint8_t *v; size_t vlen; int have = 0;
+        if ((e = field_raw(req, req_len, "stream", &v, &vlen, &have)))
+            return respond_error(out, DC_ERR_REQ_MALFORMED);
+        if (!have) return respond_error(out, DC_ERR_REQ_MISSING_FIELD);
+        { cur c = { v, vlen, 0 }; double d;
+          if (read_number(&c, &d)) return respond_error(out, DC_ERR_REQ_MALFORMED);
+          id = (int64_t)d; }
+        e = dbs_close_stream(s, client, (uint64_t)id);
+        if (e) return respond_error(out, e);
+        bj_builder *sb = bj_builder_new();
+        if (!sb) return BJ_ERR_OOM;
+        bj_begin_object(sb);
+        PUT_KEY(sb, "ok");     bj_put_bool(sb, 1);
+        PUT_KEY(sb, "closed"); bj_put_bool(sb, 1);
+        bj_end_object(sb);
+        int se = finish(sb, out);
+        bj_builder_free(sb);
+        return se;
+    }
+
+    /*
      * listCollections names no collection -- it is the question you ask
      * when you do not know what there is -- so it is answered here,
      * before `coll` is required, for the same reason ping is.
@@ -1046,12 +1201,33 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = dbs_create_collection(s, (const char *)coll, coll_len, &made);
             if (!e) e = dbs_collection(s, (const char *)coll, coll_len, &bc);
         }
-        if (!e) e = do_bulk_write(bc, (const char *)coll, coll_len,
+        if (!e) e = do_bulk_write(s, bc, (const char *)coll, coll_len,
                                   writes, writes_len, types.data, types.len,
                                   ordered, bulk_now, bulk_have_now, out);
         dbuf_free(&types);
         if (e) return respond_error(out, e);
         return BJ_OK;
+    }
+
+    /*
+     * watch resolves nothing. A collection that does not exist yet is a
+     * perfectly good thing to watch -- the first insert makes it, and
+     * that insert is an event the watcher wants. Opening it here would
+     * refuse exactly the case a change stream is most useful for.
+     */
+    if (op == OP_WATCH) {
+        uint64_t id = 0;
+        e = dbs_watch(s, client, (const char *)coll, coll_len, &id);
+        if (e) return respond_error(out, e);
+        bj_builder *wb = bj_builder_new();
+        if (!wb) return BJ_ERR_OOM;
+        bj_begin_object(wb);
+        PUT_KEY(wb, "ok");     bj_put_bool(wb, 1);
+        PUT_KEY(wb, "stream"); bj_put_int(wb, (int64_t)id);
+        bj_end_object(wb);
+        int we = finish(wb, out);
+        bj_builder_free(wb);
+        return we;
     }
 
     dc_collection *c = NULL;
@@ -1280,7 +1456,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
 
             write_result wr;
             dbuf pre = {0};
-            e = run_write(c, (const char *)coll, coll_len, wreq,
+            e = run_write(s, c, (const char *)coll, coll_len, wreq,
                           filter, (uint32_t)filter_len, arg, arg_len,
                           upsert, id, &wr, return_new ? NULL : &pre);
             if (e) { dbuf_free(&pre); break; }
@@ -1337,7 +1513,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                 size_t start = fc.pos;
                 if ((e = skip_value(&fc))) break;
                 write_result wr;
-                e = run_write(c, (const char *)coll, coll_len, DC_WREQ_DELETE_MANY,
+                e = run_write(s, c, (const char *)coll, coll_len, DC_WREQ_DELETE_MANY,
                               filters.data + start, (uint32_t)(fc.pos - start),
                               NULL, 0, 0, id, &wr, NULL);
                 if (!e) deleted += wr.deleted;
@@ -1441,7 +1617,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             if (!have) { e = DC_ERR_REQ_MISSING_FIELD; break; }
             int ordered = 1;
             if ((e = field_flag(req, req_len, "ordered", 1, &ordered))) break;
-            e = do_insert_many(c, (const char *)coll, coll_len,
+            e = do_insert_many(s, c, (const char *)coll, coll_len,
                                docs_v, docs_vlen, ordered, out);
             if (e) break;
             dbuf_free(&body); dbuf_free(&dates);
@@ -1493,7 +1669,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                 }
                 if (needs) { e = DC_ERR_REQ_MISSING_FIELD; break; }
             }
-            e = do_write(c, (const char *)coll, coll_len, wreq,
+            e = do_write(s, c, (const char *)coll, coll_len, wreq,
                          a, a_len, b, b_len, upsert, id, &body);
             body_key = "result";
             break;

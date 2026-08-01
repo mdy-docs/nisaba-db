@@ -159,7 +159,7 @@ For the same reason `--order` is refused with `--server`: the order the
 files were written with is the server's to know, and it takes its own
 `--order` if they were not made with the default 32.
 
-The wire carries twenty-nine operations, and the CLI commands that ride
+The wire carries thirty-one operations, and the CLI commands that ride
 on them:
 
 | Works over `--server` | |
@@ -171,6 +171,7 @@ on them:
 | `create-index`, `drop-index`, `list-indexes` | the server plans, builds and backfills the index |
 | `find-by-index <coll> <indexName> <values>` | equality lookup with no planner in the way |
 | `prune-expired <coll>` | the TTL sweep, on this end's clock |
+| `watch <coll>` | live change events, pushed by the server as other clients write |
 | `drop-collection` | |
 | `collections` | |
 | `dump [coll]` | walks `collections` → `list-indexes` → a `find` cursor |
@@ -179,20 +180,21 @@ on them:
 | `find-one-and-update`, `find-one-and-replace`, `find-one-and-delete` | the document itself, before or `--return-document after`; no `sort`, as locally |
 | `delete-one`, `delete-many` | |
 
-Everything else — `watch`, and `compact` with no collection named — is
-not on the wire yet, and says so rather than pretending (`aggregate` and
+The only thing left — `compact` with no collection named — is not on the
+wire, and says so rather than pretending (`aggregate` and
 `explain` are on the wire but have never been CLI commands):
 
 ```
-$ db --server 8097 watch events
-Error: the server has no collection.watch() -- its wire carries ping,
-find, findOne, count, distinct, aggregate, explain, insert, insertMany,
-update, updateMany, replace, delete, deleteMany, findOneAndUpdate,
-findOneAndReplace, findOneAndDelete, bulkWrite, findByIndex,
-pruneExpired, getMore, closeCursor, compact, createCollection,
-dropCollection, createIndex, dropIndex, listIndexes, listCollections.
-Open the database directly for the rest.
+$ db --server 8097 compact
+Error: the server has no db.compact() -- the wire's compact is a
+collection operation; ask a collection for it.
 ```
+
+**`watch` works over `--server` too**, which is the one command that
+receives frames it did not ask for: the server pushes a change event as
+other clients write, and this CLI prints it. Unlike the local `watch`,
+it sees writes made by *anyone* connected to that server -- which is the
+thing the local one explicitly cannot do.
 
 **The server serves many connections, up to its `--max-clients`.** A CLI
 invocation connects, asks, and disconnects, so a shell full of them is

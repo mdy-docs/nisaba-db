@@ -84,10 +84,11 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Twenty-nine
-operations — twenty about a collection's documents, five about its
-schema, two about a cursor, and two about neither: `listCollections` and
-`ping`.
+**One request object in, one response object out** — except for change
+events, which are the other kind of frame and are described below.
+Thirty-one operations: twenty about a collection's documents, five about
+its schema, two about a cursor, two about a change stream, and two about
+none of those (`listCollections` and `ping`).
 
 | Request | Response |
 | --- | --- |
@@ -102,6 +103,8 @@ schema, two about a cursor, and two about neither: `listCollections` and
 | `{op:'aggregate', coll, stages:[...]}` | `{ok:true, docs:[...]}` |
 | `{op:'findByIndex', coll, index, values:[...]}` | `{ok:true, docs:[...]}` |
 | `{op:'pruneExpired', coll, now}` | `{ok:true, deletedCount}` |
+| `{op:'watch', coll}` | `{ok:true, stream}` |
+| `{op:'closeStream', stream}` | `{ok:true, closed:true}` |
 | `{op:'explain', coll, filter}` | `{ok:true, plan:{source, index}}` |
 | `{op:'insert', coll, doc, id}` | `{ok:true, result}` |
 | `{op:'insertMany', coll, docs:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
@@ -239,6 +242,67 @@ whichever document the scan reaches first. The in-process API has no
 `sort` either, and a wire that sorted while the local API did not would
 be a worse divergence than the shared gap; adding it means teaching the
 planner to order matches before picking one, which is not plumbing.
+
+**A frame is an answer or an event.** Every frame used to be an answer,
+in request order — which is why there are no request ids on this wire and
+none are needed. `watch` adds the other kind: a frame the server sends
+because *somebody else* wrote something.
+
+```
+  client                                    server
+    │  {op:'watch', coll:'notes'}   ──────▶ │  this connection is watching
+    │ ◀──────  {ok:true, stream:7}          │
+    │  {op:'count', coll:'notes'}   ──────▶ │
+    │ ◀──────  {ok:true, n:3}               │
+    │                                       │  ← another client inserts
+    │ ◀──────  {stream:7, event:{…}}        │  pushed, unasked
+    │  {op:'closeStream', stream:7} ──────▶ │
+    │ ◀──────  {ok:true, closed:true}       │
+```
+
+They are told apart by **shape**: an answer carries `ok`, an event
+carries `stream`. A client that never watches never sees one, so the old
+sentence still holds for it word for word. The event is the object an
+in-process watcher gets, `ns` and all:
+
+```js
+{ ns: { coll: 'notes' }, operationType: 'insert' | 'update' | 'replace' | 'delete',
+  documentKey: { _id }, fullDocument: {...} }   // absent on a delete
+```
+
+**The events cost the engine nothing new.** A logged command already
+names the one document it touched — the planner expanded `updateMany`
+into one command per matched document before any of it ran — so an event
+is built from the command and its result, which is the derivation every
+other host of this library makes. The one read it cannot avoid is an
+update's post-image: an update names its *changes*, not its outcome. That
+read is a `bpt_search` by `_id`, and it happens only while somebody is
+watching.
+
+**A stream is a cursor's twin**: a bounded table (`DBS_MAX_STREAMS`), an
+owner, and a death with its connection. Its opposite in one respect — a
+cursor is pulled and a stream is pushed — which is where the two bounds
+come from:
+
+- The **session** holds at most `DBS_STREAM_EVENTS` (256) events or
+  `DBS_STREAM_BYTES` (1 MB) per stream. Past that the stream *overflows*:
+  it stops collecting, sends `{stream, overflow: true}` once, and closes.
+  A flag rather than a count, deliberately — once a stream overflows,
+  nothing more is built for it, so any number would mean "however many
+  happened before the transport next looked".
+- The **transport** stops handing a connection events once it is holding
+  `OUT_HIGH_WATER` (64 KB) of unsent bytes. Without that the backlog
+  would simply move into a buffer nothing counts, and a consumer that
+  stopped reading would cost the server memory instead of costing itself
+  its stream.
+
+**And the loop does not sleep while a frame is owed.** Everything else
+here becomes deliverable because a socket did something, which is what
+`poll` waits for; an event becomes deliverable because *another* client
+wrote, and the connection it is owed to may be silent, backed up, or
+both. `dbs_stream_pending` is what the loop asks before blocking — added
+after an overflow notice sat undelivered until an unrelated request
+happened to wake the loop.
 
 **`pruneExpired` is a sweep somebody asks for, not a background
 thread.** The engine runs no timers, so *when* to expire stays with
@@ -432,10 +496,11 @@ Stated here rather than discovered later.
   name. There is no scheduler either: the engine runs no timers, so
   *when* to compact stays with whoever is driving
   (`docs/compaction.md`).
-- **No change streams.** `watch` is the one method left that cannot be
-  an op: it needs frames the client did not ask for, and this protocol
-  has no shape for those. Everything else the in-process `Collection`
-  has is here.
+- **No change-stream pipelines, no `updateDescription`, no resume
+  tokens.** The same three non-goals the in-process `watch()` has
+  (README). A stream watches one collection, whole events, and an
+  overflowed consumer re-watches rather than resuming.
+- **No `sort` on the find-one-and-\* family**, as above.
 - **No TLS, no auth, no tenants.** Loopback only. Those belong to the
   gateway in front, not to the database
   (`docs/replicaton-roadmap.md` step 4 records that boundary).

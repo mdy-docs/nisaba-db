@@ -2850,8 +2850,11 @@ class Collection {
     const fbytes = encode(filter);
     const rc = withBytes(M, fbytes, (p, n) => M._dcw_explain(this._outCtx, this._collCtx, p, n));
     if (rc !== 0) throw codeError(rc, 'explain');
-    const { kind, index } = this._readOut(M);
-    return { source: ['scan', 'ids', 'equality', 'text', 'geo'][kind] || 'scan', index: index ?? null };
+    // The plan's NAME is C's (dc_explain_source), not an array here that
+    // a second host could spell differently -- which is exactly what
+    // happened when the server needed one.
+    const { source, index } = this._readOut(M);
+    return { source, index: index ?? null };
   }
 
   /**

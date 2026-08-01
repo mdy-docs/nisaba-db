@@ -1569,6 +1569,16 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
  * 2 equality index, 3 text index, 4 geo index. For kinds 2-4 the serving
  * index's name is dbuf_dup'd into *name_out (caller frees).
  */
+const char *dc_explain_source(int kind) {
+    switch (kind) {
+        case 1:  return "ids";
+        case 2:  return "equality";
+        case 3:  return "text";
+        case 4:  return "geo";
+        default: return "scan";
+    }
+}
+
 int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                int *kind_out, uint8_t **name_out, size_t *name_len_out) {
     *kind_out = 0; *name_out = NULL; *name_len_out = 0;

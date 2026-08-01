@@ -380,6 +380,18 @@ int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                int *kind_out, uint8_t **name_out, size_t *name_len_out);
 
 /*
+ * The driver-facing name for a kind: "scan", "ids", "equality", "text",
+ * "geo" (anything unrecognized reads as "scan", which is what an
+ * unrecognized plan would in fact do).
+ *
+ * Here rather than in each host because it is the same fact as the
+ * numbering above, and two hosts that spelled it differently would
+ * report one plan two ways. It was a JavaScript array until a second
+ * host needed it.
+ */
+const char *dc_explain_source(int kind);
+
+/*
  * A resumable, bounded-memory cursor over documents matching `filter`
  * (opened via dc_cursor_open, advanced in batches via
  * dc_cursor_next_batch, released via dc_cursor_close). Unlike dc_find,

@@ -58,7 +58,8 @@ typedef enum {
     OP_LIST_COLLECTIONS,
     OP_INSERT_MANY,
     OP_BULK_WRITE,
-    OP_AGGREGATE
+    OP_AGGREGATE,
+    OP_EXPLAIN
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -91,6 +92,7 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     OP("insertMany",       OP_INSERT_MANY),
     OP("bulkWrite",        OP_BULK_WRITE),
     OP("aggregate",        OP_AGGREGATE),
+    OP("explain",          OP_EXPLAIN),
 };
 
 #undef OP
@@ -1186,6 +1188,35 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = cdata ? dbuf_put(&body, cdata, clen) : BJ_ERR_OOM;
             bj_builder_free(cb);
             body_key = "result";
+            break;
+        }
+        case OP_EXPLAIN: {
+            /*
+             * Which source the dispatch WOULD use, without running
+             * anything: dc_explain consults the very planners the
+             * queries consult, so a report cannot drift from what
+             * actually happens -- and the name of the plan is C's too,
+             * so this server and an in-process host cannot describe one
+             * plan two ways.
+             */
+            int kind = 0; uint8_t *name = NULL; size_t name_len = 0;
+            e = dc_explain(c, filter, (uint32_t)filter_len, &kind, &name, &name_len);
+            if (e) break;
+            const char *source = dc_explain_source(kind);
+            bj_builder *xb = bj_builder_new();
+            if (!xb) { free(name); e = BJ_ERR_OOM; break; }
+            bj_begin_object(xb);
+            PUT_KEY(xb, "source");
+            bj_put_string(xb, (const uint8_t *)source, (uint32_t)strlen(source));
+            PUT_KEY(xb, "index");
+            if (name) bj_put_string(xb, name, (uint32_t)name_len); else bj_put_null(xb);
+            bj_end_object(xb);
+            free(name);
+            size_t xlen = 0;
+            const uint8_t *xdata = bj_builder_data(xb, &xlen);
+            e = xdata ? dbuf_put(&body, xdata, xlen) : BJ_ERR_OOM;
+            bj_builder_free(xb);
+            body_key = "plan";
             break;
         }
         case OP_AGGREGATE: {

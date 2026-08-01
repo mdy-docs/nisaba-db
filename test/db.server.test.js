@@ -390,6 +390,25 @@ for (const engine of ENGINES) {
       expect(err.message).toMatch(/\$match, \$sort, \$skip, \$limit, \$project, \$group, \$count/);
     });
 
+    it('reports the plan a query would use, in the words C chose', async () => {
+      const users = db.collection('planned');
+      const { insertedIds } = await users.insertMany([
+        { team: 'core', n: 1 }, { team: 'research', n: 2 }
+      ]);
+      await users.createIndex({ team: 1 });
+
+      expect(await users.explain({ team: 'core' })).toEqual({ source: 'equality', index: 'team_1' });
+      expect(await users.explain({ _id: insertedIds[0] })).toEqual({ source: 'ids', index: null });
+      expect(await users.explain({ n: { $gt: 0 } })).toEqual({ source: 'scan', index: null });
+
+      // The cursor sugar the in-process FindCursor has, on both cursor
+      // shapes -- and neither of them ran the query to answer.
+      expect(await users.find({ team: 'core' }).explain())
+        .toEqual({ source: 'equality', index: 'team_1' });
+      expect(await users.find({ team: 'core' }, { batchSize: 1 }).explain())
+        .toEqual({ source: 'equality', index: 'team_1' });
+    });
+
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
       expect(() => db.storageEstimate()).toThrow(/no db\.storageEstimate/);
       expect(() => db.collection('users').pruneExpired()).toThrow(/no collection\.pruneExpired/);

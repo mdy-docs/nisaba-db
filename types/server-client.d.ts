@@ -45,6 +45,13 @@ export interface RemoteWriteResult {
   upsertedId: ObjectId | null;
 }
 
+/** Which source the query dispatch would use, without executing it. The
+ * names are C's (`dc_explain_source`), shared with the in-process host. */
+export interface RemotePlan {
+  source: 'scan' | 'ids' | 'equality' | 'text' | 'geo';
+  index: string | null;
+}
+
 export interface RemoteCursor<T = Document> {
   toArray(): Promise<T[]>;
   /** One document at a time, the shape the in-process cursor uses. */
@@ -56,6 +63,9 @@ export interface RemoteCursor<T = Document> {
    * connection, both do it for you. */
   close(): Promise<void>;
   [Symbol.asyncIterator](): AsyncIterableIterator<T>;
+  /** The plan this cursor's filter gets. Present on a find's cursor; an
+   * aggregate's has no single filter to explain. */
+  explain?(): Promise<RemotePlan>;
 }
 
 export interface RemoteInsertManyResult {
@@ -86,6 +96,9 @@ export interface RemoteCollection<T extends Document = Document> {
    * cursor is a position in an array this side already holds. A bad
    * stage rejects with a ServerError whose `index` names it. */
   aggregate<R extends Document = Document>(pipeline?: Document[]): RemoteCursor<R>;
+  /** Which source the dispatch would use for `filter`, without running
+   * it -- the same planners the queries consult. */
+  explain(filter?: Filter): Promise<RemotePlan>;
   /** The `_id` is minted client-side (C will not invent one: it needs a clock). */
   insertOne(doc: T): Promise<RemoteWriteResult & { insertedId: ObjectId }>;
   /** Every document in one round trip; ids minted client-side as above.

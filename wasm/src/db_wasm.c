@@ -364,19 +364,22 @@ EMSCRIPTEN_KEEPALIVE double dcw_count(dc_collection *c, const uint8_t *filter, i
     return e ? (double)e : (double)n;
 }
 
-/* The out slot receives {kind: <int -- see dc_explain>, index: <string|null>}.
- * Returns 0 on success, negative on error. */
+/* The out slot receives {source: <string -- see dc_explain_source>,
+ * index: <string|null>}, which is the driver-facing shape as it stands:
+ * the kind's NAME is C's, so that this host and the server report one
+ * plan the same way. Returns 0 on success, negative on error. */
 EMSCRIPTEN_KEEPALIVE int dcw_explain(dcw_out *o, dc_collection *c,
         const uint8_t *filter, int filter_len) {
     reset_out(o);
     int kind = 0; uint8_t *name = NULL; size_t name_len = 0;
     int e = dc_explain(c, filter, (uint32_t)filter_len, &kind, &name, &name_len);
     if (e) return e;
+    const char *source = dc_explain_source(kind);
     bj_builder *b = bj_builder_new();
     if (!b) { free(name); return BJ_ERR_OOM; }
     e = bj_begin_object(b);
-    if (!e) e = bj_put_key(b, (const uint8_t *)"kind", 4);
-    if (!e) e = bj_put_int(b, kind);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"source", 6);
+    if (!e) e = bj_put_string(b, (const uint8_t *)source, (uint32_t)strlen(source));
     if (!e) e = bj_put_key(b, (const uint8_t *)"index", 5);
     if (!e) e = name ? bj_put_string(b, name, (uint32_t)name_len) : bj_put_null(b);
     if (!e) e = bj_end_object(b);

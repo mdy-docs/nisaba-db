@@ -84,8 +84,8 @@ producing an error response: a reader that has lost the frame boundary
 cannot resynchronise, and answering would be pretending it had. Every
 other refusal is a response.
 
-**One request object in, one response object out.** Twenty-three
-operations — fourteen about a collection's documents, five about its
+**One request object in, one response object out.** Twenty-four
+operations — fifteen about a collection's documents, five about its
 schema, two about a cursor, and two about neither: `listCollections` and
 `ping`.
 
@@ -100,6 +100,7 @@ schema, two about a cursor, and two about neither: `listCollections` and
 | `{op:'count', coll, filter}` | `{ok:true, n}` |
 | `{op:'distinct', coll, field, filter}` | `{ok:true, values:[...]}` |
 | `{op:'aggregate', coll, stages:[...]}` | `{ok:true, docs:[...]}` |
+| `{op:'explain', coll, filter}` | `{ok:true, plan:{source, index}}` |
 | `{op:'insert', coll, doc, id}` | `{ok:true, result}` |
 | `{op:'insertMany', coll, docs:[...], ordered}` | `{ok:true, result, attempted, upserted, errors}` |
 | `{op:'bulkWrite', coll, writes:[...], ordered, now}` | `{ok:true, result, attempted, upserted, errors}` |
@@ -210,6 +211,17 @@ resume — the same reason a sorted find cannot be batched. A stage the
 subset does not have is refused with `index` naming its position, and the
 client quotes what was at that position, because C does not format
 messages around user data.
+
+**`explain` answers without executing.** It reports which source the
+dispatch *would* use for a filter — `scan`, `ids`, `equality`, `text`,
+`geo`, with the serving index named for the last three — by consulting
+the very planners the queries consult, so the report cannot drift from
+what a query would really do.
+
+The plan's *name* is C's too (`dc_explain_source`). It was a JavaScript
+array until this wire needed one, and two hosts spelling one plan
+differently is a fact with two owners; changing `equality` in C now fails
+tests in the in-process suite, the coordinator suite and this one.
 
 **A sorted find cannot be batched** (`-48`). An arbitrary sort needs
 every match before the first ordered result exists — the reason
@@ -367,7 +379,7 @@ Stated here rather than discovered later.
   *when* to compact stays with whoever is driving
   (`docs/compaction.md`).
 - **No change streams, no `find-one-and-*` family, no
-  `findByIndex`/`pruneExpired`, no `explain`.** Each is an op in
+  `findByIndex`/`pruneExpired`.** Each is an op in
   `wasm/src/db_request.c` plus a method in the client — except `watch`,
   which also needs frames the client did not ask for, and this protocol
   has no shape for those. `dump` and `restore` both work today.

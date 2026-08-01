@@ -57,7 +57,7 @@
  * operations with even if it wanted to. So the list goes over whole and
  * the answer says how many members were attempted and which failed.
  *
- * WHAT IS NOT HERE. The wire has twenty-three ops (WIRE_OPS below) and
+ * WHAT IS NOT HERE. The wire has twenty-four ops (WIRE_OPS below) and
  * this client has exactly those. Change streams and the
  * find-one-and-* family are not on the wire yet; asking for one gets a
  * sentence saying so rather than a TypeError about undefined not being a
@@ -76,7 +76,7 @@ export { encode, decode, ObjectId, Pointer };
  */
 export const WIRE_OPS = [
   'ping',
-  'find', 'findOne', 'count', 'distinct', 'aggregate',
+  'find', 'findOne', 'count', 'distinct', 'aggregate', 'explain',
   'insert', 'insertMany', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
   'bulkWrite',
   'getMore', 'closeCursor', 'compact',
@@ -287,9 +287,10 @@ function atStage(err, pipeline) {
  * `docs` is the promise of that array, so a caller that never asks for a
  * document never waits for one.
  */
-function materialized(docs) {
+function materialized(docs, extras = {}) {
   let at = 0;
   return guard({
+    ...extras,
     toArray: () => docs,
     /* {value, done}, the shape the in-process cursor uses -- so a caller
      * that pulls one document at a time reads the same either way,
@@ -348,7 +349,8 @@ function collection(conn, name) {
 
       if (!batchSize) {
         return materialized(call({ op: 'find', filter, ...(opts ? { opts } : {}) })
-          .then((res) => res.docs || []));
+          .then((res) => res.docs || []),
+          { explain: () => impl.explain(filter) });
       }
 
       let id = null;          // the server's cursor id while one is open
@@ -399,7 +401,10 @@ function collection(conn, name) {
           } finally {
             await cursor.close();   // a `break` mid-scan still gives the slot back
           }
-        }
+        },
+        /** The plan this cursor's filter gets -- the same sugar the
+         * in-process FindCursor carries. */
+        explain: () => impl.explain(filter)
       };
       return guard(cursor, 'cursor');
     },
@@ -425,6 +430,13 @@ function collection(conn, name) {
           .then((res) => res.docs || [])
           .catch((err) => { throw atStage(err, pipeline); })
       );
+    },
+
+    /* Which source the query dispatch would use for this filter,
+     * without running it. The plan's name is C's (dc_explain_source), so
+     * this reports what an in-process host reports, word for word. */
+    async explain(filter = {}) {
+      return (await call({ op: 'explain', filter })).plan;
     },
 
     async countDocuments(filter = {}) {

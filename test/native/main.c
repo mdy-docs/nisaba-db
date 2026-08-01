@@ -2586,6 +2586,76 @@ static void put_bulk_op(bj_builder *b, const char *name,
     bj_end_object(b);
 }
 
+TEST(explain_names_the_plan_the_same_way_for_every_host) {
+    /*
+     * dc_explain consults the very planners the queries consult, so its
+     * report cannot drift from what a query would actually do. What
+     * could drift is the NAME: "equality" was an array in
+     * wasm/nisaba-wasm.js until a second host needed it, and two hosts
+     * spelling one plan differently is a fact with two owners. It lives
+     * in C now (dc_explain_source), which is what this checks -- through
+     * the wire, on a database with a real index on it.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-explain", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+    const uint64_t CLIENT = 11;
+
+    struct { const char *field; int by_id; const char *want; const char *index; } cases[] = {
+        { "team", 0, "equality", "team_1" },   /* the index build_users_db made */
+        { "age",  0, "scan",     NULL      },  /* no index on it */
+        { NULL,   1, "ids",      NULL      },  /* {_id: <oid>} point lookup */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        doc *q = doc_new();
+        if (cases[i].by_id) {
+            uint8_t oid[12]; mk_oid(oid, 1);
+            doc_oid(q, "_id", oid);
+        } else {
+            doc_str(q, cases[i].field, "core");
+        }
+        uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("explain", "users", "filter", qb, qlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+
+        const uint8_t *plan; size_t plan_len; int f = 0;
+        CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"plan", 4,
+                               &plan, &plan_len, &f));
+        CHECK_I64(f, 1);
+        char source[32] = "";
+        CHECK_I64(doc_get_str(plan, plan_len, "source", source, sizeof source), 1);
+        if (strcmp(source, cases[i].want) != 0)
+            TAP_FAIL("case %zu: source '%s', want '%s'", i, source, cases[i].want);
+        char name[64] = "";
+        int had = doc_get_str(plan, plan_len, "index", name, sizeof name);
+        if (cases[i].index) {
+            CHECK_I64(had, 1);
+            if (had) CHECK(strcmp(name, cases[i].index) == 0);
+        } else {
+            CHECK_I64(had, 0);   /* null, not a name */
+        }
+        dbuf_free(&res); bj_builder_free(rb); doc_free(q);
+    }
+
+    /* Nothing was executed to find that out: explain is the one read
+     * that answers without touching a document. */
+    CHECK_I64(dbs_cursor_count(s), 0);
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(an_aggregate_pipeline_runs_whole_in_one_request) {
     /*
      * The pipeline was already C's (db_agg.h) -- including the decision
@@ -7603,6 +7673,7 @@ int main(void) {
     RUN(a_list_of_writes_is_one_request_and_reports_every_member);
     RUN(current_date_is_resolved_with_the_callers_clock_or_refused);
     RUN(an_aggregate_pipeline_runs_whole_in_one_request);
+    RUN(explain_names_the_plan_the_same_way_for_every_host);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

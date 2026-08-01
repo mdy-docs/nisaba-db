@@ -45,7 +45,8 @@ typedef enum {
     OP_DELETE,
     OP_DELETE_MANY,
     OP_GET_MORE,
-    OP_KILL_CURSOR
+    OP_KILL_CURSOR,
+    OP_COMPACT
 } dbs_op;
 
 static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = {
@@ -62,6 +63,7 @@ static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = 
     { "deleteMany",10, OP_DELETE_MANY },
     { "getMore",    7, OP_GET_MORE    },
     { "killCursor",10, OP_KILL_CURSOR },
+    { "compact",    7, OP_COMPACT     },
 };
 
 /* ---- reading the request ----------------------------------------------- */
@@ -504,6 +506,34 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = dbuf_put(&body, vals, vals_len);
             free(vals);
             body_key = "values";
+            break;
+        }
+        case OP_COMPACT: {
+            /*
+             * The one op that is not a query or a write: it replaces the
+             * collection's files. It is here rather than in the
+             * transport because it is a REQUEST -- a client asks, and
+             * gets the same {ok:false, code, msg} refusal shape as any
+             * other request when a cursor is in the way (-49).
+             */
+            dbs_compact_stats st;
+            e = dbs_compact(s, (const char *)coll, coll_len, &st);
+            if (e) break;
+            bj_builder *cb = bj_builder_new();
+            if (!cb) { e = BJ_ERR_OOM; break; }
+            bj_begin_object(cb);
+            PUT_KEY(cb, "generation");  bj_put_int(cb, st.generation);
+            PUT_KEY(cb, "bytesBefore"); bj_put_int(cb, (int64_t)st.bytes_before);
+            PUT_KEY(cb, "bytesAfter");  bj_put_int(cb, (int64_t)st.bytes_after);
+            PUT_KEY(cb, "bytesFreed");
+            bj_put_int(cb, st.bytes_before > st.bytes_after
+                           ? (int64_t)(st.bytes_before - st.bytes_after) : 0);
+            bj_end_object(cb);
+            size_t clen = 0;
+            const uint8_t *cdata = bj_builder_data(cb, &clen);
+            e = cdata ? dbuf_put(&body, cdata, clen) : BJ_ERR_OOM;
+            bj_builder_free(cb);
+            body_key = "result";
             break;
         }
         case OP_INSERT:

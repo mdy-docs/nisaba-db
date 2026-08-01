@@ -162,12 +162,14 @@ The wire carries ten operations, and the CLI commands that ride on them:
 | --- | --- |
 | `find`, `find-one`, `count`, `distinct` | reads, including `--sort`/`--skip`/`--limit`/`--project` |
 | `insert` | the `_id` is minted by this end — C will not invent one, since that needs a clock |
+| `compact <coll>` | one collection at a time; refused while a cursor is reading it |
 | `update-one`, `update-many`, `replace-one` | including `--upsert` |
 | `delete-one`, `delete-many` | |
 
-Everything else — `collections`, `create-index`, `compact`, `dump`,
-`restore`, `watch`, `bulk-write`, `insert-many`, the `find-one-and-*`
-family — is not on the wire yet, and says so rather than pretending:
+Everything else — `collections`, `create-index`, `dump`, `restore`,
+`watch`, `bulk-write`, `insert-many`, the `find-one-and-*` family, and
+`compact` with no collection named (that one needs `collections`) — is
+not on the wire yet, and says so rather than pretending:
 
 ```
 $ db --server 8097 collections

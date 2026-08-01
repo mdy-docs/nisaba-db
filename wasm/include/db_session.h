@@ -122,6 +122,33 @@ int dbs_collection(dbs *s, const char *name, size_t name_len,
  * server that wants to say so. */
 int dbs_open_count(const dbs *s);
 
+/* ---- compaction ---------------------------------------------------------
+ *
+ * Rewrite a collection's whole file set without its append-only history
+ * and adopt the result: plan, stream, flip, reopen, delete
+ * (docs/compaction.md). One synchronous call, because between the last
+ * byte of the new generation and the catalog write that adopts it,
+ * nothing may observe the collection half-migrated.
+ *
+ * REFUSED while a cursor is scanning this collection
+ * (DC_ERR_CURSORS_OPEN, before anything is written): the scan is
+ * positioned inside files this replaces. Drain or kill the cursor and
+ * ask again.
+ *
+ * All or nothing in the way that matters: a failure before the flip
+ * leaves the collection entirely on its old generation with the new
+ * files orphaned for the next sweep. After the flip the new generation
+ * is authoritative and this reopens it, so a failure there is a session
+ * that must be reopened, not a database that lost anything.
+ */
+typedef struct {
+    int      generation;
+    uint64_t bytes_before;
+    uint64_t bytes_after;
+} dbs_compact_stats;
+
+int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *out);
+
 /* ---- cursors ------------------------------------------------------------
  *
  * A cursor is the only thing here that outlives the request that made

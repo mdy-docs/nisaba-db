@@ -66,6 +66,9 @@ export interface RemoteCollection<T extends Document = Document> {
   replaceOne(filter: Filter, doc: T, options?: { upsert?: boolean }): Promise<RemoteWriteResult>;
   updateOne(filter: Filter, update: Update, options?: { upsert?: boolean }): Promise<RemoteWriteResult>;
   updateMany(filter: Filter, update: Update, options?: { upsert?: boolean }): Promise<RemoteWriteResult>;
+  /** Rewrite this collection's files without their append-only history.
+   * Refused (ServerError -49) while any cursor is open over it. */
+  compact(): Promise<{ generation: number; bytesBefore: number; bytesAfter: number; bytesFreed: number }>;
 }
 
 export interface RemoteDb {

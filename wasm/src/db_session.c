@@ -27,6 +27,8 @@
 typedef struct {
     int      kind;                          /* dc_index_plan_kind */
     int      n_files;
+    char    *name;                          /* owned copy */
+    size_t   name_len;
     bj_io    io[DBS_MAX_INDEX_FILES];
     bpt     *tree[DBS_MAX_INDEX_FILES];     /* equality: [0]; text: [0..2] */
     rtree   *rt;                            /* geo */
@@ -144,6 +146,9 @@ static void index_release(bj_ns *ns, dbs_index *ix) {
     if (ix->rt) { rtree_free(ix->rt); ix->rt = NULL; }
     for (int i = 0; i < ix->n_files; i++) ns->close(ns->ctx, &ix->io[i]);
     ix->n_files = 0;
+    free(ix->name);
+    ix->name = NULL;
+    ix->name_len = 0;
 }
 
 /* Everything one entry holds, released in the reverse of the order it was
@@ -183,6 +188,17 @@ static int open_index(dbs *s, dbs_entry *en, const char *coll, size_t coll_len,
     e = plan_int(def, def_len, "kind", &kind, &found);
     if (e) return e;
     ix->kind = kind;
+
+    /* Kept so a later compaction can match a plan's build entry to the
+     * index it names rather than trusting two arrays to be in the same
+     * order. They are, today -- both come from the catalog entry's index
+     * list -- but streaming the wrong tree into the wrong file corrupts
+     * an index silently, which is too quiet a failure to leave resting
+     * on an ordering nobody checks. */
+    ix->name = (char *)malloc(name_len ? name_len : 1);
+    if (!ix->name) return BJ_ERR_OOM;
+    memcpy(ix->name, name, name_len);
+    ix->name_len = name_len;
 
     const uint8_t *files; size_t files_len;
     e = plan_raw(def, def_len, "files", &files, &files_len, &found);
@@ -395,6 +411,185 @@ int dbs_collection(dbs *s, const char *name, size_t name_len, dc_collection **ou
     if (e) return e;
 
     *out = s->open[slot].coll;
+    return BJ_OK;
+}
+
+/* ---- compaction ---------------------------------------------------------
+ *
+ * The whole of docs/compaction.md, from the side of a host that has no
+ * asynchronous opens: plan, stream, flip, reopen, delete. The browser
+ * needs a pre-open pass between the plan and the execute because OPFS
+ * opens are promises; here ns->open really opens, so the same two calls
+ * sit next to each other with nothing between them. That difference --
+ * and only that difference -- is what the plan/execute split buys.
+ *
+ * Refused while a cursor is scanning: dc_compact_execute returns
+ * DC_ERR_CURSORS_OPEN before writing a byte, because the scan is
+ * positioned in files this is about to replace. Nothing here has to
+ * remember that; the tree counts its readers (bpt_pinned).
+ */
+
+static dbs_entry *find_entry(dbs *s, const char *name, size_t name_len) {
+    for (int i = 0; i < DBS_MAX_COLLECTIONS; i++) {
+        dbs_entry *en = &s->open[i];
+        if (en->used && en->name_len == name_len && memcmp(en->name, name, name_len) == 0)
+            return en;
+    }
+    return NULL;
+}
+
+/* Every byte this collection currently occupies: the primary, the
+ * journal, and each index file. The same measure before and after, which
+ * is the only way the difference means anything. */
+static uint64_t entry_bytes(const dbs_entry *en) {
+    uint64_t n = en->primary_io.size ? en->primary_io.size(en->primary_io.ctx) : 0;
+    if (en->has_journal && en->journal_io.size) n += en->journal_io.size(en->journal_io.ctx);
+    for (int i = 0; i < en->n_idx; i++) {
+        for (int j = 0; j < en->idx[i].n_files; j++) {
+            const bj_io *io = &en->idx[i].io[j];
+            if (io->size) n += io->size(io->ctx);
+        }
+    }
+    return n;
+}
+
+/* The live structures to stream, in the plan's build order: the primary,
+ * then each index's files in the order the plan named them. Matched to
+ * the session's open indexes BY NAME -- see dbs_index.name. */
+static int gather_sources(dbs_entry *en, const uint8_t *plan, size_t plan_len,
+                          void **sources, int *kinds, uint32_t cap, uint32_t *n_out) {
+    uint32_t n = 0;
+    if (cap == 0) return BJ_ERR_RANGE;
+    sources[n] = en->primary; kinds[n] = DC_SRC_BPT; n++;
+
+    const uint8_t *build; size_t build_len; int found = 0;
+    int e = plan_raw(plan, plan_len, "build", &build, &build_len, &found);
+    if (e) return e;
+    if (!found) return DC_ERR_CATALOG_ENTRY;
+    uint32_t n_build = 0;
+    if ((e = arr_len(build, build_len, &n_build))) return e;
+
+    for (uint32_t i = 0; i < n_build; i++) {
+        const uint8_t *def; size_t def_len;
+        if ((e = arr_at(build, build_len, i, &def, &def_len))) return e;
+
+        const uint8_t *name; uint32_t name_len;
+        if ((e = plan_str(def, def_len, "name", &name, &name_len, &found))) return e;
+        if (!found) return DC_ERR_CATALOG_ENTRY;
+
+        dbs_index *ix = NULL;
+        for (int j = 0; j < en->n_idx; j++) {
+            if (en->idx[j].name_len == name_len &&
+                memcmp(en->idx[j].name, name, name_len) == 0) { ix = &en->idx[j]; break; }
+        }
+        /* A plan naming an index this session does not hold open means
+         * the catalog and the open collection disagree, which is a
+         * corrupt database rather than a bad request. */
+        if (!ix) return DC_ERR_CATALOG_ENTRY;
+
+        const uint8_t *files; size_t files_len;
+        if ((e = plan_raw(def, def_len, "files", &files, &files_len, &found))) return e;
+        if (!found) return DC_ERR_CATALOG_ENTRY;
+        uint32_t n_files = 0;
+        if ((e = arr_len(files, files_len, &n_files))) return e;
+        if ((int)n_files != ix->n_files) return DC_ERR_CATALOG_ENTRY;
+
+        for (uint32_t f = 0; f < n_files; f++) {
+            if (n >= cap) return BJ_ERR_RANGE;
+            if (ix->rt) { sources[n] = ix->rt; kinds[n] = DC_SRC_RTREE; }
+            else        { sources[n] = ix->tree[f]; kinds[n] = DC_SRC_BPT; }
+            n++;
+        }
+    }
+    *n_out = n;
+    return BJ_OK;
+}
+
+int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *out) {
+    if (!s || !name || !out) return BJ_ERR_STATE;
+    memset(out, 0, sizeof(*out));
+
+    /* Open it first: the sources are the live structures, so there has to
+     * be something live to stream from. */
+    dc_collection *coll = NULL;
+    int e = dbs_collection(s, name, name_len, &coll);
+    if (e) return e;
+    dbs_entry *en = find_entry(s, name, name_len);
+    if (!en) return BJ_ERR_STATE;
+
+    bpt_key key = { .is_string = 1, .num = 0,
+                    .str = (const uint8_t *)name, .str_len = (uint32_t)name_len };
+    int found = 0;
+    const uint8_t *vp = NULL; size_t vlen = 0;
+    if ((e = bpt_search(s->catalog, &key, &found, &vp, &vlen))) return e;
+    if (!found) return DC_ERR_NO_COLLECTION;
+
+    /* Copied for the same reason dbs_collection copies it: this is the
+     * catalog's own output buffer, and the flip below writes to that very
+     * tree. */
+    uint8_t *entry = NULL; size_t entry_len = 0;
+    if ((e = dbuf_dup(vp, vlen, &entry, &entry_len))) return e;
+
+    dbuf plan = {0};
+    e = dc_compact_plan(entry, entry_len, name, name_len, &plan);
+    free(entry);
+    if (e) { dbuf_free(&plan); return e; }
+
+    void *sources[1 + DBS_MAX_INDEXES * DBS_MAX_INDEX_FILES];
+    int kinds[1 + DBS_MAX_INDEXES * DBS_MAX_INDEX_FILES];
+    uint32_t nsources = 0;
+    e = gather_sources(en, plan.data, plan.len, sources, kinds,
+                       (uint32_t)(sizeof sources / sizeof sources[0]), &nsources);
+    if (e) { dbuf_free(&plan); return e; }
+
+    int gen = 0;
+    if ((e = plan_int(plan.data, plan.len, "gen", &gen, &found))) { dbuf_free(&plan); return e; }
+
+    out->bytes_before = entry_bytes(en);
+
+    uint64_t built = 0;
+    e = dc_compact_execute(s->ns, s->catalog, name, name_len, plan.data, plan.len,
+                           sources, kinds, nsources, &built);
+    if (e) { dbuf_free(&plan); return e; }   /* nothing flipped; still on the old generation */
+
+    /*
+     * Flipped. From here the new generation is authoritative, so every
+     * remaining step is best-effort in the sense that failing one does
+     * not put the old files back -- reopening is what a failure here
+     * costs, and the catalog already says which generation is real.
+     *
+     * The session's handles are the OLD files: let them go before the
+     * names are unlinked, and reopen from the flipped catalog.
+     */
+    entry_release(s->ns, en);
+
+    const uint8_t *old_files; size_t old_len; int have_old = 0;
+    if (plan_raw(plan.data, plan.len, "oldFiles", &old_files, &old_len, &have_old) == BJ_OK && have_old) {
+        uint32_t n_old = 0;
+        if (arr_len(old_files, old_len, &n_old) == BJ_OK) {
+            for (uint32_t i = 0; i < n_old; i++) {
+                const uint8_t *fv; size_t fvlen;
+                if (arr_at(old_files, old_len, i, &fv, &fvlen)) break;
+                cur c = { fv, fvlen, 0 };
+                const uint8_t *fp; uint32_t flen;
+                if (take_string(&c, &fp, &flen)) continue;
+                /* Best effort, like every other sweep: a name left behind
+                 * is an orphan the next sweep collects, never a
+                 * correctness problem (db_catalog.h). */
+                s->ns->remove(s->ns->ctx, (const char *)fp, flen);
+            }
+        }
+    }
+    dbuf_free(&plan);
+
+    /* Reopen, which is also the proof: if the new generation cannot be
+     * opened, the caller hears about it now rather than on the next
+     * request. */
+    e = dbs_collection(s, name, name_len, &coll);
+    if (e) return e;
+    en = find_entry(s, name, name_len);
+    out->bytes_after = en ? entry_bytes(en) : built;
+    out->generation = gen;
     return BJ_OK;
 }
 

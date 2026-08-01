@@ -154,7 +154,8 @@ queues:
   host — which is what makes this a guarantee rather than a convention
   that every caller has to keep. It matters because a cursor can now
   outlive the request that opened it: the database server pages one
-  across several ([`db-server.md`](db-server.md)).
+  across several, and serves `{op:'compact'}` to anyone who asks
+  ([`db-server.md`](db-server.md)).
 - While a compact is in flight, **every other operation on that
   collection waits for it** and then runs against the new generation,
   and symmetrically **a compact waits for every in-flight operation to

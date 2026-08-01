@@ -231,9 +231,13 @@ Stated here rather than discovered later.
   waiting is always looked at before one further down. Nothing starves
   while requests are small; a stream of large ones from slot 0 would make
   slot 5 wait.
-- **Ten data operations.** No index management, compaction, change
-  streams, collection listing, or the `find-one-and-*` family. Each is an op in
+- **Eleven collection operations.** No index management, change streams,
+  collection listing, or the `find-one-and-*` family. Each is an op in
   `wasm/src/db_request.c` plus a method in the client.
+- **Compaction is per collection, and per request.** No `compact()`
+  across a whole database (that needs collection listing), and no
+  scheduler: the engine runs no timers, so *when* to compact stays with
+  whoever is driving (`docs/compaction.md`).
 - **No TLS, no auth, no tenants.** Loopback only. Those belong to the
   gateway in front, not to the database
   (`docs/replicaton-roadmap.md` step 4 records that boundary).

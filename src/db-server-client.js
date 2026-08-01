@@ -50,7 +50,7 @@
  * can use -- close() gives it back, draining gives it back, and losing
  * the connection gives it back.
  *
- * WHAT IS NOT HERE. The wire has thirteen ops (WIRE_OPS below) and this
+ * WHAT IS NOT HERE. The wire has fourteen ops (WIRE_OPS below) and this
  * client has exactly those. Indexes, compaction, change streams, listing
  * collections and the find-one-and-* family are not on the wire yet;
  * asking for one gets a sentence saying so rather than a TypeError about
@@ -72,7 +72,7 @@ export const WIRE_OPS = [
   'ping',
   'find', 'findOne', 'count', 'distinct',
   'insert', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
-  'getMore', 'killCursor'
+  'getMore', 'killCursor', 'compact'
 ];
 
 /** Pings per idle timeout. The server's default is 60s; a third of that
@@ -222,16 +222,25 @@ class Connection {
  * a proxy that answers `then` with a function is a thenable, and `await
  * db.collection(name)` would call it.
  */
-function guard(impl) {
+function guard(impl, what) {
   return new Proxy(impl, {
     get(target, prop) {
       if (prop in target) return target[prop];
       if (typeof prop !== 'string') return undefined;
       if (prop === 'then' || prop === 'catch' || prop === 'finally') return undefined;
       return () => {
+        /* An op that IS on the wire, asked of the wrong thing, gets said
+         * so plainly -- `db.compact()` listing `compact` among the
+         * available ops reads as a contradiction, and the useful fact is
+         * that compaction is per-collection. */
+        if (WIRE_OPS.includes(prop)) {
+          throw new Error(
+            `the server has no ${what}.${prop}() -- the wire's ${prop} is a ` +
+            `collection operation; ask a collection for it.`);
+        }
         throw new Error(
-          `the server has no ${prop}() -- its wire carries ${WIRE_OPS.join(', ')}. ` +
-          `Open the database directly for the rest.`);
+          `the server has no ${what}.${prop}() -- its wire carries ` +
+          `${WIRE_OPS.join(', ')}. Open the database directly for the rest.`);
       };
     }
   });
@@ -280,7 +289,7 @@ function collection(conn, name) {
           toArray: () => docs,
           close: async () => {},
           async *[Symbol.asyncIterator]() { yield* await docs; }
-        });
+        }, 'cursor');
       }
 
       let id = null;          // the server's cursor id while one is open
@@ -323,7 +332,7 @@ function collection(conn, name) {
           }
         }
       };
-      return guard(cursor);
+      return guard(cursor, 'cursor');
     },
 
     async findOne(filter = {}) {
@@ -366,6 +375,16 @@ function collection(conn, name) {
 
     async updateMany(filter, update, options = undefined) {
       return write('updateMany', { filter, update }, options);
+    },
+
+    /*
+     * Rewrite this collection's files without their append-only history
+     * (docs/compaction.md). Refused while any client -- including this
+     * one -- has a cursor open over it, since the scan is positioned in
+     * the files being replaced.
+     */
+    async compact() {
+      return (await call({ op: 'compact' })).result;
     }
   };
 
@@ -378,7 +397,7 @@ function collection(conn, name) {
     return res.result;
   }
 
-  return guard(impl);
+  return guard(impl, 'collection');
 }
 
 /**
@@ -438,5 +457,5 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
       await conn.close();
     }
   };
-  return guard(impl);
+  return guard(impl, 'db');
 }

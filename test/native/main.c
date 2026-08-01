@@ -2082,6 +2082,162 @@ TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
     close(dirfd);
 }
 
+TEST(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads) {
+    /*
+     * Compaction as a REQUEST: the same plan/stream/flip/reopen/delete
+     * the browser drives with awaits between every step, driven here by
+     * one binjson object -- because under POSIX ns->open really opens,
+     * so nothing has to happen between the plan and the execute.
+     *
+     * And the guard, end to end: a cursor open over the collection makes
+     * this refuse with the code and the sentence, rather than pulling
+     * the files out from under a scan.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-wire-cmp", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, &s) == BJ_OK);
+    const uint64_t CLIENT = 3;
+
+    /* Churn: every document replaced, so the append-only file holds far
+     * more than the live set it will compact to. */
+    for (int round = 0; round < 8; round++) {
+        doc *f = doc_new();
+        doc_str(f, "team", "core");
+        uint32_t flen; const uint8_t *fb = doc_done(f, &flen);
+        doc *u = doc_new();
+        doc *set = doc_new();
+        doc_int(set, "round", round);
+        uint32_t slen; const uint8_t *sb = doc_done(set, &slen);
+        bj_builder *ub = bj_builder_new();
+        bj_begin_object(ub);
+        bj_put_key(ub, (const uint8_t *)"$set", 4);
+        bj_put_raw(ub, sb, slen);
+        bj_end_object(ub);
+        size_t ulen_s = 0; const uint8_t *ubytes = bj_builder_data(ub, &ulen_s);
+
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = bj_builder_new();
+        bj_begin_object(rb);
+        bj_put_key(rb, (const uint8_t *)"op", 2);
+        bj_put_string(rb, (const uint8_t *)"updateMany", 10);
+        bj_put_key(rb, (const uint8_t *)"coll", 4);
+        bj_put_string(rb, (const uint8_t *)"users", 5);
+        bj_put_key(rb, (const uint8_t *)"filter", 6);
+        bj_put_raw(rb, fb, flen);
+        bj_put_key(rb, (const uint8_t *)"update", 6);
+        bj_put_raw(rb, ubytes, (uint32_t)ulen_s);
+        bj_end_object(rb);
+        size_t rl = 0; req = bj_builder_data(rb, &rl); req_len = (uint32_t)rl;
+
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res);
+        bj_builder_free(rb); bj_builder_free(ub);
+        doc_free(f); doc_free(u); doc_free(set);
+    }
+
+    /* ---- a cursor over the collection, and compaction refuses. */
+    int64_t cursor_id = 0;
+    {
+        const uint8_t *opts; uint32_t opts_len;
+        bj_builder *ob = opts_of(1, 0, &opts, &opts_len);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("find", "users", "opts", opts, opts_len, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        int f = 0;
+        cursor_id = response_num(&res, "cursor", &f);
+        CHECK_I64(f, 1);
+        dbuf_free(&res); bj_builder_free(rb); bj_builder_free(ob);
+    }
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("compact", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 0);
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_CURSORS_OPEN);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- kill it, and the same request goes through. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = cursor_request("killCursor", cursor_id, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    int64_t before = 0, after = 0;
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("compact", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        const uint8_t *r; size_t rlen; int f = 0;
+        CHECK_OK(obj_get_field(res.data, res.len, (const uint8_t *)"result", 6, &r, &rlen, &f));
+        CHECK_I64(f, 1);
+        dbuf rres = {0};
+        CHECK_OK(dbuf_put(&rres, r, rlen));
+        int nf = 0;
+        CHECK_I64(response_num(&rres, "generation", &nf), 1);
+        before = response_num(&rres, "bytesBefore", &nf);
+        after  = response_num(&rres, "bytesAfter", &nf);
+        CHECK_I64(response_num(&rres, "bytesFreed", &nf), before - after);
+        dbuf_free(&rres);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+    /* Reclaiming is the point: eight rounds of updates over three
+     * documents leave far more file than the live set needs. */
+    CHECK(after < before);
+
+    /* ---- and the collection still answers, from the new generation the
+     * session reopened for itself. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        int f = 0;
+        CHECK_I64(response_num(&res, "n", &f), 3);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* ---- the index came with it: an equality lookup still resolves
+     * through the compacted index file, not the deleted one. */
+    {
+        doc *q = doc_new();
+        doc_str(q, "team", "core");
+        uint32_t qlen; const uint8_t *qb = doc_done(q, &qlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "users", "filter", qb, qlen, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(s, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        int f = 0;
+        CHECK_I64(response_num(&res, "n", &f), 2);
+        dbuf_free(&res); bj_builder_free(rb); doc_free(q);
+    }
+
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(every_way_a_request_can_be_wrong_is_answered_not_thrown) {
     /*
      * A refusal is a RESPONSE. The client asked a question; it is owed a
@@ -6585,6 +6741,7 @@ int main(void) {
     RUN(bulk_grammar_rejects_malformed_lists_and_names_the_index);
     RUN(ttl_cutoff_and_filter);
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
+    RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);
     RUN(strerror_covers_every_code_the_layer_can_raise);
     RUN(divergence_classification_defaults_to_halting);
     RUN(name_validation_matches_the_js_rules);

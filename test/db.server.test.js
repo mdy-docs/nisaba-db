@@ -248,12 +248,16 @@ let portSlot = 1;
 const nextPort = () => 18000 + (portSlot++) * 1000 + (process.pid % 1000);
 
 async function startServer(engine, port, extra = [], docs = 0) {
-  const [cmd, args, opts] = engine.argv(await seedDb(docs), port, extra);
+  const dir = await seedDb(docs);
+  const [cmd, args, opts] = engine.argv(dir, port, extra);
   const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  // The directory comes back too: a test that wants to read the files
+  // afterwards -- with the JS implementation, once the server is gone --
+  // needs to know which ones.
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${engine.name} server did not start`)), 30000);
     proc.stderr.on('data', (d) => {
-      if (String(d).includes('serving')) { clearTimeout(t); resolve(proc); }
+      if (String(d).includes('serving')) { clearTimeout(t); resolve({ proc, dir }); }
     });
   });
 }
@@ -282,7 +286,7 @@ for (const engine of ENGINES) {
     const port = nextPort();
 
     beforeAll(async () => {
-      proc = await startServer(engine, port);
+      ({ proc } = await startServer(engine, port));
       db = await connectServer(port);   // a bare port means loopback
       return async () => { await db.close(); proc.kill(); };
     });
@@ -314,11 +318,15 @@ for (const engine of ENGINES) {
     });
 
     it('says what the wire does not carry, rather than failing as a TypeError', () => {
-      expect(() => db.listCollections()).toThrow(/no listCollections/);
-      expect(() => db.collection('users').createIndex({ team: 1 })).toThrow(/no createIndex/);
+      expect(() => db.listCollections()).toThrow(/no db\.listCollections/);
+      expect(() => db.collection('users').createIndex({ team: 1 })).toThrow(/no collection\.createIndex/);
       // The sentence names the ops that DO exist, so the refusal is
       // actionable without reading the source.
       expect(() => db.collection('users').watch()).toThrow(WIRE_OPS.join(', '));
+      // And an op that IS on the wire, asked of the wrong thing, says
+      // that instead of listing `compact` as available while refusing
+      // compact -- which is what it used to do.
+      expect(() => db.compact()).toThrow(/compact is a collection operation/);
     });
   });
 
@@ -330,7 +338,7 @@ for (const engine of ENGINES) {
     ], { encoding: 'utf8' });
 
     beforeAll(async () => {
-      proc = await startServer(engine, port);
+      ({ proc } = await startServer(engine, port));
       return () => { proc.kill(); };
     });
 
@@ -350,7 +358,7 @@ for (const engine of ENGINES) {
     it('refuses, from the CLI, what only a local database can do', () => {
       const listed = cli('collections');
       expect(listed.status).toBe(1);
-      expect(listed.stderr).toMatch(/no listCollections/);
+      expect(listed.stderr).toMatch(/no db\.listCollections/);
 
       // --order is the server's, decided when it opened the directory.
       const ordered = cli('count', 'users', '--order', '64');
@@ -377,7 +385,7 @@ for (const engine of ENGINES) {
     const port = nextPort();
 
     beforeAll(async () => {
-      proc = await startServer(engine, port, ['--idle-timeout', '1']);
+      ({ proc } = await startServer(engine, port, ['--idle-timeout', '1']));
       return () => { proc.kill(); };
     });
 
@@ -426,7 +434,7 @@ for (const engine of ENGINES) {
     ], { encoding: 'utf8' });
 
     beforeAll(async () => {
-      proc = await startServer(engine, port, ['--max-clients', '2']);
+      ({ proc } = await startServer(engine, port, ['--max-clients', '2']));
       return () => { proc.kill(); };
     });
 
@@ -503,6 +511,82 @@ for (const engine of ENGINES) {
   });
 
   /*
+   * Compaction over the wire: the same plan/stream/flip/reopen/delete
+   * the browser drives with an await between every step, asked for with
+   * one object -- and refused while a cursor is reading the files it
+   * would replace.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: compact (${engine.name})`, () => {
+    let proc, db, dir;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      ({ proc, dir } = await startServer(engine, port, [], 40));
+      db = await connectServer(port);
+      return async () => { await db.close(); proc.kill(); };
+    });
+
+    it('reclaims what an append-only file holds, and keeps every document', async () => {
+      const users = db.collection('users');
+      // Churn: every bulk document rewritten several times over, so the
+      // file holds far more than the live set.
+      for (let round = 0; round < 6; round++) {
+        await users.updateMany({ team: 'bulk' }, { $set: { round } });
+      }
+      const before = await users.countDocuments({});
+      expect(before).toBe(43);
+
+      const res = await users.compact();
+      expect(res.generation).toBe(1);
+      expect(res.bytesFreed).toBeGreaterThan(0);
+      expect(res.bytesAfter).toBeLessThan(res.bytesBefore);
+
+      // The session reopened the new generation for itself -- the next
+      // request is answered from it without anybody reconnecting.
+      expect(await users.countDocuments({})).toBe(before);
+      expect((await users.findOne({ name: 'Ada' })).team).toBe('core');
+      expect(await users.countDocuments({ team: 'bulk' })).toBe(40);
+
+      // And again: a second compaction of an already-compact collection
+      // is legal, cheap, and lands on the next generation.
+      expect((await users.compact()).generation).toBe(2);
+    });
+
+    it('refuses while a cursor is reading, and proceeds once it is closed', async () => {
+      const users = db.collection('users');
+      const cursor = users.find({}, { batchSize: 5 });
+      await cursor.nextBatch();
+
+      let err = null;
+      try { await users.compact(); } catch (e) { err = e; }
+      expect(err).toBeInstanceOf(ServerError);
+      expect(err.code).toBe(-49);
+      expect(err.message).toMatch(/compact a collection while a cursor/);
+
+      await cursor.close();
+      expect((await users.compact()).generation).toBeGreaterThan(0);
+    });
+
+    it('leaves a database the JS implementation can still open', async () => {
+      // The whole point of the format claim: a C process rewrote every
+      // file, and the JavaScript implementation reads the result.
+      const users = db.collection('users');
+      await users.compact();
+      await db.close();
+      proc.kill();
+      await new Promise(r => proc.once('exit', r));
+
+      const provider = new NodeFSStorageProvider(dir);
+      const jsDb = await connect(provider);
+      const jsUsers = await jsDb.collection('users');
+      expect(await jsUsers.countDocuments({})).toBe(43);
+      expect((await jsUsers.find({ team: 'core' }).toArray()).length).toBe(2);
+      await jsDb.close();
+      await provider.close();
+    });
+  });
+
+  /*
    * Cursors. 43 documents and a batch of 10, so the paging is real:
    * four full batches, a remainder, and an id that goes null exactly
    * once. What the server holds between calls is a POSITION in a B+ tree
@@ -515,7 +599,7 @@ for (const engine of ENGINES) {
     const TOTAL = 43;
 
     beforeAll(async () => {
-      proc = await startServer(engine, port, [], TOTAL - 3);
+      ({ proc } = await startServer(engine, port, [], TOTAL - 3));
       db = await connectServer(port);
       return async () => { await db.close(); proc.kill(); };
     });

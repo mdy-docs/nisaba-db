@@ -60,12 +60,11 @@ processes elect a leader, replicate every write through the log before
 applying it, survive the leader being killed, and catch a restarted
 member up — with no JavaScript in any of them
 ([`docs/db-server.md`](../db-server.md)). The peer wire is
-`src/raft-transport-tcp.js`'s — a 4-byte length, then
-`{ t, id, env }` — with one known discrepancy still to fix: JavaScript
-puts the raft message in `env` as a BINARY blob (it hands the transport
-encoded bytes) and C splices it as a nested object, so C-to-C is
-self-consistent and C-to-Node is not yet. Without the flag nothing
-changes, file layout included.
+`src/raft-transport-tcp.js`'s — a 4-byte length, then `{ t, id, env }`
+with the message as opaque BINARY — so a member running in Node sits in
+the same cluster as C members, which `test/db.server.test.js` proves
+with two C members and one `RaftNode` that the quorum cannot do without.
+Without the flag nothing changes, file layout included.
 
 Two things the brief listed are deliberately NOT built, and both are
 waiting on the same thing rather than on a decision:

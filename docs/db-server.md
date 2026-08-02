@@ -92,15 +92,25 @@ length, then a binjson `{ t: "req"|"res", id, env|value|error }`, with
 `id` the sender's correlation id echoed back. The client port and the
 peer port are separate listeners and separate grammars.
 
-**One known discrepancy, not yet fixed.** JavaScript hands its transport
-already-encoded bytes, so `env` arrives on the wire as a binjson BINARY
-blob; C splices the message as a nested OBJECT instead. C-to-C is
-self-consistent and works, and C-to-Node does not — a Node member would
-hand `handleMessage` an object where it expects bytes. So "a native
-member and a Node member in one cluster" is the intent and not yet the
-fact. The fix is `bj_put_binary` on the way out and unwrapping the BINARY
-on the way in, plus a test that actually joins a Node node to C nodes,
-which is the only thing that would have caught it.
+`env` (and a reply's `value`) carries the message as **opaque bytes** —
+binjson BINARY, not the message spliced in as a nested object. That is
+what the other end does: `src/raft.js` hands its transport an
+already-encoded message, and the receiving host passes it to
+`handleMessage(bytes)` without ever decoding it.
+
+**A member running in Node can sit in this cluster**, and
+`test/db.server.test.js` proves it: two C members and one `RaftNode` over
+`src/raft-transport-tcp.js`, electing, replicating, and — with one C
+member stopped — unable to commit anything without the Node member's
+vote and acks.
+
+What that does and does not show is worth stating. The Node member's
+`RaftNode` wraps `RaftCore`, which is the SAME C `raft_node` compiled to
+WASM, so this is not two implementations of Raft agreeing; it is one
+implementation with two hosts around it, and the only thing that differs
+is the transport. Which is exactly where they HAD drifted: C spliced the
+message into `env` as a nested object, C-to-C agreed with itself, and no
+C-only test could ever have noticed.
 
 ## Clients
 

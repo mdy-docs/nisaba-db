@@ -166,9 +166,8 @@ joined has one more reason to want it.
 - **`seedRequest`'s envelope carries a group.** It sends
   `{ group, msg }` because `RaftGroupHost` multiplexes; a native member
   has one group and no envelope. Do not copy the wrapper along with the
-  logic, and see the note on `env` framing in
-  [`../db-server.md`](../db-server.md) before assuming the two wires
-  already agree.
+  logic: the frame's `env` is the message and nothing around it, which is
+  what lets a Node member and a C member share a cluster today.
 - **`--stdio` cannot join anything**, for the reason it cannot be a peer:
   there is no poll loop there to serve one with.
 

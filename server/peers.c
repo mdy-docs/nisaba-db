@@ -234,6 +234,19 @@ static int chan_put(chan *c, const uint8_t *body, size_t blen) {
 
 /* ---- the frame grammar -------------------------------------------------- */
 
+/*
+ * A message rides in `env` (and in `value`) as OPAQUE BYTES -- binjson's
+ * BINARY, not the message spliced in as a nested object.
+ *
+ * That is not a taste: it is what the other end does. src/raft.js hands
+ * its transport an already-encoded message (`transport.call(peer,
+ * bytes)`), so binjson tags it BINARY, and the receiving host passes it
+ * straight to handleMessage(bytes) without ever decoding it. A nested
+ * object would arrive there as a decoded object where bytes are
+ * expected. It cost nothing while both ends were C -- they agreed with
+ * each other -- and made the two hosts unable to share a cluster, which
+ * is the entire reason this wire is a copy of that file's.
+ */
 static int build_req(uint64_t corr, const uint8_t *env, uint32_t len, dbuf *out) {
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
@@ -243,7 +256,7 @@ static int build_req(uint64_t corr, const uint8_t *env, uint32_t len, dbuf *out)
     if (!e) e = bj_put_key(b, (const uint8_t *)"id", 2);
     if (!e) e = bj_put_int(b, (int64_t)corr);
     if (!e) e = bj_put_key(b, (const uint8_t *)"env", 3);
-    if (!e) e = bj_put_raw(b, env, len);
+    if (!e) e = bj_put_binary(b, env, len);
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -271,7 +284,7 @@ static int build_res(uint64_t corr, const uint8_t *value, uint32_t len,
         if (!e) e = bj_put_string(b, (const uint8_t *)error, (uint32_t)strlen(error));
     } else {
         if (!e) e = bj_put_key(b, (const uint8_t *)"value", 5);
-        if (!e) e = bj_put_raw(b, value, len);
+        if (!e) e = bj_put_binary(b, value, len);
     }
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
@@ -305,12 +318,20 @@ static int frame_u64(const uint8_t *body, size_t blen, const char *key, uint64_t
     return read_u64(&c, out) == BJ_OK ? 0 : -1;
 }
 
-static int frame_span(const uint8_t *body, size_t blen, const char *key,
-                      const uint8_t **v, uint32_t *len) {
-    size_t vlen; int found = 0;
+/* The PAYLOAD of a BINARY field: past its type byte and its u32 length,
+ * which is take_string's shape with BINARY's tag. What comes back is the
+ * message exactly as the sender's node emitted it, which is what
+ * rn_handle and rn_on_reply take. */
+static int frame_binary(const uint8_t *body, size_t blen, const char *key,
+                        const uint8_t **v, uint32_t *len) {
+    const uint8_t *span; size_t slen; int found = 0;
     if (obj_get_field(body, blen, (const uint8_t *)key, (uint32_t)strlen(key),
-                      v, &vlen, &found) != BJ_OK || !found) return -1;
-    *len = (uint32_t)vlen;
+                      &span, &slen, &found) != BJ_OK || !found) return -1;
+    if (slen < 5 || span[0] != BJ_TYPE_BINARY) return -1;
+    uint32_t n = rdu32(span + 1);
+    if ((size_t)n + 5 != slen) return -1;
+    *v = span + 5;
+    *len = n;
     return 0;
 }
 
@@ -660,7 +681,7 @@ int peers_next(peers *p, peer_event *ev, int *have) {
             ev->kind = PEER_EV_REQUEST;
             ev->from = ib->conv;
             ev->corr = corr;
-            if (frame_span(body, blen, "env", &ev->bytes, &ev->len) != 0) goto broken;
+            if (frame_binary(body, blen, "env", &ev->bytes, &ev->len) != 0) goto broken;
             *have = 1;
             return BJ_OK;
         }
@@ -677,7 +698,7 @@ int peers_next(peers *p, peer_event *ev, int *have) {
 
         memset(ev, 0, sizeof *ev);
         ev->corr = corr;
-        if (ok && frame_span(body, blen, "value", &ev->bytes, &ev->len) == 0) {
+        if (ok && frame_binary(body, blen, "value", &ev->bytes, &ev->len) == 0) {
             ev->kind = PEER_EV_REPLY;
         } else {
             /* A refusal is an answer, and to the node it is the same

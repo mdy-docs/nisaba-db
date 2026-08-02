@@ -25,7 +25,9 @@ import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
 import { connect, ObjectId } from '../src/db.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
 import { connectServer, ServerError, WIRE_OPS, ChangeStreamOverflowError } from '../src/db-server-client.js';
-import { BPlusTree } from '../wasm/nisaba-wasm.js';
+import { BPlusTree, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { RaftNode } from '../src/raft.js';
+import { TcpRaftTransport } from '../src/raft-transport-tcp.js';
 
 await ready();
 
@@ -797,6 +799,207 @@ for (const engine of ENGINES) {
       await write('epsilon');
       await agree(['alpha', 'beta', 'contested', 'delta', 'epsilon', 'gamma', 'redirected']);
     }, 30000);
+  });
+
+  /*
+   * ONE CLUSTER, TWO HOSTS: two C members and one member running in
+   * Node.
+   *
+   * What is and is not being proved matters here. The Node member's
+   * RaftNode wraps RaftCore -- the SAME C raft_node, compiled to WASM --
+   * so this is not two implementations of Raft agreeing. It is one
+   * implementation with two hosts around it, and the only thing that
+   * differs between them is the transport: server/peers.c on one side,
+   * src/raft-transport-tcp.js on the other. So this suite tests the
+   * FRAMING, which is exactly where they had drifted apart -- C spliced
+   * the message into `env` as a nested object where JavaScript, which
+   * hands its transport already-encoded bytes, puts binjson BINARY.
+   * C-to-C agreed with itself and could not talk to a Node member at
+   * all.
+   *
+   * Across the three suites every combination is covered: C writes
+   * `env` and C reads it (the three-process cluster above), JavaScript
+   * writes it and JavaScript reads it (test/raft-tcp.test.js, a real
+   * 3-node cluster over real sockets), and here C writes `env` for
+   * JavaScript to read while JavaScript writes `value` for C to read.
+   *
+   * The Node member is a full VOTER, which is the part that carries the
+   * proof: with one C member stopped, nothing commits without it.
+   *
+   * It is also entitled to WIN an election, and that is a problem the
+   * suite has to solve rather than prevent -- a leader with no database
+   * is a leader no client can send a write to. Not ticking it does not
+   * work and it is worth writing down why: a follower campaigns only
+   * from tick(), but its clock advances only from tick() too, so leader
+   * stickiness never expires and it refuses every vote forever. (It did.
+   * The surviving C member could not get elected at all.) So it ticks
+   * like any member, and when it wins it hands leadership to a C member
+   * with TimeoutNow -- section 3.10, and also the one message this suite
+   * sends from the Node member TO C.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: a C cluster with a Node member (${engine.name})`, () => {
+    const base = nextPort();
+    const C_MEMBERS = [1, 2].map((id) => ({
+      id, port: base + id - 1, raftPort: base + 10 + id - 1
+    }));
+    const NODE = { id: 3, raftPort: base + 12 };
+    const RECORDS = [
+      ...C_MEMBERS.map((m) => ({ id: m.id, host: '127.0.0.1', port: m.raftPort })),
+      { id: NODE.id, host: '127.0.0.1', port: NODE.raftPort }
+    ];
+    const argsFor = (m) => [
+      '--raft', String(m.id), '--raft-port', String(m.raftPort),
+      ...RECORDS.filter((r) => r.id !== m.id)
+        .flatMap((r) => ['--peer', `${r.id}@${r.host}:${r.port}`])
+    ];
+
+    /* Records what the log gave it and nothing else. The C members
+     * replicate DATABASE commands, and this member has no database to
+     * apply them to -- what is being watched is that the entries arrive
+     * at all, in order, through a transport written in the other
+     * language. */
+    class RecordingMachine {
+      constructor() { this.applied = 0; this.count = 0; this.bytes = 0; }
+      appliedIndex() { return this.applied; }
+      async apply(entry) {
+        this.count++;
+        this.bytes += entry.payload.length;
+        this.applied = entry.index;
+      }
+    }
+
+    let cNodes = [];
+    let node = null, transport = null, log = null, machine = null, ticker = null;
+
+    const stopC = async (m) => {
+      if (!m.alive) return;
+      m.alive = false;
+      m.proc.kill();
+      await new Promise((r) => m.proc.once('exit', r));
+    };
+
+    const until = async (pred, ms = 15000) => {
+      const started = Date.now();
+      while (Date.now() - started < ms) {
+        if (await pred()) return Date.now() - started;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      throw new Error('condition never held');
+    };
+
+    /* Leadership somewhere a client can reach. */
+    const ensureCLeads = async () => {
+      await until(() => node.role === 'leader' ||
+                        cNodes.some((m) => m.alive && m.id === node.leaderId));
+      if (node.role !== 'leader') return;
+      await node.transferLeadership(cNodes.find((m) => m.alive).id);
+      await until(() => node.role !== 'leader');
+    };
+
+    const writeVia = async (name, tries = 100) => {
+      await ensureCLeads();
+      let last = null;
+      for (let i = 0; i < tries; i++) {
+        for (const m of cNodes.filter((n) => n.alive)) {
+          let db = null;
+          try {
+            db = await connectServer(m.port);
+            await db.collection('users').insertOne({ name });
+            await db.close();
+            return m;
+          } catch (err) {
+            last = err;
+            try { await db?.close(); } catch { /* already gone */ }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error(`no C member took the write "${name}": ${last?.message}`);
+    };
+
+    beforeAll(async () => {
+      cNodes = [];
+      for (const m of C_MEMBERS) {
+        const { proc, dir } = await startServer(engine, m.port, argsFor(m), -1);
+        cNodes.push(Object.assign(m, { proc, dir, alive: true }));
+      }
+
+      log = new EntryLog(new MemoryHandle());
+      await log.open();
+      machine = new RecordingMachine();
+      transport = new TcpRaftTransport({
+        listenPort: NODE.raftPort,
+        peers: Object.fromEntries(C_MEMBERS.map((m) => [m.id, { host: '127.0.0.1', port: m.raftPort }])),
+        // `env` arrives decoded. It must be BYTES: handleMessage hands
+        // them straight to C without looking inside, which is the whole
+        // reason the field is BINARY rather than a nested object.
+        onMessage: (env) => node.handleMessage(env),
+        requestTimeoutMs: 1000
+      });
+      await transport.start();
+      node = new RaftNode({ id: NODE.id, peers: RECORDS, log, stateMachine: machine, transport });
+      await node.start(Date.now());
+      // The clock, on the same interval RaftGroupHost uses. Without it
+      // nothing about this member's timers is true -- including, and
+      // least obviously, when it may grant a vote.
+      ticker = setInterval(() => node.tick(Date.now()), 20);
+      ticker.unref?.();
+
+      return async () => {
+        clearInterval(ticker);
+        for (const m of cNodes) await stopC(m);
+        await node.stop();
+        await transport.stop();
+        await log.close();
+      };
+    });
+
+    it('a C leader replicates its log into the Node member', async () => {
+      await writeVia('from-c');
+      // Entries, in order, decoded by a host that never saw a byte of
+      // this frame written. Two at least: the leader's own NOOP and the
+      // insert -- the NOOP is not applied, so `count` is the documents.
+      await until(() => log.lastIndex >= 2);
+      await until(() => machine.count >= 1 && machine.bytes > 0);
+      expect(machine.applied).toBe(log.lastIndex);
+    });
+
+    it('and its vote and its acks are what the quorum needs', async () => {
+      const before = log.lastIndex;
+      // Three voters, so a quorum is two. With one C member gone there
+      // is exactly one C member left: it cannot elect itself and cannot
+      // commit anything without the member running in Node.
+      await stopC(cNodes.find((m) => m.alive));
+      expect(cNodes.filter((m) => m.alive).length).toBe(1);
+
+      const took = await writeVia('needs-the-node-member');
+      expect(took.id).toBeDefined();
+      // Committed means a quorum matched, and the quorum is this member.
+      await until(() => log.lastIndex > before);
+      expect(node.leaderId).toBe(took.id);
+
+      // And the surviving C member really has it, read back over the
+      // wire like any other client.
+      const db = await connectServer(took.port);
+      try {
+        expect((await db.collection('users').find({}, { sort: { name: 1 } }).toArray())
+          .map((d) => d.name)).toEqual(['from-c', 'needs-the-node-member']);
+      } finally { await db.close(); }
+    }, 30000);
+
+    it('leaves files the JS engine reads, after a cluster of two languages wrote them', async () => {
+      const survivor = cNodes.find((m) => m.alive);
+      await stopC(survivor);
+      // The claim this repository rests on, through a mixed cluster: a
+      // third implementation opens what the others agreed on.
+      const provider = new NodeFSStorageProvider(survivor.dir);
+      const jsDb = await connect(provider);
+      const users = await jsDb.collection('users');
+      expect((await users.find({}, { sort: { name: 1 } }).toArray()).map((d) => d.name))
+        .toEqual(['from-c', 'needs-the-node-member']);
+      await jsDb.close();
+      await provider.close();
+    });
   });
 
   describe.skipIf(!enabled)(`nisaba-server: the JS client (${engine.name})`, () => {

@@ -370,12 +370,15 @@ processes hosting the WASM engine**, and **C processes hosting nothing**.
 What is still missing on the C side — briefs in [`steps/`](steps/):
 
 1. **Databases in the server**
-   (`steps/databases-in-the-server.md`) — one executable, one root
-   folder, many databases beneath it. The library already writes that
-   layout (`Client.db(name)`, a real subdirectory per name); the server
-   serves one directory as one database and the wire has no `db` field.
-   Its first deliverable is a decision: one log for the instance, or one
-   per database.
+   (`steps/databases-in-the-server.md`) — the MongoDB shape: one
+   connection to an instance, `client.db("analytics")` and
+   `client.db("billing")` switched between over it, in the native server
+   and in the browser alike. The library already writes that layout in
+   process (`Client.db(name)`, a real subdirectory per name); the server
+   serves one directory as one database, the wire has no `db` field, and
+   `connectServer` returns a `Db` with no client above it. Its first
+   deliverable is a decision: one log for the instance, or one per
+   database.
 2. **Joining a native cluster**
    (`steps/joining-a-native-cluster.md`) — growing a cluster without
    restarting its members. The node already answers a join; nothing in C

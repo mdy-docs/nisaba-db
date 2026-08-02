@@ -13,7 +13,7 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [databases-in-the-server.md](databases-in-the-server.md) | One executable, one root folder, many databases beneath it — the shape `Client.db(name)` already writes and the server cannot yet serve. |
+| 1 | [databases-in-the-server.md](databases-in-the-server.md) | `client.db("analytics")` and `client.db("billing")` over ONE connection, in the server and in the browser. The shape `Client.db(name)` already writes in process and the server cannot yet serve. |
 | 2 | [joining-a-native-cluster.md](joining-a-native-cluster.md) | Growing a cluster without restarting its members. The node already answers a join; nothing in C has ever asked. |
 | 3 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
 | 4 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
@@ -41,15 +41,15 @@ tenants make quiescence the design rather than an optimization — and
 always-on instance quiesces nothing and places nothing, and almost
 nothing of the brief survived the constraint.
 
-What it was mistaken for is now brief 1: `instance -> databases ->
-collections`, one executable over one root folder. That is a different
-thing — one cluster serving several named databases, rather than several
-clusters sharing a process — and it is much cheaper, because under one
-log for the instance Raft does not change at all. Brief 1's first
-deliverable is deciding whether that is the right shape or whether a log
-per database is; the argument is written out there. The rest of the
-retired brief's inventory (the seed loop, the deferred reply) is brief 2,
-where it belongs.
+What it was mistaken for is now brief 1: the MongoDB shape — one
+connection to an instance, `client.db(name)` switching between databases
+over it, in the server and in the browser alike. That is a different
+thing from a seat — one cluster serving several named databases, rather
+than several clusters sharing a process — and it is much cheaper,
+because under one log for the instance Raft does not change at all.
+Whether that is the right choice is brief 1's first deliverable; the
+argument is written out there. The rest of the retired brief's inventory
+(the seed loop, the deferred reply) is brief 2, where it belongs.
 
 **The server is a cluster member**, which is why its brief is gone.
 `nisaba-server --raft ID --raft-port N --peer ID@HOST:PORT` is a Raft

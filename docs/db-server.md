@@ -1,9 +1,9 @@
 # The database server
 
-A process that holds one database directory and answers binjson frames
-over a socket, with no JavaScript in it at all. It is the same C the
-browser and Node builds link — `server/main.c` adds a `main()` and a
-transport, and nothing else.
+A process that holds one directory — an INSTANCE, with a subdirectory per
+database — and answers binjson frames over a socket, with no JavaScript in
+it at all. It is the same C the browser and Node builds link:
+`server/main.c` adds a `main()` and a transport, and nothing else.
 
 The deployment target is **`wasm32-wasip2`**, run by `wasmtime run`. The
 native build exists so the same code runs wherever a `cc` does, and the
@@ -18,17 +18,33 @@ depend on sockets (preview1 has none).
 ./wasm/build-server.sh --wasip1     # wasm32-wasip1, --stdio only
 ```
 
-The database directory is the working directory (native) or the preopen
-mapped to `.` (WASI). One process per directory, for its whole lifetime:
+The ROOT directory is the working directory (native) or the preopen
+mapped to `.` (WASI). One process per root, for its whole lifetime:
 
 ```sh
-wasmtime run -S inherit-network --dir ~/.nisaba/mydb::. \
+wasmtime run -S inherit-network --dir ~/.nisaba::. \
   wasm/lib/nisaba-server-wasip2.wasm --port 8097
 
-cd ~/.nisaba/mydb && nisaba-server --port 8097     # or natively
-cd /tmp/brand-new && nisaba-server --port 8097     # an empty directory becomes a database
+cd ~/.nisaba && nisaba-server --port 8097          # or natively
+cd /tmp/brand-new && nisaba-server --port 8097     # an empty directory is an empty instance
 nisaba-server --stdio                              # frames on stdin/stdout
 ```
+
+```
+~/.nisaba/                 the root -- one process owns it
+├── analytics/             a database: its own catalog and files
+│   ├── __catalog__.bj
+│   └── coll-events.bj
+├── billing/
+│   └── ...
+└── __wal__.bj             the log, with --raft: ONE for the instance
+```
+
+**A directory that is itself a database is refused**, with the sentence
+saying to move its files into a subdirectory named for the database and
+serve the parent. A server that quietly reinterpreted one as a root would
+open an instance with no databases in it, standing on top of somebody's
+data and reporting nothing wrong.
 
 | Flag | |
 | --- | --- |
@@ -59,6 +75,17 @@ cd node3 && nisaba-server --port 8099 --raft 3 --raft-port 9003 \
 Three directories, three processes, no JavaScript in any of them. They
 elect a leader, put every write through a log before applying it, and
 survive one of them dying — two of three is still a quorum.
+
+**One log for the whole instance**, not one per database: one leader,
+one election, one member set, one failover story for the executable. A
+log entry carries the database its command is for, and that is the whole
+of what replication had to learn — `server/replica.c` and
+`server/peers.c` do not know a database has a name.
+
+What that costs, accepted deliberately: one database's write rate is
+every database's, and a halt in one halts all of them. Per-database
+placement is not available and is not planned — it was a tenancy
+requirement, and tenancy is a layer above this repository.
 
 **Every member is told the same member set**, because there is no join
 yet: growing a cluster means restarting its members with a longer list.
@@ -111,6 +138,55 @@ implementation with two hosts around it, and the only thing that differs
 is the transport. Which is exactly where they HAD drifted: C spliced the
 message into `env` as a nested object, C-to-C agreed with itself, and no
 C-only test could ever have noticed.
+
+## Databases
+
+One connection reaches all of them, and switches between them freely:
+
+```js
+const client = await connectServer('127.0.0.1:8097');
+const analytics = client.db('analytics');
+const billing   = client.db('billing');
+
+await analytics.collection('events').insertOne({ n: 1 });
+await billing.collection('invoices').insertOne({ n: 2 });   // same socket
+```
+
+`client.db(name)` **sends nothing** — it is a handle, exactly as
+`Client.db(name)` is in process (`docs/db-api.md`). What makes that
+possible is that the CONNECTION is not stateful about which database:
+every request carries a `db` field, so two handles can be held at once
+and interleaved. There is no "use" op and there will not be one — a
+request whose meaning depends on an earlier request could not be
+interleaved with another database's at all.
+
+| Op | |
+| --- | --- |
+| `{op:'listDatabases'}` | `{ok:true, databases:[...]}` — the subdirectories of the root |
+| `{op:'dropDatabase', db}` | `{ok:true, dropped}` — the directory and everything in it; `false` if there was none |
+
+**Named is made.** A request naming a database that is not there creates
+it, the same way an insert makes a collection: there is nothing to be
+gained from a separate act of creation whose only effect is a directory.
+
+**A request naming NO database is refused** (`code: -42`) rather than
+falling back to a default — a write landing somewhere nobody named is
+worse than a refusal a client can act on. `ping` is the exception, and
+the reason it is one: it touches nothing, so a connection can stay warm
+before it has opened anything.
+
+**`listDatabases` reports the directories**, not a set proven to hold a
+catalog. Proving it would mean opening each one, and a listing that opens
+every database it names is a listing nobody can afford to call. Files in
+the root — the log, a snapshot generation — are never listed as
+databases.
+
+**Bounded, and it says so.** Sixteen databases OPEN at once (not a limit
+on how many may exist: one nobody has asked for costs a directory), with
+`code: -65` when a request would need a seventeenth.
+
+Cursor and change-stream ids are minted from one counter for the whole
+process, so an id from one database is never an id in another.
 
 ## Clients
 

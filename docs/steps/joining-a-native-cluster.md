@@ -173,12 +173,9 @@ joined has one more reason to want it.
 
 ## Ordering
 
-Independent of
-[`databases-in-the-server.md`](databases-in-the-server.md); both sit on
-the server that exists. If that one lands first and answers "one log per
-database", decide whether a join is per instance or per database — with
-one log for the instance there is a single member set and the question
-does not arise.
+Nothing blocks it. The server holds an instance now, with ONE log for
+every database in it, so there is a single member set and "is a join per
+instance or per database" never arises.
 
 ## Verification
 

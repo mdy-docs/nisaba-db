@@ -171,6 +171,15 @@ int dbs_open(bj_ns *ns, int order, int create, dbs **out);
  *
  * The returned collection is the session's; do not free it.
  */
+/*
+ * Mint cursor and change-stream ids from `shared` rather than from this
+ * session's own counters. For a host that holds SEVERAL sessions at once
+ * (db_instance.h): every session starting at 1 hands one client two live
+ * cursors with the same id, which is a thing no request can then name
+ * unambiguously. NULL restores the session's own.
+ */
+void dbs_set_id_source(dbs *s, uint64_t *shared);
+
 int dbs_collection(dbs *s, const char *name, size_t name_len,
                    dc_collection **out);
 

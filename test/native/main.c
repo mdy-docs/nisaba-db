@@ -28,6 +28,8 @@
 #include "db_catalog.h"
 #include "db_wal.h"
 #include "db_session.h"
+#include "db_instance.h"
+#include "root.h"
 #include "snapstore.h"
 #include "bjfile.h"    /* bjfile_crc32: what a snapshot manifest records per file */
 #include "raft_core.h"
@@ -800,6 +802,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
          * DC_ERR_UNSUPPORTED_ID until these three needed the next free
          * codes: it had text only by accident, and the wrong text. */
         DC_ERR_NO_COLLECTION, DC_ERR_TOO_MANY_COLLECTIONS, DC_ERR_TOO_MANY_INDEXES,
+        DC_ERR_TOO_MANY_DATABASES,
         DC_ERR_REQ_MALFORMED, DC_ERR_REQ_UNKNOWN_OP, DC_ERR_REQ_MISSING_FIELD,
         DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
         DC_ERR_NO_CURSOR, DC_ERR_TOO_MANY_CURSORS, DC_ERR_CURSOR_SORTED,
@@ -2183,6 +2186,259 @@ static uint32_t array_len(const uint8_t *arr, size_t len) {
     uint32_t n = 0;
     if (array_begin(&c, &n)) return 0;
     return n;
+}
+
+/*
+ * An instance over a real directory, through server/root.c -- the same
+ * openat/readdir/unlinkat implementation the server uses, so what this
+ * exercises is the thing that ships rather than a stand-in.
+ */
+typedef struct { int fd; root_state *st; dbi *i; char dir[64]; } inst_fixture;
+
+static int inst_open(inst_fixture *fx, const char *tag) {
+    memset(fx, 0, sizeof *fx);
+    if (scratch_dir(tag, fx->dir, sizeof fx->dir) != 0) return -1;
+    fx->fd = open(fx->dir, O_RDONLY);
+    if (fx->fd < 0) return -1;
+    fx->st = root_new(fx->fd);
+    if (!fx->st) return -1;
+    dbi_root root;
+    root_fill(fx->st, &root);
+    return dbi_open(&root, ORDER, &fx->i) == BJ_OK ? 0 : -1;
+}
+
+static void inst_close(inst_fixture *fx) {
+    dbi_close(fx->i);
+    root_free(fx->st);
+    if (fx->fd >= 0) close(fx->fd);
+}
+
+/* Count a binjson ARRAY of strings, and whether `want` is among them. */
+static int names_have(const dbuf *arr, const char *want, uint32_t *count) {
+    cur c = { arr->data, arr->len, 0 };
+    uint32_t n = 0;
+    if (array_begin(&c, &n)) return -1;
+    *count = n;
+    int found = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *s; uint32_t slen;
+        if (take_string(&c, &s, &slen)) return -1;
+        if (slen == strlen(want) && memcmp(s, want, slen) == 0) found = 1;
+    }
+    return found;
+}
+
+TEST(an_instance_keeps_its_databases_apart_and_addresses_them_by_name) {
+    inst_fixture fx;
+    CHECK_FATAL(inst_open(&fx, "nisaba-inst") == 0);
+
+    /* Named is made: there is no separate act of creation whose only
+     * effect is a directory, the same way an insert makes a collection. */
+    dbs *a = NULL, *b = NULL;
+    CHECK_OK(dbi_database(fx.i, "analytics", 9, 1, &a));
+    CHECK_OK(dbi_database(fx.i, "billing", 7, 1, &b));
+    CHECK(a != b);
+    CHECK_I64(dbi_open_count(fx.i), 2);
+
+    /* The same name is the same session, which is what makes two client
+     * handles on one connection cost nothing. */
+    dbs *again = NULL;
+    CHECK_OK(dbi_database(fx.i, "analytics", 9, 0, &again));
+    CHECK(again == a);
+    CHECK_I64(dbi_open_count(fx.i), 2);
+
+    /* A name that is not one, and one nobody made. */
+    dbs *bad = NULL;
+    CHECK_RC(dbi_database(fx.i, "a/b", 3, 1, &bad), DC_ERR_INVALID_DB_NAME);
+    CHECK_RC(dbi_database(fx.i, "", 0, 1, &bad), DC_ERR_INVALID_DB_NAME);
+    CHECK_RC(dbi_database(fx.i, "absent", 6, 0, &bad), DC_ERR_NO_DATABASE);
+
+    /* A collection of the same name in each is two collections. */
+    int made = 0;
+    CHECK_OK(dbs_create_collection(a, "users", 5, &made));
+    CHECK_OK(dbs_create_collection(b, "users", 5, &made));
+    dbuf la = {0}, lb = {0};
+    CHECK_OK(dbs_list_collections(a, &la));
+    CHECK_OK(dbs_list_collections(b, &lb));
+    dbuf_free(&la); dbuf_free(&lb);
+
+    /* Listing is the DIRECTORY's answer, so it sees a database this
+     * instance never opened -- and does not see a file. */
+    {
+        int fd2 = openat(fx.fd, "made-by-hand", O_RDONLY | O_DIRECTORY);
+        if (fd2 < 0) { CHECK_FATAL(mkdirat(fx.fd, "made-by-hand", 0777) == 0); }
+        else close(fd2);
+        int wal = openat(fx.fd, "__wal__.bj", O_CREAT | O_WRONLY, 0666);
+        CHECK_FATAL(wal >= 0);
+        close(wal);
+
+        dbuf names = {0};
+        uint32_t n = 0;
+        CHECK_OK(dbi_list(fx.i, &names));
+        CHECK_I64(names_have(&names, "made-by-hand", &n), 1);
+        CHECK_I64((long long)n, 3);           /* not the log: files are not databases */
+        CHECK_I64(names_have(&names, "__wal__.bj", &n), 0);
+        dbuf_free(&names);
+    }
+
+    /* Dropping takes the directory and everything in it, closes the
+     * session first, and leaves the neighbour alone. */
+    int dropped = 0;
+    CHECK_OK(dbi_drop(fx.i, "billing", 7, &dropped));
+    CHECK_I64(dropped, 1);
+    CHECK_I64(dbi_open_count(fx.i), 1);
+    CHECK_OK(dbi_drop(fx.i, "billing", 7, &dropped));
+    CHECK_I64(dropped, 0);                    /* the already-gone */
+    {
+        dbuf names = {0};
+        uint32_t n = 0;
+        CHECK_OK(dbi_list(fx.i, &names));
+        CHECK_I64(names_have(&names, "billing", &n), 0);
+        dbuf_free(&names);
+    }
+    /* And `analytics` still answers, which a recursive remove of the
+     * wrong subtree would have taken with it. */
+    dbuf still = {0};
+    CHECK_OK(dbs_list_collections(a, &still));
+    dbuf_free(&still);
+
+    inst_close(&fx);
+}
+
+TEST(one_log_addresses_every_database_and_the_floor_spans_all_of_them) {
+    /*
+     * Replication follows the INSTANCE. A command comes back wrapped --
+     * { d: "<database>", c: <the command> } -- because "which database"
+     * is addressing rather than part of what a command means to a
+     * collection, and applying unwraps it.
+     *
+     * And the replay floor is the instance's. Taken over only the
+     * databases that happen to be OPEN it would miss one entirely, and a
+     * replica resuming above a closed database's floor never replays
+     * what that database is still owed.
+     */
+    inst_fixture fx;
+    CHECK_FATAL(inst_open(&fx, "nisaba-inst-log") == 0);
+    const uint64_t CLIENT = 5;
+    uint64_t index = 700;
+
+    static const char *const DBS[] = { "alpha", "beta" };
+    uint64_t last[2] = { 0, 0 };
+    for (int round = 0; round < 2; round++) {
+        uint8_t oid[12];
+        memset(oid, 0, sizeof oid);
+        oid[0] = 0xD0; oid[11] = (uint8_t)(round + 1);
+        doc *d = doc_new();
+        doc_oid(d, "_id", oid);
+        doc_str(d, "who", DBS[round]);
+        uint32_t dlen; const uint8_t *body = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request_with_id("insert", "people", "doc", body, dlen, oid,
+                                         &req, &req_len);
+        /* The request names its database, the way every request on the
+         * wire does. */
+        bj_builder *wb = bj_builder_new();
+        CHECK_FATAL(wb != NULL);
+        CHECK_OK(bj_begin_object(wb));
+        CHECK_OK(bj_put_key(wb, (const uint8_t *)"db", 2));
+        CHECK_OK(bj_put_string(wb, (const uint8_t *)DBS[round],
+                               (uint32_t)strlen(DBS[round])));
+        {   /* every field of the original, after it */
+            cur c = { req, req_len, 0 };
+            uint32_t n = 0;
+            CHECK_OK(object_begin(&c, &n));
+            for (uint32_t k = 0; k < n; k++) {
+                const uint8_t *kn; uint32_t klen;
+                CHECK_OK(take_key(&c, &kn, &klen));
+                size_t start = c.pos;
+                CHECK_OK(skip_value(&c));
+                CHECK_OK(bj_put_key(wb, kn, klen));
+                CHECK_OK(bj_put_raw(wb, c.d + start, (uint32_t)(c.pos - start)));
+            }
+        }
+        CHECK_OK(bj_end_object(wb));
+        size_t wlen = 0;
+        const uint8_t *wreq = bj_builder_data(wb, &wlen);
+        CHECK_FATAL(wreq != NULL);
+
+        dbuf res = {0}, cmds = {0};
+        uint64_t token = 0;
+        CHECK_OK(dbi_propose(fx.i, CLIENT, wreq, wlen, &token, &cmds, &res));
+        CHECK(token != 0);
+
+        /* One command, wrapped, naming its database. */
+        uint32_t n = array_len(cmds.data, cmds.len);
+        CHECK_I64((long long)n, 1);
+        {
+            cur c = { cmds.data, cmds.len, 0 };
+            uint32_t got = 0;
+            CHECK_OK(array_begin(&c, &got));
+            size_t start = c.pos;
+            CHECK_OK(skip_value(&c));
+            const uint8_t *v; size_t vlen; int f = 0;
+            CHECK_OK(obj_get_field(c.d + start, c.pos - start,
+                                   (const uint8_t *)"d", 1, &v, &vlen, &f));
+            CHECK_I64(f, 1);
+            cur dc = { v, vlen, 0 };
+            const uint8_t *sp; uint32_t splen;
+            CHECK_OK(take_string(&dc, &sp, &splen));
+            CHECK_I64(splen == strlen(DBS[round]) &&
+                      memcmp(sp, DBS[round], splen) == 0, 1);
+        }
+
+        /* Apply it the way the pump does: through the instance, which
+         * unwraps and routes. */
+        uint64_t ix[1];
+        dbuf out = {0};
+        dbs_result r0;
+        {
+            cur c = { cmds.data, cmds.len, 0 };
+            uint32_t got = 0;
+            CHECK_OK(array_begin(&c, &got));
+            size_t start = c.pos;
+            CHECK_OK(skip_value(&c));
+            ix[0] = index++;
+            r0.rc = dbi_apply(fx.i, ix[0], c.d + start, (uint32_t)(c.pos - start), &out);
+            CHECK_I64(r0.rc, 0);
+            r0.data = out.data;
+            r0.len = (uint32_t)out.len;
+        }
+        last[round] = ix[0];
+
+        uint64_t more = 0;
+        dbuf again = {0};
+        res.len = 0;
+        CHECK_OK(dbi_step(fx.i, token, ix, &r0, 1, &more, &again, &res));
+        CHECK_I64((long long)more, 0);
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&again); dbuf_free(&out); dbuf_free(&cmds); dbuf_free(&res);
+        bj_builder_free(wb); bj_builder_free(rb); doc_free(d);
+    }
+
+    /* The floor is the LATER of the two, and it is the same answer from
+     * an instance that has nothing open -- which is the call a restarting
+     * replica actually makes. */
+    CHECK_I64((long long)dbi_applied_floor(fx.i), (long long)last[1]);
+    inst_close(&fx);
+
+    inst_fixture back;
+    memset(&back, 0, sizeof back);
+    memcpy(back.dir, fx.dir, sizeof back.dir);
+    back.fd = open(back.dir, O_RDONLY);
+    CHECK_FATAL(back.fd >= 0);
+    back.st = root_new(back.fd);
+    CHECK_FATAL(back.st != NULL);
+    {
+        dbi_root root;
+        root_fill(back.st, &root);
+        CHECK_OK(dbi_open(&root, ORDER, &back.i));
+    }
+    CHECK_I64(dbi_open_count(back.i), 0);
+    CHECK_I64((long long)dbi_applied_floor(back.i), (long long)last[1]);
+    /* And asking did not leave them open: a listing that filled the
+     * table would be a listing nobody could afford to call. */
+    CHECK_I64(dbi_open_count(back.i), 0);
+    inst_close(&back);
 }
 
 TEST(a_reopened_session_knows_where_its_apply_got_to) {
@@ -10812,6 +11068,8 @@ int main(void) {
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
     RUN(ddl_is_a_command_a_second_database_can_be_caught_up_by);
     RUN(a_replicated_write_answers_exactly_what_an_unreplicated_one_does);
+    RUN(an_instance_keeps_its_databases_apart_and_addresses_them_by_name);
+    RUN(one_log_addresses_every_database_and_the_floor_spans_all_of_them);
     RUN(a_reopened_session_knows_where_its_apply_got_to);
     RUN(a_bulk_writes_later_operation_sees_its_earlier_ones);
     RUN(a_database_can_be_built_from_an_empty_directory);

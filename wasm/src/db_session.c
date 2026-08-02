@@ -148,6 +148,13 @@ struct dbs {
     dbs_entry   open[DBS_MAX_COLLECTIONS];
     dbs_cursor  cursors[DBS_MAX_CURSORS];
     uint64_t    next_cursor_id;             /* 1, 2, 3, ... never reused */
+    /* ...unless an instance is minting them (dbs_set_id_source). Two
+     * databases in one process each start at 1, and a client holding a
+     * cursor in both would then hold two with the same id -- routed
+     * apart by the request's `db` today, and by nothing at all the first
+     * time a caller names the wrong one. A shared counter removes the
+     * question instead of answering it. */
+    uint64_t   *id_source;
     dbs_stream  streams[DBS_MAX_STREAMS];
     uint64_t    next_stream_id;
 
@@ -530,6 +537,10 @@ int dbs_open(bj_ns *ns, int order, int create, dbs **out) {
 
     *out = s;
     return BJ_OK;
+}
+
+void dbs_set_id_source(dbs *s, uint64_t *shared) {
+    if (s) s->id_source = shared;
 }
 
 int dbs_collection(dbs *s, const char *name, size_t name_len, dc_collection **out) {
@@ -1339,7 +1350,7 @@ int dbs_cursor_add(dbs *s, uint64_t client, dc_cursor *cur, uint32_t batch,
     if (!s || !cur || !id_out) return BJ_ERR_STATE;
     for (int i = 0; i < DBS_MAX_CURSORS; i++) {
         if (s->cursors[i].id) continue;
-        s->cursors[i].id     = ++s->next_cursor_id;
+        s->cursors[i].id     = s->id_source ? ++*s->id_source : ++s->next_cursor_id;
         s->cursors[i].client = client;
         s->cursors[i].batch  = batch;
         s->cursors[i].cur    = cur;
@@ -1423,7 +1434,7 @@ int dbs_watch(dbs *s, uint64_t client, const char *coll, size_t coll_len,
         if (!st->coll) return BJ_ERR_OOM;
         memcpy(st->coll, coll, coll_len);
         st->coll_len = coll_len;
-        st->id       = ++s->next_stream_id;
+        st->id       = s->id_source ? ++*s->id_source : ++s->next_stream_id;
         st->client   = client;
         st->count      = 0;
         st->overflowed = 0;

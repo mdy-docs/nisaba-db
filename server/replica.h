@@ -61,6 +61,7 @@
 #include "bjns.h"
 #include "dbuf.h"
 #include "db_session.h"
+#include "db_instance.h"
 #include "peers.h"
 
 typedef struct replica replica;
@@ -69,8 +70,13 @@ typedef struct replica replica;
  * Open the log in `ns` and put a node over it. The member set is
  * `self_id` plus whatever `px` was told about, with each member's
  * address carried in its record so a refusal can name where the leader
- * actually is. `px` may be NULL, which is a group of one. The session,
+ * actually is. `px` may be NULL, which is a group of one. The instance,
  * the namespace and the transport are BORROWED and must outlive this.
+ *
+ * `ns` is the ROOT's namespace -- the log sits beside the database
+ * directories, because there is ONE log for the whole instance. Which
+ * database an entry is for is the entry's own business
+ * (db_instance.h's envelope), and nothing here reads it.
  *
  * `now` is the same monotonic clock replica_tick will be given. The
  * node's timers measure DIFFERENCES, so starting it at zero and then
@@ -78,7 +84,7 @@ typedef struct replica replica;
  * of however long the machine has been up -- which elects it instantly
  * and hides the fact that the timer was never running.
  */
-int  replica_open(bj_ns *ns, dbs *s, uint64_t self_id, peers *px, uint64_t now,
+int  replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px, uint64_t now,
                   replica **out);
 void replica_close(replica *r);
 

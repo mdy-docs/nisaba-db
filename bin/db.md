@@ -8,10 +8,10 @@ complete JS API this wraps
 
 ```
 db <name> <command> [args] [options]
-db --server <host:port> <command> [args] [options]
+db --server <host:port> <name> <command> [args] [options]
 ```
 
-`<name>` selects (creating if needed) an OPFS subdirectory holding that
+`<name>` selects (creating if needed) a subdirectory holding that
 database's catalog and collection/index files. If `<command>` is omitted it
 defaults to `collections`.
 
@@ -36,6 +36,8 @@ same format. Point `NISABA_DIR=~/.node-opfs` to keep using them.
 
 | Command | Description |
 | --- | --- |
+| `databases` | List the databases under the data root (or on the server) |
+| `drop-database [name]` | Delete a database and every file in it |
 | `collections` | List collection names (default) |
 | `drop-collection <coll>` | Drop a collection and its indexes |
 | `compact [coll]` | Rewrite a collection's files (all collections if omitted) without their append-only history, reclaiming space — see `docs/compaction.md` |
@@ -138,23 +140,27 @@ speaking binjson over a socket, with no JavaScript in it at all
 at one instead of opening files itself.
 
 ```sh
-# start one over a database directory -- natively,
-./wasm/lib/nisaba-server --port 8097            # (cwd = the directory)
+# start one over a ROOT -- a directory with a subdirectory per database.
+./wasm/lib/nisaba-server --port 8097            # (cwd = the root)
 # or as the wasm32-wasip2 command it is meant to be deployed as
-wasmtime run -S inherit-network --dir ~/.nisaba/mydb::. \
+wasmtime run -S inherit-network --dir ~/.nisaba::. \
   wasm/lib/nisaba-server-wasip2.wasm --port 8097
 
-db --server 127.0.0.1:8097 count users
-db --server 8097 insert users '{"name":"Ada","team":"core"}'   # bare port = loopback
-db --server 8097 find users '{"team":"core"}' --sort '{"name":1}'
+db --server 127.0.0.1:8097 mydb count users
+db --server 8097 mydb insert users '{"name":"Ada","team":"core"}'  # bare port = loopback
+db --server 8097 mydb find users '{"team":"core"}' --sort '{"name":1}'
+db --server 8097 databases                      # what the server holds
+db --server 8097 mydb drop-database             # ...and one fewer
 ```
 
-There is **no `<name>`**: the server was pointed at one directory when it
-started and serves that one for its lifetime (one process per database
-directory — the same one-writer rule the advisory lock enforces locally).
-That directory may be **empty**: the server writes the catalog at
-startup, and an `insert` into a collection that does not exist creates
-it, so a database can be built from nothing over the wire.
+**`<name>` means the same thing on both sides**, which it did not use to:
+a server holds an INSTANCE now — one root, a subdirectory per database —
+so the first word names the database whether the engine is in this
+process or on the other end of a socket. The root may be **empty**:
+naming a database creates it, and an `insert` into a collection that does
+not exist creates that, so a database can be built from nothing over the
+wire. One process per ROOT is the one-writer rule, widened from the
+directory the advisory lock enforces locally.
 For the same reason `--order` is refused with `--server`: the order the
 files were written with is the server's to know, and it takes its own
 `--order` if they were not made with the default 32.
@@ -179,6 +185,7 @@ on them:
 | `update-one`, `update-many`, `replace-one` | including `--upsert` |
 | `find-one-and-update`, `find-one-and-replace`, `find-one-and-delete` | the document itself, before or `--return-document after`; no `sort`, as locally |
 | `delete-one`, `delete-many` | |
+| `databases`, `drop-database` | the instance itself; they name no collection |
 
 Nothing is left out: every command above works over `--server`. What the
 server still owns is not a command, and says so rather than pretending (`aggregate` and

@@ -51,7 +51,7 @@ typedef struct {
 
 struct replica {
     bj_ns     *ns;              /* borrowed */
-    dbs       *s;               /* borrowed */
+    dbi       *inst;            /* borrowed */
     peers     *px;              /* borrowed; NULL is a group of one */
     bj_io      log_io;
     elog      *log;
@@ -146,15 +146,15 @@ static int put_member(bj_builder *b, uint64_t id, const char *host, int port) {
     return e;
 }
 
-int replica_open(bj_ns *ns, dbs *s, uint64_t self_id, peers *px, uint64_t now,
+int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px, uint64_t now,
                  replica **out) {
-    if (!ns || !s || !out || !self_id) return BJ_ERR_STATE;
+    if (!ns || !inst || !out || !self_id) return BJ_ERR_STATE;
     if (px && peers_count(px) > rn_max_peers()) return RAFT_ERR_CAPACITY;
     *out = NULL;
     replica *r = (replica *)calloc(1, sizeof *r);
     if (!r) return BJ_ERR_OOM;
     r->ns = ns;
-    r->s = s;
+    r->inst = inst;
     r->px = px;
     /* Non-zero, or xorshift stays at zero forever and every member draws
      * the same nothing -- which is the bug this exists to avoid. */
@@ -223,7 +223,7 @@ int replica_open(bj_ns *ns, dbs *s, uint64_t self_id, peers *px, uint64_t now,
      * the first tick, which is what makes a crash between commit and
      * apply a non-event.
      */
-    r->applied = dbs_applied_floor(s);
+    r->applied = dbi_applied_floor(inst);
     rn_seed_commit(r->node, r->applied > elog_commit_index(r->log)
                                 ? r->applied : elog_commit_index(r->log));
 
@@ -332,7 +332,7 @@ static int apply_committed(replica *r) {
             dbuf  scratch = {0};
             dbuf *into = &scratch;
             pending *p = pending_for_index(r, index, &into);
-            int rc = dbs_apply(r->s, index, payload.data, (uint32_t)payload.len, into);
+            int rc = dbi_apply(r->inst, index, payload.data, (uint32_t)payload.len, into);
             if (p) p->view[p->at].rc = rc;
             dbuf_free(&scratch);
             if (rc && !dc_is_deterministic(rc)) { e = rc; break; }
@@ -550,7 +550,7 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
 
     dbuf cmds = {0};
     uint64_t token = 0;
-    int e = dbs_propose(r->s, client, req, len, &token, &cmds, out);
+    int e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
     if (e) { dbuf_free(&cmds); return e; }
     if (!token) { dbuf_free(&cmds); return 0; }   /* a read, a ping, a refusal */
 
@@ -558,7 +558,7 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
      * follower cannot take. Nothing has been applied, so abandoning the
      * plan leaves the database exactly as it was. */
     if (!replica_is_leader(r)) {
-        dbs_abandon(r->s, token);
+        dbi_abandon(r->inst, token);
         dbuf_free(&cmds);
         out->len = 0;
         e = refuse(r, DC_ERR_NOT_LEADER, out);
@@ -572,7 +572,7 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
     e = propose_batch(r, p, &cmds);
     dbuf_free(&cmds);
     if (e) {
-        dbs_abandon(r->s, token);
+        dbi_abandon(r->inst, token);
         pending_release(p);
         return e;
     }
@@ -597,21 +597,21 @@ static int advance(replica *r, pending *p) {
         p->view[i].data = p->results[i].data;
         p->view[i].len = (uint32_t)p->results[i].len;
     }
-    int e = dbs_step(r->s, p->token, p->indices, p->view, p->n, &next, &cmds, &p->answer);
+    int e = dbi_step(r->inst, p->token, p->indices, p->view, p->n, &next, &cmds, &p->answer);
     if (e) { dbuf_free(&cmds); return e; }
     if (!next) { dbuf_free(&cmds); p->done = 1; return BJ_OK; }
 
     p->token = next;
     e = propose_batch(r, p, &cmds);
     dbuf_free(&cmds);
-    if (e) dbs_abandon(r->s, p->token);
+    if (e) dbi_abandon(r->inst, p->token);
     return e;
 }
 
 /* A write whose entry a different leader wrote over. It did not happen
  * and no replica holds it, so the client is told exactly that. */
 static int lost(replica *r, pending *p) {
-    dbs_abandon(r->s, p->token);
+    dbi_abandon(r->inst, p->token);
     p->answer.len = 0;
     int e = refuse(r, DC_ERR_WRITE_LOST, &p->answer);
     p->done = 1;
@@ -694,7 +694,7 @@ void replica_drop_client(replica *r, uint64_t client) {
     for (int i = 0; i < REPLICA_MAX_PENDING; i++) {
         pending *p = &r->waiting[i];
         if (!p->used || p->client != client) continue;
-        if (!p->done) dbs_abandon(r->s, p->token);
+        if (!p->done) dbi_abandon(r->inst, p->token);
         pending_release(p);
     }
 }

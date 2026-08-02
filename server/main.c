@@ -110,7 +110,9 @@
 #endif
 
 #include "db_session.h"
+#include "db_instance.h"
 #include "replica.h"
+#include "root.h"
 #include "peers.h"
 #include "db_names.h"
 #include "db_validate.h"   /* dc_strerror: a refusal says why, even here */
@@ -160,6 +162,18 @@
  * Unmeasurable ends the connection: a reader that has lost the frame
  * boundary cannot resynchronise, and answering would be pretending it
  * had. */
+/*
+ * Is this directory itself a database rather than a directory of them?
+ *
+ * It used to be one -- a server held ONE database and the preopen was
+ * it. Silently reinterpreting such a directory as a root would open a
+ * server with no databases in it standing on top of somebody's data, so
+ * it is refused with the sentence that says what to do instead.
+ */
+static int root_holds_a_database(int dirfd) {
+    return faccessat(dirfd, DC_CATALOG_FILE, F_OK, 0) == 0;
+}
+
 static int frame_total(const uint8_t *p, size_t len, size_t *total) {
     if (len < FRAME_HEADER) return 1;
     if (bj_value_size(p, len, 0, total) != BJ_OK) return -1;
@@ -213,7 +227,7 @@ static uint64_t now_ms(void) {
  * clean close, -1 otherwise -- neither is fatal to the server, because
  * one client's bad frame is not the next client's problem.
  */
-static int serve(dbs *s, replica *rep, int in_fd, int out_fd) {
+static int serve(dbi *inst, replica *rep, int in_fd, int out_fd) {
     for (;;) {
         uint8_t head[FRAME_HEADER];
         int r = read_exact(in_fd, head, sizeof head);
@@ -238,7 +252,7 @@ static int serve(dbs *s, replica *rep, int in_fd, int out_fd) {
         dbuf res = {0};
         /* --stdio is one client by construction; it takes the first id. */
         int e = rep ? replica_submit(rep, 1, req, total, &res)
-                    : dbs_handle(s, 1, req, total, &res);
+                    : dbi_handle(inst, 1, req, total, &res);
         free(req);
         if (e < 0) { dbuf_free(&res); return -1; }   /* no response was built */
         /*
@@ -275,7 +289,7 @@ static int serve(dbs *s, replica *rep, int in_fd, int out_fd) {
         for (;;) {
             dbuf frame = {0};
             int have = 0;
-            if (dbs_stream_take(s, 1, &frame, &have) != 0 || !have) {
+            if (dbi_stream_take(inst, 1, &frame, &have) != 0 || !have) {
                 dbuf_free(&frame);
                 break;
             }
@@ -334,8 +348,8 @@ static void conn_close(conn *c) {
  * does any write it was still waiting on: the entries stay committed
  * and still apply, but the answer has nowhere to go.
  */
-static void conn_gone(dbs *s, replica *rep, conn *c) {
-    dbs_drop_client(s, c->client);
+static void conn_gone(dbi *inst, replica *rep, conn *c) {
+    dbi_drop_client(inst, c->client);
     if (rep) replica_drop_client(rep, c->client);
     conn_close(c);
 }
@@ -389,7 +403,7 @@ static int conn_flush(conn *c) {
  * finished with the request by then either way, so a slow reader delays
  * nobody but itself.
  */
-static int conn_readable(dbs *s, replica *rep, conn *c) {
+static int conn_readable(dbi *inst, replica *rep, conn *c) {
     uint8_t chunk[8192];
     ssize_t r = read(c->fd, chunk, sizeof chunk);
     if (r == 0) return -1;                            /* clean EOF */
@@ -413,7 +427,7 @@ static int conn_readable(dbs *s, replica *rep, conn *c) {
          * connection through replica_ready, once the entries it became
          * have committed and applied. */
         int e = rep ? replica_submit(rep, c->client, c->in, total, &c->out)
-                    : dbs_handle(s, c->client, c->in, total, &c->out);
+                    : dbi_handle(inst, c->client, c->in, total, &c->out);
         if (e < 0) return -1;                         /* no response was built */
         c->quiet_since = now_ms();                    /* it asked something */
 
@@ -472,7 +486,7 @@ static int listen_on(int port) {
  * client whose last answer has not gone out, so a pipelining client
  * cannot make the server hold an unbounded number of answers for it.
  */
-static int serve_forever(dbs *s, replica *rep, peers *px, int srv,
+static int serve_forever(dbi *inst, replica *rep, peers *px, int srv,
                          int max_clients, int idle_seconds) {
     const uint64_t idle_ms = (uint64_t)(idle_seconds > 0 ? idle_seconds : 0) * 1000u;
     conn *cs = (conn *)calloc((size_t)max_clients, sizeof *cs);
@@ -528,7 +542,7 @@ static int serve_forever(dbs *s, replica *rep, peers *px, int srv,
          * overflow notice sits undelivered until an unrelated request
          * happens to wake the loop.
          */
-        if (dbs_stream_pending(s)) wait_ms = 0;
+        if (dbi_stream_pending(inst)) wait_ms = 0;
         else if (idle_ms && n > 0) {
             uint64_t now = now_ms(), earliest = 0;
             for (int i = 0; i < n; i++)
@@ -593,7 +607,7 @@ static int serve_forever(dbs *s, replica *rep, peers *px, int srv,
                 if (now - cs[i].quiet_since < idle_ms) continue;
                 int fd = cs[i].fd;
                 cs[i].fd = -1;              /* conn_gone must not close it first */
-                conn_gone(s, rep, &cs[i]);
+                conn_gone(inst, rep, &cs[i]);
                 refuse_and_close(fd, DC_ERR_IDLE_TIMEOUT);
                 cs[i] = cs[n - 1];
                 conn_clear(&cs[n - 1]);
@@ -611,9 +625,9 @@ static int serve_forever(dbs *s, replica *rep, peers *px, int srv,
             int dead = 0;
             if (ev & (POLLERR | POLLNVAL)) dead = 1;
             else if (ev & POLLOUT) dead = conn_flush(&cs[i]) != 0;
-            else if (ev & (POLLIN | POLLHUP)) dead = conn_readable(s, rep, &cs[i]) != 0;
+            else if (ev & (POLLIN | POLLHUP)) dead = conn_readable(inst, rep, &cs[i]) != 0;
             if (dead) {
-                conn_gone(s, rep, &cs[i]);
+                conn_gone(inst, rep, &cs[i]);
                 cs[i] = cs[n - 1];      /* the last one moves into the hole */
                 conn_clear(&cs[n - 1]); /* and its old slot owns nothing now */
                 n--;
@@ -644,7 +658,7 @@ static int serve_forever(dbs *s, replica *rep, peers *px, int srv,
                  * rather than costing itself its stream. */
                 if (cs[i].out.len - cs[i].out_off >= OUT_HIGH_WATER) break;
                 int have = 0;
-                if (dbs_stream_take(s, cs[i].client, &cs[i].out, &have) != 0) break;
+                if (dbi_stream_take(inst, cs[i].client, &cs[i].out, &have) != 0) break;
                 if (!have) break;
                 any = 1;
             }
@@ -655,7 +669,7 @@ static int serve_forever(dbs *s, replica *rep, peers *px, int srv,
              * because a failed write is a connection that has gone. */
             if (!any) continue;
             if (conn_flush(&cs[i]) != 0) {
-                conn_gone(s, rep, &cs[i]);
+                conn_gone(inst, rep, &cs[i]);
                 cs[i] = cs[n - 1];
                 conn_clear(&cs[n - 1]);
                 n--;
@@ -684,7 +698,7 @@ static int serve_forever(dbs *s, replica *rep, peers *px, int srv,
                 if (found >= 0) {
                     if (dbuf_put(&cs[found].out, answer.data, answer.len) == 0 &&
                         conn_flush(&cs[found]) != 0) {
-                        conn_gone(s, rep, &cs[found]);
+                        conn_gone(inst, rep, &cs[found]);
                         cs[found] = cs[n - 1];
                         conn_clear(&cs[n - 1]);
                         n--;
@@ -712,7 +726,7 @@ static int serve_forever(dbs *s, replica *rep, peers *px, int srv,
         }
     }
 
-    for (int i = 0; i < n; i++) conn_gone(s, rep, &cs[i]);
+    for (int i = 0; i < n; i++) conn_gone(inst, rep, &cs[i]);
     free(cs);
     free(pf);
     return -1;
@@ -836,29 +850,44 @@ int main(int argc, char **argv) {
     int dirfd = open(".", O_RDONLY);
     if (dirfd < 0) { perror("open ."); return 1; }
 
+    /*
+     * The preopen is the INSTANCE's root: the databases are directories
+     * under it, and nothing of the database format lives in it directly.
+     * The log does, when this is a replica -- one log for the whole
+     * instance, beside the databases it replicates.
+     */
     bj_ns ns;
     if (bjns_posix_open(dirfd, &ns) != BJ_OK) {
-        fprintf(stderr, "cannot open the database directory\n");
+        fprintf(stderr, "cannot open the directory\n");
         return 1;
     }
-
-    dbs *s = NULL;
-    /* create: a directory the operator pointed this at becomes a
-     * database. Refusing to start because a fresh directory has no
-     * catalog would make "serve this directory" a two-step operation
-     * with a different tool for the first step. */
-    int e = dbs_open(&ns, order, 1, &s);
-    if (e != BJ_OK) {
-        fprintf(stderr, "cannot open the database: %s\n", dc_strerror(e));
+    if (root_holds_a_database(dirfd)) {
+        fprintf(stderr,
+                "this directory is a DATABASE, not a directory of them: it has a "
+                DC_CATALOG_FILE ".\n"
+                "  A server holds an instance now -- one folder, a subdirectory per "
+                "database.\n"
+                "  Move its files into a subdirectory named for the database and "
+                "serve the parent.\n");
         bjns_posix_free(&ns);
         return 1;
     }
 
-    /*
-     * The Raft half, if this is a member. It opens the log, which is the
-     * one thing in the directory the session does not own -- so it comes
-     * after dbs_open and goes before it at the end.
-     */
+    root_state *rst = root_new(dirfd);
+    dbi_root rootops;
+    dbi *inst = NULL;
+    int e = rst ? BJ_OK : BJ_ERR_OOM;
+    if (!e) {
+        root_fill(rst, &rootops);
+        e = dbi_open(&rootops, order, &inst);
+    }
+    if (e != BJ_OK) {
+        fprintf(stderr, "cannot open the instance: %s\n", dc_strerror(e));
+        root_free(rst);
+        bjns_posix_free(&ns);
+        return 1;
+    }
+
     /*
      * The peer transport, if this member has anyone to talk to. It comes
      * before the node because the node's member set is built from it --
@@ -870,7 +899,8 @@ int main(int argc, char **argv) {
             peers_listen(px, "127.0.0.1", raft_port) != BJ_OK) {
             fprintf(stderr, "cannot listen for peers on 127.0.0.1:%d\n", raft_port);
             peers_free(px);
-            dbs_close(s);
+            dbi_close(inst);
+            root_free(rst);
             bjns_posix_free(&ns);
             return 1;
         }
@@ -884,7 +914,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "bad --peer %s (want ID@HOST:PORT, and not this node)\n",
                         peer_spec[i]);
                 peers_free(px);
-                dbs_close(s);
+                dbi_close(inst);
+                root_free(rst);
                 bjns_posix_free(&ns);
                 return 1;
             }
@@ -893,11 +924,12 @@ int main(int argc, char **argv) {
 
     replica *rep = NULL;
     if (node_id > 0) {
-        e = replica_open(&ns, s, (uint64_t)node_id, px, now_ms(), &rep);
+        e = replica_open(&ns, inst, (uint64_t)node_id, px, now_ms(), &rep);
         if (e != BJ_OK) {
             fprintf(stderr, "cannot open the log: %s\n", dc_strerror(e));
             peers_free(px);
-            dbs_close(s);
+            dbi_close(inst);
+            root_free(rst);
             bjns_posix_free(&ns);
             return 1;
         }
@@ -908,7 +940,7 @@ int main(int argc, char **argv) {
 
     int rc = 0;
     if (use_stdio) {
-        rc = serve(s, rep, STDIN_FILENO, STDOUT_FILENO) == 0 ? 0 : 1;
+        rc = serve(inst, rep, STDIN_FILENO, STDOUT_FILENO) == 0 ? 0 : 1;
     } else {
 #if defined(NISABA_SOCKETS)
         int srv = listen_on(port);
@@ -918,7 +950,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "nisaba: serving 127.0.0.1:%d (max %d clients, idle timeout %ds)\n",
                 port, max_clients, idle_seconds);
         fflush(stderr);
-        rc = serve_forever(s, rep, px, srv, max_clients, idle_seconds) == 0 ? 0 : 1;
+        rc = serve_forever(inst, rep, px, srv, max_clients, idle_seconds) == 0 ? 0 : 1;
         close(srv);
 #else
         (void)port;   /* accepted and refused, rather than not accepted */
@@ -934,12 +966,14 @@ int main(int argc, char **argv) {
 #if defined(NISABA_SOCKETS)
 done:
 #endif
-    /* The node before the session: it holds plans that point at the
-     * collections dbs_close is about to free. And the transport after
-     * the node, which borrows it. */
+    /* The node before the instance: it holds plans that point at the
+     * collections dbi_close is about to free. The transport after the
+     * node, which borrows it; the root state after the instance, which
+     * holds the fd of every database the instance had open. */
     replica_close(rep);
     peers_free(px);
-    dbs_close(s);
+    dbi_close(inst);
+    root_free(rst);
     bjns_posix_free(&ns);
     close(dirfd);
     return rc;

@@ -112,8 +112,7 @@ closes what THIS client opened.
 Under `NodeFSStorageProvider` it also **refuses to drop a database
 somebody else has open**, with the same "locked by pid" error opening one
 twice gives. A database can be opened directly rather than through a
-client — `nisaba-server` does exactly that, one process per database
-directory — and deleting it anyway would pull the files out from under a
+client — and deleting it anyway would pull the files out from under a
 live writer. The refusal leaves everything as it was.
 
 Both need two capabilities from the provider — `listSubProviders()` and
@@ -121,9 +120,9 @@ Both need two capabilities from the provider — `listSubProviders()` and
 three providers here have them; a host's own provider that does not gets
 a sentence saying so rather than a `TypeError`.
 
-**Not on the server wire yet.** `connectServer(address)` returns one
-`Db`, so these are in-process only for now
-([`steps/databases-in-the-server.md`](steps/databases-in-the-server.md)).
+**The same shape over a socket.** `connectServer(address)` returns a
+client with the same three methods, against a server that holds an
+instance — see [`db-server.md`](db-server.md).
 
 `bin/db.js` (the `db` CLI) and `index.html`'s
 console bridge (`window.client`) both use this, one OPFS root per install/page, one

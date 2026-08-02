@@ -82,7 +82,7 @@ export { encode, decode, ObjectId, Pointer };
  * what a refusal is refusing, not to decide anything.
  */
 export const WIRE_OPS = [
-  'ping',
+  'ping', 'listDatabases', 'dropDatabase',
   'find', 'findOne', 'count', 'distinct', 'aggregate', 'explain',
   'insert', 'insertMany', 'update', 'updateMany', 'replace', 'delete', 'deleteMany',
   'findOneAndUpdate', 'findOneAndReplace', 'findOneAndDelete',
@@ -863,14 +863,100 @@ function collection(conn, name) {
   return guard(impl, 'collection');
 }
 
-/**
- * Connect to a server. The DIRECTORY is not this end's choice: the server
- * was pointed at one when it started and serves that one for its lifetime
- * (one process per database directory, the invariant that makes the
- * concurrency question disappear), so there is no database name here.
+/*
+ * One database, over a connection that carries many.
+ *
+ * Every request it sends names its database, which is what `db` is doing
+ * in front of every op: the CONNECTION is not stateful about which one,
+ * so two of these can be held at once and switched between freely. That
+ * is `client.db(name)`'s whole contract, and the reason there is no
+ * "use" op -- a request whose meaning depends on an earlier request
+ * could not be interleaved with another database's at all.
+ *
+ * Duck-typed as a connection rather than wrapping one, so `collection()`
+ * and the change-stream plumbing below it need to know nothing about
+ * databases: they call `.call` and get the field added underneath them.
+ */
+function scope(conn, name) {
+  return {
+    call: (req) => conn.call({ db: name, ...req }),
+    request: (req) => conn.request({ db: name, ...req }),
+    _watching: (...a) => conn._watching(...a),
+    _unwatching: (...a) => conn._unwatching(...a)
+  };
+}
+
+function database(conn, name) {
+  const sc = scope(conn, name);
+  const impl = {
+    name,
+    get isOpen() { return conn.isOpen !== false; },
+    collection: (coll) => collection(sc, coll),
+    /** Make a collection with no documents in it. Idempotent: an
+     * existing one answers `false` and is left alone. An insert creates
+     * one too, so this is for the empty-collection case and for saying
+     * when it happened. */
+    async createCollection(coll) {
+      return (await sc.call({ op: 'createCollection', coll })).created;
+    },
+    async dropCollection(coll) {
+      return (await sc.call({ op: 'dropCollection', coll })).dropped;
+    },
+    /*
+     * Compact every collection (docs/compaction.md), reporting
+     * { [name]: stats | null } -- null meaning skipped.
+     *
+     * The three options are the whole difference between this and a loop
+     * over collection.compact(), and two of them read state this side
+     * cannot see: `factor` compares a file set against the size the
+     * catalog recorded right after its last compaction, and `skipBusy`
+     * asks whether anyone is scanning it. So the sweep is the server's,
+     * as it is in-process.
+     */
+    async compact(options = undefined) {
+      const req = { op: 'compact' };
+      if (options?.minBytes) req.minBytes = options.minBytes;
+      if (options?.factor) req.factor = options.factor;
+      if (options?.skipBusy) req.skipBusy = true;
+      return (await sc.call(req)).result || {};
+    },
+    /** Every collection in THIS database. */
+    async listCollections() {
+      return (await sc.call({ op: 'listCollections' })).collections || [];
+    },
+    /* The escape hatch, and the only thing here that is not shaped like
+     * the in-process API: send an op the wire has and read the response
+     * object as it came. A new op is usable from JavaScript the day it
+     * lands in C, before it has a method. */
+    request: (req) => sc.call(req),
+    /** A handle, not a resource: the CONNECTION is what closes, and it
+     * is the client's. Here so that code holding a `Db` can say it is
+     * done without knowing which. */
+    close: () => conn.close()
+  };
+  return guard(impl, 'db');
+}
+
+/*
+ * A connection to a nisaba-server, which holds an INSTANCE: one root
+ * directory, a subdirectory per database.
+ *
+ *     const client = await connectServer('127.0.0.1:8097');
+ *     const analytics = client.db('analytics');
+ *     const billing   = client.db('billing');
+ *
+ * `client.db(name)` sends nothing -- it is a handle, exactly as
+ * `Client.db(name)` is in process (wasm/nisaba-wasm.js). The mirror is
+ * deliberate: `connect`/`connectClient` there, and here the one that
+ * holds many, with a socket where the provider is.
+ *
+ * ONE PROCESS PER ROOT is still the whole answer to concurrent writers,
+ * with the scope widened: the server owns the root directory and
+ * everything beneath it, so no two openers ever meet.
  *
  * @param {string|{host:string,port:number}} address `host:port`, or a port
- * @returns {Promise<object>} a Db-shaped handle: collection(), close()
+ * @returns {Promise<object>} db(name), listDatabases(), dropDatabase(),
+ *   ping(), close()
  */
 export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_MS } = {}) {
   const { host, port } = parseAddress(address);
@@ -899,53 +985,37 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
     keepAlive.unref?.();
   }
 
+  const dbs = new Map();   // name -> the handle, cached like Client's
   const impl = {
     isOpen: true,
     address: `${host}:${port}`,
-    collection: (name) => collection(conn, name),
-    /** Make a collection with no documents in it. Idempotent: an
-     * existing one answers `false` and is left alone. An insert creates
-     * one too, so this is for the empty-collection case and for saying
-     * when it happened. */
-    async createCollection(name) {
-      return (await conn.call({ op: 'createCollection', coll: name })).created;
+    /** A database on this connection. Sends nothing; the same name
+     * returns the same handle, as `Client.db(name)` does in process. */
+    db(name) {
+      const cached = dbs.get(name);
+      if (cached) return cached;
+      const d = database(conn, name);
+      dbs.set(name, d);
+      return d;
     },
-    async dropCollection(name) {
-      return (await conn.call({ op: 'dropCollection', coll: name })).dropped;
+    /** Every database under the server's root. */
+    async listDatabases() {
+      return (await conn.call({ op: 'listDatabases' })).databases || [];
     },
-    /*
-     * Compact every collection (docs/compaction.md), reporting
-     * { [name]: stats | null } -- null meaning skipped.
-     *
-     * The three options are the whole difference between this and a loop
-     * over collection.compact(), and two of them read state this side
-     * cannot see: `factor` compares a file set against the size the
-     * catalog recorded right after its last compaction, and `skipBusy`
-     * asks whether anyone is scanning it. So the sweep is the server's,
-     * as it is in-process.
-     */
-    async compact(options = undefined) {
-      const req = { op: 'compact' };
-      if (options?.minBytes) req.minBytes = options.minBytes;
-      if (options?.factor) req.factor = options.factor;
-      if (options?.skipBusy) req.skipBusy = true;
-      return (await conn.call(req)).result || {};
+    /** Delete one and every file in it; `false` if there was none. */
+    async dropDatabase(name) {
+      dbs.delete(name);
+      return (await conn.call({ op: 'dropDatabase', db: name })).dropped;
     },
-
-    /** Every collection in the database this server holds. */
-    async listCollections() {
-      return (await conn.call({ op: 'listCollections' })).collections || [];
-    },
-    /** The one op that touches no collection: it exists so a connection
-     * can stay warm without pretending to be a query. */
+    /** The one op that names no database and touches nothing: it exists
+     * so a connection can stay warm without pretending to be a query. */
     async ping() {
       await conn.call({ op: 'ping' });
       return true;
     },
-    /* The escape hatch, and the only thing here that is not shaped like
-     * the in-process API: send an op the wire has and read the response
-     * object as it came. A new op is usable from JavaScript the day it
-     * lands in C, before it has a method. */
+    /* The escape hatch: send an op the wire has, `db` and all, and read
+     * the response object as it came. A new op is usable from JavaScript
+     * the day it lands in C, before it has a method. */
     request: (req) => conn.call(req),
     async close() {
       impl.isOpen = false;
@@ -953,5 +1023,5 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
       await conn.close();
     }
   };
-  return guard(impl, 'db');
+  return guard(impl, 'client');
 }

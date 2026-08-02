@@ -13,15 +13,13 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [databases-in-the-server.md](databases-in-the-server.md) | `client.db("analytics")` and `client.db("billing")` over ONE connection, in the server and in the browser. The shape `Client.db(name)` already writes in process and the server cannot yet serve. |
-| 2 | [joining-a-native-cluster.md](joining-a-native-cluster.md) | Growing a cluster without restarting its members. The node already answers a join; nothing in C has ever asked. |
-| 3 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
-| 4 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
-| 5 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
+| 1 | [joining-a-native-cluster.md](joining-a-native-cluster.md) | Growing a cluster without restarting its members. The node already answers a join; nothing in C has ever asked. |
+| 2 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
+| 3 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
+| 4 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
 
-1 and 2 are independent of each other and both sit on the server that
-exists; 3 is how a client reaches it; 4 is a feature; 5 is the coverage
-all of it rests on.
+1 is the last thing about a cluster that argv decides; 2 is how a client
+reaches one; 3 is a feature; 4 is the coverage all of it rests on.
 
 **They are load-bearing rather than speculative.** They were written
 assuming the C server would one day be the cluster member; that is
@@ -29,7 +27,39 @@ decided ([`../deployment-shapes.md`](../deployment-shapes.md),
 Decision A). One program covers "a persistent server" and "a replicated
 server".
 
-**Four briefs retired recently, which is why they are not listed.**
+**Five briefs retired recently, which is why they are not listed.**
+
+**The server holds an INSTANCE**, which is why that brief is gone. One
+process, one root directory, a subdirectory per database, and one
+connection that reaches all of them:
+
+```js
+const client = await connectServer('127.0.0.1:8097');
+const analytics = client.db('analytics');
+const billing   = client.db('billing');
+```
+
+`client.db(name)` sends nothing — it is a handle, exactly as
+`Client.db(name)` is in process — because the CONNECTION is not stateful
+about which database. Every request names its own in a `db` field, which
+is the only reason two handles can be held at once and interleaved, and
+the reason there is no "use" op. A request naming none is refused rather
+than given a default. `listDatabases` and `dropDatabase` arrived on the
+wire and in `bin/db.js`, whose first word now means the same thing over
+`--server` as it does locally.
+
+**Replication follows the INSTANCE**: one log, one leader, one member
+set, one failover story for the executable. A log entry gained an
+envelope saying which database its command is for
+(`wasm/include/db_instance.h`), and that is the whole of what
+`server/replica.c` and `server/peers.c` had to learn — which is nothing;
+they are untouched. The cost, accepted: one database's write rate is
+every database's, and a halt in one halts all of them.
+
+The three pieces that could not be `bj_ns`'s — opening a subdirectory,
+listing one, removing one whole — are `server/root.c`, because a `bj_ns`
+is one directory by construction and deliberately cannot enumerate. No
+browser runs that file, which is the point.
 
 **`native-composition.md` is gone, and not because it was built.** It
 asked for a SEAT: N independent Raft groups in one process, each with its
@@ -41,17 +71,11 @@ tenants make quiescence the design rather than an optimization — and
 always-on instance quiesces nothing and places nothing, and almost
 nothing of the brief survived the constraint.
 
-What it was mistaken for is now brief 1: the MongoDB shape — one
-connection to an instance, `client.db(name)` switching between databases
-over it, in the server and in the browser alike. That is a different
-thing from a seat — one cluster serving several named databases, rather
-than several clusters sharing a process — and it is much cheaper,
-because **replication follows the instance**: one log, one leader, one
-member set for the executable, so `server/replica.c` and
-`server/peers.c` are untouched and the database axis is the session's.
-That is decided and the argument is written out there. The rest of the
-retired brief's inventory (the seed loop, the deferred reply) is brief
-2, where it belongs.
+What it was mistaken for is the MongoDB shape — one connection to an
+instance, `client.db(name)` switching between databases over it — which
+is a different thing from a seat, and which is now BUILT (above). The
+rest of the retired brief's inventory (the seed loop, the deferred
+reply) is brief 1, where it belongs.
 
 **The server is a cluster member**, which is why its brief is gone.
 `nisaba-server --raft ID --raft-port N --peer ID@HOST:PORT` is a Raft

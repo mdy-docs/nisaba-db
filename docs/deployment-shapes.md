@@ -369,18 +369,7 @@ processes hosting the WASM engine**, and **C processes hosting nothing**.
 
 What is still missing on the C side — briefs in [`steps/`](steps/):
 
-1. **Databases in the server**
-   (`steps/databases-in-the-server.md`) — the MongoDB shape: one
-   connection to an instance, `client.db("analytics")` and
-   `client.db("billing")` switched between over it, in the native server
-   and in the browser alike. The library already writes that layout in
-   process (`Client.db(name)`, a real subdirectory per name); the server
-   serves one directory as one database, the wire has no `db` field, and
-   `connectServer` returns a `Db` with no client above it. Replication
-   follows the instance rather than each database — one log, one leader,
-   one member set for the executable — so `server/replica.c` and
-   `server/peers.c` are untouched by it.
-2. **Joining a native cluster**
+1. **Joining a native cluster**
    (`steps/joining-a-native-cluster.md`) — growing a cluster without
    restarting its members. The node already answers a join; nothing in C
    has ever asked one.
@@ -390,6 +379,13 @@ compaction and a snapshot store in the process. A joiner does not need
 them — nothing compacts, so an empty joiner is caught up by plain
 AppendEntries — but a long-lived member's `__wal__.bj` is every write it
 has ever taken. `steps/README.md` records it.
+
+**The server holds an INSTANCE**, which retired the brief for it: one
+root directory, a subdirectory per database, and one connection that
+reaches all of them (`client.db(name)`, exactly as in process).
+Replication follows the instance — one log, one leader, one member set
+for the executable — so `server/replica.c` and `server/peers.c` were
+untouched by it.
 
 **`steps/native-composition.md` is retired, unbuilt**, because it asked
 for a multi-tenant seat: N independent Raft groups in one process, with

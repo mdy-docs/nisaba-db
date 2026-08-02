@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
-import { connect, ObjectId } from '../src/db.js';
+import { connect, connectClient, ObjectId } from '../src/db.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
 import { connectServer, ServerError, WIRE_OPS, ChangeStreamOverflowError } from '../src/db-server-client.js';
 import { BPlusTree, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
@@ -59,11 +59,18 @@ function framer(onValue) {
   };
 }
 
-/** A database with three people in it, written by the JS implementation --
- * so the server under test is opening somebody else's files. */
+/* The database every suite here works in. A server holds an INSTANCE --
+ * one root directory, a subdirectory per database -- so a name is needed
+ * on both sides, and this is it. */
+const DB = 'main';
+
+/** A root with one database in it, three people in that, written by the
+ * JS implementation -- so the server under test is opening somebody
+ * else's files, in somebody else's layout. */
 async function seedDb(extra = 0) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-server-'));
-  const provider = new NodeFSStorageProvider(dir);
+  const root = new NodeFSStorageProvider(dir);
+  const provider = await root.subProvider(DB);
   const db = await connect(provider);
   const users = await db.collection('users');
   await users.insertOne({ name: 'Ada', team: 'core' });
@@ -76,7 +83,7 @@ async function seedDb(extra = 0) {
   // Release the advisory lock as well as the handles: one writer per
   // database directory is the rule the server relies on too, and the
   // provider holds it until asked, not until Db.close().
-  await provider.close();
+  await root.close();
   return dir;
 }
 
@@ -104,9 +111,13 @@ function client(write, onData) {
     const next = waiting.shift();
     if (next) next(value);
   }));
+  /* Every request names its database, because the CONNECTION does not:
+   * that is what lets one carry several, and it is what
+   * db-server-client.js's scope() does underneath a Db handle. Named
+   * here rather than in each test for the same reason. */
   const call = (req) => new Promise((resolve) => {
     waiting.push(resolve);
-    write(Buffer.from(encode(req)));
+    write(Buffer.from(encode({ db: DB, ...req })));
   });
   call.events = events;
   return call;
@@ -182,7 +193,7 @@ describe('nisaba-server: the client mints an _id before it sends', () => {
    */
   it('sends no insert-shaped command carrying a document without one', async () => {
     const server = await recordingServer();
-    const db = await connectServer(server.port, { keepAliveMs: 0 });
+    const db = (await connectServer(server.port, { keepAliveMs: 0 })).db(DB);
     const c = db.collection('users');
 
     /* A path that stops minting can fail in three places -- the codec,
@@ -238,7 +249,7 @@ describe('nisaba-server: the client mints an _id before it sends', () => {
     // identity keeps it, and that is what makes an insert idempotent to
     // retry from the caller's side.
     const server = await recordingServer();
-    const db = await connectServer(server.port, { keepAliveMs: 0 });
+    const db = (await connectServer(server.port, { keepAliveMs: 0 })).db(DB);
     const mine = new ObjectId();
     await db.collection('users').insertOne({ _id: mine, name: 'Ada' });
     await db.close();
@@ -318,7 +329,7 @@ describe.skipIf(!have(NATIVE))('nisaba-server: frames over a pipe (native, --std
     // JavaScript implementation reads it back from the same files.
     proc.kill();
     await new Promise(r => proc.once('exit', r));
-    const provider = new NodeFSStorageProvider(dir);
+    const provider = new NodeFSStorageProvider(path.join(dir, DB));
     const db = await connect(provider);
     const users = await db.collection('users');
     expect(await users.countDocuments({})).toBe(4);
@@ -467,6 +478,28 @@ async function startServer(engine, port, extra = [], docs = 0, reuse = null) {
  */
 const REQUIRED = process.env.NISABA_SERVER_TESTS === 'required';
 
+/*
+ * A directory that IS a database, handed to a server that now holds a
+ * directory OF them. Serving it as a root would open an instance with no
+ * databases in it, standing on top of somebody's data and reporting
+ * nothing wrong -- so it says what it found and what to do instead.
+ */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: a root that is a database ($name)', (engine) => {
+    it('refuses to serve it, and says how to move it', async () => {
+      const dir = await seedDb();
+      // seedDb builds root/main; hand the server the DATABASE.
+      const [cmd, args, opts] = engine.argv(path.join(dir, DB), nextPort(), []);
+      const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+      let err = '';
+      proc.stderr.on('data', (d) => { err += String(d); });
+      const code = await new Promise((r) => proc.once('exit', r));
+      expect(code).not.toBe(0);
+      expect(err).toMatch(/is a DATABASE, not a directory of them/);
+      expect(err).toMatch(/subdirectory named for the database/);
+    });
+  });
+
 describe.runIf(REQUIRED)('nisaba-server: the artifacts CI promises', () => {
   it.each(ENGINES)('$name is built and runnable', (engine) => {
     expect(engine.ready()).toBe(true);
@@ -494,7 +527,7 @@ for (const engine of ENGINES) {
 
     beforeAll(async () => {
       ({ proc, dir } = await startServer(engine, port, ['--raft', '1']));
-      db = await connectServer(port);
+      db = (await connectServer(port)).db(DB);
       return async () => { await db.close(); proc.kill(); };
     });
 
@@ -561,7 +594,7 @@ for (const engine of ENGINES) {
       // has already passed, which is not a deterministic failure, so the
       // replica halts on the way up rather than answering.
       const restarted = await startServer(engine, port + 1, ['--raft', '1'], 0, dir);
-      const back = await connectServer(port + 1);
+      const back = (await connectServer(port + 1)).db(DB);
       const backUsers = back.collection('users');
       expect(await backUsers.countDocuments({})).toBe(before);
       expect(await backUsers.countDocuments({ name: 'Edsger' })).toBe(edsgers);
@@ -570,7 +603,7 @@ for (const engine of ENGINES) {
       restarted.proc.kill();
       await new Promise(r => restarted.proc.once('exit', r));
 
-      const provider = new NodeFSStorageProvider(dir);
+      const provider = new NodeFSStorageProvider(path.join(dir, DB));
       const jsDb = await connect(provider);
       const jsUsers = await jsDb.collection('users');
       expect(await jsUsers.countDocuments({})).toBe(before);
@@ -639,7 +672,7 @@ for (const engine of ENGINES) {
         for (const m of nodes.filter((n) => n.alive)) {
           let db = null;
           try {
-            db = await connectServer(m.port);
+            db = (await connectServer(m.port)).db(DB);
             await db.collection('users').insertOne({ name });
             await db.close();
             return m;
@@ -658,7 +691,7 @@ for (const engine of ENGINES) {
      * applying, so a follower polled before that answers -37 rather than
      * an empty list, and that is "not caught up", not a failure. */
     const namesOn = async (m) => {
-      const db = await connectServer(m.port);
+      const db = (await connectServer(m.port)).db(DB);
       try {
         return (await db.collection('users').find({}, { sort: { name: 1 } }).toArray())
           .map((d) => d.name);
@@ -681,7 +714,7 @@ for (const engine of ENGINES) {
      */
     const offerToAll = async (name) => {
       const attempts = await Promise.allSettled(nodes.filter((n) => n.alive).map(async (m) => {
-        const db = await connectServer(m.port);
+        const db = (await connectServer(m.port)).db(DB);
         try {
           await db.collection('users').insertOne({ name });
           return m.id;
@@ -903,7 +936,7 @@ for (const engine of ENGINES) {
         for (const m of cNodes.filter((n) => n.alive)) {
           let db = null;
           try {
-            db = await connectServer(m.port);
+            db = (await connectServer(m.port)).db(DB);
             await db.collection('users').insertOne({ name });
             await db.close();
             return m;
@@ -980,7 +1013,7 @@ for (const engine of ENGINES) {
 
       // And the surviving C member really has it, read back over the
       // wire like any other client.
-      const db = await connectServer(took.port);
+      const db = (await connectServer(took.port)).db(DB);
       try {
         expect((await db.collection('users').find({}, { sort: { name: 1 } }).toArray())
           .map((d) => d.name)).toEqual(['from-c', 'needs-the-node-member']);
@@ -992,7 +1025,7 @@ for (const engine of ENGINES) {
       await stopC(survivor);
       // The claim this repository rests on, through a mixed cluster: a
       // third implementation opens what the others agreed on.
-      const provider = new NodeFSStorageProvider(survivor.dir);
+      const provider = new NodeFSStorageProvider(path.join(survivor.dir, DB));
       const jsDb = await connect(provider);
       const users = await jsDb.collection('users');
       expect((await users.find({}, { sort: { name: 1 } }).toArray()).map((d) => d.name))
@@ -1002,13 +1035,285 @@ for (const engine of ENGINES) {
     });
   });
 
+  /*
+   * docs/steps/databases-in-the-server.md: the server holds an INSTANCE.
+   *
+   * One connection, many databases, switched between at will -- which
+   * only works because `client.db(name)` sends NOTHING and the
+   * connection is not stateful about which one. Every request names its
+   * own, and the two halves of that are what the suite is checking:
+   * that the handles are cheap, and that nothing leaks between them.
+   */
+  /*
+   * One log for the INSTANCE, not one per database. That is the whole
+   * of what replication had to learn here: server/replica.c and
+   * server/peers.c are untouched, and a log entry gained an envelope
+   * saying which database its command is for.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: a replicated instance (${engine.name})`, () => {
+    let proc, client, dir;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      ({ proc, dir } = await startServer(engine, port, ['--raft', '1'], -1));
+      client = await connectServer(port);
+      return async () => { if (client.isOpen) await client.close(); proc.kill(); };
+    });
+
+    it('puts writes to every database through the one log', async () => {
+      const a = client.db('analytics');
+      const b = client.db('billing');
+      await a.collection('events').insertOne({ n: 1 });
+      await b.collection('invoices').insertOne({ n: 2 });
+      await a.collection('events').insertOne({ n: 3 });
+      expect(await a.collection('events').countDocuments({})).toBe(2);
+      expect(await b.collection('invoices').countDocuments({})).toBe(1);
+      // Applied ONCE each, in both: the pump is the only applier, and
+      // the envelope is what tells it which database to apply into.
+      expect((await a.collection('events').find({}).toArray()).map(d => d.n).sort())
+        .toEqual([1, 3]);
+
+      // One log, beside the databases rather than inside one.
+      expect(fs.existsSync(path.join(dir, '__wal__.bj'))).toBe(true);
+      expect(fs.existsSync(path.join(dir, 'analytics', '__wal__.bj'))).toBe(false);
+      // ...and it is not a database, so nothing lists it as one.
+      expect((await client.listDatabases()).sort()).toEqual(['analytics', 'billing']);
+    });
+
+    it('a list of writes still takes one trip to the log per operation', async () => {
+      const id = new ObjectId();
+      const r = await client.db('billing').collection('invoices').bulkWrite([
+        { insertOne: { document: { _id: id, n: 9 } } },
+        { updateOne: { filter: { _id: id }, update: { $set: { paid: true } } } }
+      ]);
+      expect(r.insertedCount).toBe(1);
+      expect(r.matchedCount).toBe(1);
+      expect((await client.db('billing').collection('invoices').findOne({ _id: id })).paid)
+        .toBe(true);
+    });
+
+    it('resumes across a restart at the floor of EVERY database, not one', async () => {
+      const before = {
+        analytics: await client.db('analytics').collection('events').countDocuments({}),
+        billing: await client.db('billing').collection('invoices').countDocuments({})
+      };
+      await client.close();
+      proc.kill();
+      await new Promise(r => proc.once('exit', r));
+
+      /*
+       * The replay floor is the instance's: the highest index applied
+       * across every database in the root, including ones nothing has
+       * opened yet. Taken from only the open ones it would be zero on
+       * the way up, and replaying a prefix that was already applied
+       * hands a collection an applied index it has already passed --
+       * which is refused, is not deterministic, and halts the replica
+       * before it serves anything.
+       */
+      const again = await startServer(engine, port + 1, ['--raft', '1'], 0, dir);
+      const back = await connectServer(port + 1);
+      expect(await back.db('analytics').collection('events').countDocuments({}))
+        .toBe(before.analytics);
+      expect(await back.db('billing').collection('invoices').countDocuments({}))
+        .toBe(before.billing);
+      await back.close();
+      again.proc.kill();
+      await new Promise(r => again.proc.once('exit', r));
+    }, 30000);
+  });
+
+  describe.skipIf(!enabled)(`nisaba-server: bin/db.js names a database (${engine.name})`, () => {
+    let proc;
+    const port = nextPort();
+    const cli = (...args) => spawnSync(process.execPath,
+      ['bin/db.js', '--server', `127.0.0.1:${port}`, ...args], { encoding: 'utf8' });
+
+    beforeAll(async () => {
+      ({ proc } = await startServer(engine, port, [], -1));
+      return () => { proc.kill(); };
+    });
+
+    it('reaches every database on the server, and the instance itself', () => {
+      expect(cli('shop', 'insert', 'products', '{"name":"widget"}').status).toBe(0);
+      expect(cli('warehouse', 'insert', 'bins', '{"id":7}').status).toBe(0);
+      expect(cli('shop', 'count', 'products').stdout.trim()).toBe('1');
+      // The first word means the same thing it does locally, which it
+      // did not before: the server holds an instance.
+      expect(cli('databases').stdout.trim().split('\n').sort())
+        .toEqual(['shop', 'warehouse']);
+      // Both spellings a person would type.
+      expect(cli('drop-database', 'warehouse').stdout).toMatch(/Dropped database warehouse/);
+      expect(cli('shop', 'drop-database').stdout).toMatch(/Dropped database shop/);
+      expect(cli('databases').stdout.trim()).toBe('No databases.');
+    });
+  });
+
+  describe.skipIf(!enabled)(`nisaba-server: an instance of databases (${engine.name})`, () => {
+    let proc, client, dir;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      // An EMPTY root: no database in it at all, so everything below is
+      // something the server made.
+      ({ proc, dir } = await startServer(engine, port, [], -1));
+      client = await connectServer(port);
+      return async () => { await client.close(); proc.kill(); };
+    });
+
+    it('holds two databases at once over one connection, interleaved', async () => {
+      expect(await client.listDatabases()).toEqual([]);
+
+      const analytics = client.db('analytics');
+      const billing = client.db('billing');
+      // Handles, not round trips: the same name is the same object, and
+      // nothing has been sent yet.
+      expect(client.db('analytics')).toBe(analytics);
+      expect(await client.listDatabases()).toEqual([]);
+
+      await analytics.collection('events').insertOne({ n: 1 });
+      await billing.collection('invoices').insertOne({ n: 2 });
+      // Interleaved on the one socket, which a per-connection "use"
+      // could not do at all.
+      await analytics.collection('events').insertOne({ n: 3 });
+      await billing.collection('invoices').insertOne({ n: 4 });
+
+      expect(await analytics.listCollections()).toEqual(['events']);
+      expect(await billing.listCollections()).toEqual(['invoices']);
+      expect((await analytics.collection('events').find({}).toArray()).map(d => d.n).sort())
+        .toEqual([1, 3]);
+      expect((await billing.collection('invoices').find({}).toArray()).map(d => d.n).sort())
+        .toEqual([2, 4]);
+
+      // A collection name they share is two different collections.
+      await analytics.collection('users').insertOne({ from: 'analytics' });
+      await billing.collection('users').insertOne({ from: 'billing' });
+      expect((await analytics.collection('users').findOne({})).from).toBe('analytics');
+      expect((await billing.collection('users').findOne({})).from).toBe('billing');
+
+      // A real subdirectory each, which is the guarantee: two names
+      // never share a catalog or a collection file.
+      expect(fs.existsSync(path.join(dir, 'analytics', '__catalog__.bj'))).toBe(true);
+      expect(fs.existsSync(path.join(dir, 'billing', '__catalog__.bj'))).toBe(true);
+      expect(fs.existsSync(path.join(dir, '__catalog__.bj'))).toBe(false);
+    });
+
+    it('lists them, and drops one without touching its neighbour', async () => {
+      expect((await client.listDatabases()).sort()).toEqual(['analytics', 'billing']);
+
+      expect(await client.dropDatabase('billing')).toBe(true);
+      expect(await client.listDatabases()).toEqual(['analytics']);
+      expect(fs.existsSync(path.join(dir, 'billing'))).toBe(false);
+      // Dropping the already-gone is what the caller asked for.
+      expect(await client.dropDatabase('billing')).toBe(false);
+
+      expect((await client.db('analytics').collection('events').find({}).toArray()).length).toBe(2);
+      // And the name is free: a fresh, empty database rather than the
+      // old one coming back.
+      expect(await client.db('billing').listCollections()).toEqual([]);
+      expect(await client.dropDatabase('billing')).toBe(true);
+    });
+
+    it('refuses an operation that names no database, rather than guessing one', async () => {
+      // No default. A write landing in a database nobody named is worse
+      // than a refusal a client can act on, and "whatever was used last"
+      // is exactly the connection state this shape exists to avoid.
+      await expect(client.request({ op: 'count', coll: 'events' }))
+        .rejects.toMatchObject({ code: -42 });
+      await expect(client.request({ op: 'listCollections' }))
+        .rejects.toMatchObject({ code: -42 });
+      // ping names none and needs none -- it is how a connection stays
+      // warm before it has opened anything.
+      expect(await client.ping()).toBe(true);
+    });
+
+    it('refuses a database name that is not one', async () => {
+      await expect(client.request({ op: 'count', db: 'a/b', coll: 'x' }))
+        .rejects.toMatchObject({ code: -16 });
+      await expect(client.request({ op: 'count', db: '', coll: 'x' }))
+        .rejects.toMatchObject({ code: -16 });
+    });
+
+    it('keeps cursors apart: two databases never mint the same id', async () => {
+      const a = client.db('analytics');
+      const b = client.db('billing');
+      for (let i = 0; i < 20; i++) {
+        await a.collection('rows').insertOne({ from: 'analytics', i });
+        await b.collection('rows').insertOne({ from: 'billing', i });
+      }
+      // A cursor open in EACH, which is the only arrangement in which
+      // ids can collide -- and where per-session counters would both
+      // start at 1.
+      const ca = await a.request({ op: 'find', coll: 'rows', opts: { batchSize: 5 } });
+      const cb = await b.request({ op: 'find', coll: 'rows', opts: { batchSize: 5 } });
+      expect(ca.cursor).toBeGreaterThan(0);
+      expect(cb.cursor).toBeGreaterThan(0);
+
+      /*
+       * Minted from ONE counter for the whole process. Routing by the
+       * request's `db` alone would work right up until a caller named
+       * the wrong one, and then it would hand back somebody else's scan
+       * rather than refusing -- which is not a bug you find by testing
+       * the happy path.
+       */
+      expect(ca.cursor).not.toBe(cb.cursor);
+      await expect(b.request({ op: 'getMore', cursor: ca.cursor }))
+        .rejects.toMatchObject({ code: -46 });
+      await expect(a.request({ op: 'getMore', cursor: cb.cursor }))
+        .rejects.toMatchObject({ code: -46 });
+
+      // And each is still its own, still where it was.
+      const nextA = await a.request({ op: 'getMore', cursor: ca.cursor });
+      expect(nextA.docs.length).toBe(5);
+      expect(nextA.docs.every(d => d.from === 'analytics')).toBe(true);
+      await a.request({ op: 'closeCursor', cursor: ca.cursor });
+      await b.request({ op: 'closeCursor', cursor: cb.cursor });
+      await a.dropCollection('rows');
+      await b.dropCollection('rows');
+    });
+
+    it('keeps change events apart, including a collection of the same name', async () => {
+      const a = client.db('analytics');
+      const b = client.db('billing');
+      const seen = [];
+      const stream = await a.collection('watched').watch();
+      stream.on('change', (c) => seen.push(c));
+
+      await b.collection('watched').insertOne({ from: 'billing' });
+      await a.collection('watched').insertOne({ from: 'analytics' });
+      await new Promise(r => setTimeout(r, 200));
+
+      // dbs_watched and dbs_emit match on the collection NAME, so two
+      // databases with a `watched` each would cross-deliver if they were
+      // not separate sessions. They are.
+      expect(seen.map(c => c.fullDocument?.from)).toEqual(['analytics']);
+      await stream.close();
+    });
+
+    it('leaves a directory per database that the JS Client opens by name', async () => {
+      await client.close();
+      proc.kill();
+      await new Promise(r => proc.once('exit', r));
+
+      // The claim this repository rests on, one level up: a root the C
+      // server built, opened by the in-process Client that writes the
+      // same layout.
+      const root = new NodeFSStorageProvider(dir);
+      const js = await connectClient(root);
+      expect((await js.listDatabases()).sort()).toEqual(['analytics', 'billing']);
+      const events = await (await js.db('analytics')).collection('events');
+      expect((await events.find({}).toArray()).map(d => d.n).sort()).toEqual([1, 3]);
+      await js.close();
+      await root.close();
+    });
+  });
+
   describe.skipIf(!enabled)(`nisaba-server: the JS client (${engine.name})`, () => {
     let proc, db;
     const port = nextPort();
 
     beforeAll(async () => {
       ({ proc } = await startServer(engine, port));
-      db = await connectServer(port);   // a bare port means loopback
+      db = (await connectServer(port)).db(DB);   // a bare port means loopback
       return async () => { await db.close(); proc.kill(); };
     });
 
@@ -1263,7 +1568,7 @@ for (const engine of ENGINES) {
     let proc;
     const port = nextPort();
     const cli = (...args) => spawnSync(process.execPath, [
-      'bin/db.js', '--server', `127.0.0.1:${port}`, ...args
+      'bin/db.js', '--server', `127.0.0.1:${port}`, DB, ...args
     ], { encoding: 'utf8' });
 
     beforeAll(async () => {
@@ -1308,7 +1613,7 @@ for (const engine of ENGINES) {
         .join('\n');
 
       const restored = spawnSync(process.execPath, [
-        'bin/db.js', '--server', `127.0.0.1:${port}`, 'restore'
+        'bin/db.js', '--server', `127.0.0.1:${port}`, DB, 'restore'
       ], { encoding: 'utf8', input: renamed });
       expect(restored.status).toBe(0);
       expect(restored.stdout).toMatch(
@@ -1338,7 +1643,7 @@ for (const engine of ENGINES) {
       expect(ordered.stderr).toMatch(/--order is the server's/);
 
       // And an address with nothing behind it names the address.
-      const nowhere = spawnSync(process.execPath, ['bin/db.js', '--server', '127.0.0.1:1', 'count', 'users'], { encoding: 'utf8' });
+      const nowhere = spawnSync(process.execPath, ['bin/db.js', '--server', '127.0.0.1:1', DB, 'count', 'users'], { encoding: 'utf8' });
       expect(nowhere.status).toBe(1);
       expect(nowhere.stderr).toMatch(/cannot reach a nisaba server at 127\.0\.0\.1:1/);
     });
@@ -1363,7 +1668,7 @@ for (const engine of ENGINES) {
 
     it('takes back the slot of a connection that asks nothing, and says why', async () => {
       // keepAliveMs: 0 -- this client is deliberately silent.
-      const quiet = await connectServer(port, { keepAliveMs: 0 });
+      const quiet = (await connectServer(port, { keepAliveMs: 0 })).db(DB);
       expect(await quiet.collection('users').countDocuments({})).toBe(3);
 
       await new Promise(r => setTimeout(r, 2500));
@@ -1385,7 +1690,9 @@ for (const engine of ENGINES) {
       try {
         await new Promise(r => setTimeout(r, 2500));
         // Still there, still answering, three timeouts later.
-        expect(await warm.collection('users').countDocuments({})).toBe(3);
+        expect(await warm.db(DB).collection('users').countDocuments({})).toBe(3);
+        // ping is the CLIENT's: it names no database, which is what
+        // makes it usable by a connection that has not opened one.
         expect(await warm.ping()).toBe(true);
       } finally {
         await warm.close();
@@ -1402,7 +1709,7 @@ for (const engine of ENGINES) {
     let proc;
     const port = nextPort();
     const cli = (...args) => spawnSync(process.execPath, [
-      'bin/db.js', '--server', `127.0.0.1:${port}`, ...args
+      'bin/db.js', '--server', `127.0.0.1:${port}`, DB, ...args
     ], { encoding: 'utf8' });
 
     beforeAll(async () => {
@@ -1411,8 +1718,8 @@ for (const engine of ENGINES) {
     });
 
     it('serves two connections at once, and a CLI while one of them sits idle', async () => {
-      const a = await connectServer(port);
-      const b = await connectServer(port);
+      const a = (await connectServer(port)).db(DB);
+      const b = (await connectServer(port)).db(DB);
       try {
         // Both live, both answered -- interleaved, not one after the other.
         const [x, y] = await Promise.all([
@@ -1439,14 +1746,14 @@ for (const engine of ENGINES) {
     });
 
     it('refuses past the limit, saying so, and takes the next client after a slot frees', async () => {
-      const a = await connectServer(port);
-      const b = await connectServer(port);
+      const a = (await connectServer(port)).db(DB);
+      const b = (await connectServer(port)).db(DB);
       try {
         // Accepted and TOLD, not left in the listen backlog looking slow.
         // One rejection, inspected once: the connection is closed behind
         // the refusal, so a second request on it races the close and
         // would be asserting on whichever won.
-        const third = await connectServer(port);
+        const third = (await connectServer(port)).db(DB);
         let refusal = null;
         try { await third.collection('users').countDocuments({}); }
         catch (err) { refusal = err; }
@@ -1458,7 +1765,7 @@ for (const engine of ENGINES) {
         // And a client that connects and says nothing still learns why:
         // the refusal arrives before it has asked anything, which is a
         // response to no request -- kept, and raised at the first ask.
-        const quiet = await connectServer(port);
+        const quiet = (await connectServer(port)).db(DB);
         await new Promise(r => setTimeout(r, 200));
         await expect(quiet.collection('users').countDocuments({}))
           .rejects.toMatchObject({ name: 'ServerError', code: -44 });
@@ -1472,7 +1779,7 @@ for (const engine of ENGINES) {
       }
 
       // A slot came back when `a` closed, so this one is served.
-      const c = await connectServer(port);
+      const c = (await connectServer(port)).db(DB);
       try {
         expect(await c.collection('users').countDocuments({})).toBe(4);
       } finally {
@@ -1498,15 +1805,18 @@ for (const engine of ENGINES) {
 
     beforeAll(async () => {
       ({ proc, dir } = await startServer(engine, port, [], -1));
-      db = await connectServer(port);
+      db = (await connectServer(port)).db(DB);
       return async () => { if (db.isOpen) await db.close(); proc.kill(); };
     });
 
     it('makes a database, a collection, documents and an index', async () => {
-      // The directory had no catalog: starting the server made one.
-      expect(fs.existsSync(path.join(dir, '__catalog__.bj'))).toBe(true);
-
+      // The ROOT had nothing in it, and naming a database made one:
+      // there is no separate act of creation whose only effect is a
+      // directory, the same way an insert makes a collection.
+      expect(fs.existsSync(path.join(dir, DB))).toBe(false);
       expect(await db.createCollection('users')).toBe(true);
+      expect(fs.existsSync(path.join(dir, DB, '__catalog__.bj'))).toBe(true);
+      expect(await db.listCollections()).toEqual(['users']);
       expect(await db.createCollection('users')).toBe(false);   // idempotent
 
       const users = db.collection('users');
@@ -1558,7 +1868,7 @@ for (const engine of ENGINES) {
       proc.kill();
       await new Promise(r => proc.once('exit', r));
 
-      const provider = new NodeFSStorageProvider(dir);
+      const provider = new NodeFSStorageProvider(path.join(dir, DB));
 
       // The format stamp first, straight out of the catalog: a database
       // is one format however many implementations write it, and this is
@@ -1598,7 +1908,7 @@ for (const engine of ENGINES) {
 
     beforeAll(async () => {
       ({ proc, dir } = await startServer(engine, port, [], 40));
-      db = await connectServer(port);
+      db = (await connectServer(port)).db(DB);
       return async () => { await db.close(); proc.kill(); };
     });
 
@@ -1688,7 +1998,7 @@ for (const engine of ENGINES) {
       proc.kill();
       await new Promise(r => proc.once('exit', r));
 
-      const provider = new NodeFSStorageProvider(dir);
+      const provider = new NodeFSStorageProvider(path.join(dir, DB));
       const jsDb = await connect(provider);
       const jsUsers = await jsDb.collection('users');
       expect(await jsUsers.countDocuments({})).toBe(43);
@@ -1712,7 +2022,7 @@ for (const engine of ENGINES) {
 
     beforeAll(async () => {
       ({ proc } = await startServer(engine, port, [], TOTAL - 3));
-      db = await connectServer(port);
+      db = (await connectServer(port)).db(DB);
       return async () => { await db.close(); proc.kill(); };
     });
 
@@ -1775,7 +2085,7 @@ for (const engine of ENGINES) {
     });
 
     it('will not let one connection touch another connection cursor', async () => {
-      const other = await connectServer(port);
+      const other = (await connectServer(port)).db(DB);
       try {
         // Raw, so the test holds the server's actual id -- the client
         // keeps it to itself, and a live id is the only thing that can
@@ -1798,7 +2108,7 @@ for (const engine of ENGINES) {
 
     it('drops the cursors of a connection that goes away', async () => {
       // Fill the server's table from a connection that then disappears.
-      const doomed = await connectServer(port);
+      const doomed = (await connectServer(port)).db(DB);
       for (let i = 0; i < 16; i++) {
         const c = doomed.collection('users').find({}, { batchSize: 1 });
         await c.nextBatch();
@@ -1830,8 +2140,8 @@ for (const engine of ENGINES) {
 
     beforeAll(async () => {
       ({ proc } = await startServer(engine, port));
-      db = await connectServer(port);
-      other = await connectServer(port);
+      db = (await connectServer(port)).db(DB);
+      other = (await connectServer(port)).db(DB);
       return async () => { await db.close(); await other.close(); proc.kill(); };
     });
 
@@ -1919,7 +2229,7 @@ for (const engine of ENGINES) {
       expect(await stream.next()).toEqual({ value: undefined, done: true });
 
       // A stream is its connection's: losing one ends the other.
-      const doomed = await connectServer(port);
+      const doomed = (await connectServer(port)).db(DB);
       const orphan = doomed.collection('stopping').watch();
       await settle();
       const pending = orphan.next();
@@ -1946,7 +2256,7 @@ for (const engine of ENGINES) {
           buf = buf.subarray(total);
         }
       });
-      sock.write(Buffer.from(encode({ op: 'watch', coll: 'flood' })));
+      sock.write(Buffer.from(encode({ db: DB, op: 'watch', coll: 'flood' })));
       await settle();
       expect(frames.shift()).toMatchObject({ ok: true });
       sock.pause();                                   // and stop reading
@@ -1985,7 +2295,7 @@ for (const engine of ENGINES) {
       await settle();
       const docs = JSON.stringify(Array.from({ length: 1500 }, (_, i) => ({ i })));
       const wrote = spawnSync(process.execPath, [
-        'bin/db.js', '--server', `127.0.0.1:${port}`, 'insert-many', 'blocked', docs
+        'bin/db.js', '--server', `127.0.0.1:${port}`, DB, 'insert-many', 'blocked', docs
       ], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
       expect(wrote.status).toBe(0);
 
@@ -2023,7 +2333,7 @@ for (const engine of ENGINES) {
 
     beforeAll(async () => {
       ({ proc, dir } = await startServer(engine, port));
-      db = await connectServer(port);
+      db = (await connectServer(port)).db(DB);
       return async () => { await db.close(); proc.kill(); };
     });
 
@@ -2185,7 +2495,7 @@ for (const engine of ENGINES) {
       proc.kill();
       await new Promise(r => proc.once('exit', r));
 
-      const provider = new NodeFSStorageProvider(dir);
+      const provider = new NodeFSStorageProvider(path.join(dir, DB));
       const jsDb = await connect(provider);
       expect(await (await jsDb.collection('teams')).countDocuments({})).toBe(3);
       expect(await (await jsDb.collection('ordered')).countDocuments({})).toBe(3);

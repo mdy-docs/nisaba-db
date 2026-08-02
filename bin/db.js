@@ -17,18 +17,20 @@ const DATA_ROOT = process.env.NISABA_DIR || path.join(os.homedir(), '.nisaba');
 
 function usage() {
   console.error(`Usage: db <name> <command> [args] [options]
-       db --server <host:port> <command> [args] [options]
+       db --server <host:port> <name> <command> [args] [options]
 
-A document database. <name> selects (creating if needed) an OPFS
-subdirectory holding its catalog and collection/index files.
+A document database. <name> selects (creating if needed) a subdirectory
+holding its catalog and collection/index files.
 
 With --server the database is a server process (server/main.c, run
-natively or as a wasm32-wasip2 command) and this is only a client: there
-is no <name>, because the server was pointed at one directory when it
-started and serves that one. The wire carries ten operations -- find,
-find-one, count, distinct, insert, update-one, update-many, replace-one,
-delete-one, delete-many -- and any other command says so rather than
-pretending.
+natively or as a wasm32-wasip2 command) and this is only a client -- no
+engine in this process at all. <name> means the same thing there: a
+server holds an INSTANCE, one directory with a subdirectory per database,
+and one connection reaches all of them.
+
+Instance commands:
+  databases                              List the databases on this server
+  drop-database <name>                   Delete a database and all its files
 
 Database commands:
   collections                            List collection names (default)
@@ -271,16 +273,28 @@ function requireArgs(args, n, message) {
 async function main() {
   const { opts, positional } = parseArgs(process.argv.slice(2));
 
-  // Two ways to reach a database, one command set. Locally the first word
-  // names a directory under the data root; with --server it names the
-  // command, because the directory was the server's choice when it
-  // started -- one process per database directory (see
-  // docs/db-server.md).
+  // Two ways to reach a database, one command set and one word order.
+  // The first word names the database in both -- locally a directory
+  // under the data root, remotely one of the server's; a server holds an
+  // instance now, so there is nothing left for the two to disagree
+  // about (docs/db-server.md).
   const remote = opts.server !== undefined;
   if (!positional[0]) usage();
 
-  const command = (remote ? positional[0] : (positional[1] || 'collections')).toLowerCase();
-  const args = positional.slice(remote ? 1 : 2);
+  /*
+   * `databases` and `drop-database` are about the INSTANCE, so they name
+   * no database of their own -- and both spellings a person would type
+   * work: `db databases`, `db drop-database mydb`, and `db mydb
+   * drop-database`. The first word is the command only when it cannot
+   * also be a name being followed by one, so a database that really is
+   * called `databases` is still reachable.
+   */
+  const INSTANCE_COMMANDS = new Set(['databases', 'drop-database']);
+  const first = positional[0].toLowerCase();
+  const firstIsCommand = INSTANCE_COMMANDS.has(first) &&
+                         (!positional[1] || first === 'drop-database');
+  const command = (firstIsCommand ? first : (positional[1] || 'collections')).toLowerCase();
+  const args = positional.slice(firstIsCommand ? 1 : 2);
 
   let db, closeAll;
   if (remote) {
@@ -291,13 +305,35 @@ async function main() {
       console.error('Error: --order is the server\'s, chosen when it opened the directory');
       process.exit(1);
     }
+    let client;
     try {
-      db = await connectServer(opts.server);
+      client = await connectServer(opts.server);
     } catch (err) {
       console.error(`Error: ${err.message}`);
       process.exit(1);
     }
-    closeAll = async () => { if (db.isOpen) await db.close(); };
+    // The instance commands are the client's, not a database's, so they
+    // are answered before one is named.
+    if (command === 'databases' || command === 'drop-database') {
+      try {
+        if (command === 'databases') {
+          const names = await client.listDatabases();
+          if (names.length === 0) console.log('No databases.');
+          else for (const n of names) console.log(n);
+        } else {
+          const name = args[0] || positional[0];
+          console.log(await client.dropDatabase(name)
+            ? `Dropped database ${name}` : `No database ${name}`);
+        }
+      } catch (err) {
+        console.error(`Error: ${err.message}`);
+        process.exit(1);
+      }
+      await client.close();
+      return;
+    }
+    db = client.db(positional[0]);
+    closeAll = async () => { if (client.isOpen) await client.close(); };
   } else {
     // Loaded here rather than at the top so a client is a client: with
     // --server this process never instantiates the WASM engine at all.
@@ -306,6 +342,20 @@ async function main() {
     await ready();
     const provider = new NodeFSStorageProvider(DATA_ROOT);
     const client = await connectClient(provider, { order: opts.order });
+    if (command === 'databases' || command === 'drop-database') {
+      if (command === 'databases') {
+        const names = await client.listDatabases();
+        if (names.length === 0) console.log('No databases.');
+        else for (const n of names) console.log(n);
+      } else {
+        const name = args[0] || positional[0];
+        console.log(await client.dropDatabase(name)
+          ? `Dropped database ${name}` : `No database ${name}`);
+      }
+      await client.close();
+      await provider.close();
+      return;
+    }
     db = await client.db(positional[0]);
     closeAll = async () => {
       if (db.isOpen) await client.close();

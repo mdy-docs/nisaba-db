@@ -72,7 +72,11 @@ if [ "$FUZZ" = 1 ]; then
   OUT="${TMPDIR:-/tmp}/nisaba-native-fuzz"
   SOURCES+=(third_party/binjson-structures/test/fuzz.c)
 else
-  SOURCES+=(test/native/memfs.c test/native/nscheck.c test/native/main.c)
+  # server/root.c is the instance's directory seam (db_instance.h's
+  # dbi_root), and it is here rather than stubbed so the instance tests
+  # exercise the REAL openat/readdir/unlinkat implementation under
+  # ASan/UBSan -- a stand-in would have proved the test's own code.
+  SOURCES+=(server/root.c test/native/memfs.c test/native/nscheck.c test/native/main.c)
 fi
 
 LIBS=()
@@ -80,7 +84,7 @@ FLAGS=(
   -std=c11 -g -O1
   -Wall -Wextra -Werror
   "${INCLUDE_FLAGS[@]}"
-  -Itest/native
+  -Itest/native -Iserver
 )
 
 if [ "$WASI" = 1 ]; then

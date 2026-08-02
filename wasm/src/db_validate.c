@@ -9,6 +9,7 @@
 #include "db_catalog.h"
 #include "db_wal.h"
 #include "db_session.h"
+#include "db_instance.h"
 #include "db.h"
 #include "raft_core.h"
 #include "raft_msg.h"
@@ -123,6 +124,10 @@ const char *dc_strerror(int code) {
         /* db_session.h */
         case DC_ERR_NO_COLLECTION:
             return "No collection of that name in this database's catalog";
+        case DC_ERR_TOO_MANY_DATABASES:
+            return "Too many databases open at once in this process; close one "
+                   "(a database nobody has asked for costs nothing, but one that "
+                   "is open holds a catalog and its collections' files)";
         case DC_ERR_TOO_MANY_COLLECTIONS:
             return "Too many collections open at once in this session";
         case DC_ERR_TOO_MANY_INDEXES:

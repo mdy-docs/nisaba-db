@@ -119,10 +119,13 @@ Now the replication roadmap. Having read the new primitives' contracts, here's t
      is a VIEW: _setMembers asks the node to adopt and then reads the
      derivation back, so the voter list, the peer cursors, the addresses
      and the quorum count are one copy with one owner rather than two
-     that agree by convention. InstallSnapshot stays refused, and stays
-     honestly so: it writes FILES, and this layer has no namespace to
-     write them through -- that is the file-seam piece, not this one, and
-     it is specified in docs/steps/install-snapshot-in-c.md.
+     that agree by convention. InstallSnapshot is the node's too,
+     since the file seam landed: give it a bj_ns and a snapshot store and
+     it serves an install, stages and verifies an incoming one, and
+     adopts it -- generation files onto the live names, its own log
+     rebased onto the boundary. What is left on this side is opening a
+     file (asynchronous in a browser, so never inside a synchronous call)
+     and the close/reopen the adoption runs between.
 
    NOTE: the remaining work below, and what is left of the C pushdown, is
    specified one brief per piece in docs/steps/ (see its README for the

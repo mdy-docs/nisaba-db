@@ -366,13 +366,19 @@ hosting the WASM engine**, which is a different program from shape 4.
 What is still missing on the C side, in dependency order — briefs in
 [`steps/`](steps/):
 
-1. **InstallSnapshot in C** (`steps/install-snapshot-in-c.md`) — the last
-   Raft message kind a host must answer.
-2. **Completions in C** (`steps/completions-in-c.md`) — answering a
+1. **Completions in C** (`steps/completions-in-c.md`) — answering a
    proposal without a promise. Small.
-3. **Native composition** (`steps/native-composition.md`) — seating
+2. **Native composition** (`steps/native-composition.md`) — seating
    several Raft groups over sockets in one process, and deciding what is
    policy.
+
+**InstallSnapshot in C is done** and its brief is retired. All five Raft
+message kinds are the node's now: it serves an install, receives one,
+verifies it and adopts it — the generation's files onto the live names,
+its own log rebased onto the boundary — through a `bj_ns` it is handed
+(`wasm/include/raft_node.h`). The JavaScript implementation went with
+it; what remains on any host is opening a file, which is asynchronous in
+a browser, and the close/reopen an adoption runs between.
 
 Two prerequisites *were* just closed and are worth noting, because they
 were the reason this was blocked rather than merely unstarted:
@@ -407,8 +413,8 @@ server-side driver; Node is required for neither shape.
 What this commits us to — the briefs in [`steps/`](steps/) were written
 on this assumption and are now confirmed rather than speculative:
 
-1. `steps/install-snapshot-in-c.md` — the last Raft message kind a host
-   must answer.
+1. ~~`steps/install-snapshot-in-c.md`~~ — **done**, and retired: the last
+   Raft message kind a host had to answer is the node's.
 2. `steps/completions-in-c.md` — answering a proposal without a promise.
 3. `steps/native-composition.md` — several Raft groups over sockets in
    one process.

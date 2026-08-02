@@ -65,10 +65,11 @@ For the replicated path, additionally:
    successor must commit the same prefix.
 8. **mid-install** — a snapshot install interrupted at each of: staging
    chunks, after the manifest commits, mid-adopt (live files partly
-   replaced), after adopt but before the log rebase. This one depends on
-   `install-snapshot-in-c.md` landing first, and is the most valuable of
+   replaced), after adopt but before the log rebase. The most valuable of
    the set: the adopt step is the only place in the system that replaces
-   live files wholesale.
+   live files wholesale. It is unblocked — the install is the node's now
+   (`wasm/include/raft_node.h`), and `rn_adopt_pending` is precisely the
+   question a node restarted mid-adoption asks.
 
 ## Shape
 

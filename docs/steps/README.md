@@ -13,28 +13,31 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [install-snapshot-in-c.md](install-snapshot-in-c.md) | The last Raft message kind a host must answer. Gives the node a file namespace, which everything below also wants. |
-| 2 | [completions-in-c.md](completions-in-c.md) | Answering a proposal without a promise. Small; can go before or beside 1. |
-| 3 | [native-composition.md](native-composition.md) | Seating several Raft groups over sockets, and deciding what is policy. Sits on top of the server; wants 1 and 2 done. |
-| 4 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
-| 5 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. Its install cases want 1 done; the rest do not wait. |
+| 1 | [completions-in-c.md](completions-in-c.md) | Answering a proposal without a promise. |
+| 2 | [native-composition.md](native-composition.md) | Seating several Raft groups over sockets, and deciding what is policy. Sits on top of the server; wants 1 done. |
+| 3 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
+| 4 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
 
-1 and 2 are the C pushdown's remaining substance; 3 turns one server into
-a cluster; 4 is a feature; 5 is the coverage all of it rests on.
+1 is the C pushdown's remaining substance; 2 turns one server into a
+cluster; 3 is a feature; 4 is the coverage all of it rests on.
 
-**1–3 are now load-bearing rather than speculative.** They were written
+**They are load-bearing rather than speculative.** They were written
 assuming the C server would one day be the cluster member; that is
 decided ([`../deployment-shapes.md`](../deployment-shapes.md),
-Decisions A). One program covers "a persistent server" and "a replicated
-server", so `src/raft.js`, `raft-host.js`, `db-replicated.js` and both
-peer transports stay correct and tested as the embedded-Node story
-rather than as the road to production clustering.
+Decision A). One program covers "a persistent server" and "a replicated
+server".
 
-Two prerequisites closed recently, and both were reasons 1 was blocked
-rather than merely unstarted: `dbs_apply` means a C process can apply a
-committed entry of *any* kind (it needed a JavaScript host for the three
-DDL opcodes until then), and the C server's own DDL is now planned into
-a command, so a leader has something to send.
+**InstallSnapshot in C is done**, which is why its brief is gone. The
+node serves an install, receives one, verifies it and adopts it —
+generation files onto the live names, its own log rebased onto the
+boundary — through a `bj_ns` it is handed (`wasm/include/raft_node.h`).
+That closed the last message kind a host had to answer, and it took the
+JavaScript implementation with it: `src/raft.js` has no snapshotter, no
+`rebaseLog` and no chunk loop, `ReplicatedDb` hands the node its files
+instead of running the transfer, and the deterministic simulator drives
+the C path under partitions and crashes. What is left on the host side
+is what will never move — opening a file, which is asynchronous in a
+browser, and the close/reopen an adoption runs between.
 
 **HTTP is not one of these briefs, deliberately.** It goes in a Node
 process in front of the server, over `src/db-server-client.js`, rather

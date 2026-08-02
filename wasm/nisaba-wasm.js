@@ -1426,6 +1426,14 @@ class RaftCore {
     this._files = { open, remove };
   }
 
+  /** Give the store back. The namespace stays -- a node with a scope and
+   * no store serves nothing (rn_serves_snapshots wants both), and
+   * dropping the ns as well would mean rebuilding it to reattach. */
+  detachFiles() {
+    requireModule()._rnw_set_snapstore(this._p, 0);
+    this._files = null;
+  }
+
   /** Whether this node can serve an install itself -- what a host asks to
    * know whether it still has to. */
   get servesSnapshots() { return requireModule()._rnw_serves_snapshots(this._p) === 1; }

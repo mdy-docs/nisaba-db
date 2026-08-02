@@ -2,13 +2,41 @@
  * Deterministic simulation harness for the Raft core (roadmap step 7):
  * a virtual clock with a seeded rng, an in-memory network with delays,
  * partitions, and unreachable-peer failures, a tiny KV state machine,
- * and a cluster factory over MemoryHandle-backed EntryLogs. Nothing here
+ * and a cluster factory over per-node in-memory DISKS. Nothing here
  * touches a real clock: nodes see time only through tick(), the network
  * delivers only when the simulation advances, and every random draw
  * comes from the seed — a failing schedule replays exactly.
+ *
+ * A disk rather than a log handle, because an install replaces FILES —
+ * the state machine's, and the log itself. A member that survives a
+ * crash-stop here survives as everything on its disk: its KV file, its
+ * snapshot generations, and whichever log the latest generation is
+ * paired with. That is what lets the simulator drive the install the
+ * node performs itself (raft_node.h) rather than a test double of one.
  */
-import { EntryLog, MemoryHandle, encode, decode, crc32, snapshotCheckFiles } from '../wasm/nisaba-wasm.js';
+import {
+  EntryLog, MemoryStorageProvider, SnapshotStore, encode, decode
+} from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
+
+/** The KV machine's live state, and the snapshot store's prefix. */
+const KV_FILE = 'kv.bj';
+const WAL_FILE = 'wal.bj';
+const SNAP_PREFIX = 'snap';
+
+/** A node's disk: named files that survive its process. */
+export const makeDisk = () => new MemoryStorageProvider();
+
+/** The getFileHandle-shaped view SnapshotStore consumes. */
+function directoryOf(disk) {
+  return {
+    async getFileHandle(name, options = {}) {
+      return { createSyncAccessHandle: () => disk.openFile(name, options) };
+    },
+    async removeEntry(name) { return disk.deleteFile(name); },
+    async *entries() { for (const name of await disk.listFiles()) yield [name]; }
+  };
+}
 
 /**
  * Send `msg` to `node` the way a transport would: encoded on the way in,
@@ -127,19 +155,62 @@ export class MemoryNetwork {
   }
 }
 
-/** Trivial deterministic state machine: {op:'set'|'del', k, v} commands. */
+/**
+ * Trivial deterministic state machine: {op:'set'|'del', k, v} commands,
+ * kept in ONE FILE on the node's disk.
+ *
+ * The file is the point. An install replaces files — that is what an
+ * install is — so a machine whose state lives only in a Map is a machine
+ * no install can reach, and a harness built on one would exercise a
+ * transfer nothing downstream performs. One file rewritten whole per
+ * apply is wasteful and completely deterministic, which is the trade a
+ * simulator wants.
+ *
+ * Without a disk it is the pure in-memory machine it always was, for the
+ * tests that only need something to apply into (raft-host.test.js).
+ */
 export class KvMachine {
-  constructor() {
+  constructor(disk = null) {
+    this.disk = disk;
     this.map = new Map();
     this.applied = 0;
   }
+
+  /** Read whatever is on disk — at boot, and again after an install has
+   * put a different file there. */
+  async reload() {
+    if (!this.disk) return;
+    let bytes = null;
+    try {
+      const h = await this.disk.openFile(KV_FILE, { create: false });
+      bytes = new Uint8Array(h.getSize());
+      if (bytes.length) h.read(bytes, { at: 0 });
+    } catch { return; }        // no file yet: an empty machine
+    if (!bytes.length) return;
+    const state = decode(bytes);
+    this.map = new Map(state.entries);
+    this.applied = state.applied;
+  }
+
   appliedIndex() { return this.applied; }
-  apply(entry) {
+
+  async apply(entry) {
     const c = decode(entry.payload);
     if (c.op === 'set') this.map.set(c.k, c.v);
     else if (c.op === 'del') this.map.delete(c.k);
     this.applied = entry.index;
+    await this._persist();
   }
+
+  async _persist() {
+    if (!this.disk) return;
+    const bytes = encode({ entries: [...this.map.entries()], applied: this.applied });
+    const h = await this.disk.openFile(KV_FILE, { create: true });
+    h.truncate(0);
+    h.write(bytes, { at: 0 });
+    h.flush();
+  }
+
   snapshot() { return [...this.map.entries()].sort(); }
 }
 
@@ -147,136 +218,106 @@ export const kvSet = (k, v) => encode({ op: 'set', k, v });
 export const kvDel = (k) => encode({ op: 'del', k });
 
 /**
- * In-memory implementation of the RaftNode snapshotter contract over a
- * KvMachine: take() freezes the current map into a single 'kv' role file
- * (binjson bytes + manifest CRC); beginInstall stages chunks, and
- * commit() validates size + CRC against the manifest and adopts the
- * whole state into the machine.
- */
-export class KvSnapshotter {
-  constructor(machine) {
-    this.machine = machine;
-    this._latest = null; // { lastIncludedIndex, lastIncludedTerm, config, files, bytes }
-  }
-
-  /** Leader-side: freeze the machine's state at the given boundary. */
-  take(lastIncludedIndex, lastIncludedTerm) {
-    const bytes = encode({ entries: [...this.machine.map.entries()] });
-    this._latest = {
-      lastIncludedIndex, lastIncludedTerm, config: null,
-      files: [{ role: 'kv', size: bytes.length, crc: crc32(bytes) }],
-      bytes
-    };
-    return this._latest;
-  }
-
-  latest() { return this._latest; }
-
-  openFile(role) {
-    if (!this._latest || role !== 'kv') throw new Error(`no snapshot file for role ${role}`);
-    const bytes = this._latest.bytes;
-    return {
-      read(buf, { at = 0 } = {}) {
-        const n = Math.min(buf.length, bytes.length - at);
-        if (n > 0) buf.set(bytes.subarray(at, at + n), 0);
-        return Math.max(0, n);
-      },
-      close() {}
-    };
-  }
-
-  beginInstall(manifest) {
-    const staged = new Map(); // role -> growing Uint8Array
-    const snapshotter = this;
-    return {
-      writeChunk(role, offset, data) {
-        let buf = staged.get(role) || new Uint8Array(0);
-        if (offset + data.length > buf.length) {
-          const grown = new Uint8Array(offset + data.length);
-          grown.set(buf, 0);
-          buf = grown;
-        }
-        buf.set(data, offset);
-        staged.set(role, buf);
-      },
-      commit() {
-        // The same check the real store and the replicated install path
-        // run (snapstore.h). This used to be its own loop -- and a
-        // harness whose validation is laxer than production's passes
-        // exactly the snapshots production would reject, which is the
-        // opposite of what a harness is for.
-        snapshotCheckFiles(
-          [...staged].map(([role, buf]) => ({ role, size: buf.length, crc: crc32(buf) })),
-          manifest.files
-        );
-        const { entries } = decode(staged.get('kv') || encode({ entries: [] }));
-        snapshotter.machine.map = new Map(entries);
-        snapshotter.machine.applied = manifest.lastIncludedIndex;
-        // The installed state is also this node's own latest snapshot —
-        // it can serve it onward if it ever leads.
-        snapshotter.take(manifest.lastIncludedIndex, manifest.lastIncludedTerm);
-      },
-      abort() { staged.clear(); }
-    };
-  }
-}
-
-/**
  * Quiesced leader-side snapshot: freeze the state machine at the node's
- * lastApplied and compact the EntryLog through that boundary into a
- * fresh MemoryHandle (raising baseIndex — what forces InstallSnapshot
- * for lagging peers). Mirrors what WalDb.snapshot() does with the
- * SnapshotStore (roadmap step 3), scaled down to the harness.
+ * lastApplied into a new store generation, and compact the EntryLog
+ * through that boundary into the log file the store pairs with it
+ * (raising baseIndex -- what forces InstallSnapshot for lagging peers).
+ * This is WalDb.snapshot() scaled down to one role file.
+ *
+ * `config.live` is the part that matters to an install: it says which
+ * live filename each role is restored ONTO, and a follower adopting this
+ * generation has no other way to know (raft_node.h).
  */
 export async function takeSnapshot(member) {
-  const { node, log } = member;
+  const { node, log, store, machine } = member;
   const boundary = node.lastApplied;
   const boundaryTerm = log.termAt(boundary);
-  member.snapshotter.take(boundary, boundaryTerm);
-  const dest = new MemoryHandle();
+
+  const tx = await store.begin();
+  const handle = await tx.createFile('kv');
+  const bytes = encode({ entries: [...machine.map.entries()], applied: boundary });
+  handle.write(bytes, { at: 0 });
+  handle.flush();
+  await handle.close();
+  await tx.commit({
+    lastIncludedIndex: boundary, lastIncludedTerm: boundaryTerm,
+    config: { live: [{ role: 'kv', name: KV_FILE }] }
+  });
+
+  const { name, handle: dest } = await store.createLogFile();
+  dest.truncate(0);                       // may be a torn leftover
   await log.compact(dest, boundary, boundaryTerm);
   const fresh = new EntryLog(dest);
   await fresh.open();
   await log.close();
   member.log = fresh;
-  member.handle = dest;
-  node.log = fresh;
+  node.log = fresh;                       // the setter repoints C too
+  await store.pruneLogs(name);
+  try { await member.disk.deleteFile(WAL_FILE); } catch { /* best-effort */ }
+  // A new generation is a new set of filenames, and a leader streams
+  // chunks from them inside a synchronous tick.
+  await node.refreshSnapshotFiles();
   return boundary;
 }
 
 /**
  * Build an n-node cluster on the network. Returns Map(id -> { node, log,
- * handle, machine }); `handle` outlives restarts (restartNode reopens it).
+ * disk, machine, store }); `disk` outlives restarts (bootNode reopens it).
  */
 export async function makeCluster(n, sim, net, nodeOptions = {}) {
   const ids = Array.from({ length: n }, (_, i) => i + 1);
   const cluster = new Map();
   for (const id of ids) {
-    cluster.set(id, await bootNode(id, ids, sim, net, new MemoryHandle(), nodeOptions));
+    cluster.set(id, await bootNode(id, ids, sim, net, makeDisk(), nodeOptions));
   }
   return cluster;
 }
 
-export async function bootNode(id, ids, sim, net, handle, nodeOptions = {}) {
-  const log = new EntryLog(handle);
+/**
+ * Boot one member over `disk`. Everything durable is on it: the KV
+ * file, the snapshot store's generations, and the log -- which is the
+ * store's paired one if a generation has been adopted, and a plain WAL
+ * otherwise. That is openWalStorage's rule, scaled down.
+ */
+export async function bootNode(id, ids, sim, net, disk, nodeOptions = {}) {
+  const store = new SnapshotStore(directoryOf(disk), { prefix: SNAP_PREFIX });
+  await store.open();
+
+  const logName = store.latest ? store.logName : WAL_FILE;
+  const log = new EntryLog(await disk.openFile(logName, { create: true }), store.latest
+    ? { baseIndex: store.latest.lastIncludedIndex, baseTerm: store.latest.lastIncludedTerm }
+    : {});
   await log.open();
-  const machine = new KvMachine();
-  const snapshotter = new KvSnapshotter(machine);
-  const member = { log, handle, machine, snapshotter };
+
+  const machine = new KvMachine(disk);
+  await machine.reload();
+  const member = { disk, store, log, machine };
+
+  // The node serves, receives and adopts an install itself: it reads the
+  // generation's files, stages an incoming one, verifies it against the
+  // leader's manifest, and rebases its own log onto the boundary
+  // (raft_node.h). What is left here is opening a file -- asynchronous
+  // in a browser, so never inside a synchronous C call -- and the window
+  // the flip happens in.
+  member.files = {
+    store,
+    open: (name) => disk.openFile(name, { create: true }),
+    remove: (name) => disk.deleteFile(name),
+    async swap(adopt) {
+      // The database, such as it is, is one file. "Closing" it is having
+      // nothing to reload from; reopening it is reloading.
+      const victims = (await disk.listFiles())
+        .filter((n) => !n.startsWith(`${SNAP_PREFIX}-`));
+      await adopt(victims);
+      await machine.reload();
+      member.log = member.node.log;       // rn_adopt rebased it
+    }
+  };
+
   const node = new RaftNode({
     id, peers: ids, log, stateMachine: machine,
     transport: { call: (to, msg) => net.call(id, to, msg) },
-    snapshotter,
-    // After an install commits, the follower's log restarts at the
-    // boundary on a fresh handle (the old file's history is superseded).
-    rebaseLog: async (lastIncludedIndex, lastIncludedTerm) => {
-      member.handle = new MemoryHandle();
-      member.log = new EntryLog(member.handle, {
-        baseIndex: lastIncludedIndex, baseTerm: lastIncludedTerm
-      });
-      await member.log.open();
-      return member.log;
-    },
+    files: member.files,
     random: sim.rng,
     ...nodeOptions
   });
@@ -286,12 +327,13 @@ export async function bootNode(id, ids, sim, net, handle, nodeOptions = {}) {
   return member;
 }
 
-/** Fully stop a member (network + node + log); its handle survives for a
+/** Fully stop a member (network + node + log); its DISK survives for a
  * later bootNode — a crash-stop with durable storage. */
 export async function stopNode(net, member) {
   net.unregister(member.node.id);
   await member.node.stop();
   await member.log.close();
+  await member.store.close();
 }
 
 export function leaders(cluster) {

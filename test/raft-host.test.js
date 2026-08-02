@@ -8,7 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { ready, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { RaftGroupHost } from '../src/raft-host.js';
-import { Sim, MemoryNetwork, KvMachine, KvSnapshotter, kvSet, until, settle, rpc } from './raft-harness.js';
+import { Sim, MemoryNetwork, KvMachine, kvSet, until, settle, rpc } from './raft-harness.js';
 
 await ready();
 
@@ -35,7 +35,6 @@ async function makeHostedCluster(n, groups, sim, net, { quiesceAfterMs = 0, node
       const machine = new KvMachine();
       const node = new RaftNode({
         id, peers: ids, log, stateMachine: machine,
-        snapshotter: new KvSnapshotter(machine),
         transport: host.groupTransport(gid),
         random: sim.rng,
         ...nodeOptions
@@ -180,7 +179,6 @@ describe('raft: member records, address sync, join/leave (sim)', () => {
       const machine = new KvMachine();
       const node = new RaftNode({
         id, peers: records, log, stateMachine: machine,
-        snapshotter: new KvSnapshotter(machine),
         transport: host.groupTransport('g'),
         random: sim.rng
       });
@@ -302,7 +300,7 @@ describe('raft: learners (non-voting members)', () => {
   it('a joiner starts as a learner: no quorum weight, no campaigning, no votes — then auto-promotes when caught up', async () => {
     const sim = new Sim(91);
     const net = new MemoryNetwork(sim);
-    const { makeCluster, bootNode, leaders: rawLeaders } = await import('./raft-harness.js');
+    const { makeCluster, bootNode, makeDisk, leaders: rawLeaders } = await import('./raft-harness.js');
     const cluster = await makeCluster(3, sim, net);
     await until(sim, cluster, () => rawLeaders(cluster).length === 1);
     const leader = () => rawLeaders(cluster)[0];
@@ -329,7 +327,7 @@ describe('raft: learners (non-voting members)', () => {
     net.register(deadVoter.node.id, (msg) => deadVoter.node.handleMessage(msg));
 
     // A learner refuses votes outright, pre or real.
-    const { MemoryHandle: MH, EntryLog: EL } = await import('../wasm/nisaba-wasm.js');
+    const { EntryLog: EL, MemoryHandle: MH } = await import('../wasm/nisaba-wasm.js');
     const learnerLog = new EL(new MH());
     await learnerLog.open();
     const { RaftNode: RN } = await import('../src/raft.js');
@@ -355,7 +353,7 @@ describe('raft: learners (non-voting members)', () => {
 
     // Now bring node 4 ONLINE: it catches up, and the leader promotes it
     // automatically — the log ends up with voting:true and 4 voters.
-    const four = await bootNode(4, [1, 2, 3, 4], sim, net, new MH());
+    const four = await bootNode(4, [1, 2, 3, 4], sim, net, makeDisk());
     cluster.set(4, four);
     await until(sim, cluster, () => leader().node.voters.includes(4), 20_000);
     expect(leader().node.memberInfo.find((m) => m.id === 4).voting).toBe(true);
@@ -395,15 +393,14 @@ describe('raft: membership changes (CONFIG entries)', () => {
   it('growing a cluster from 3 to 4: the new member is caught up and votes', async () => {
     const sim = new Sim(74);
     const net = new MemoryNetwork(sim);
-    const { makeCluster, bootNode, leaders: rawLeaders } = await import('./raft-harness.js');
+    const { makeCluster, bootNode, makeDisk, leaders: rawLeaders } = await import('./raft-harness.js');
     const cluster = await makeCluster(3, sim, net);
     await until(sim, cluster, () => rawLeaders(cluster).length === 1);
     const leader = () => rawLeaders(cluster)[0];
     await settle(sim, cluster, leader().node.propose(kvSet('pre', 1)));
 
     // Boot node 4 (knowing the full new set), then propose the change.
-    const { MemoryHandle: MH } = await import('../wasm/nisaba-wasm.js');
-    const four = await bootNode(4, [1, 2, 3, 4], sim, net, new MH());
+        const four = await bootNode(4, [1, 2, 3, 4], sim, net, makeDisk());
     cluster.set(4, four);
     const change = await settle(sim, cluster, leader().node.changeMembership([1, 2, 3, 4]));
     expect(change.error).toBeUndefined();
@@ -450,13 +447,12 @@ describe('raft: membership changes (CONFIG entries)', () => {
   it('membership survives restart via the committed CONFIG entry', async () => {
     const sim = new Sim(76);
     const net = new MemoryNetwork(sim);
-    const { makeCluster, bootNode, stopNode, leaders: rawLeaders } = await import('./raft-harness.js');
+    const { makeCluster, bootNode, stopNode, makeDisk, leaders: rawLeaders } = await import('./raft-harness.js');
     const cluster = await makeCluster(3, sim, net);
     await until(sim, cluster, () => rawLeaders(cluster).length === 1);
     const leader = () => rawLeaders(cluster)[0];
 
-    const { MemoryHandle: MH } = await import('../wasm/nisaba-wasm.js');
-    const four = await bootNode(4, [1, 2, 3, 4], sim, net, new MH());
+        const four = await bootNode(4, [1, 2, 3, 4], sim, net, makeDisk());
     cluster.set(4, four);
     await settle(sim, cluster, leader().node.changeMembership([1, 2, 3, 4]));
     await settle(sim, cluster, leader().node.propose(kvSet('x', 1)));
@@ -466,7 +462,7 @@ describe('raft: membership changes (CONFIG entries)', () => {
     // CONFIG entry in its log must win over the stale static peers.
     const victim = [...cluster.values()].find((m) => m.node.role !== 'leader' && m.node.id !== 4);
     await stopNode(net, victim);
-    const reborn = await bootNode(victim.node.id, [1, 2, 3], sim, net, victim.handle);
+    const reborn = await bootNode(victim.node.id, [1, 2, 3], sim, net, victim.disk);
     cluster.set(victim.node.id, reborn);
     expect(reborn.node.members.join(',')).toBe('1,2,3,4'); // recovered from the log
     await until(sim, cluster, () => reborn.machine.map.get('x') === 1);

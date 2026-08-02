@@ -82,9 +82,10 @@ because applying needs a state machine. Two options:
    pump applies; the node emits the completions that unlocks. Small,
    works today, keeps the pump where it is.
 2. **The pump moves too.** `dc_wal_apply` already performs a command
-   against an open collection, so C could drive the loop — but it would
-   need to resolve a collection BY NAME, which needs a namespace, which
-   is `install-snapshot-in-c.md`'s work.
+   against an open collection, so C could drive the loop — and resolving
+   a collection BY NAME is no longer the blocker it was: the node has a
+   `bj_ns` (`rn_set_ns`), and `dbs_apply` performs a committed command of
+   any kind against a session.
 
 (1) is the right first move and does not block (2). Say which you chose
 and why.
@@ -101,8 +102,8 @@ and why.
 - **Bounded.** A fixed table like `pending` in `raft_node.c` (with an
   explicit refusal when full), not an unbounded one — and if it can
   overflow, it says so, the way `rn_effects_lost` does.
-- **All-or-nothing, no silent drops, falsify both ways.** See
-  `install-snapshot-in-c.md`'s invariants section; they are the same.
+- **All-or-nothing, no silent drops, falsify both ways.** The same house
+  rules everything else here was built to.
 
 ## Verification
 

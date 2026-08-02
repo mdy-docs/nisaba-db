@@ -113,9 +113,9 @@ refusing explicitly when that index has been compacted away.
   clock is wrong. Nothing in this codebase currently assumes bounded
   clock skew; a lease would be the first, and that is a real design
   change, not an optimization.
-- **The usual house rules** — one owner per rule, explicit errors with
-  `dc_strerror` text, falsify both ways. See
-  `install-snapshot-in-c.md`'s invariants section.
+- **The usual house rules** — one owner per rule, all or nothing,
+  nothing dropped in silence, ordering is the contract, explicit errors
+  with `dc_strerror` text, falsify both ways.
 
 ## Verification
 

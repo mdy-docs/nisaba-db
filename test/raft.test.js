@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
 import { NotLeaderError } from '../src/raft.js';
 import {
-  Sim, MemoryNetwork, makeCluster, bootNode, stopNode, takeSnapshot,
+  Sim, MemoryNetwork, makeCluster, bootNode, stopNode, takeSnapshot, makeDisk,
   leaders, until, settle, kvSet
 } from './raft-harness.js';
 
@@ -133,7 +133,7 @@ describe('raft: snapshot install (5b)', () => {
 
     // The rebooted follower's log ends far below the leader's base: only
     // an install can catch it up.
-    const reborn = await bootNode(victimId, [...cluster.keys()], sim, net, victim.handle, { snapshotChunkBytes: 16 });
+    const reborn = await bootNode(victimId, [...cluster.keys()], sim, net, victim.disk, { snapshotChunkBytes: 16 });
     cluster.set(victimId, reborn);
     await until(sim, cluster, () => reborn.machine.map.get('k12') === 12);
     expect(reborn.machine.snapshot()).toEqual(leader().machine.snapshot());
@@ -157,8 +157,7 @@ describe('raft: snapshot install (5b)', () => {
     const deadId = [...cluster.values()].find((m) => m.node.role !== 'leader').node.id;
     await stopNode(net, cluster.get(deadId));
     await sim.advance(200, [...cluster.values()].filter((m) => m.node.isRunning).map((m) => m.node));
-    const { MemoryHandle } = await import('../wasm/nisaba-wasm.js');
-    const replacement = await bootNode(deadId, [...cluster.keys()], sim, net, new MemoryHandle());
+    const replacement = await bootNode(deadId, [...cluster.keys()], sim, net, makeDisk());
     cluster.set(deadId, replacement);
 
     await until(sim, cluster, () => replacement.machine.map.get('k5') === 5);
@@ -191,7 +190,11 @@ describe('raft: snapshot install (5b)', () => {
     expect(follower.node.lastApplied).toBeLessThan(100);
   });
 
-  it('without a leader-side snapshotter the peer parks; restoring it recovers', async () => {
+  it('a leader with no files to serve from parks the peer; giving it some recovers', async () => {
+    // A node serves an install only when it has BOTH a namespace and a
+    // store with a generation in it (rn_serves_snapshots). Without them
+    // nothing is attempted and nothing is hidden: the peer that cannot be
+    // caught up is named in peersNeedingSnapshot, for a host to notice.
     const sim = new Sim(34);
     const net = new MemoryNetwork(sim);
     const cluster = await makeCluster(3, sim, net);
@@ -200,20 +203,21 @@ describe('raft: snapshot install (5b)', () => {
 
     for (let i = 1; i <= 4; i++) await settle(sim, cluster, leader().node.propose(kvSet(`k${i}`, i)));
     await takeSnapshot(leader());
-    const disabled = leader().node.snapshotter;
-    leader().node.snapshotter = null;
+    // Take the seam away, leaving the compacted log behind: this leader
+    // now knows a peer needs a snapshot and cannot send one.
+    const seam = leader().files;
+    await leader().node.detachFiles();
 
     const deadId = [...cluster.values()].find((m) => m.node.role !== 'leader').node.id;
     await stopNode(net, cluster.get(deadId));
     await sim.advance(200, [...cluster.values()].filter((m) => m.node.isRunning).map((m) => m.node));
-    const { MemoryHandle } = await import('../wasm/nisaba-wasm.js');
-    const replacement = await bootNode(deadId, [...cluster.keys()], sim, net, new MemoryHandle());
+    const replacement = await bootNode(deadId, [...cluster.keys()], sim, net, makeDisk());
     cluster.set(deadId, replacement);
 
     await until(sim, cluster, () => leader().node.peersNeedingSnapshot.includes(deadId));
     expect(replacement.machine.map.size).toBe(0); // stuck, as designed
 
-    leader().node.snapshotter = disabled; // host intervenes
+    await leader().node.attachFiles(seam); // host intervenes
     await until(sim, cluster, () => replacement.machine.map.get('k4') === 4);
     expect(leader().node.peersNeedingSnapshot).toEqual([]);
   });
@@ -302,7 +306,7 @@ describe('raft: failures and partitions', () => {
 
     // Reboot over the same bytes: term/vote restored, state machine
     // rebuilt by replay, then caught up by the leader.
-    const reborn = await bootNode(victimId, [...cluster.keys()], sim, net, victim.handle);
+    const reborn = await bootNode(victimId, [...cluster.keys()], sim, net, victim.disk);
     cluster.set(victimId, reborn);
     expect(reborn.log.currentTerm).toBeGreaterThanOrEqual(termAtCrash);
     await until(sim, cluster, () =>
@@ -490,7 +494,7 @@ describe('raft: config precedence on restart', () => {
     // voters and the removed leader refuses to vote) — restart it, the
     // documented heal.
     await stopNode(net, F);
-    const reborn = await bootNode(fid, [lid, fid], sim, net, F.handle);
+    const reborn = await bootNode(fid, [lid, fid], sim, net, F.disk);
     cluster.set(fid, reborn);
 
     // The latest-in-log CONFIG survived the replay of its predecessors...

@@ -67,10 +67,11 @@ record it rather than quietly implementing it in one host.
 
 ## Ordering
 
-This should come AFTER `install-snapshot-in-c.md` and
-`completions-in-c.md`. A seat that cannot answer an InstallSnapshot, or
-cannot tell a client its write finished, is not a server — and both of
-those change the surface a seat sits on.
+This should come AFTER `completions-in-c.md`. A seat that cannot tell a
+client its write finished is not a server, and that changes the surface
+a seat sits on. The other prerequisite is already met: the node answers
+all five message kinds, InstallSnapshot included, since the file seam
+landed (`wasm/include/raft_node.h`).
 
 ## Suggested staging
 

@@ -29,9 +29,9 @@
  *   - the transport, and every promise that settles from one
  *   - the apply pump and its waiters (a state machine to apply into, a
  *     promise to resolve at read-your-writes)
- *   - the snapshot transfer, which reads FILES: the leader streams chunks
- *     it gets from `snapshotter`, the follower stages them; C's part is
- *     the chunk walk (raft_drive.h) and the cursor bookkeeping
+ *   - OPENING a file, which is asynchronous in a browser and so can never
+ *     be inside a synchronous call, and the close/reopen a snapshot
+ *     install's adoption runs between. The install ITSELF is the node's
  *   - the CONFIG scan at startup (it reads the log), learner promotion's
  *     trigger, and the promise a membership change resolves with.
  *     Everything else about membership is the node's: who is a member,
@@ -69,20 +69,27 @@
  *
  * Snapshot install (5b): when a follower's nextIndex falls below the
  * leader's log base, AppendEntries can never catch it up — the entries
- * are compacted away, and C says so with a NEEDS_SNAPSHOT effect. With a
- * `snapshotter` configured, the host streams its latest snapshot instead:
- * the manifest travels with the first chunk, then every file chunk-by-
- * chunk over the same request/response transport, each chunk awaited (a
- * stale term in any reply aborts). The follower stages chunks through
- * snapshotter.beginInstall's transaction; commit() validates and adopts
- * the whole state (its appliedIndex becomes the boundary), then the node
- * swaps its log for a fresh one based at the boundary via the `rebaseLog`
- * hook — EntryLog cannot rebase in place — and re-persists its hard state
- * onto it. Assigning `node.log` repoints the C node too (rn_set_log): it
- * holds a BORROWED pointer, so a swap it is not told about is a dangling
- * one. The commit and swap are serialized through the apply chain so an
- * in-flight apply loop can never observe the swap. Without a snapshotter,
- * such peers park in `peersNeedingSnapshot` for the host to notice.
+ * are compacted away. Given `files` (a snapshot store and a way to open
+ * one), THE NODE DOES THE WHOLE TRANSFER: it reads the generation and
+ * queues chunks through the outbox like any other message, stages an
+ * incoming one, verifies the staged bytes against the leader's manifest,
+ * and writes the manifest that commits the generation — then rebases its
+ * own log onto the boundary, carrying the hard state forward, which is
+ * what retired the `rebaseLog` hook (raft_node.h). Without `files` it
+ * cannot serve one and says so: such peers park in
+ * `peersNeedingSnapshot` for the host to notice.
+ *
+ * Two beats stay here, and both are the same constraint. Opening a file
+ * is asynchronous in a browser and cannot happen inside a synchronous C
+ * call, so every file-touching operation is planned first: ask which
+ * names it will touch, open exactly those, then make ONE call (bjns.h).
+ * And ADOPTION — putting the generation's files onto the names the
+ * database opens — runs between the host's close and its reopen, because
+ * reopening rebuilds handles C has no idea exist. In between, the
+ * database is neither the old one nor the new one and nothing may observe
+ * it; that is why it is one synchronous call and not a sequence of
+ * awaits. It is serialized through the apply chain so an in-flight apply
+ * loop can never see the swap.
  *
  * Membership (5d): the cluster's member set travels through the log as
  * CONFIG entries, proposed one at a time via changeMembership() and
@@ -143,7 +150,7 @@
  * (src/raft-host.js) drives both ends.
  */
 import {
-  ENTRYLOG_TYPE, EntryLog, encode, decode, raftMsg, raftDrive,
+  ENTRYLOG_TYPE, EntryLog, encode, decode, raftMsg,
   RaftCore, RAFT_ROLE, RN_EFFECT
 } from '../wasm/nisaba-wasm.js';
 
@@ -202,15 +209,6 @@ export class RaftNode {
    *   once per index per process (crash replay is the state machine's
    *   appliedIndex contract, roadmap step 1)
    * @param {object} options.transport - { call(peerId, msg) -> Promise<reply> }
-   * @param {object} [options.snapshotter] - snapshot serving + install:
-   *   { latest() -> { lastIncludedIndex, lastIncludedTerm, config,
-   *       files: [{ role, size, crc, ... }] } | null,      // leader side
-   *     openFile(role) -> { read(buf, {at}), close() },     // leader side
-   *     beginInstall(manifest) -> {                         // follower side
-   *       writeChunk(role, offset, data), commit(), abort() } }
-   *   commit() must validate the staged bytes and adopt the whole state
-   *   into the state machine (appliedIndex becomes the boundary).
-   *   IGNORED when `files` is given: the node does all three itself.
    * @param {object} [options.files] - the file seam that lets the NODE
    *   serve, receive and adopt an install (raft_node.h):
    *   { store,                  // an open SnapshotStore, BORROWED
@@ -223,11 +221,6 @@ export class RaftNode {
    *   it. Everything between those two lines is one synchronous C call,
    *   because in there the database is neither the old one nor the new
    *   one and nothing may observe it (raft_node.h).
-   * @param {(lastIncludedIndex, lastIncludedTerm) => Promise<EntryLog>}
-   *   [options.rebaseLog] - after an install commits, return a fresh OPEN
-   *   EntryLog based at the boundary (the node closes the old log first
-   *   and re-persists its hard state onto it). Required for a follower to
-   *   accept installs.
    * @param {[number, number]} [options.electionTimeoutMs=[150,300]]
    * @param {number} [options.heartbeatMs=50]
    * @param {number} [options.maxBatchBytes=65536] - AppendEntries batch cap
@@ -236,7 +229,7 @@ export class RaftNode {
    */
   constructor({
     id, peers, log, stateMachine, transport,
-    snapshotter = null, rebaseLog = null, files = null, onConfig = null, onEvent = null,
+    files = null, onConfig = null, onEvent = null,
     electionTimeoutMs = [150, 300], heartbeatMs = 50,
     maxBatchBytes = 65536, snapshotChunkBytes = 65536, random = Math.random
   }) {
@@ -247,8 +240,6 @@ export class RaftNode {
     this._log = log;
     this.stateMachine = stateMachine;
     this.transport = transport;
-    this.snapshotter = snapshotter;
-    this.rebaseLog = rebaseLog;
     this.electionTimeoutMs = electionTimeoutMs;
     this.heartbeatMs = heartbeatMs;
     this.maxBatchBytes = maxBatchBytes;
@@ -262,16 +253,12 @@ export class RaftNode {
 
     /**
      * The file seam. With it, the node serves an install, receives one
-     * and adopts it entirely in C — `snapshotter` and `rebaseLog` are
-     * never consulted, and the only thing left on this side is opening
-     * a file, which is asynchronous in a browser and so can never be
-     * inside a synchronous call (bjns.h).
+     * and adopts it entirely in C. Without it a node still replicates
+     * and elects normally; it simply cannot serve or accept an install,
+     * and peers that need one park where the host can see them.
      */
-    this._files = files;
-    if (files) {
-      this._core.attachFiles(files);
-      this._core.chunkBytes = snapshotChunkBytes;
-    }
+    this._files = null;
+    if (files) this._attachFiles(files);
 
     this._reachable = new Map(); // peer -> bool (edge-triggered events)
     const boot = new Map();
@@ -299,11 +286,9 @@ export class RaftNode {
     /** Shadow of the last role C reported, for edge detection only — the
      * `role` getter always asks C. */
     this._role = ROLE.FOLLOWER;
-    this._needsSnapshot = new Set(); // peers parked for want of a snapshotter
-    this._sending = new Set();       // peers with a snapshot transfer running
+    this._needsSnapshot = new Set(); // peers parked for want of files to serve
     this._waiters = [];              // propose() promises: {index, term, resolve, reject}
     this._applyChain = Promise.resolve();
-    this._install = null;            // follower: in-progress install transaction
     this._exclusive = null;          // runExclusive gate promise, or null
     this._transfer = null;           // in-flight transfer: {targetId, deadline, sent, resolve, reject}
     this._leaderAt = 0;              // this._now when we became leader
@@ -446,7 +431,7 @@ export class RaftNode {
             match: this._core.matchOf(p),
             next: this._core.nextOf(p),
             lag: this._log.lastIndex - this._core.matchOf(p),
-            inflight: this._core.inflightOf(p) !== 0 || this._sending.has(p),
+            inflight: this._core.inflightOf(p) !== 0,
             needsSnapshot: this._needsSnapshot.has(p),
             reachable: this._reachable.get(p) !== false
           }))
@@ -615,7 +600,7 @@ export class RaftNode {
 
   /** Peers the leader knows are behind its log base and cannot be caught
    * up by AppendEntries — they need an InstallSnapshot (roadmap 5b) and
-   * this node has no snapshotter to serve one. */
+   * this node has no files to serve one from. */
   get peersNeedingSnapshot() {
     return [...this._needsSnapshot].filter(
       (p) => this.peers.includes(p) && this._core.nextOf(p) <= this._log.baseIndex
@@ -863,7 +848,6 @@ export class RaftNode {
       }
       this._rejectWaiters(new NotLeaderError(this.leaderId));
     }
-    if (role === ROLE.CANDIDATE) this._abortInstall(); // a half-staged install belongs to the old world
     this._emit('role', { role, leaderId: this.leaderId, wasLeader });
   }
 
@@ -871,11 +855,6 @@ export class RaftNode {
    * install can catch it up. With a snapshot to serve, stream it; without
    * one, park the peer where the host can see it. */
   _onNeedsSnapshot(peer) {
-    if (this.snapshotter && this.snapshotter.latest()) {
-      this._needsSnapshot.delete(peer);
-      this._sendSnapshot(peer);
-      return;
-    }
     this._needsSnapshot.add(peer);
   }
 
@@ -899,9 +878,7 @@ export class RaftNode {
     // InstallSnapshot is the one kind the node refuses: it writes FILES,
     // and C has no namespace to write them through. Everything else --
     // votes, entries, join, leave, TimeoutNow -- the node answers itself.
-    if (kind === raftMsg.KIND.INSTALL_SNAPSHOT) {
-      return this._files ? this._stageInstall(bytes) : this._onInstallSnapshot(decode(bytes));
-    }
+    if (kind === raftMsg.KIND.INSTALL_SNAPSHOT) return this._stageInstall(bytes);
     return this._handleRaftMessage(bytes);
   }
 
@@ -999,6 +976,35 @@ export class RaftNode {
    * to be open already. Called whenever `latest` moves: at start, after
    * an install is adopted, and after the host takes a local snapshot.
    */
+  _attachFiles(files) {
+    this._files = files;
+    this._core.attachFiles(files);
+    this._core.chunkBytes = this.snapshotChunkBytes;
+  }
+
+  /**
+   * Give the node its files after construction, for a host that did not
+   * have a store to give it yet. Until then the node cannot serve an
+   * install and says so: peers that need one park in
+   * peersNeedingSnapshot rather than being caught up by a transfer
+   * nobody can make.
+   */
+  async attachFiles(files) {
+    this._attachFiles(files);
+    await this.refreshSnapshotFiles();
+    this._flush();
+  }
+
+  /** Take them away again: the node stops being able to serve, and says
+   * so the only way it can — peers it cannot catch up park in
+   * peersNeedingSnapshot instead of being sent a transfer that would
+   * fail halfway. The handles it was holding open go back. */
+  async detachFiles() {
+    await this._core.releaseFiles();
+    this._core.detachFiles();
+    this._files = null;
+  }
+
   async refreshSnapshotFiles() {
     if (!this._files) return;
     const latest = this._files.store.refresh();
@@ -1045,194 +1051,6 @@ export class RaftNode {
     return new Promise((resolve, reject) => {
       this._awaiting.set(corr, { resolve, reject });
     });
-  }
-
-  /**
-   * InstallSnapshot, the one message class the host answers: it writes
-   * FILES, which is the whole reason it did not move. The term rules
-   * around it are still C's — rn_observe_leader adopts the leader's term
-   * exactly as an AppendEntries would, and refuses a stale one.
-   */
-  async _onInstallSnapshot(msg) {
-    if (!this._core.observeLeader(msg.term, msg.leaderId, this.random())) {
-      return encode({ term: this._log.currentTerm, success: false });
-    }
-    this._flush(); // a step-down is a role change the host has to see
-
-    if (!this.snapshotter || !this.rebaseLog) {
-      return encode({ term: this._log.currentTerm, success: false });
-    }
-
-    if (msg.manifest) {
-      // First chunk of a (re)started install: supersede anything staged.
-      this._emit('install', { phase: 'started', lastIncludedIndex: msg.lastIncludedIndex, from: msg.leaderId });
-      await this._abortInstall();
-      this._install = {
-        lastIncludedIndex: msg.lastIncludedIndex,
-        lastIncludedTerm: msg.lastIncludedTerm,
-        members: msg.manifest.members ?? null,
-        tx: await this.snapshotter.beginInstall({
-          lastIncludedIndex: msg.lastIncludedIndex,
-          lastIncludedTerm: msg.lastIncludedTerm,
-          config: msg.manifest.config,
-          files: msg.manifest.files
-        })
-      };
-    }
-    const install = this._install;
-    if (!install ||
-        install.lastIncludedIndex !== msg.lastIncludedIndex ||
-        install.lastIncludedTerm !== msg.lastIncludedTerm) {
-      // A chunk for an install we never started (leader restarted, or we
-      // aborted): ask for the manifest again.
-      return encode({ term: this._log.currentTerm, success: false, restart: true });
-    }
-    if (msg.role != null && msg.data && msg.data.length) {
-      await install.tx.writeChunk(msg.role, msg.offset, msg.data);
-    }
-
-    if (msg.done) {
-      // Commit + log swap serialize through the apply chain so an
-      // in-flight apply loop can never observe the swap mid-batch.
-      const finish = async () => {
-        await install.tx.commit(); // validate + adopt into the state machine
-        const term = this._log.currentTerm;
-        const votedFor = this._log.votedFor;
-        await this._log.close();
-        // The setter repoints C too: it borrowed the log we just closed.
-        this.log = await this.rebaseLog(msg.lastIncludedIndex, msg.lastIncludedTerm);
-        if (term > 0) this._log.setHardState(term, votedFor); // fresh logs start at 0/0
-        this.lastApplied = msg.lastIncludedIndex;
-        this._core.seedCommit(msg.lastIncludedIndex);
-        if (install.members) {
-          this._setMembers(install.members);
-          this._configIndex = msg.lastIncludedIndex; // the manifest's set stands in for every CONFIG at or below the boundary
-        }
-        this._install = null;
-      };
-      const run = this._applyChain.then(finish);
-      this._applyChain = run.catch(() => {});
-      try {
-        await run;
-        this._emit('install', { phase: 'finished', lastIncludedIndex: msg.lastIncludedIndex });
-      } catch (err) {
-        // A failed commit (e.g. checksum mismatch on a corrupted
-        // transfer) adopts nothing; have the leader start over.
-        this._install = null;
-        this._emit('install', { phase: 'failed', lastIncludedIndex: msg.lastIncludedIndex, error: String(err?.message ?? err) });
-        return encode({ term: this._log.currentTerm, success: false, restart: true });
-      }
-    }
-    return encode({ term: this._log.currentTerm, success: true });
-  }
-
-  async _abortInstall() {
-    const install = this._install;
-    this._install = null;
-    if (install) {
-      try { await install.tx.abort(); } catch { /* best-effort */ }
-    }
-  }
-
-  // ---- snapshot streaming (leader) ----------------------------------------
-
-  /** Stream the latest snapshot to a peer, chunk by chunk, each chunk
-   * awaited: the manifest rides the first chunk, `done` marks the last
-   * chunk of the last file. On success the peer stands at the snapshot
-   * boundary and ordinary AppendEntries resumes from there. */
-  async _sendSnapshot(peer) {
-    if (this._sending.has(peer)) return;
-    this._sending.add(peer);
-    const term = this._log.currentTerm;
-    let installed = false;
-    let boundary = 0;
-    this._emit('send-snapshot', { phase: 'started', peer });
-    try {
-      const snap = this.snapshotter.latest();
-      const { lastIncludedIndex, lastIncludedTerm } = snap;
-      boundary = lastIncludedIndex;
-      const files = snap.files;
-      const base = {
-        kind: 'installSnapshot', term, leaderId: this.id,
-        lastIncludedIndex, lastIncludedTerm
-      };
-      const manifest = {
-        config: snap.config ?? null,
-        files: files.map(({ role, size, crc }) => ({ role, size, crc })),
-        // The member records (ids AND addresses) travel with the install
-        // so a bootstrapped node — whose log won't contain the CONFIG
-        // history — adopts the whole cluster shape. This is the CURRENT
-        // set, an approximation of "the set at the boundary" that is
-        // exact whenever changes are committed and settled — the only
-        // time snapshots should be taken anyway.
-        members: this.memberInfo
-      };
-      const send = async (msg) => {
-        const reply = decode(await this.transport.call(peer, encode(msg)));
-        if (!this.isRunning || this.role !== ROLE.LEADER || this._log.currentTerm !== term) return false;
-        if (reply.term > term) {
-          // A reply the host awaited, carrying a higher term: C decides
-          // what that costs us, as it does for every other reply.
-          this._core.stepDown(reply.term, this.random());
-          this._flush();
-          return false;
-        }
-        return reply.success === true; // restart/false: give up, retry from the top later
-      };
-
-      // The chunk walk is C's (raft_drive.h): which file, which offset,
-      // which chunk carries the manifest and which ends the stream. It
-      // replaces a doubly-nested loop with a labelled break, a `first`
-      // flag mutated across both levels, and a `done` computed from two
-      // indices at once. The cursor comes BACK from C rather than being
-      // derived here -- offset + len cannot distinguish "sent the empty
-      // file" from "have not", which is an infinite loop on any snapshot
-      // whose last file is empty.
-      const sizes = files.map((f) => f.size);
-      let handle = null, openRole = null;
-      try {
-        let cursor = { file: 0, offset: 0 };
-        for (;;) {
-          const c = raftDrive.chunkNext(sizes, this.snapshotChunkBytes, cursor.file, cursor.offset);
-          if (!c) break;
-          const file = files[c.fileIndex] ?? null;
-
-          // One handle at a time, held across the chunks of its own file.
-          if (file && openRole !== file.role) {
-            if (handle?.close) await handle.close();
-            handle = await this.snapshotter.openFile(file.role);
-            openRole = file.role;
-          }
-          const data = new Uint8Array(c.len);
-          if (c.len) handle.read(data, { at: c.offset });
-
-          const msg = { ...base, role: file ? file.role : null, offset: c.offset, data, done: c.isDone };
-          if (c.isFirst) msg.manifest = manifest;
-          if (!await send(msg)) break;
-          if (c.isDone) { installed = true; break; }
-          cursor = { file: c.nextFile, offset: c.nextOffset };
-        }
-      } finally {
-        if (handle?.close) await handle.close();
-      }
-      if (installed) {
-        // Where the peer now stands, and what that lets us commit: C's
-        // (raft_drive.h's raft_repl_installed — match never regresses, a
-        // peer already past the snapshot keeps what it had).
-        this._core.installed(peer, boundary);
-        this._needsSnapshot.delete(peer);
-        this._flush();
-      }
-    } catch {
-      // Peer unreachable mid-transfer; the next heartbeat starts over.
-    } finally {
-      this._sending.delete(peer);
-      this._emit('send-snapshot', { phase: installed ? 'finished' : 'failed', peer, boundary });
-    }
-    if (installed && this.role === ROLE.LEADER && this._core.nextOf(peer) <= this._log.lastIndex) {
-      this._core.replicate(peer);
-      this._flush();
-    }
   }
 
   /**

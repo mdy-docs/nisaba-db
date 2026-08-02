@@ -328,6 +328,83 @@ describe('replicated db: failures and recovery', () => {
     for (const m of cluster.values()) await m.rdb.close();
   });
 
+  it('an install lands on a disk that still holds the old database, and leaves none of it', async () => {
+    // The blank-replacement case above cannot see the sharpest half of an
+    // adoption, because a blank disk has nothing to leave behind. Here
+    // the member comes back to its OWN files -- a stale database, a stale
+    // WAL, a stale journal -- and every one of them is a file the
+    // installed generation does not restore. A journal is the dangerous
+    // one: left in place, recovery replays it over a restored file and
+    // rewinds it.
+    //
+    // Which of these files are the database's is the HOST's knowledge --
+    // a Raft node has no idea what a collection is -- so the victim list
+    // is computed here and passed in (db-replicated.js's _swapForInstall).
+    const sim = new Sim(77);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeDbCluster(3, sim, net, { snapshotChunkBytes: 128 });
+    const leader = leaderOf(cluster);
+    const users = await leader.rdb.collection('users');
+    for (let i = 1; i <= 4; i++) {
+      await settle(sim, cluster, users.insertOne({ _id: oid(i), name: `old-${i}` }));
+    }
+
+    // Take one member down and let it fall irrecoverably behind: it keeps
+    // its disk, but the leader compacts past everything on it.
+    const victim = followersOf(cluster)[0];
+    const disk = victim.provider;
+    net.unregister(victim.id);
+    await victim.rdb.close();
+    const staleFiles = await disk.listFiles();
+    expect(staleFiles.length).toBeGreaterThan(0);
+
+    await settle(sim, cluster, users.deleteOne({ _id: oid(1) }));
+    for (let i = 5; i <= 9; i++) {
+      await settle(sim, cluster, users.insertOne({ _id: oid(i), name: `new-${i}` }));
+    }
+    const snap = await leader.rdb.snapshot();
+    await sim.advance(300, [...cluster.values()].filter((m) => m.node.isRunning).map((m) => m.node));
+
+    const reborn = await bootMember(
+      victim.id, [...cluster.keys()], sim, net, disk, { snapshotChunkBytes: 128 });
+    cluster.set(victim.id, reborn);
+
+    await untilAsync(sim, cluster, async () => {
+      if (reborn.node.lastApplied < snap.lastIncludedIndex) return false;
+      const col = await reborn.rdb.collection('users');
+      return (await col.countDocuments({})) === 8;
+    }, 20_000);
+
+    // The leader's state, not its own: the document it never saw deleted
+    // is gone, and the five it never saw written are there.
+    const col = await reborn.rdb.collection('users');
+    expect(await col.findOne({ _id: oid(1) })).toBe(null);
+    expect((await col.findOne({ _id: oid(9) })).name).toBe('new-9');
+    expect(reborn.node.log.baseIndex).toBe(snap.lastIncludedIndex);
+
+    // And nothing of the old database survived on the disk. Anything
+    // still there is either the snapshot store's or a name the
+    // generation restored -- with two exceptions that have to be checked
+    // rather than listed, because reopening the database recreates them.
+    const after = await disk.listFiles();
+    const live = new Set(reborn.rdb._store.latest.config.live.map((f) => f.name));
+    const strangers = after.filter(
+      (n) => !n.startsWith(`${reborn.rdb._store.prefix}-`) && !live.has(n));
+    // The old WAL is simply gone: nothing recreates it, because the
+    // node's log is the generation's own now.
+    expect(strangers).not.toContain('__wal__.bj');
+    // Everything else in that set was recreated EMPTY by the reopen
+    // rather than left behind. A journal that survived WITH BYTES IN IT
+    // is precisely the rewind this removal exists to prevent, and it is
+    // invisible by name.
+    for (const name of strangers) {
+      const h = await disk.openFile(name, { create: false });
+      try { expect([name, h.getSize()]).toEqual([name, 0]); }
+      finally { await h.close(); }
+    }
+    for (const m of cluster.values()) await m.rdb.close();
+  });
+
   it('transferLeadership moves the leader with zero data copied; the new leader serves reads and writes', async () => {
     const sim = new Sim(91);
     const net = new MemoryNetwork(sim);

@@ -22,15 +22,15 @@
  *     the max of every collection's persisted appliedIndex (apply is
  *     strictly ordered, so the max IS the applied prefix).
  *
- *   - The SnapshotStore (roadmap step 3) is adapted onto the RaftNode's
- *     5b snapshotter contract: latest()/openFile() serve install chunks
- *     straight from the adopted generation; beginInstall() stages a new
- *     generation via store.begin(), CRC-checks every staged file against
- *     the leader's manifest BEFORE committing, then adopts it into the
- *     live database — close the inner Db, restore the generation onto
- *     the live filenames, reconnect, and repoint every cached
- *     WalCollection. rebaseLog() pairs a fresh boundary-based log with
- *     the installed generation.
+ *   - The SnapshotStore (roadmap step 3) is handed to the RaftNode as
+ *     its `files` seam, and the NODE runs the install: it streams the
+ *     adopted generation's chunks, stages an incoming one, CRC-checks
+ *     every staged file against the leader's manifest before writing the
+ *     manifest that commits it, and rebases its own log onto the
+ *     boundary (raft_node.h). What is left here is the two things C
+ *     cannot do — opening a file, which is asynchronous in a browser,
+ *     and the window the flip runs in: close the inner Db, let C replace
+ *     the files, reconnect, and repoint every cached WalCollection.
  *
  *   - snapshot() must not run under a live node's feet (an AppendEntries
  *     mid-swap would append to a dead log object), so it runs inside
@@ -47,11 +47,10 @@
  * the RaftNode owns replay, applying exactly the committed prefix — an
  * uncommitted local suffix stays unapplied until a leader settles it.
  */
-import { connect, EntryLog, crc32, isDeterministicError } from '../wasm/nisaba-wasm.js';
+import { connect, isDeterministicError } from '../wasm/nisaba-wasm.js';
 import { RaftNode, NotLeaderError } from './raft.js';
 import {
-  WalDb, WAL_FILE, SNAP_PREFIX,
-  openWalStorage, restoreFromStore, reconcileLogWithAppliedFloor
+  WalDb, SNAP_PREFIX, openWalStorage, reconcileLogWithAppliedFloor
 } from './db-wal.js';
 
 /** How many recent per-entry results the state machine retains for local
@@ -197,6 +196,10 @@ export class ReplicatedDb extends WalDb {
     return this._serialize(() => this._raft.runExclusive(async () => {
       const info = await this._snapshotLocked(this._raft.lastApplied);
       this._raft.log = this._log; // _snapshotLocked swapped it
+      // A new generation is a new set of filenames, and a leader streams
+      // chunks from them inside a synchronous tick — so they have to be
+      // resolvable before the next one runs (see refreshSnapshotFiles).
+      await this._raft.refreshSnapshotFiles();
       return info;
     }));
   }
@@ -215,100 +218,68 @@ export class ReplicatedDb extends WalDb {
     await super.close();
   }
 
-  // ---- snapshotter adapter (RaftNode 5b contract over SnapshotStore) ------
+  // ---- the file seam (RaftNode `files`, over the SnapshotStore) -----------
 
-  _makeSnapshotter() {
-    const rdb = this;
-    const store = this._store;
+  /**
+   * What the node needs to run an install itself: a store to name
+   * generations in, a way to open and unlink a file, and the one thing
+   * that stays on this side forever -- the window the flip happens in.
+   *
+   * Opening is this side's because it is asynchronous in a browser and
+   * can never be inside a synchronous C call (bjns.h). Closing and
+   * reopening the database is this side's for a different reason: the
+   * reopen rebuilds every collection handle, which C has no idea exists.
+   */
+  _makeFiles() {
     return {
-      latest() { return store.latest; },
-      openFile(role) { return store.openFile(role); },
-      async beginInstall(manifest) {
-        const tx = await store.begin();
-        const open = new Map();   // role -> { handle, written, crc }
-        return {
-          async writeChunk(role, offset, data) {
-            let f = open.get(role);
-            if (!f) {
-              f = { handle: await tx.createFile(role), written: 0, crc: 0 };
-              open.set(role, f);
-            }
-            if (offset !== f.written) {
-              throw new Error(`snapshot chunk out of order for ${role}: at ${offset}, expected ${f.written}`);
-            }
-            f.handle.write(data, { at: offset });
-            f.written += data.length;
-            f.crc = crc32(data, f.crc);
-          },
-          async commit() {
-            // Validate the staged bytes against the LEADER's manifest
-            // before anything becomes adoptable -- through the store's
-            // own check, which is C's (snapstore.h). This used to be a
-            // hand-written loop here, one of three copies of the rule; a
-            // follower deciding whether transferred bytes really are the
-            // leader's snapshot is not a place for three opinions.
-            store.checkFiles(
-              [...open].map(([role, f]) => ({ role, size: f.written, crc: f.crc })),
-              manifest.files
-            );
-            for (const f of open.values()) {
-              f.handle.flush();
-              await f.handle.close();
-            }
-            await tx.commit({
-              lastIncludedIndex: manifest.lastIncludedIndex,
-              lastIncludedTerm: manifest.lastIncludedTerm,
-              config: manifest.config
-            });
-            await rdb._adoptInstalledSnapshot();
-          },
-          async abort() {
-            for (const f of open.values()) {
-              try { await f.handle.close(); } catch { /* best-effort */ }
-            }
-            await tx.abort();
-          }
-        };
-      }
+      store: this._store,
+      open: (name) => this._provider.openFile(name, { create: true }),
+      remove: (name) => this._provider.deleteFile(name),
+      swap: (adopt) => this._swapForInstall(adopt)
     };
   }
 
-  /** The installed generation becomes the live database: close the inner
-   * Db, restore the generation onto the live filenames, reconnect, and
-   * repoint every cached WalCollection at the fresh inner collections.
-   * The read gate holds async reads off the closed collections' freed
-   * WASM contexts for the duration. */
-  async _adoptInstalledSnapshot() {
+  /**
+   * The installed generation becomes the live database. Between the
+   * close and the reopen the database is neither the old one nor the new
+   * one and nothing may observe it there -- so what runs in the middle is
+   * ONE synchronous call (raft_node.h's rn_adopt), and the read gate
+   * holds async reads off the closed collections' freed WASM contexts
+   * for the whole window.
+   *
+   * The victims are every file that is not the snapshot store's: the
+   * live collection and index files, their journals, and the old WAL. A
+   * journal is the sharp one -- left behind, recovery replays it over a
+   * restored file and rewinds it. Which files are the database's is
+   * exactly the knowledge a Raft node does not have, which is why it
+   * asks rather than derives; ones the generation is about to restore
+   * are skipped rather than removed, because bjns.h forbids ordering a
+   * create against a remove.
+   */
+  async _swapForInstall(adopt) {
     let release;
     this._readGate = new Promise((resolve) => { release = resolve; });
     try {
+      const mine = `${this._store.prefix}-`;
+      const victims = (await this._provider.listFiles()).filter((n) => !n.startsWith(mine));
       await this._db.close();
-      await restoreFromStore(this._provider, this._store);
-      this._db = await connect(this._provider, this._dbOptions);
-      for (const [name, col] of this._collections) {
-        col._inner = await this._db.collection(name);
+      try {
+        await adopt(victims);
+      } finally {
+        this._db = await connect(this._provider, this._dbOptions);
+        for (const [name, col] of this._collections) {
+          col._inner = await this._db.collection(name);
+        }
       }
+      // Superseded generations' logs, which the store's own scan leaves
+      // alone by design (it cannot tell a torn newest one from a stale
+      // one without opening it). The name to keep is the store's: the
+      // node created that file, so this side never saw it.
+      await this._store.pruneLogs(this._store.logName);
     } finally {
       this._readGate = null;
       release();
     }
-  }
-
-  /** rebaseLog hook (5b): pair a fresh boundary-based log with the just-
-   * installed generation; the node re-persists hard state onto it. */
-  _makeRebaseLog() {
-    return async (lastIncludedIndex, lastIncludedTerm) => {
-      const { name, handle } = await this._store.createLogFile();
-      handle.truncate(0); // may be a torn leftover at this generation
-      const log = new EntryLog(handle, {
-        baseIndex: lastIncludedIndex, baseTerm: lastIncludedTerm
-      });
-      await log.open();
-      this._log = log;
-      await this._store.pruneLogs(name);
-      try { await this._provider.deleteFile(WAL_FILE); } catch { /* best-effort */ }
-      return log;
-    };
   }
 }
 
@@ -346,8 +317,7 @@ export async function connectReplicated(provider, options = {}) {
     const machine = new DbStateMachine(rdb);
     const node = new RaftNode({
       id, peers, log, stateMachine: machine, transport,
-      snapshotter: rdb._makeSnapshotter(),
-      rebaseLog: rdb._makeRebaseLog(),
+      files: rdb._makeFiles(),
       ...raftOptions
     });
     rdb._raft = node;

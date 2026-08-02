@@ -5,10 +5,10 @@ the effort. It says what to build, what already exists so it is not built
 twice, the shape the answer has to take and why, and what must still be
 true afterwards.
 
-The client shape is decided and is stated first. One decision is still
-open — whether replication follows the instance or each database — and it
-is the brief's first deliverable, in writing, before any of this is
-implemented. It is in "The choice to make first" below.
+Both of its design decisions are made and are recorded below with the
+reasons: the client shape, and **one log per instance**. What is left is
+implementation and the small choices inside it, which the relevant
+section names as it goes.
 
 ## The shape, stated first
 
@@ -82,58 +82,58 @@ database the way it already does locally, the browser reaches the same
 shape through the same `Client`, and — with `--raft` — a write to either
 one goes through the log and lands on every member.
 
-## The choice to make first
+## The replication shape: ONE LOG PER INSTANCE
 
-**One log for the instance, or one log per database?** Everything else
-here is mechanical; this is not. Decide it, write down why, and put that
-paragraph in this file before writing code.
+Decided. Entries carry the database as well as the collection; there is
+one log, one leader, one election, one member set and one failover story
+for the whole executable.
 
-**(a) One log for the instance.** Entries carry the database as well as
-the collection. One leader, one election, one member set, one failover
-story for the whole executable. Raft does not change AT ALL —
-`server/replica.c` and `server/peers.c` stand exactly as they are — and
-what grows a database axis is the SESSION.
+**Raft does not change at all.** `server/replica.c` and
+`server/peers.c` stand exactly as they are. What grows a database axis is
+the SESSION, which is the half of this brief that was always going to be
+work.
 
-- Costs: one database's write rate is every database's, a slow apply
-  blocks all of them, and no database can be placed on a different set of
-  machines from its neighbours.
+The alternative was one log per database — what `src/raft-host.js` does
+(one WalDb = one log = one group), and what the retired
+`native-composition.md` specified: N nodes, N logs, N leaders in one
+process, multiplexed with a `{group, msg}` envelope, idle groups
+quiesced. Two reasons it is not this.
 
-**(b) One log per database.** What `src/raft-host.js` does (one WalDb =
-one log = one group) and what the retired brief specified: N nodes, N
-logs, N leaders in one process, multiplexed over one transport with a
-`{group, msg}` envelope and one tick loop, with idle groups quiesced.
+Its justification was **tenancy**: independently placed, mostly-idle
+databases, where quiescence is the design rather than an optimization.
+Tenancy is a layer above this repository. An always-on instance quiesces
+nothing and places nothing, so the whole apparatus would be paid for and
+unused.
 
-- Costs: a seat, a group registry, the envelope in C, quiescence — and N
-  leaders means a client has to find the leader PER DATABASE rather than
-  per server, which changes the redirect that `--raft` just made real.
+And it fights the **connection shape** above. One connection holds many
+databases, and under `--raft` only the leader takes a write. With one log
+that is one refusal for the whole connection: this server leads, or that
+one does. With a log per database, leadership is per database — one
+socket could be leader for `analytics` and follower for `billing`, and a
+caller would need a redirect table keyed by database and connections to
+several servers at once to satisfy a single `client` object. Every
+caller pays that, [`http-front-end.md`](http-front-end.md) included, for
+a property that is out of scope.
 
-**The recommendation is (a)**, for two reasons.
+**What this costs, accepted deliberately:** one database's write rate is
+every database's, and one apply pump serves all of them — a deterministic
+failure in one is still a result, but a HALT in one halts every database
+in the instance. Per-database placement is not available and is not
+planned.
 
-The first is that (b)'s justification was tenancy: independently placed,
-mostly-idle databases, where quiescence is the design rather than an
-optimization. With tenancy out of scope, an always-on instance quiesces
-nothing and places nothing. (b) can also be built on top of (a)'s naming
-later without redoing it; the reverse is not true.
+**What it does not foreclose:** a log per database can be built on top of
+this naming later without redoing it. The reverse is not true, which is
+the other reason to start here.
 
-The second comes from the connection shape above and is the sharper one.
-**One connection holds many databases**, and under `--raft` only the
-leader takes a write — a follower refuses with the leader's id and
-address. Under (a) that is one refusal for the whole connection: this
-server leads, or that one does. Under (b) leadership is per database, so
-one socket could be leader for `analytics` and follower for `billing`,
-and a client would have to keep a redirect table keyed by database and
-maintain connections to several servers at once to satisfy one `client`
-object. That is a real cost paid by every caller, including
-[`http-front-end.md`](http-front-end.md), and it is paid for a property
-(independent placement) that is out of scope.
-
-### A consequence worth seeing before you choose
+### The consequence that follows immediately
 
 `dbs_applied_floor` is the replay floor — the highest index this database
-has applied, and the number a restarting replica resumes from. With ONE
-log for the instance it becomes the floor across EVERY database, because
-apply is strictly ordered across the whole log and the max is the applied
-prefix only if the max is taken over everything the log wrote.
+has applied, and the number a restarting replica resumes from. With one
+log it becomes the floor across EVERY database, because apply is strictly
+ordered across the whole log and the max is the applied prefix only if
+the max is taken over everything the log wrote. A floor computed per
+database, or over only the databases that happen to be open, is a
+replica that replays entries it has already applied.
 
 This is not hypothetical. That function has already shipped wrong once
 and been fixed: it asked `dbs_collection` to open each collection while
@@ -155,7 +155,7 @@ after it.
 | Naming files inside one database | `db_names.h` — collections, indexes, journals, compaction generations |
 | A session over one database | `db_session.h`'s `dbs`; `dbs_open` takes a `bj_ns`, and a `bj_ns` is one directory |
 | The client, when the wire grows a field | `src/db-server-client.js` — `WIRE_OPS` in one place |
-| Everything replication does | `server/replica.c`, `server/peers.c` — untouched under (a) |
+| Everything replication does | `server/replica.c`, `server/peers.c` — untouched: one log per instance is a session change, not a Raft one |
 
 ## What has to be built
 
@@ -184,27 +184,45 @@ after it.
    quiet should be closeable — which the in-process `Client` never has to
    do, because it caches a `Db` per name forever and a page does not have
    a thousand of them.
-4. **The two instance operations, which exist nowhere.** There is no
-   `listDatabases` and no `dropDatabase` in this repository — not on the
-   wire, not on the in-process `Client`, not in `bin/db.js`. The instance
-   shape is the first thing that needs them, so they arrive here, in
-   BOTH: the wire ops and the `Client` methods, with the same names and
-   the same meanings.
-   Listing needs a directory listing, and **`bj_ns` deliberately cannot
-   produce one** — OPFS enumeration is asynchronous, so `bjns.h` passes
-   listings in rather than offering them. So each host lists for itself:
-   the server with POSIX/WASI `readdir` (nothing in the process reads a
-   directory today), the browser through the provider that already knows
-   how to make a subdirectory. That split is correct rather than a
-   workaround, and it is why listing is not the namespace's job.
+4. **`listDatabases` and `dropDatabase`, which exist nowhere.** Neither
+   name appears anywhere in this repository, in any commit, on any
+   branch. It is an easy thing to misremember, because the COLLECTION
+   pair is everywhere — `Db.listCollections` / `Db.dropCollection`, both
+   on the wire, both in `bin/db.js`, both in `docs/db-example.js`. The
+   database-level pair has never been written.
+
+   They arrive here, and in BOTH halves at once: the wire ops and the
+   `Client` methods, same names, same meanings, because a `Client` method
+   that only works over a socket has missed the point of there being one
+   `Client`.
+
+   Neither is free at the provider layer, and that is the part to scope
+   before starting. A provider today has `listFiles()`, which filters to
+   `kind === 'file'` (OPFS) and `isFile()` (Node) and therefore cannot
+   see a database at all, and `subProvider(name)`, which CREATES on
+   demand and so cannot answer "does this one exist". There is
+   `deleteFile(name)` and nothing that removes a subdirectory. So all
+   three providers — OPFS, Node, memory — grow two capabilities, and
+   `dropDatabase` has to decide what it means for the Node provider's
+   per-directory lock and for a `Db` the `Client` still has cached.
+
+   In C, listing needs a directory listing and **`bj_ns` deliberately
+   cannot produce one** — OPFS enumeration is asynchronous, so `bjns.h`
+   passes listings in rather than offering them. Nothing in the server
+   reads a directory today; it will need POSIX/WASI `readdir`. That
+   split is correct rather than a workaround, and it is exactly why
+   listing is each host's own and not the namespace's.
 5. **The database axis through the session.** Cursors, change streams,
    the applied index, compaction and the orphan sweep are all keyed by
    collection name today; each becomes `(db, coll)`. Change streams are
    the one that fails silently rather than loudly: `dbs_watched` and
    `dbs_emit` match on the collection name alone, so two databases with a
    `users` in each would cross-deliver events.
-6. **Whatever the choice above committed you to.** Under (a) that is the
-   database in the logged command and the floor across every database.
+6. **The database in the logged command, and the floor across all of
+   them.** `dc_wal_plan_build` names a collection; a command that does
+   not also name its database is a command a replica cannot apply.
+   `dbs_applied_floor` becomes the instance's, per the section above.
+   Both are the whole of what one-log-per-instance costs in C.
 
 ## Invariants that must hold
 

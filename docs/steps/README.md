@@ -46,10 +46,12 @@ connection to an instance, `client.db(name)` switching between databases
 over it, in the server and in the browser alike. That is a different
 thing from a seat — one cluster serving several named databases, rather
 than several clusters sharing a process — and it is much cheaper,
-because under one log for the instance Raft does not change at all.
-Whether that is the right choice is brief 1's first deliverable; the
-argument is written out there. The rest of the retired brief's inventory
-(the seed loop, the deferred reply) is brief 2, where it belongs.
+because **replication follows the instance**: one log, one leader, one
+member set for the executable, so `server/replica.c` and
+`server/peers.c` are untouched and the database axis is the session's.
+That is decided and the argument is written out there. The rest of the
+retired brief's inventory (the seed loop, the deferred reply) is brief
+2, where it belongs.
 
 **The server is a cluster member**, which is why its brief is gone.
 `nisaba-server --raft ID --raft-port N --peer ID@HOST:PORT` is a Raft

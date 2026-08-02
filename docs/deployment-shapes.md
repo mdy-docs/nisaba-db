@@ -376,9 +376,10 @@ What is still missing on the C side — briefs in [`steps/`](steps/):
    and in the browser alike. The library already writes that layout in
    process (`Client.db(name)`, a real subdirectory per name); the server
    serves one directory as one database, the wire has no `db` field, and
-   `connectServer` returns a `Db` with no client above it. Its first
-   deliverable is a decision: one log for the instance, or one per
-   database.
+   `connectServer` returns a `Db` with no client above it. Replication
+   follows the instance rather than each database — one log, one leader,
+   one member set for the executable — so `server/replica.c` and
+   `server/peers.c` are untouched by it.
 2. **Joining a native cluster**
    (`steps/joining-a-native-cluster.md`) — growing a cluster without
    restarting its members. The node already answers a join; nothing in C

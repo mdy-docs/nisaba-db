@@ -143,8 +143,14 @@ Each step should land green on its own.
    `sst_check_files` before writing the manifest that commits the
    generation. It then raises `RN_EFFECT_INSTALLED` — because adoption
    is the host's, permanently (see "What moves").
-4. **Adopt and log rebase.** One synchronous call between the host's close
-   and reopen. `rebaseLog` disappears wherever a namespace is present.
+4. ~~**Adopt and log rebase.**~~ **Done.** `rn_adopt_plan` names what
+   the adoption will touch; `rn_adopt` removes the stale live files,
+   copies the generation onto its live names, and rebases the log onto
+   the boundary carrying the hard state forward -- one synchronous call,
+   where the host's close and reopen are either side of it. `rebaseLog`
+   has nothing left to do wherever a namespace is present: the node
+   opens the log itself and owns it (`rn_log` reaches it; `rn_free`
+   closes it and its handle, which `elog_free` does not).
 5. **Retire the `snapshotter` object**, or keep it as the no-namespace
    fallback, and update `ReplicatedDb` and the test harness.
 

@@ -179,6 +179,69 @@ int rn_install_plan(raft_node *n, const uint8_t *msg, uint32_t len, dbuf *out);
 int      rn_installing(const raft_node *n);
 uint64_t rn_install_boundary(const raft_node *n);
 
+/* ---- adopting one -------------------------------------------------------
+ *
+ * A committed generation is a snapshot ON DISK; adopting it is putting
+ * its files onto the names the database actually opens. That is the last
+ * step of an install and the only irreversible one after the manifest.
+ *
+ * IT RUNS BETWEEN THE HOST'S CLOSE AND ITS REOPEN. Closing and reopening
+ * the database stays the host's forever -- reopening rebuilds collection
+ * handles and, in a browser, needs asynchronous opens -- so the sequence
+ * is exactly dc_compact_execute's:
+ *
+ *     RN_EFFECT_INSTALLED arrives
+ *     host quiesces and CLOSES the database
+ *     rn_adopt_plan(n, &names)      names every file this will touch
+ *     ... host makes those resolvable ...
+ *     rn_adopt(n, victims, len, &old)   ONE synchronous call
+ *     host REOPENS the database, and frees `old`
+ *
+ * One call, because between the first restored file and the last the
+ * database is neither the old one nor the new one, and nothing may
+ * observe it there. A sequence of awaits would have to be held apart by
+ * a host-side gate; a synchronous call cannot be interleaved at all.
+ *
+ * `victims` is the NUL-separated list of live files to REMOVE first --
+ * the ones the new generation does not have, including stale journals,
+ * which would otherwise rewind a restored file on the next recovery.
+ * The host supplies it because deciding which of its files are the
+ * database's is the host's knowledge, not this layer's: a Raft node has
+ * no idea what a collection is. A victim that is about to be restored is
+ * skipped rather than removed-then-created, which bjns.h forbids
+ * outright (a deferred remove could land after the create).
+ *
+ * The LOG is rebased here too, which is what retires `rebaseLog`: a
+ * fresh log based at the snapshot's boundary, carrying the hard state
+ * forward, opened through the namespace this node already has. The one
+ * it replaces is handed back through `*old` -- rn_new BORROWED that log
+ * and this file has never freed one. The new log is the node's own and
+ * dies with rn_free.
+ *
+ * Ordering is the contract, as everywhere else here: the log is rebased
+ * LAST, so a failure part-way leaves a node whose files moved but whose
+ * log still describes the old state -- which recovery resolves by
+ * replaying, rather than a log that promises entries no file holds.
+ */
+int rn_adopt_plan(raft_node *n, dbuf *out);
+int rn_adopt(raft_node *n, const char *victims, size_t victims_len, elog **old);
+
+/* Whether an install has committed and is waiting to be adopted, and the
+ * boundary it will move this node to. A host that restarts mid-adoption
+ * asks this after reopening. */
+int      rn_adopt_pending(const raft_node *n);
+uint64_t rn_adopt_boundary(const raft_node *n);
+
+/*
+ * The log this node is using. Normally the one the caller lent it and
+ * already has -- but after rn_adopt it is one the NODE opened, and a
+ * host has no other way to reach it. Read-only in spirit: the durable
+ * half of the node's state is in here (currentTerm, votedFor, the
+ * entries), and a host that writes to it behind the node's back is
+ * writing to state the node believes it owns.
+ */
+elog *rn_log(const raft_node *n);
+
 /* The most files one snapshot may have. A generation past this is
  * refused with RAFT_ERR_CAPACITY when a transfer would start, rather
  * than being streamed half-way: the bound exists so the chunk walk can

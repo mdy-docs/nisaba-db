@@ -125,6 +125,32 @@ struct raft_node {
         uint32_t crc[RN_MAX_SNAP_FILES];
     } recv;
 
+    /*
+     * What a committed install still owes: putting its files onto the
+     * live names. Kept across the host's close/reopen, because that is
+     * precisely the window adoption runs in.
+     *
+     * `members` is stashed here rather than re-read from the store,
+     * because the store's manifest does not carry it -- the member set
+     * rides the INSTALL, so a bootstrapped node whose log holds no
+     * CONFIG history learns the cluster's shape from the snapshot that
+     * built it.
+     */
+    struct {
+        int      pending;
+        uint64_t gen, index, term;
+        dbuf     members;
+    } adopt;
+    /* A log this node created for itself in rn_adopt, and therefore
+     * frees. The one rn_new was given is the caller's, always.
+     *
+     * The io is kept because elog_free does not close one -- it holds a
+     * COPY of the vtable, not the handle behind it -- so a rebase that
+     * dropped it would leak a descriptor per install.
+     */
+    int    owns_log;
+    bj_io  own_io;
+
     int      role;
     uint64_t leader_id;
     uint64_t commit_index;
@@ -308,6 +334,14 @@ void rn_free(raft_node *n) {
     dbuf_free(&n->adopted);
     dbuf_free(&n->snap_manifest);
     dbuf_free(&n->recv.manifest);
+    dbuf_free(&n->adopt.members);
+    /* A log this node rebased for itself, and the handle under it. The
+     * one it was GIVEN is the caller's and is never freed here --
+     * rn_new's contract. */
+    if (n->owns_log) {
+        elog_free(n->log);
+        if (n->own_io.close) n->own_io.close(n->own_io.ctx);
+    }
     free(n);
 }
 
@@ -1274,6 +1308,23 @@ static int handle_install(raft_node *n, uint64_t corr,
                     ok = 0;
                     restart = 1;
                 } else {
+                    /* What adoption still owes, recorded before the
+                     * staging state is cleared: the generation to put
+                     * onto the live names, and the member set that rode
+                     * the install (the store's manifest does not carry
+                     * one). */
+                    n->adopt.pending = 1;
+                    n->adopt.gen = n->recv.gen;
+                    n->adopt.index = n->recv.index;
+                    n->adopt.term = n->recv.term;
+                    n->adopt.members.len = 0;
+                    {
+                        uint32_t mlen = 0;
+                        const uint8_t *m = rec_raw(n->recv.manifest.data,
+                                                   (uint32_t)n->recv.manifest.len,
+                                                   "members", &mlen);
+                        if (m && mlen) dbuf_put(&n->adopt.members, m, mlen);
+                    }
                     uint64_t boundary = n->recv.index;
                     install_abort(n);
                     emit(n, RN_EFFECT_INSTALLED, boundary, 0);
@@ -1288,6 +1339,241 @@ static int handle_install(raft_node *n, uint64_t corr,
     if (!e) e = queue(n, in.leader_id, corr, 1, reply.data, reply.len);
     dbuf_free(&reply);
     return e;
+}
+
+/* ---- adopting one ------------------------------------------------------- */
+
+elog    *rn_log(const raft_node *n)            { return n ? n->log : NULL; }
+int      rn_adopt_pending(const raft_node *n)  { return n && n->adopt.pending; }
+uint64_t rn_adopt_boundary(const raft_node *n) { return n ? n->adopt.index : 0; }
+
+/* Each {role, name} of the adopted generation's `config.live` -- the map
+ * from a snapshot's roles back to the file names the database opens. */
+typedef int (*live_visit_fn)(void *ctx, const char *role, uint32_t role_len,
+                             const char *name, uint32_t name_len);
+
+static int live_each(const uint8_t *latest, uint32_t latest_len,
+                     live_visit_fn visit, void *ctx) {
+    uint32_t clen = 0;
+    const uint8_t *config = rec_raw(latest, latest_len, "config", &clen);
+    if (!config) return RAFT_ERR_MESSAGE;
+    uint32_t llen = 0;
+    const uint8_t *live = rec_raw(config, clen, "live", &llen);
+    if (!live) return RAFT_ERR_MESSAGE;
+
+    cur c = { live, llen, 0 };
+    uint32_t count = 0;
+    if (array_begin(&c, &count)) return RAFT_ERR_MESSAGE;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c)) return RAFT_ERR_MESSAGE;
+        const uint8_t *el = c.d + start;
+        size_t el_len = c.pos - start;
+        uint32_t rlen = 0, nlen = 0;
+        const char *role = entry_role(el, el_len, &rlen);
+        const uint8_t *nv = rec_raw(el, el_len, "name", &nlen);
+        if (!role || !nv || nlen < 5 || nv[0] != BJ_TYPE_STRING) return RAFT_ERR_MESSAGE;
+        uint32_t n_str = rdu32(nv + 1);
+        if ((size_t)n_str + 5 != nlen) return RAFT_ERR_MESSAGE;
+        int e = visit(ctx, role, rlen, (const char *)(nv + 5), n_str);
+        if (e) return e;
+    }
+    return BJ_OK;
+}
+
+typedef struct { raft_node *n; dbuf *out; int e; } plan_ctx;
+
+static int put_name(dbuf *out, const uint8_t *name, size_t len) {
+    int e = dbuf_put(out, name, len);
+    if (!e) e = dbuf_put(out, (const uint8_t *)"", 1);
+    return e;
+}
+
+static int plan_live(void *vctx, const char *role, uint32_t role_len,
+                     const char *name, uint32_t name_len) {
+    plan_ctx *p = (plan_ctx *)vctx;
+    dbuf gen_name = {0};
+    int e = sst_data_name(p->n->store, p->n->adopt.gen, role, role_len, &gen_name);
+    if (!e) e = put_name(p->out, gen_name.data, gen_name.len);
+    dbuf_free(&gen_name);
+    if (!e) e = put_name(p->out, (const uint8_t *)name, name_len);
+    return e;
+}
+
+int rn_adopt_plan(raft_node *n, dbuf *out) {
+    if (!n || !out) return BJ_ERR_STATE;
+    if (!n->adopt.pending || !n->store) return BJ_OK;
+
+    dbuf latest = {0};
+    int has = 0;
+    int e = sst_latest(n->store, &latest, &has);
+    if (!e && has) {
+        plan_ctx ctx = { n, out, 0 };
+        e = live_each(latest.data, (uint32_t)latest.len, plan_live, &ctx);
+    }
+    dbuf_free(&latest);
+    if (e) return e;
+
+    /* The log this adoption will create. Named by the store, like every
+     * other file in a generation. */
+    dbuf log_name = {0};
+    e = sst_log_name(n->store, n->adopt.gen, &log_name);
+    if (!e) e = put_name(out, log_name.data, log_name.len);
+    dbuf_free(&log_name);
+    return e;
+}
+
+/* Copy one generation file onto the live name the manifest maps it to.
+ * A chunk at a time, so a large collection is not a large allocation. */
+typedef struct { raft_node *n; uint8_t *buf; uint32_t cap; } copy_ctx;
+
+static int copy_live(void *vctx, const char *role, uint32_t role_len,
+                     const char *name, uint32_t name_len) {
+    copy_ctx *c = (copy_ctx *)vctx;
+    bj_ns *ns = c->n->ns;
+    dbuf gen_name = {0};
+    int e = sst_data_name(c->n->store, c->n->adopt.gen, role, role_len, &gen_name);
+    if (e) { dbuf_free(&gen_name); return e; }
+
+    bj_io src, dst;
+    e = ns->open(ns->ctx, (const char *)gen_name.data, (uint32_t)gen_name.len, 0, &src);
+    dbuf_free(&gen_name);
+    if (e) return e;
+    /* TRUNC, never remove-then-create: a deferred remove could land
+     * after the create and take the restored file with it (bjns.h). */
+    e = ns->open(ns->ctx, name, name_len, BJ_NS_CREATE | BJ_NS_TRUNC, &dst);
+    if (e) { if (src.close) src.close(src.ctx); return e; }
+
+    uint64_t total = src.size(src.ctx), at = 0;
+    while (!e && at < total) {
+        uint32_t want = (uint32_t)((total - at > c->cap) ? c->cap : (total - at));
+        int64_t got = src.read(src.ctx, at, c->buf, want);
+        if (got <= 0) { e = (int)(got < 0 ? got : BJ_ERR_EOF); break; }
+        e = dst.write(dst.ctx, at, c->buf, (uint32_t)got);
+        at += (uint64_t)got;
+    }
+    /* Durable before the log is rebased onto it: a restored file still
+     * in a buffer is a snapshot the next crash does not have. */
+    if (!e && dst.sync) e = dst.sync(dst.ctx);
+    if (dst.close) dst.close(dst.ctx);
+    if (src.close) src.close(src.ctx);
+    return e;
+}
+
+/* Is `name` one of the live names the generation restores? */
+typedef struct { const char *name; uint32_t len; int found; } is_live_ctx;
+
+static int is_live(void *vctx, const char *role, uint32_t role_len,
+                   const char *name, uint32_t name_len) {
+    is_live_ctx *c = (is_live_ctx *)vctx;
+    (void)role; (void)role_len;
+    if (name_len == c->len && memcmp(name, c->name, name_len) == 0) {
+        c->found = 1;
+        return 1;
+    }
+    return 0;
+}
+
+int rn_adopt(raft_node *n, const char *victims, size_t victims_len, elog **old) {
+    if (!n || !old) return BJ_ERR_STATE;
+    *old = NULL;
+    if (!n->adopt.pending) return BJ_ERR_STATE;
+    if (!n->ns || !n->store) return BJ_ERR_STATE;
+
+    dbuf latest = {0};
+    int has = 0;
+    int e = sst_latest(n->store, &latest, &has);
+    if (!e && !has) e = RAFT_ERR_CAPACITY;
+    if (e) { dbuf_free(&latest); return e; }
+
+    /* The hard state has to outlive the log that holds it: a fresh log
+     * starts at term 0 having voted for nobody, and a node that forgot
+     * its vote can vote twice in one term. */
+    uint64_t hard_term = elog_current_term(n->log);
+    uint64_t hard_voted = elog_voted_for(n->log);
+
+    /* Stale live files first -- the ones this generation does not
+     * restore. A journal left behind is the sharp one: recovery would
+     * replay it over a restored file and rewind it. */
+    for (size_t at = 0; at < victims_len; ) {
+        size_t end = at;
+        while (end < victims_len && victims[end] != '\0') end++;
+        if (end > at) {
+            is_live_ctx c = { victims + at, (uint32_t)(end - at), 0 };
+            live_each(latest.data, (uint32_t)latest.len, is_live, &c);
+            if (!c.found)
+                n->ns->remove(n->ns->ctx, victims + at, (uint32_t)(end - at));
+        }
+        at = end + 1;
+    }
+
+    /* Then the restore itself. */
+    {
+        static const uint32_t CHUNK = 64u * 1024u;
+        copy_ctx c = { n, (uint8_t *)malloc(CHUNK), CHUNK };
+        if (!c.buf) e = BJ_ERR_OOM;
+        else e = live_each(latest.data, (uint32_t)latest.len, copy_live, &c);
+        free(c.buf);
+    }
+    dbuf_free(&latest);
+    if (e) return e;
+
+    /* And the log, LAST. Until this line the node still describes the
+     * state it had; after it, the one it was sent. */
+    dbuf log_name = {0};
+    e = sst_log_name(n->store, n->adopt.gen, &log_name);
+    elog *fresh = NULL;
+    bj_io io;
+    memset(&io, 0, sizeof io);
+    if (!e) {
+        e = n->ns->open(n->ns->ctx, (const char *)log_name.data, (uint32_t)log_name.len,
+                        BJ_NS_CREATE | BJ_NS_TRUNC, &io);
+        if (!e) {
+            /* elog_create_at copies the vtable, so this stack io is
+             * safe to pass -- but the HANDLE behind it is not closed by
+             * elog_free, which is why it is kept below. */
+            fresh = elog_create_at(&io, n->adopt.index, n->adopt.term);
+            if (!fresh) e = BJ_ERR_OOM;
+        }
+    }
+    dbuf_free(&log_name);
+    if (e) {
+        if (io.close) io.close(io.ctx);
+        return e;
+    }
+
+    if (hard_term > 0) e = elog_set_hard_state(fresh, hard_term, hard_voted);
+    if (e) {
+        elog_free(fresh);
+        if (io.close) io.close(io.ctx);
+        return e;
+    }
+
+    /* A second adoption replaces a log this node already owned, and
+     * that one is ours to close rather than the caller's to be handed
+     * back twice. The caller only ever gets the log it lent us. */
+    if (n->owns_log) {
+        elog_free(n->log);
+        if (n->own_io.close) n->own_io.close(n->own_io.ctx);
+        *old = NULL;
+    } else {
+        *old = n->log;
+    }
+    n->log = fresh;
+    n->own_io = io;
+    n->owns_log = 1;
+
+    /* Where this node now stands. The member set rode the install
+     * because a bootstrapped log has no CONFIG history to derive it
+     * from; it goes through rn_set_members like every other adoption,
+     * which is what keeps the voter list and the peer cursors together. */
+    rn_seed_commit(n, n->adopt.index);
+    if (n->adopt.members.len)
+        rn_set_members(n, n->adopt.members.data, (uint32_t)n->adopt.members.len);
+
+    n->adopt.pending = 0;
+    n->adopt.members.len = 0;
+    return BJ_OK;
 }
 
 /* ---- replication -------------------------------------------------------- */

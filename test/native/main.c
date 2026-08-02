@@ -8533,6 +8533,244 @@ fail:
     return NULL;
 }
 
+/*
+ * A namespace whose remove() is DEFERRED, the way the browser adapter's
+ * is: bjns_bridge.c queues the name and the host drains the queue after
+ * the synchronous C call returns, because OPFS removeEntry() is
+ * asynchronous.
+ *
+ * It exists because the rule bjns.h states -- "what is NOT safe is
+ * ordering a create against a remove" -- is invisible under POSIX, where
+ * unlink happens immediately and remove-then-create works by accident. A
+ * caller that got this wrong would pass every native test and delete a
+ * restored file in a browser.
+ */
+typedef struct {
+    bj_ns    inner;
+    dbuf     queued;      /* NUL-separated names awaiting removal */
+} deferred_ns;
+
+static int32_t dns_open(void *ctx, const char *name, uint32_t name_len,
+                        uint32_t flags, bj_io *out) {
+    deferred_ns *d = (deferred_ns *)ctx;
+    return d->inner.open(d->inner.ctx, name, name_len, flags, out);
+}
+static int32_t dns_close(void *ctx, bj_io *io) {
+    deferred_ns *d = (deferred_ns *)ctx;
+    return d->inner.close(d->inner.ctx, io);
+}
+static int32_t dns_remove(void *ctx, const char *name, uint32_t name_len) {
+    deferred_ns *d = (deferred_ns *)ctx;
+    dbuf_put(&d->queued, (const uint8_t *)name, name_len);
+    dbuf_put(&d->queued, (const uint8_t *)"", 1);
+    return BJ_OK;                       /* accepted, not performed */
+}
+static int32_t dns_sync(void *ctx) {
+    deferred_ns *d = (deferred_ns *)ctx;
+    return d->inner.sync ? d->inner.sync(d->inner.ctx) : BJ_OK;
+}
+
+/* What the host does once the synchronous call has returned. */
+static void deferred_drain(deferred_ns *d) {
+    for (size_t at = 0; at < d->queued.len; ) {
+        size_t end = at;
+        while (end < d->queued.len && d->queued.data[end] != '\0') end++;
+        if (end > at)
+            d->inner.remove(d->inner.ctx, (const char *)d->queued.data + at,
+                            (uint32_t)(end - at));
+        at = end + 1;
+    }
+    d->queued.len = 0;
+}
+
+static void deferred_wrap(deferred_ns *d, bj_ns *out) {
+    out->ctx = d;
+    out->open = dns_open;
+    out->close = dns_close;
+    out->remove = dns_remove;
+    out->sync = dns_sync;
+}
+
+TEST(adopting_an_install_puts_its_files_where_the_database_looks) {
+    /*
+     * docs/steps/install-snapshot-in-c.md stage 4. A committed
+     * generation is a snapshot ON DISK; adopting it is putting its files
+     * onto the names the database actually opens, and rebasing the log
+     * onto the boundary it covers.
+     *
+     * This was _adoptInstalledSnapshot plus restoreFromStore plus the
+     * rebaseLog callback -- and rebaseLog existed for exactly one
+     * reason, which the brief names: "the node needs a FILE and has no
+     * way to ask for one". It has a namespace now.
+     *
+     * The window this runs in is the whole design: between the host's
+     * close and its reopen, in ONE synchronous call, because between the
+     * first restored file and the last the database is neither the old
+     * one nor the new one.
+     */
+    char dir[64];
+    CHECK_FATAL(scratch_dir("nisaba-adopt", dir, sizeof dir) == 0);
+    int dfd = open(dir, O_RDONLY);
+    CHECK_FATAL(dfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dfd, &ns) == BJ_OK);
+
+    /* ---- the state this node is about to stop having: a live file with
+     * the OLD contents, and a stale journal beside it. The journal is
+     * the sharp one -- recovery replays it, so a restore that left it
+     * behind would rewind the file it just wrote. */
+    static const char OLD[] = "the state before the install";
+    static const char JOURNAL[] = "a half-finished commit from before";
+    bj_io io;
+    CHECK_OK(ns.open(ns.ctx, "coll-users.bj", 13, BJ_NS_CREATE | BJ_NS_TRUNC, &io));
+    CHECK_OK(io.write(io.ctx, 0, (const uint8_t *)OLD, (uint32_t)sizeof OLD));
+    if (io.close) io.close(io.ctx);
+    CHECK_OK(ns.open(ns.ctx, "coll-users.journal.bj", 21, BJ_NS_CREATE | BJ_NS_TRUNC, &io));
+    CHECK_OK(io.write(io.ctx, 0, (const uint8_t *)JOURNAL, (uint32_t)sizeof JOURNAL));
+    if (io.close) io.close(io.ctx);
+
+    /* ---- an empty store: the generation this node adopts is the one
+     * the install is about to create, which is the whole path rather
+     * than a fixture standing in for most of it. */
+    static const char NEW[] = "the state the leader sent, which is different";
+    sst *store = sst_new("snap", 4);
+    CHECK_FATAL(store != NULL);
+    CHECK_OK(sst_scan(store, (const uint8_t *)"", 0));
+
+    /* ---- the node, with a log carrying hard state worth keeping. */
+    bj_io lio;
+    CHECK_OK(ns.open(ns.ctx, "raft.bj", 7, BJ_NS_CREATE | BJ_NS_TRUNC, &lio));
+    elog *log = elog_create(&lio);
+    CHECK_FATAL(log != NULL);
+    CHECK_OK(elog_set_hard_state(log, 9, 3));      /* term 9, voted for node 3 */
+    raft_node *n = rn_new(2, log);
+    CHECK_FATAL(n != NULL);
+    rn_set_ns(n, &ns);
+    rn_set_snapstore(n, store);
+
+    /* An install lands. Driven through the real handler so the adoption
+     * is fed by the thing that produces it, not by a test poking state. */
+    {
+        doc *m = doc_new();
+        /* config.live is the map from a snapshot's roles back to the
+         * names the database opens -- and it travels WITH the install,
+         * because the live names are the database's scheme and are the
+         * same on every replica. Without it a generation is a set of
+         * files nobody can put anywhere. */
+        doc_begin_obj(m, "config");
+        doc_begin_arr(m, "live");
+        bj_begin_object(m->b);
+        doc_str(m, "role", "users");
+        doc_str(m, "name", "coll-users.bj");
+        bj_end_object(m->b);
+        doc_end_arr(m);
+        doc_end_obj(m);
+        doc_begin_arr(m, "files");
+        bj_begin_object(m->b);
+        doc_str(m, "role", "users");
+        doc_int(m, "size", (int64_t)sizeof NEW);
+        doc_int(m, "crc", (int64_t)bjfile_crc32(0, (const uint8_t *)NEW, sizeof NEW));
+        bj_end_object(m->b);
+        doc_end_arr(m);
+        doc_begin_arr(m, "members");
+        bj_begin_object(m->b);
+        doc_int(m, "id", 2);
+        bj_end_object(m->b);
+        bj_begin_object(m->b);
+        doc_int(m, "id", 5);
+        bj_end_object(m->b);
+        doc_end_arr(m);
+        uint32_t mlen; const uint8_t *mbuf = doc_done(m, &mlen);
+
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_install_snapshot(9, 1, 40, 6, "users", 5, 0,
+                                             (const uint8_t *)NEW, (uint32_t)sizeof NEW,
+                                             1, mbuf, mlen, &msg));
+        CHECK_OK(rn_handle(n, 1, msg.data, (uint32_t)msg.len, 0.0));
+        rn_out_clear(n);
+        rn_effects_clear(n);
+        dbuf_free(&msg);
+        doc_free(m);
+    }
+    CHECK_I64(rn_adopt_pending(n), 1);
+    CHECK_I64((int64_t)rn_adopt_boundary(n), 40);
+
+    /* ---- the plan names what the adoption will touch, so a browser
+     * host can open exactly these before the synchronous call. Under
+     * POSIX nothing needs pre-opening -- but asking is the discipline. */
+    {
+        dbuf names = {0};
+        CHECK_OK(rn_adopt_plan(n, &names));
+        CHECK(dirlist_has(&names, "coll-users.bj"));      /* the destination */
+        CHECK(dirlist_has(&names, "snap-1-users.bj"));    /* the source */
+        dbuf_free(&names);
+    }
+
+    /* ---- and the adoption itself: one call, where the host's close and
+     * reopen would be either side of it.
+     *
+     * Run through a namespace whose remove() is DEFERRED, like the
+     * browser adapter's. `coll-users.bj` is named as a victim AND
+     * restored as a live name -- the ordering bjns.h forbids ("never
+     * order a create against a remove"). Under POSIX a mistake here is
+     * invisible, because unlink is immediate and remove-then-create
+     * works by accident; with the removal deferred it lands AFTER the
+     * create and takes the restored file with it. */
+    deferred_ns dns;
+    memset(&dns, 0, sizeof dns);
+    dns.inner = ns;
+    bj_ns slow;
+    deferred_wrap(&dns, &slow);
+    rn_set_ns(n, &slow);
+    {
+        /* Every live database file, which is the host's knowledge to
+         * have -- a Raft node has no idea what a collection is. */
+        static const char VICTIMS[] = "coll-users.bj\0coll-users.journal.bj\0";
+        elog *old = NULL;
+        CHECK_OK(rn_adopt(n, VICTIMS, sizeof VICTIMS - 1, &old));
+        CHECK(old == log);        /* the log we lent it, back to free */
+        elog_free(old);
+        if (lio.close) lio.close(lio.ctx);
+    }
+    deferred_drain(&dns);
+    dbuf_free(&dns.queued);
+    CHECK_I64(rn_adopt_pending(n), 0);
+
+    /* The live file holds what the leader sent. */
+    {
+        CHECK_OK(ns.open(ns.ctx, "coll-users.bj", 13, 0, &io));
+        char got[128];
+        memset(got, 0, sizeof got);
+        CHECK_I64(io.read(io.ctx, 0, (uint8_t *)got, (uint32_t)sizeof NEW),
+                  (int64_t)sizeof NEW);
+        CHECK(memcmp(got, NEW, sizeof NEW) == 0);
+        if (io.close) io.close(io.ctx);
+    }
+
+    /* And the stale journal is GONE. It named no role, so nothing
+     * restored over it; left behind, recovery would replay it and rewind
+     * the file that was just written. */
+    {
+        int rc = ns.open(ns.ctx, "coll-users.journal.bj", 21, 0, &io);
+        if (rc == BJ_OK && io.close) io.close(io.ctx);
+        CHECK(rc != BJ_OK);   /* it named no role, so nothing restored over it */
+    }
+
+    /* The log was rebased onto the boundary, and carried the hard state
+     * across: a fresh log starts at term 0 having voted for nobody, and
+     * a node that forgot its vote can vote twice in one term. */
+    CHECK_I64((int64_t)rn_commit_index(n), 40);
+    CHECK_I64((int64_t)elog_current_term(rn_log(n)), 9);
+    CHECK_I64((int64_t)elog_voted_for(rn_log(n)), 3);
+    CHECK_I64((int64_t)elog_base_index(rn_log(n)), 40);
+    CHECK_I64((int64_t)rn_quorum(n), 2);      /* the manifest's two members */
+
+    rn_free(n);      /* frees the log it made for itself, and its handle */
+    sst_free(store);
+    bjns_posix_free(&ns);
+    close(dfd);
+}
+
 TEST(an_install_crosses_two_c_nodes_and_nothing_else) {
     /*
      * docs/steps/install-snapshot-in-c.md, the receive side -- and the
@@ -9911,6 +10149,7 @@ int main(void) {
     RUN(effects_coalesce_rather_than_pile_up_and_a_loss_is_never_silent);
     RUN(join_leave_and_timeout_now_are_answered_without_a_host);
     RUN(a_leader_streams_its_own_snapshot_with_no_host_to_read_the_files);
+    RUN(adopting_an_install_puts_its_files_where_the_database_looks);
     RUN(an_install_crosses_two_c_nodes_and_nothing_else);
     RUN(a_staged_install_adopts_nothing_unless_every_byte_checks_out);
     RUN(a_reply_goes_to_whoever_the_message_says_sent_it);

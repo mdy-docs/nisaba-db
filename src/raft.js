@@ -143,7 +143,7 @@
  * (src/raft-host.js) drives both ends.
  */
 import {
-  ENTRYLOG_TYPE, encode, decode, raftMsg, raftDrive,
+  ENTRYLOG_TYPE, EntryLog, encode, decode, raftMsg, raftDrive,
   RaftCore, RAFT_ROLE, RN_EFFECT
 } from '../wasm/nisaba-wasm.js';
 
@@ -210,6 +210,19 @@ export class RaftNode {
    *       writeChunk(role, offset, data), commit(), abort() } }
    *   commit() must validate the staged bytes and adopt the whole state
    *   into the state machine (appliedIndex becomes the boundary).
+   *   IGNORED when `files` is given: the node does all three itself.
+   * @param {object} [options.files] - the file seam that lets the NODE
+   *   serve, receive and adopt an install (raft_node.h):
+   *   { store,                  // an open SnapshotStore, BORROWED
+   *     open(name) -> Promise<syncHandle>,   // create if missing
+   *     remove(name) -> Promise<void>,
+   *     swap(adopt) -> Promise<void> }
+   *   `swap` is the close/reopen the host owns forever: close the
+   *   database, `await adopt(victims)` — the live filenames this
+   *   generation does not restore, stale journals included — and reopen
+   *   it. Everything between those two lines is one synchronous C call,
+   *   because in there the database is neither the old one nor the new
+   *   one and nothing may observe it (raft_node.h).
    * @param {(lastIncludedIndex, lastIncludedTerm) => Promise<EntryLog>}
    *   [options.rebaseLog] - after an install commits, return a fresh OPEN
    *   EntryLog based at the boundary (the node closes the old log first
@@ -223,7 +236,7 @@ export class RaftNode {
    */
   constructor({
     id, peers, log, stateMachine, transport,
-    snapshotter = null, rebaseLog = null, onConfig = null, onEvent = null,
+    snapshotter = null, rebaseLog = null, files = null, onConfig = null, onEvent = null,
     electionTimeoutMs = [150, 300], heartbeatMs = 50,
     maxBatchBytes = 65536, snapshotChunkBytes = 65536, random = Math.random
   }) {
@@ -246,6 +259,19 @@ export class RaftNode {
      * below is the host's half; anything that looks like a Raft decision
      * is a question asked of this. */
     this._core = new RaftCore(id, log, { electionTimeoutMs, heartbeatMs, maxBatchBytes });
+
+    /**
+     * The file seam. With it, the node serves an install, receives one
+     * and adopts it entirely in C — `snapshotter` and `rebaseLog` are
+     * never consulted, and the only thing left on this side is opening
+     * a file, which is asynchronous in a browser and so can never be
+     * inside a synchronous call (bjns.h).
+     */
+    this._files = files;
+    if (files) {
+      this._core.attachFiles(files);
+      this._core.chunkBytes = snapshotChunkBytes;
+    }
 
     this._reachable = new Map(); // peer -> bool (edge-triggered events)
     const boot = new Map();
@@ -322,6 +348,16 @@ export class RaftNode {
     // derivation that could disagree with the first. There is nothing to
     // keep in step now: there is one copy, and this is a view of it.
     this._core.setMembers(input);
+    this._readMembers();
+  }
+
+  /**
+   * The view half of _setMembers, on its own for the one adoption this
+   * side does not perform: rn_adopt takes the member set out of the
+   * install's manifest itself (a bootstrapped log has no CONFIG history
+   * to derive it from), so there is nothing left to do but read it.
+   */
+  _readMembers() {
     const { members, voters, peers } = this._core.adopted;
     this.memberInfo = members;
     this.members = members.map((m) => m.id);
@@ -444,6 +480,9 @@ export class RaftNode {
       }
       scan = batch[batch.length - 1].index + 1;
     }
+    // Before the first tick, because the first tick can be the one that
+    // finds a peer below this node's log base and starts streaming.
+    await this.refreshSnapshotFiles();
     this.isRunning = true;
     this._core.start(now, this.random());
     this._flush();
@@ -466,6 +505,11 @@ export class RaftNode {
     for (const [, w] of this._awaiting) w.reject(new Error('node stopped'));
     this._awaiting.clear();
     await this._applyChain.catch(() => {});
+    // The snapshot generation this node was holding open to stream from.
+    // The host opened those handles, so the host closes them — and a
+    // browser refuses a second sync access handle while the first lives,
+    // so a node stopped without this cannot be restarted.
+    await this._core.releaseFiles();
   }
 
   /**
@@ -788,6 +832,8 @@ export class RaftNode {
         return this._emit('truncate', { from: eff.arg, lastIndex: this._log.lastIndex });
       case RN_EFFECT.ELECTION:
         return this._emit('election', { preVote: eff.flag, forTerm: eff.arg });
+      case RN_EFFECT.INSTALLED:
+        return this._onInstalled(eff.arg);
       default:
         return undefined;
     }
@@ -853,8 +899,110 @@ export class RaftNode {
     // InstallSnapshot is the one kind the node refuses: it writes FILES,
     // and C has no namespace to write them through. Everything else --
     // votes, entries, join, leave, TimeoutNow -- the node answers itself.
-    if (kind === raftMsg.KIND.INSTALL_SNAPSHOT) return this._onInstallSnapshot(decode(bytes));
+    if (kind === raftMsg.KIND.INSTALL_SNAPSHOT) {
+      return this._files ? this._stageInstall(bytes) : this._onInstallSnapshot(decode(bytes));
+    }
     return this._handleRaftMessage(bytes);
+  }
+
+  /**
+   * An install chunk, answered by the NODE. C plans, the host opens, C
+   * executes (bjns.h): ask which files this chunk will touch, open
+   * exactly those, then one synchronous call that stages it — and, on
+   * the last chunk, verifies the whole generation against the leader's
+   * manifest and writes the manifest that commits it.
+   *
+   * ADOPTION IS NOT IN HERE, and the reply does not wait for it. What
+   * this answers is "the bytes are on disk and they are the ones you
+   * sent", which is a fact about files; putting them onto the names the
+   * database opens is a local follow-up that survives a restart in its
+   * own right (rn_adopt_pending).
+   */
+  async _stageInstall(bytes) {
+    const corr = ++this._inCorr;
+    const names = this._core.installPlan(bytes);
+    let reply = null;
+    let refused = null;
+    await this._core.withFiles(names, () => {
+      const rc = this._core.handle(corr, bytes, this.random());
+      if (rc !== 0) { refused = rc; return; }
+      for (const msg of this._core.drainOutbox()) {
+        if (msg.isReply && msg.corr === corr) reply = msg.bytes;
+        else this._send(msg);
+      }
+    });
+    if (refused !== null) throw new Error(`raft: message refused (${refused})`);
+    // Drained OUT here, not inside: an INSTALLED effect starts an
+    // adoption that reopens these same files by name, and a browser
+    // refuses a second sync access handle while the first is live.
+    this._flush();
+    return reply ?? encode({ term: this._log.currentTerm, success: false });
+  }
+
+  /**
+   * The generation committed; make it this node's state.
+   *
+   * Serialized through the apply chain for the reason the JavaScript
+   * install always was: an in-flight apply loop must never observe the
+   * swap, and after it lastApplied is a different number than the loop
+   * started with.
+   */
+  _onInstalled(boundary) {
+    this._emit('install', { phase: 'committed', lastIncludedIndex: boundary });
+    const run = this._applyChain.then(() => this._adoptInstall(boundary));
+    this._applyChain = run.catch(() => {});
+    run.catch((err) => this._emit('install', {
+      phase: 'failed', lastIncludedIndex: boundary, error: String(err?.message ?? err)
+    }));
+  }
+
+  async _adoptInstall(boundary) {
+    const names = this._core.adoptPlan();
+    // Planned last because it is REBASED last (raft_node.h): until that
+    // line the node still describes the state it had.
+    const logName = names[names.length - 1];
+    const previous = this._log;
+    await this._files.swap(async (victims) => {
+      await this._core.withFiles(
+        names, () => this._core.adopt(victims), { keep: [logName] }
+      );
+      // The node opened this log and owns it; what came back is the
+      // host's half — the handle and the fd, which bns_close deliberately
+      // does not touch. Assigned directly rather than through the `log`
+      // setter: C is already using it, and telling it again would say
+      // "here is a log you are borrowing" about one it owns.
+      const kept = this._core.keptFile(logName);
+      this._log = EntryLog.adopting(this._core.logCtx, kept.handle, kept.fd);
+      // Whichever log this replaced: one it had rebased before is already
+      // freed inside rn_adopt, and EntryLog.adopting's close() knows not
+      // to free it twice — but its file handle is the host's either way,
+      // and nothing else would ever close it.
+      await previous.close();
+    });
+    this.lastApplied = boundary;
+    // The manifest's member set stands in for every CONFIG at or below
+    // the boundary; rn_adopt already gave it to the node, so this side
+    // reads it back rather than adopting a second copy.
+    this._readMembers();
+    this._configIndex = boundary;
+    await this.refreshSnapshotFiles();
+    this._flush();
+    this._emit('install', { phase: 'finished', lastIncludedIndex: boundary });
+  }
+
+  /**
+   * Make the current snapshot generation resolvable BY NAME, standing,
+   * for as long as it is the latest.
+   *
+   * A leader streams chunks from inside rn_tick and rn_on_reply, which
+   * are synchronous — there is no plan beat to open on, so the names have
+   * to be open already. Called whenever `latest` moves: at start, after
+   * an install is adopted, and after the host takes a local snapshot.
+   */
+  async refreshSnapshotFiles() {
+    if (!this._files) return;
+    const latest = this._files.store.refresh();
+    await this._core.declareSnapshot(latest ? latest.files.map((f) => f.name) : []);
   }
 
   /**

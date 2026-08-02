@@ -1341,7 +1341,7 @@ const raftDrive = {
 const RAFT_ROLE = Object.freeze({ FOLLOWER: 0, CANDIDATE: 1, LEADER: 2 });
 const RN_EFFECT = Object.freeze({
   ROLE: 0, COMMIT: 1, NEEDS_SNAPSHOT: 2, PROMOTE: 3, REACHABLE: 4, TRUNCATED: 5,
-  ELECTION: 6
+  ELECTION: 6, INSTALLED: 7
 });
 
 class RaftCore {
@@ -1357,6 +1357,7 @@ class RaftCore {
     this._scope = 0;
     this._files = null;
     this._kept = null;
+    this._standing = null;   // name -> { fd, handle }, held open (declareSnapshot)
   }
 
   /**
@@ -1455,28 +1456,92 @@ class RaftCore {
   get adoptPending() { return requireModule()._rnw_adopt_pending(this._p) === 1; }
   get adoptBoundary() { return requireModule()._rnw_adopt_boundary(this._p); }
 
+  /** This node's name -> fd table; C resolves every open through it. */
+  _table() {
+    const M = requireModule();
+    const scopes = (M.bjnsScopes ||= {});
+    return (scopes[this._scope] ||= {});
+  }
+
+  /** bj_ns.remove MAY BE DEFERRED here -- OPFS removeEntry returns a
+   * promise (bjns.h) -- so the adapter queues names and this side drains
+   * the queue once the synchronous call has returned. */
+  async _drainRemoves() {
+    const M = requireModule();
+    const pending = M.bjnsPending && M.bjnsPending[this._scope];
+    if (!pending || !pending.length) return;
+    M.bjnsPending[this._scope] = [];
+    for (const f of pending) {
+      try { await this._files.remove(f); } catch { /* an orphan, not a fault */ }
+    }
+  }
+
+  /**
+   * Declare the files this node may read WITHOUT BEING ASKED FIRST: the
+   * current snapshot generation's, which a leader streams chunks from
+   * inside rn_tick and rn_on_reply. Those are synchronous, so there is no
+   * plan beat to open on -- the names have to be standing already.
+   *
+   * Call it whenever the store's `latest` moves (a local snapshot, an
+   * adopted install) and the previous generation's handles are released.
+   * A generation's data files are immutable and nothing else opens them,
+   * so holding them is free; it is the sending side's whole cost.
+   */
+  async declareSnapshot(names) {
+    const M = requireModule();
+    const table = this._table();
+    const previous = this._standing || new Map();
+    const standing = new Map();
+    for (const name of names) {
+      const already = previous.get(name);
+      if (already) { previous.delete(name); standing.set(name, already); continue; }
+      const handle = await this._files.open(name);
+      const fd = registerHandle(M, handle);
+      table[name] = fd;
+      standing.set(name, { fd, handle });
+    }
+    this._standing = standing;
+    await this._releaseAll(previous, table);
+  }
+
+  async _releaseAll(held, table) {
+    const M = requireModule();
+    let failure = null;
+    for (const [name, { fd, handle }] of held) {
+      delete table[name];
+      unregisterHandle(M, fd);
+      try { await handle.close(); } catch (err) { failure ||= err; }
+    }
+    held.clear();
+    if (failure) throw failure;
+  }
+
+  /** Give every standing handle back. The host opened them, so the host
+   * closes them -- bns_close is deliberately a no-op on the handle. */
+  async releaseFiles() {
+    if (this._standing) await this._releaseAll(this._standing, this._table());
+  }
+
   /**
    * Open every planned name into this node's scope table, run `fn()`,
    * then give the handles back. C resolves names from that table rather
    * than opening (bjns_bridge.c), which is the whole reason the opens
-   * happen out here.
+   * happen out here. Names already standing (declareSnapshot) are left
+   * alone: a browser refuses a second sync access handle on a live one.
    *
    * A name in `keep` is NOT closed: rn_adopt leaves the node holding the
    * log file it just created, and closing that handle would pull the
    * file out from under the log. Its handle and fd come back instead, for
    * whoever now owns them.
-   *
-   * Deletions the call ordered are drained afterwards, because bj_ns.remove
-   * MAY BE DEFERRED here -- OPFS removeEntry returns a promise (bjns.h).
    */
   async withFiles(names, fn, { keep = [] } = {}) {
     const M = requireModule();
-    const scope = this._scope;
-    const table = (M.bjnsScopes ||= {})[scope] = {};
+    const table = this._table();
     const opened = [];  // { name, fd, handle }
     const kept = new Map();
     try {
       for (const name of names) {
+        if (table[name] !== undefined) continue;   // already standing (see declare)
         const handle = await this._files.open(name);
         const fd = registerHandle(M, handle);
         table[name] = fd;
@@ -1484,23 +1549,17 @@ class RaftCore {
       }
       return fn();
     } finally {
-      delete M.bjnsScopes[scope];
       let failure = null;
       while (opened.length) {
         const { name, fd, handle } = opened.pop();
+        delete table[name];
         if (keep.includes(name)) { kept.set(name, { fd, handle }); continue; }
         unregisterHandle(M, fd);
         try { handle.flush?.(); await handle.close(); }
         catch (err) { failure ||= err; }
       }
       this._kept = kept;
-      const pending = M.bjnsPending && M.bjnsPending[scope];
-      if (pending && pending.length) {
-        M.bjnsPending[scope] = [];
-        for (const f of pending) {
-          try { await this._files.remove(f); } catch { /* an orphan, not a fault */ }
-        }
-      }
+      await this._drainRemoves();
       if (failure) throw failure;
     }
   }

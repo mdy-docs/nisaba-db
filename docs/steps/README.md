@@ -22,6 +22,27 @@ write down why" rather than guessing on the implementer's behalf.
 1 and 2 are the C pushdown's remaining substance; 3 turns one server into
 a cluster; 4 is a feature; 5 is the coverage all of it rests on.
 
+**1–3 are now load-bearing rather than speculative.** They were written
+assuming the C server would one day be the cluster member; that is
+decided ([`../deployment-shapes.md`](../deployment-shapes.md),
+Decisions A). One program covers "a persistent server" and "a replicated
+server", so `src/raft.js`, `raft-host.js`, `db-replicated.js` and both
+peer transports stay correct and tested as the embedded-Node story
+rather than as the road to production clustering.
+
+Two prerequisites closed recently, and both were reasons 1 was blocked
+rather than merely unstarted: `dbs_apply` means a C process can apply a
+committed entry of *any* kind (it needed a JavaScript host for the three
+DDL opcodes until then), and the C server's own DDL is now planned into
+a command, so a leader has something to send.
+
+**HTTP is not one of these briefs, deliberately.** It goes in a Node
+process in front of the server, over `src/db-server-client.js`, rather
+than in `server/main.c` — the same document records that decision and
+what it costs. The subset written for the C server is on the branch
+`wip/http-transport`; nothing on `main` depends on it, and the brief for
+the Node front end has not been written yet.
+
 **The database server is built**, which is why there is no brief for it:
 one process per database directory, binjson over sockets, as a
 `wasm32-wasip2` command, documented in

@@ -18,14 +18,18 @@ intention as though it were code.
 | 1 | Browser, WASM, JS bridge | **Built.** The bridge is not minimal, and structurally cannot be — see below |
 | 2 | Browser, many tabs, one owner | **Built.** Elected owner, others RPC to it |
 | 3 | CLI, open then close | **Built**, as Node + WASM. A native CLI does not exist |
-| 4 | One persistent server process | **Built**, speaking binjson frames over TCP. **No HTTP** |
-| 5 | Several server processes, Raft | **Built in Node.** The C server cannot replicate |
+| 4 | One persistent server process | **Built**, speaking binjson frames over TCP. HTTP goes in front, in Node |
+| 5 | Several server processes, Raft | **Built in Node.** The C server cannot replicate — and now must |
 
 The single largest gap is that **4 and 5 are two different programs
 today**: shape 4 is `server/main.c`, a C process with no JavaScript in
 it; shape 5 is a Node process hosting the WASM engine. They share the
-engine and the format, not the executable. Whether they converge, and in
-which direction, is the open question this document ends on.
+engine and the format, not the executable.
+
+**Decided: they converge on the C server** — Raft moves into it, and
+HTTP goes in front of it as a separate Node process. See
+[Decisions](#decisions) at the end, which is what the rest of this
+document is here to justify.
 
 ---
 
@@ -55,11 +59,10 @@ Every shape is assembled from these. Nothing below is per-shape.
         shapes 1, 2, 3, 5          shape 4              shape 5
 ```
 
-**Two drivers, on purpose.** The same thirty-one operations exist twice:
-once as `Collection`/`Db` in JavaScript, once as the request grammar in
-C. That is duplication, and it is not an accident — see shape 1's
-constraint, which forces it. It is the largest standing cost in the
-codebase and is worth re-reading whenever it looks avoidable.
+**Two drivers.** The same thirty-one operations exist twice: once as
+`Collection`/`Db` in JavaScript, once as the request grammar in C. Part
+of that is forced and part is not; the audit under shape 1 measures
+which, and the answer is 44/54.
 
 **One writer per database directory**, in every shape. The browser gets
 it from OPFS's exclusive sync access handles, Node from an advisory
@@ -99,7 +102,7 @@ a blocking call the spec forbids on the main thread, and real Chromium
 does not expose it there. `nisaba/remote` exists for a main thread that
 only wants to marshal calls to that Worker.
 
-### The bridge is not minimal, and cannot be
+### The bridge is not minimal
 
 `wasm/nisaba-wasm.js` is ~3,900 lines: roughly 2,000 of codec, handle
 table and glue, then `Collection` (~1,500), `Db` (~270) and the storage
@@ -114,19 +117,75 @@ Everything follows:
   opened **before** the call — C plans the file set, JS executes the
   plan, C then runs unable to block.
 - Anything that decides *which* files an operation needs therefore lives
-  above that boundary — which is most of what a driver is.
-- Hence the JS driver, and hence the second copy of the operation set in
-  C for shape 4, which has no such constraint.
+  above that boundary — opening a collection, building an index,
+  compacting, dropping.
+
+That is why a JS driver exists at all. It is NOT, it turns out, why the
+whole driver is in JS — see the audit below, which was written after
+this paragraph and corrects it.
 
 This is recorded as a settled decision in
 [`steps/README.md`](steps/README.md): the browser stays a host, and
 plan/execute is permanent. Every other host — Node, native, WASI — pays
 a discipline it does not need so that this one can exist at all.
 
-**Open question.** "Minimal JS bridge" as a goal is not currently met and
-cannot be met while that constraint holds. If minimality matters more
-than the browser-as-host, the lever is JSPI (Chrome 137+, not Safari) or
-Asyncify (a size and speed cost across every host). Neither is planned.
+### The audit: what is actually forced
+
+The claim above — that the bridge's size follows from the async-open
+constraint — was an assumption until it was measured. It is half true,
+and the half that is false is the interesting one.
+
+`wasm/nisaba-wasm.js` is 3,937 lines, and it is five things, not one:
+
+| Part | Lines | |
+| --- | ---: | --- |
+| `Db` + `Collection` — the driver | 1,804 | the subject of this audit |
+| Raft bindings (`RaftCore`, `raftDrive`, `raftMsg`) | ~550 | shape 5's, not shape 1's |
+| Codec, handle bridge, memory helpers | ~450 | forced: it is the WASM boundary |
+| Name/catalog/WAL/TTL bindings | ~480 | thin calls into C |
+| Providers, `ChangeStream`, errors, `Client` | ~650 | JS-shaped API surface |
+
+Within the 1,804-line driver, every method was classified by whether it
+touches the storage provider:
+
+```
+   plan/execute, genuinely forced          794 lines   (44%)
+     Db.open, Db.collection, Db.dropCollection, Db.compact,
+     Db._sweepOrphans, Collection._open, Collection.compact,
+     Collection.createIndex / _createTextIndex / _createGeoIndex,
+     Collection.dropIndex, and the handle lifecycle
+
+   pure marshal — JS value in, C call, JS value out
+                                          983 lines   (54%)
+     find, findOne, count, distinct, aggregate, explain,
+     findByIndex, insert, insertMany, update, updateMany,
+     replace, delete, deleteMany, the findOneAnd* three,
+     bulkWrite, pruneExpired, listIndexes, watch
+```
+
+**The 983 do not open anything.** They run against a collection whose
+files are already open, and every one of them is an operation
+`wasm/src/db_request.c` already implements for shape 4. The async-open
+constraint does not reach them: it forces *opening* to be planned in C
+and executed in JS, and opening is the other 794 lines.
+
+So the second driver is not forced. In principle the browser could hold a
+`dbs` session — the C session layer — and those 983 lines could become
+"build a request object, call `dbs_handle`, decode the answer", leaving
+one owner for the operation set. What that would cost, honestly:
+
+- Every call gains an encode/decode round trip where today it passes
+  pointers. Cheap per call, not free.
+- `find`'s 192 lines are the async-iterator and batching protocol, which
+  survives either way — it would wrap `getMore` instead of a direct
+  cursor.
+- Change-stream fan-out to JS consumers survives too; only the event
+  *derivation* moves, and C already has it (`dbs_emit`).
+- DDL and compaction stay exactly as they are. They are the forced 794.
+
+**Decided: audit first, then decide** — this is that audit. The number to
+carry forward is that **~54% of the driver is duplication that could be
+removed, and ~44% cannot be**. Nothing is scheduled on it yet.
 
 **Verified by** `test/db.test.js` (166 cases, Node), plus real-browser
 runs in CI for compaction and the coordinator via Playwright.
@@ -241,14 +300,12 @@ wasmtime — driven by the shipped client, not by test-local protocol code.
 
 ### What this shape does not have
 
-- **No HTTP.** It speaks binjson frames on a TCP socket. An HTTP
-  envelope was built (parser, listener, sessionless refusals, tests) and
-  then **reverted at your instruction** — "http handling is just another
-  moving piece we have to maintain". The work is preserved on the branch
-  `wip/http-transport` and is recoverable in full.
-
-  This contradicts the use case as stated ("provide a cli and http
-  server"), and is the first question below.
+- **No HTTP, and it is not getting any.** It speaks binjson frames on a
+  TCP socket. An HTTP envelope was built here (parser, listener,
+  sessionless refusals, tests) and reverted; the decision is that HTTP
+  belongs in a Node process in front of this one, not in this file. The
+  reverted work stays on `wip/http-transport` as a record of what the
+  other path costs. See [Decisions](#decisions) B.
 
 - **No TLS, no auth, no tenants.** Loopback only. The README places
   REST/WebSocket gateways and the control plane in the parent project,
@@ -328,64 +385,80 @@ were the reason this was blocked rather than merely unstarted:
 
 `raft-transport-http.js` is **node-to-node**, not client-to-server. The
 monitor serves `GET /status` and an SSE `/events` stream, which is
-observability, not a data API. Same question as shape 4.
+observability, not a data API. Client-facing HTTP is the Node front end
+of [Decisions](#decisions) B, and it sits in front of a cluster exactly
+as it sits in front of a single server — it holds a socket to whichever
+member is the leader.
 
 ---
 
-## Where the shapes disagree
+## Decisions
 
-Flagged rather than resolved. Each is a real fork, not a detail.
+Three of the four forks this document opened have been answered. They are
+recorded here with what they commit us to, because each one makes some
+future work obvious and some other work pointless.
 
-### A. Which program is "the server"?
+### A. Raft moves into the C server ✅
 
-Shapes 4 and 5 both say "run the db on the server", but today they are
-different executables:
+**One program covers shapes 4 and 5.** `nisaba-server` grows a log, a
+peer transport and an apply pump; the C request grammar becomes the only
+server-side driver; Node is required for neither shape.
 
-|  | shape 4 | shape 5 |
-| --- | --- | --- |
-| process | `nisaba-server` (C, wasip2/native) | Node + WASM |
-| driver | C request grammar | JS `Collection`/`Db` |
-| replication | none | full |
-| client wire | binjson frames over TCP | in-process, or your own |
+What this commits us to — the briefs in [`steps/`](steps/) were written
+on this assumption and are now confirmed rather than speculative:
 
-Two directions, and they are mutually exclusive in the medium term:
+1. `steps/install-snapshot-in-c.md` — the last Raft message kind a host
+   must answer.
+2. `steps/completions-in-c.md` — answering a proposal without a promise.
+3. `steps/native-composition.md` — several Raft groups over sockets in
+   one process.
 
-- **Raft moves into the C server.** Then one program covers 4 and 5, the
-  C request grammar is the only server-side driver, and Node is needed
-  for neither. Costs briefs 1–3, plus a log, a peer transport and an
-  apply pump in C.
-- **The persistent server is a Node process.** Then shape 5 already
-  works, shape 4's job is the embedded/single-node case, and the C
-  server's reason to exist narrows to "a database process with no
-  JavaScript in it" — which is a real reason, but a smaller one than it
-  looks today.
+Plus a log in C (`entrylog.c` is already linked into the binary and
+unused) and the apply pump, which `dbs_apply` just made possible for
+every command kind.
 
-Everything in `steps/` assumes the first. Nothing has confirmed it.
+What it makes secondary: `src/raft.js`, `src/raft-host.js`,
+`src/db-replicated.js` and the two peer transports remain correct,
+tested, and the reference implementation — but they stop being the road
+to production clustering and become the embedded-Node story.
 
-### B. HTTP: where does it live?
+### B. HTTP is a Node process in front ✅
 
-The use cases ask for an HTTP server in both 4 and 5. Three places it
-could be, and they are not equivalent:
+Not in C, and not the parent project's problem. A thin HTTP front end in
+this repo, over `src/db-server-client.js` — which already speaks all 31
+operations with no engine in the process.
 
-1. **In the C server** — what was built and reverted. Costs an HTTP
-   parser in C (~250 lines, isolated) plus session identity, since HTTP
-   has no stable connection to hang a cursor on.
-2. **In the parent project's gateway** — where the README already puts
-   "REST/WebSocket gateways", talking to this over the frame protocol.
-   Costs nothing here, and a gateway that knows every op and refusal code
-   is a second thing that knows the wire.
-3. **A Node process in front**, using `db-server-client.js`. Cheapest to
-   build, and adds a hop and a process.
+```
+   browser / REST client
+          │  HTTP
+          ▼
+   ┌─ node http front ─────────────┐   new, this repo
+   │  src/db-server-client.js      │   no WASM, no ready()
+   └──────────┬────────────────────┘
+              │  binjson frames over TCP
+              ▼
+   nisaba-server (C)                   unchanged
+```
 
-### C. "Minimal JS bridge"
+**The revert stands.** `server/main.c` stays frame-only, and the HTTP
+subset written for it stays on `wip/http-transport` as a record of what
+that path costs — chiefly session identity, since HTTP has no stable
+connection for a cursor or a change stream to belong to. A Node front end
+has the same problem to solve and a much easier place to solve it: it
+holds one real socket per session and can keep them.
 
-Not true today and not reachable without JSPI or Asyncify (shape 1). If
-the phrase means "no logic in JS beyond glue", the browser must stop
-being a host — which was already asked and answered *both* in
-`steps/README.md`. Worth re-confirming that the answer still stands, as
-it is the reason the operation set exists twice.
+The costs, stated plainly: a hop, a process, and Node back in a
+deployment the C server had removed it from.
 
-### D. Native CLI
+### C. "Minimal JS bridge": audited ✅
+
+Measured rather than assumed — see "The audit: what is actually forced"
+under shape 1. **44% of the driver is forced by the
+async-open constraint; 54% is duplication that is not.** No work is
+scheduled on the strength of it yet; the number now exists to decide
+with.
+
+### D. Native CLI — still open
 
 Shape 3 is Node + WASM. Whether a dependency-free native `db` is wanted
-has never been decided (shape 3, above).
+has never been decided, and nothing is blocked on it.

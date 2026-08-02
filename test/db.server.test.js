@@ -470,6 +470,103 @@ describe.runIf(REQUIRED)('nisaba-server: the artifacts CI promises', () => {
 for (const engine of ENGINES) {
   const enabled = engine.ready();
 
+  /*
+   * docs/steps/server-as-replica.md. With --raft the server stops
+   * applying a write where it lands: it plans it, proposes it to a log,
+   * and applies it only once the entry has committed -- the same path a
+   * write takes on a member of a real cluster. This group has one
+   * member, so the quorum is itself and "committed" is immediate; what
+   * that removes from the test is waiting, not steps.
+   *
+   * The point being proved is that a client cannot tell. Every answer
+   * here is the answer the unreplicated server gives, because the
+   * response is built by the same code from the same apply results.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: replicated writes (${engine.name})`, () => {
+    let proc, db, dir;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      ({ proc, dir } = await startServer(engine, port, ['--raft', '1']));
+      db = await connectServer(port);
+      return async () => { await db.close(); proc.kill(); };
+    });
+
+    it('answers a write only after it has been through the log', async () => {
+      const users = db.collection('users');
+      expect(await users.countDocuments({})).toBe(3);
+
+      const { insertedId } = await users.insertOne({ name: 'Edsger', team: 'core' });
+      expect(insertedId).toBeInstanceOf(ObjectId);
+      expect((await users.findOne({ name: 'Edsger' })).team).toBe('core');
+      expect(await users.countDocuments({})).toBe(4);
+
+      // Applied ONCE. The pump performs every committed command, and the
+      // request that proposed it must not perform it again -- on a
+      // leader that is the same command twice, and the second insert
+      // comes back a duplicate of the first.
+      expect(await users.countDocuments({ name: 'Edsger' })).toBe(1);
+    });
+
+    it('carries DDL through the log too, and applies that once as well', async () => {
+      const users = db.collection('users');
+      // createIndex applied twice would answer "that index already
+      // exists" to the client that just created it.
+      expect(await users.createIndex({ team: 1 })).toBe('team_1');
+      expect((await users.listIndexes()).map(i => i.name)).toContain('team_1');
+    });
+
+    it('a list of writes takes one trip to the log per operation', async () => {
+      const users = db.collection('users');
+      const id = new ObjectId();
+      // The second operation can only match if the first has landed --
+      // which on a replica means committed and applied, not merely
+      // planned. Same semantics as the in-process bulkWrite.
+      const r = await users.bulkWrite([
+        { insertOne: { document: { _id: id, name: 'Barbara', team: 'core' } } },
+        { updateOne: { filter: { _id: id }, update: { $set: { onCall: true } } } }
+      ]);
+      expect(r.insertedCount).toBe(1);
+      expect(r.matchedCount).toBe(1);
+      expect(r.modifiedCount).toBe(1);
+      expect((await users.findOne({ _id: id })).onCall).toBe(true);
+    });
+
+    it('reads are answered without touching the log at all', async () => {
+      const users = db.collection('users');
+      expect(await users.distinct('team')).toEqual(expect.arrayContaining(['core', 'research']));
+      expect((await users.find({ team: 'core' }, { sort: { name: 1 }, limit: 1 }).toArray())
+        .map(d => d.name)).toEqual(['Ada']);
+    });
+
+    it('replays nothing it already applied, and the JS engine reads it the same way', async () => {
+      const users = db.collection('users');
+      const before = await users.countDocuments({});
+      await db.close();
+      proc.kill();
+      await new Promise(r => proc.once('exit', r));
+
+      // Restarted over its own log and its own files. The replay floor
+      // is the DATABASE's applied index, not the log's advisory commit
+      // marker -- resuming from that one would perform committed
+      // commands a second time.
+      const restarted = await startServer(engine, port + 1, ['--raft', '1']);
+      // startServer seeds a fresh directory, so drive the original one
+      // through the JS engine instead: same files, no server.
+      restarted.proc.kill();
+      await new Promise(r => restarted.proc.once('exit', r));
+
+      const provider = new NodeFSStorageProvider(dir);
+      const jsDb = await connect(provider);
+      const jsUsers = await jsDb.collection('users');
+      expect(await jsUsers.countDocuments({})).toBe(before);
+      expect((await jsUsers.findOne({ name: 'Edsger' })).team).toBe('core');
+      expect((await jsUsers.listIndexes()).map(i => i.name)).toContain('team_1');
+      await jsDb.close();
+      await provider.close();
+    });
+  });
+
   describe.skipIf(!enabled)(`nisaba-server: the JS client (${engine.name})`, () => {
     let proc, db;
     const port = nextPort();

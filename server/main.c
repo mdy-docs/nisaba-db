@@ -110,6 +110,7 @@
 #endif
 
 #include "db_session.h"
+#include "replica.h"
 #include "db_names.h"
 #include "db_validate.h"   /* dc_strerror: a refusal says why, even here */
 #include "bjio_posix.h"
@@ -187,11 +188,31 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
 }
 
 /*
+ * Milliseconds on a monotonic clock -- not a wall clock, which can step
+ * backwards over an NTP correction and would take a connection's slot
+ * away for it. A clock that cannot be read stops instead of jumping: the
+ * last reading is returned, so nothing times out, which is the safe
+ * direction to fail in.
+ *
+ * Above the sockets guard because both transports need it now: the idle
+ * timer is the listener's, but the Raft timers are the replica's, and a
+ * --stdio server can be a replica too (it just has no peers to reach).
+ */
+static uint64_t now_ms(void) {
+    static uint64_t last = 0;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return last;
+    last = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    return last;
+}
+
+
+/*
  * Serve one connection until it closes or loses framing. Returns 0 on a
  * clean close, -1 otherwise -- neither is fatal to the server, because
  * one client's bad frame is not the next client's problem.
  */
-static int serve(dbs *s, int in_fd, int out_fd) {
+static int serve(dbs *s, replica *rep, int in_fd, int out_fd) {
     for (;;) {
         uint8_t head[FRAME_HEADER];
         int r = read_exact(in_fd, head, sizeof head);
@@ -215,9 +236,26 @@ static int serve(dbs *s, int in_fd, int out_fd) {
 
         dbuf res = {0};
         /* --stdio is one client by construction; it takes the first id. */
-        int e = dbs_handle(s, 1, req, total, &res);
+        int e = rep ? replica_submit(rep, 1, req, total, &res)
+                    : dbs_handle(s, 1, req, total, &res);
         free(req);
-        if (e) { dbuf_free(&res); return -1; }   /* no response could be built */
+        if (e < 0) { dbuf_free(&res); return -1; }   /* no response was built */
+        /*
+         * A replicated write is not answered by the call that took it:
+         * the entry has to commit and apply first. There is one client
+         * here and nothing else for the process to do, so it turns the
+         * clock until the answer exists -- which on a group of one is
+         * immediately, and with peers is however long a quorum takes.
+         */
+        if (e == 1) {
+            uint64_t owner = 0;
+            int have = 0;
+            for (int spin = 0; !have && spin < 100000; spin++) {
+                if (replica_tick(rep, now_ms()) != 0) { dbuf_free(&res); return -1; }
+                if (replica_ready(rep, &owner, &res, &have) != 0) { dbuf_free(&res); return -1; }
+            }
+            if (!have) { dbuf_free(&res); return -1; }
+        }
 
         int w = write_all(out_fd, res.data, res.len);
         dbuf_free(&res);
@@ -248,20 +286,6 @@ static int serve(dbs *s, int in_fd, int out_fd) {
 }
 
 #if defined(NISABA_SOCKETS)
-/*
- * Milliseconds on a monotonic clock -- not a wall clock, which can step
- * backwards over an NTP correction and would take a connection's slot
- * away for it. A clock that cannot be read stops instead of jumping: the
- * last reading is returned, so nothing times out, which is the safe
- * direction to fail in.
- */
-static uint64_t now_ms(void) {
-    static uint64_t last = 0;
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return last;
-    last = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
-    return last;
-}
 
 /*
  * One accepted client. `in` holds the bytes of a request that has only
@@ -305,10 +329,13 @@ static void conn_close(conn *c) {
  * A connection ending, however it ended -- cleanly, torn, timed out, or
  * with the server shutting down. Its cursors go with it: the session
  * holds them, the transport is the only thing that knows the client is
- * gone, and a scan nobody can reach again is a scan holding a slot.
+ * gone, and a scan nobody can reach again is a scan holding a slot. So
+ * does any write it was still waiting on: the entries stay committed
+ * and still apply, but the answer has nowhere to go.
  */
-static void conn_gone(dbs *s, conn *c) {
+static void conn_gone(dbs *s, replica *rep, conn *c) {
     dbs_drop_client(s, c->client);
+    if (rep) replica_drop_client(rep, c->client);
     conn_close(c);
 }
 
@@ -361,7 +388,7 @@ static int conn_flush(conn *c) {
  * finished with the request by then either way, so a slow reader delays
  * nobody but itself.
  */
-static int conn_readable(dbs *s, conn *c) {
+static int conn_readable(dbs *s, replica *rep, conn *c) {
     uint8_t chunk[8192];
     ssize_t r = read(c->fd, chunk, sizeof chunk);
     if (r == 0) return -1;                            /* clean EOF */
@@ -380,8 +407,13 @@ static int conn_readable(dbs *s, conn *c) {
         if (m < 0) return -1;
         if (c->in_len < total) break;
 
-        int e = dbs_handle(s, c->client, c->in, total, &c->out);
-        if (e) return -1;                             /* no response could be built */
+        /* A replicated write is not answered here: it is planned,
+         * proposed, and left for the log. Its response reaches this
+         * connection through replica_ready, once the entries it became
+         * have committed and applied. */
+        int e = rep ? replica_submit(rep, c->client, c->in, total, &c->out)
+                    : dbs_handle(s, c->client, c->in, total, &c->out);
+        if (e < 0) return -1;                         /* no response was built */
         c->quiet_since = now_ms();                    /* it asked something */
 
         c->in_len -= total;
@@ -439,7 +471,7 @@ static int listen_on(int port) {
  * client whose last answer has not gone out, so a pipelining client
  * cannot make the server hold an unbounded number of answers for it.
  */
-static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
+static int serve_forever(dbs *s, replica *rep, int srv, int max_clients, int idle_seconds) {
     const uint64_t idle_ms = (uint64_t)(idle_seconds > 0 ? idle_seconds : 0) * 1000u;
     conn *cs = (conn *)calloc((size_t)max_clients, sizeof *cs);
     struct pollfd *pf = (struct pollfd *)calloc((size_t)max_clients + 1, sizeof *pf);
@@ -481,11 +513,29 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
             uint64_t due = earliest + idle_ms;
             wait_ms = due <= now ? 0 : (int)(due - now);
         }
+        /*
+         * And the Raft timers, which are the second thing here that
+         * happens because time passed rather than because a socket did.
+         * An election that never fires because nothing connected is a
+         * cluster that never elects; whichever deadline is nearer wins.
+         */
+        if (rep) {
+            int tick = replica_wait_ms(rep, now_ms());
+            if (wait_ms < 0 || tick < wait_ms) wait_ms = tick;
+        }
 
         int r = poll(pf, (nfds_t)(n + 1), wait_ms);
         if (r < 0) {
             if (errno == EINTR) continue;
             perror("poll");
+            break;
+        }
+
+        /* The clock, before anything reads a role or a commit index off
+         * the node: an election that is due is due whether or not a
+         * socket woke us. */
+        if (rep && replica_tick(rep, now_ms()) != 0) {
+            fprintf(stderr, "replica: halted\n");
             break;
         }
 
@@ -497,7 +547,7 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
                 if (now - cs[i].quiet_since < idle_ms) continue;
                 int fd = cs[i].fd;
                 cs[i].fd = -1;              /* conn_gone must not close it first */
-                conn_gone(s, &cs[i]);
+                conn_gone(s, rep, &cs[i]);
                 refuse_and_close(fd, DC_ERR_IDLE_TIMEOUT);
                 cs[i] = cs[n - 1];
                 conn_clear(&cs[n - 1]);
@@ -515,9 +565,9 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
             int dead = 0;
             if (ev & (POLLERR | POLLNVAL)) dead = 1;
             else if (ev & POLLOUT) dead = conn_flush(&cs[i]) != 0;
-            else if (ev & (POLLIN | POLLHUP)) dead = conn_readable(s, &cs[i]) != 0;
+            else if (ev & (POLLIN | POLLHUP)) dead = conn_readable(s, rep, &cs[i]) != 0;
             if (dead) {
-                conn_gone(s, &cs[i]);
+                conn_gone(s, rep, &cs[i]);
                 cs[i] = cs[n - 1];      /* the last one moves into the hole */
                 conn_clear(&cs[n - 1]); /* and its old slot owns nothing now */
                 n--;
@@ -559,10 +609,42 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
              * because a failed write is a connection that has gone. */
             if (!any) continue;
             if (conn_flush(&cs[i]) != 0) {
-                conn_gone(s, &cs[i]);
+                conn_gone(s, rep, &cs[i]);
                 cs[i] = cs[n - 1];
                 conn_clear(&cs[n - 1]);
                 n--;
+            }
+        }
+
+        /*
+         * Answers to writes that have now committed and applied. They
+         * are appended to whatever their connection already owes, so the
+         * ordinary flush carries them out -- the same path a change
+         * event takes, for the same reason: the transport still writes
+         * bytes nobody has just read.
+         */
+        if (rep) {
+            for (;;) {
+                uint64_t owner = 0;
+                int have = 0;
+                dbuf answer = {0};
+                if (replica_ready(rep, &owner, &answer, &have) != 0) { dbuf_free(&answer); break; }
+                if (!have) { dbuf_free(&answer); break; }
+                int found = -1;
+                for (int i = 0; i < n; i++) if (cs[i].client == owner) { found = i; break; }
+                /* Nobody to give it to: the connection went while its
+                 * write was in the log. The entries still committed and
+                 * still applied -- that is what committed means. */
+                if (found >= 0) {
+                    if (dbuf_put(&cs[found].out, answer.data, answer.len) == 0 &&
+                        conn_flush(&cs[found]) != 0) {
+                        conn_gone(s, rep, &cs[found]);
+                        cs[found] = cs[n - 1];
+                        conn_clear(&cs[n - 1]);
+                        n--;
+                    }
+                }
+                dbuf_free(&answer);
             }
         }
 
@@ -584,7 +666,7 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
         }
     }
 
-    for (int i = 0; i < n; i++) conn_gone(s, &cs[i]);
+    for (int i = 0; i < n; i++) conn_gone(s, rep, &cs[i]);
     free(cs);
     free(pf);
     return -1;
@@ -594,8 +676,9 @@ static int serve_forever(dbs *s, int srv, int max_clients, int idle_seconds) {
 static void usage(const char *me) {
     fprintf(stderr,
             "usage: %s [--stdio] [--port N] [--order N] [--max-clients N]\n"
-            "           [--idle-timeout SECONDS]\n"
-            "  serves the database in the preopened directory \".\"\n", me);
+            "           [--idle-timeout SECONDS] [--raft NODE_ID]\n"
+            "  serves the database in the preopened directory \".\"\n"
+            "  --raft replicates every write through a log before applying it\n", me);
 }
 
 int main(int argc, char **argv) {
@@ -608,6 +691,10 @@ int main(int argc, char **argv) {
      * default is what every host in this repo creates with, so the flag
      * exists for a database made with `db ... --order N`. */
     int order = DC_DEFAULT_ORDER;
+    /* 0 = not a replica: every write is applied where it lands, which is
+     * what this server has always done and what it still does by
+     * default. A node id turns the log on. */
+    int node_id = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdio") == 0) use_stdio = 1;
@@ -626,6 +713,10 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--max-clients must be between 1 and %d\n", MAX_CLIENTS);
                 return 2;
             }
+        }
+        else if (strcmp(argv[i], "--raft") == 0 && i + 1 < argc) {
+            node_id = atoi(argv[++i]);
+            if (node_id <= 0) { fprintf(stderr, "--raft needs a positive node id\n"); return 2; }
         }
         else { usage(argv[0]); return 2; }
     }
@@ -651,9 +742,27 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /*
+     * The Raft half, if this is a member. It opens the log, which is the
+     * one thing in the directory the session does not own -- so it comes
+     * after dbs_open and goes before it at the end.
+     */
+    replica *rep = NULL;
+    if (node_id > 0) {
+        e = replica_open(&ns, s, (uint64_t)node_id, now_ms(), &rep);
+        if (e != BJ_OK) {
+            fprintf(stderr, "cannot open the log: %s\n", dc_strerror(e));
+            dbs_close(s);
+            bjns_posix_free(&ns);
+            return 1;
+        }
+        fprintf(stderr, "nisaba: node %d, replicating\n", node_id);
+        fflush(stderr);
+    }
+
     int rc = 0;
     if (use_stdio) {
-        rc = serve(s, STDIN_FILENO, STDOUT_FILENO) == 0 ? 0 : 1;
+        rc = serve(s, rep, STDIN_FILENO, STDOUT_FILENO) == 0 ? 0 : 1;
     } else {
 #if defined(NISABA_SOCKETS)
         int srv = listen_on(port);
@@ -663,7 +772,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "nisaba: serving 127.0.0.1:%d (max %d clients, idle timeout %ds)\n",
                 port, max_clients, idle_seconds);
         fflush(stderr);
-        rc = serve_forever(s, srv, max_clients, idle_seconds) == 0 ? 0 : 1;
+        rc = serve_forever(s, rep, srv, max_clients, idle_seconds) == 0 ? 0 : 1;
         close(srv);
 #else
         (void)port;   /* accepted and refused, rather than not accepted */
@@ -679,6 +788,9 @@ int main(int argc, char **argv) {
 #if defined(NISABA_SOCKETS)
 done:
 #endif
+    /* The node before the session: it holds plans that point at the
+     * collections dbs_close is about to free. */
+    replica_close(rep);
     dbs_close(s);
     bjns_posix_free(&ns);
     close(dirfd);

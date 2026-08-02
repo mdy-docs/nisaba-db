@@ -121,6 +121,20 @@ extern "C" {
 #define DC_ERR_NO_STREAM            (-60)
 #define DC_ERR_TOO_MANY_STREAMS     (-61)
 
+/* This member is not the leader of its group, so it cannot take a write.
+ * The response carries `leaderId` when there is one, which is the whole
+ * of what a client needs to try again in the right place: FORWARDING IS
+ * NOT THIS SERVER'S JOB. A server that forwarded would be holding a
+ * request whose outcome it cannot promise anything about, on a
+ * connection it would have to keep alive to say so. */
+#define DC_ERR_NOT_LEADER           (-63)
+
+/* Leadership moved between a write being proposed and it being applied,
+ * and the entry at its index is a different leader's. Distinct from
+ * DC_ERR_NOT_LEADER because it says something stronger: the write did
+ * not happen and no replica holds it, so a retry is safe. */
+#define DC_ERR_WRITE_LOST           (-64)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)
@@ -537,8 +551,17 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
  *                         already: a read, a ping, or a refusal.
  *         *token != 0  -- `cmds` is a binjson ARRAY of commands, in the
  *                         order they must be applied. Propose them.
- *     ... a quorum, some time later ...
- *     dbs_complete(s, token, indices, n, &out)
+ *     ... a quorum, and then the APPLY PUMP applies each committed
+ *         entry with dbs_apply, exactly as it does on a follower ...
+ *     dbs_step(s, token, indices, results, n, &token, &cmds, &out)
+ *
+ * THE PUMP IS THE ONLY THING THAT APPLIES. dbs_step does not touch the
+ * database: it is handed what applying each command produced and
+ * assembles the response from that. Any other arrangement has two places
+ * performing a committed command -- the pump on every replica, and the
+ * proposer again on the one that took the request -- which on a leader
+ * means every local write lands twice. (It did, once. The second insert
+ * came back a duplicate of the first.)
  *
  * PLANNING IS WHERE NONDETERMINISM DIES. An upsert's id and a
  * $currentDate are resolved once, by the node that took the request, and
@@ -565,19 +588,33 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
  */
 int  dbs_propose(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                  uint64_t *token, dbuf *cmds, dbuf *out);
-int  dbs_step(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
+/*
+ * What applying one command produced: dbs_apply's result bytes, and its
+ * return code -- because a deterministic failure is an ANSWER every
+ * replica computes identically, and the response has to say so.
+ */
+typedef struct {
+    int            rc;
+    const uint8_t *data;
+    uint32_t       len;
+} dbs_result;
+
+int  dbs_step(dbs *s, uint64_t token, const uint64_t *indices,
+              const dbs_result *results, uint32_t n,
               uint64_t *next, dbuf *cmds, dbuf *out);
-int  dbs_complete(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
-                  dbuf *out);
 void dbs_abandon(dbs *s, uint64_t token);
 
 /* How many planned requests are waiting to be completed. */
 uint32_t dbs_inflight(const dbs *s);
 
-/* How far a collection's applied index has got, or 0 if it is not open.
- * The replay floor -- what a restarting replica resumes from, and the
- * one thing about an apply that outlives the response. */
+/* How far a collection's applied index has got, or 0 if it is not open. */
 uint64_t dbs_applied_index(dbs *s, const char *coll, size_t coll_len);
+
+/* The replay floor: the highest index this database has applied, across
+ * every collection. Apply is strictly ordered, so the max IS the applied
+ * prefix -- what a restarting replica resumes from, and the one thing
+ * about an apply that outlives the response. */
+uint64_t dbs_applied_floor(dbs *s);
 
 /* ---- what db_request.c uses to implement the two above ------------------
  *
@@ -590,8 +627,7 @@ int          dbs_repl_active(const dbs *s);     /* mid-propose/step    */
 int          dbs_repl_hold(dbs *s, dc_wal_plan *p);
 dc_wal_plan *dbs_repl_resuming(dbs *s);
 uint64_t     dbs_repl_next_index(dbs *s);
-const dbuf  *dbs_repl_replay(dbs *s, int *rc);
-int          dbs_repl_record(dbs *s, const dbuf *result, int rc);
+int          dbs_repl_applied(dbs *s, dbuf *result, int *rc);
 
 /* Not an error: a write whose commands were planned and kept, waiting
  * for a quorum. Positive, so every `if (e)` in the write paths still

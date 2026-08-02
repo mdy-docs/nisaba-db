@@ -505,24 +505,29 @@ static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
     return DC_PENDING;
 }
 
-/* Apply one command, staging the index it committed at. Zero on a
- * single-process server, where there is no log and dc_wal_apply is told
- * so. */
+/*
+ * What applying one command produced.
+ *
+ * On a replica this APPLIES NOTHING. The pump already performed the
+ * command -- on every member alike, which is what makes it the one place
+ * a committed command is performed -- and what comes back here is what
+ * it produced. Applying again would be a second place performing it, and
+ * on the leader (the one member that also proposed it) every local write
+ * would land twice. It did, once: the second insert came back a
+ * duplicate of the first.
+ *
+ * Unreplicated there is no pump and no log, and dc_wal_apply is told so
+ * with index 0.
+ */
 static int apply_cmd(dbs *s, dc_collection *c, const uint8_t *cmd, uint32_t clen,
                      dbuf *one) {
-    /* Already applied, on an earlier trip to the log. A stepped request
-     * walks its whole dispatch again each time, and a database is not a
-     * pure function: applying this twice would insert it twice. */
-    int rc = 0;
-    const dbuf *had = dbs_repl_replay(s, &rc);
-    if (had) {
-        one->len = 0;
-        int e = dbuf_put(one, had->data, had->len);
+    if (dbs_repl_active(s)) {
+        int rc = 0;
+        int e = dbs_repl_applied(s, one, &rc);
+        (void)dbs_repl_next_index(s);   /* the lists stay in step */
         return e ? e : rc;
     }
-    rc = dc_wal_apply(c, dbs_repl_next_index(s), cmd, clen, one);
-    int e = dbs_repl_record(s, one, rc);
-    return e ? e : rc;
+    return dc_wal_apply(c, 0, cmd, clen, one);
 }
 
 /* Give the plan back, unless the session is holding it for a quorum --
@@ -1045,13 +1050,23 @@ static int do_ddl(dbs *s, const char *coll, uint32_t coll_len, int wreq,
     if (e) return e;
     uint32_t clen = 0;
     const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
-    /* index 0 for DDL either way: an index build commits catalog and
-     * index files but not the primary tree, so a staged applied-index
-     * would not persist with it. dbs_repl_next_index is still consumed,
-     * because the caller proposed a command for it and the lists must
-     * stay in step. */
-    if (dbs_repl_active(s)) (void)dbs_repl_next_index(s);
-    e = cmd ? dbs_apply(s, 0, cmd, clen, result) : BJ_ERR_STATE;
+    if (!cmd) { plan_close(s, p); return BJ_ERR_STATE; }
+    if (dbs_repl_active(s)) {
+        /* The pump applied it too, and this is the easy one to miss --
+         * DDL does not go through apply_cmd. Missing it means a
+         * createIndex performed by the pump and again by the proposer,
+         * which answers "that index already exists" to the client that
+         * just made it. */
+        int rc = 0;
+        (void)dbs_repl_next_index(s);   /* the lists stay in step */
+        e = dbs_repl_applied(s, result, &rc);
+        if (!e) e = rc;
+    } else {
+        /* index 0: an index build commits catalog and index files but
+         * not the primary tree, so a staged applied-index would not
+         * persist with it. */
+        e = dbs_apply(s, 0, cmd, clen, result);
+    }
     plan_close(s, p);
     return e;
 }

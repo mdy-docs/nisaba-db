@@ -804,6 +804,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
         DC_ERR_NO_CURSOR, DC_ERR_TOO_MANY_CURSORS, DC_ERR_CURSOR_SORTED,
         DC_ERR_NO_STREAM, DC_ERR_TOO_MANY_STREAMS,
+        DC_ERR_NOT_LEADER, DC_ERR_WRITE_LOST,
         DC_ERR_CURSORS_OPEN, DC_ERR_FORMAT_NEWER, DC_ERR_INDEX_EXISTS,
         DC_ERR_NO_INDEX, DC_ERR_INDEX_KIND, DC_ERR_INDEX_ARITY,
         /* The consensus layer's refusals reach a host the same way, and
@@ -2140,6 +2141,42 @@ TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
     close(dirfd);
 }
 
+/*
+ * The apply pump, in miniature: perform every command of a batch and
+ * collect what each produced. That is the loop a replica runs on every
+ * member, and the only place a committed command is performed -- which
+ * is why the tests below hand the results to dbs_step rather than
+ * letting it apply anything.
+ */
+typedef struct { dbuf *bufs; dbs_result *r; uint32_t n; } applied_batch;
+
+static void batch_free(applied_batch *b) {
+    for (uint32_t i = 0; i < b->n; i++) dbuf_free(&b->bufs[i]);
+    free(b->bufs); free(b->r);
+    memset(b, 0, sizeof *b);
+}
+
+static int batch_apply(dbs *s, const dbuf *cmds, uint64_t *index,
+                       uint64_t *indices, applied_batch *b) {
+    cur c = { cmds->data, cmds->len, 0 };
+    uint32_t count = 0;
+    if (array_begin(&c, &count)) return -1;
+    b->bufs = (dbuf *)calloc(count ? count : 1, sizeof *b->bufs);
+    b->r = (dbs_result *)calloc(count ? count : 1, sizeof *b->r);
+    if (!b->bufs || !b->r) return -1;
+    b->n = count;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c)) return -1;
+        indices[i] = (*index)++;
+        b->r[i].rc = dbs_apply(s, indices[i], c.d + start,
+                               (uint32_t)(c.pos - start), &b->bufs[i]);
+        b->r[i].data = b->bufs[i].data;
+        b->r[i].len = (uint32_t)b->bufs[i].len;
+    }
+    return 0;
+}
+
 /* Count the members of a binjson ARRAY. */
 static uint32_t array_len(const uint8_t *arr, size_t len) {
     cur c = { arr, len, 0 };
@@ -2239,11 +2276,14 @@ TEST(a_bulk_writes_later_operation_sees_its_earlier_ones) {
     while (token) {
         uint32_t n = array_len(cmds.data, cmds.len);
         uint64_t *ix = (uint64_t *)malloc((n ? n : 1) * sizeof *ix);
+        applied_batch batch;
+        memset(&batch, 0, sizeof batch);
         CHECK_FATAL(ix != NULL);
-        for (uint32_t i = 0; i < n; i++) ix[i] = index++;
+        CHECK_FATAL(batch_apply(split, &cmds, &index, ix, &batch) == 0);
         cmds.len = 0;
         b_res.len = 0;
-        CHECK_OK(dbs_step(split, token, ix, n, &token, &cmds, &b_res));
+        CHECK_OK(dbs_step(split, token, ix, batch.r, n, &token, &cmds, &b_res));
+        batch_free(&batch);
         free(ix);
         CHECK(++rounds < 8);
     }
@@ -2390,10 +2430,17 @@ TEST(a_replicated_write_answers_exactly_what_an_unreplicated_one_does) {
             if (round == 1) CHECK_I64((long long)n, 3);   /* one per document */
 
             uint64_t *indices = (uint64_t *)malloc(n * sizeof *indices);
+            applied_batch batch;
+            memset(&batch, 0, sizeof batch);
             CHECK_FATAL(indices != NULL);
-            for (uint32_t i = 0; i < n; i++) indices[i] = next_index++;
+            CHECK_FATAL(batch_apply(split, &cmds, &next_index, indices, &batch) == 0);
             if (round != 2) last_doc_index = next_index - 1;   /* round 2 is DDL */
-            CHECK_OK(dbs_complete(split, token, indices, n, &b_res));
+            uint64_t more = 0;
+            dbuf again = {0};
+            CHECK_OK(dbs_step(split, token, indices, batch.r, n, &more, &again, &b_res));
+            CHECK_I64((long long)more, 0);
+            dbuf_free(&again);
+            batch_free(&batch);
             free(indices);
             /* And the slot is back: a completed request holds nothing. */
             CHECK_I64((long long)dbs_inflight(split), 0);

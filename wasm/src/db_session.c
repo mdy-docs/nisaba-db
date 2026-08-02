@@ -165,9 +165,10 @@ struct dbs {
     /* The request being run right now, and where this pass has got to in
      * its caller's index list. Never nested: dbs_propose and dbs_step
      * each run one pass of one request to completion. */
-    dbs_pending    *resuming;
-    const uint64_t *indices;
-    uint32_t        nindices, at_index;
+    dbs_pending      *resuming;
+    const uint64_t   *indices;
+    const dbs_result *results;
+    uint32_t          nindices, nresults, at_index;
 };
 
 /* ---- plan reading ------------------------------------------------------ */
@@ -1443,6 +1444,44 @@ int dbs_close_stream(dbs *s, uint64_t client, uint64_t id) {
     return DC_ERR_NO_STREAM;
 }
 
+/*
+ * The replay floor: the highest log index this database has actually
+ * applied, across every collection it has.
+ *
+ * Apply is strictly ordered, so the MAX is the applied prefix -- the
+ * same derivation DbStateMachine.appliedIndex makes in JavaScript, and
+ * the same reason: dc_wal_apply stages the index atomically with the
+ * mutation, so each collection's value is durable with the data it
+ * describes.
+ *
+ * NOT the log's commit marker, which is advisory and rides the next sync
+ * -- it can be behind what was applied, and resuming from it would apply
+ * committed commands a second time. An insert would come back a
+ * duplicate, which is survivable; an $inc would silently count twice,
+ * which is not.
+ */
+uint64_t dbs_applied_floor(dbs *s) {
+    if (!s) return 0;
+    dbuf names = {0};
+    if (dbs_list_collections(s, &names) != BJ_OK) { dbuf_free(&names); return 0; }
+    cur c = { names.data, names.len, 0 };
+    uint32_t count = 0;
+    uint64_t floor = 0;
+    if (array_begin(&c, &count) == BJ_OK) {
+        for (uint32_t i = 0; i < count; i++) {
+            const uint8_t *name; uint32_t nlen;
+            if (take_string(&c, &name, &nlen)) break;
+            /* Opening it is what reads its staged value; a collection
+             * nothing has asked for yet has no context to ask. */
+            if (dbs_collection(s, (const char *)name, nlen, NULL) != BJ_OK) continue;
+            uint64_t at = dbs_applied_index(s, (const char *)name, nlen);
+            if (at > floor) floor = at;
+        }
+    }
+    dbuf_free(&names);
+    return floor;
+}
+
 uint64_t dbs_applied_index(dbs *s, const char *coll, size_t coll_len) {
     if (!s || !coll) return 0;
     for (int i = 0; i < DBS_MAX_COLLECTIONS; i++) {
@@ -1742,25 +1781,30 @@ dc_wal_plan *dbs_repl_resuming(dbs *s) {
 }
 
 /*
- * What applying this command said, if an earlier pass already applied
- * it. NULL means apply it for real.
+ * What applying the next command produced.
  *
- * The cursor advances either way, so the Nth command of the request is
- * always the Nth slot, however many passes it takes to get there.
+ * NOT an apply. The pump already performed it -- on every replica alike,
+ * which is what makes it the one place a committed command is performed
+ * -- and this hands the result back so the response can be assembled
+ * from it. A cached one on a later pass and the caller's fresh one on
+ * this pass are the same thing from here.
+ *
+ * BJ_ERR_RANGE when there is neither, which is a caller that stepped
+ * with fewer results than the plan has commands.
  */
-const dbuf *dbs_repl_replay(dbs *s, int *rc) {
-    if (!s || !s->resuming) return NULL;
+int dbs_repl_applied(dbs *s, dbuf *result, int *rc) {
+    if (!s || !s->resuming) return BJ_ERR_STATE;
     dbs_pending *e = s->resuming;
-    if (e->at_applied >= e->napplied || !e->applied[e->at_applied].done) return NULL;
-    dbs_applied *a = &e->applied[e->at_applied++];
-    *rc = a->rc;
-    return &a->result;
-}
 
-/* Remember what applying it said, for the passes that come after. */
-int dbs_repl_record(dbs *s, const dbuf *result, int rc) {
-    if (!s || !s->resuming) return BJ_OK;
-    dbs_pending *e = s->resuming;
+    if (e->at_applied < e->napplied && e->applied[e->at_applied].done) {
+        dbs_applied *a = &e->applied[e->at_applied++];
+        *rc = a->rc;
+        result->len = 0;
+        return dbuf_put(result, a->result.data, a->result.len);
+    }
+    if (!s->results || e->at_applied - e->napplied >= s->nresults) return BJ_ERR_RANGE;
+
+    const dbs_result *src = &s->results[e->at_applied - e->napplied];
     if (e->napplied == e->applied_cap) {
         uint32_t cap = e->applied_cap ? e->applied_cap * 2 : 8;
         dbs_applied *grown = (dbs_applied *)realloc(e->applied, cap * sizeof *grown);
@@ -1769,15 +1813,15 @@ int dbs_repl_record(dbs *s, const dbuf *result, int rc) {
         e->applied = grown;
         e->applied_cap = cap;
     }
-    /* Appended at the cursor, which is where this pass has got to. */
-    if (e->at_applied != e->napplied) return BJ_ERR_STATE;
     dbs_applied *a = &e->applied[e->napplied++];
     a->result.len = 0;
-    int err = result ? dbuf_put(&a->result, result->data, result->len) : BJ_OK;
-    a->rc = rc;
+    int err = src->len ? dbuf_put(&a->result, src->data, src->len) : BJ_OK;
+    a->rc = src->rc;
     a->done = 1;
     e->at_applied = e->napplied;
-    return err;
+    *rc = a->rc;
+    result->len = 0;
+    return err ? err : dbuf_put(result, a->result.data, a->result.len);
 }
 
 /*
@@ -1886,9 +1930,10 @@ int dbs_propose(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     return BJ_OK;
 }
 
-int dbs_step(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
+int dbs_step(dbs *s, uint64_t token, const uint64_t *indices,
+             const dbs_result *results, uint32_t n,
              uint64_t *next, dbuf *cmds, dbuf *out) {
-    if (!s || !out || !token || !next || !cmds) return BJ_ERR_STATE;
+    if (!s || !out || !token || !next || !cmds || !results) return BJ_ERR_STATE;
     *next = 0;
     dbs_pending *slot = pending_find(s, token);
     if (!slot || !slot->nplans) return BJ_ERR_STATE;
@@ -1902,11 +1947,13 @@ int dbs_step(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
     }
 
     s->indices  = indices;
-    s->nindices = n;
+    s->results  = results;
+    s->nindices = s->nresults = n;
     s->at_index = 0;
     int e = pass(s, slot, out);
     s->indices  = NULL;
-    s->nindices = s->at_index = 0;
+    s->results  = NULL;
+    s->nindices = s->nresults = s->at_index = 0;
     if (e) { pending_release(slot); return e; }
 
     if (slot->more) {                 /* another operation: another trip */
@@ -1919,15 +1966,4 @@ int dbs_step(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
     return BJ_OK;
 }
 
-/* The two-call shape, for a caller with nothing to step: it refuses a
- * request that turned out to need more than one trip rather than
- * answering half of one. */
-int dbs_complete(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
-                 dbuf *out) {
-    uint64_t next = 0;
-    dbuf cmds = {0};
-    int e = dbs_step(s, token, indices, n, &next, &cmds, out);
-    dbuf_free(&cmds);
-    if (!e && next) { dbs_abandon(s, next); return BJ_ERR_STATE; }
-    return e;
-}
+

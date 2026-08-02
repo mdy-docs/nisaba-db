@@ -1353,6 +1353,10 @@ class RaftCore {
     if (!this._ptr) throw codeError(-1, 'rnw_new');
     M._rnw_set_timing(this._ptr, electionTimeoutMs[0], electionTimeoutMs[1], heartbeatMs);
     M._rnw_set_limits(this._ptr, maxBatchBytes);
+    /** This node's bj_ns scope id, once it has files (attachFiles). */
+    this._scope = 0;
+    this._files = null;
+    this._kept = null;
   }
 
   /**
@@ -1360,7 +1364,16 @@ class RaftCore {
    * refuses rather than reaching through a freed pointer.
    */
   free() {
-    if (this._ptr) { requireModule()._rnw_free(this._ptr); this._ptr = 0; }
+    if (!this._ptr) return;
+    const M = requireModule();
+    // rnw_free releases the bj_ns it built; the table that ns resolved
+    // names from is this side's, and nothing else will drop it.
+    M._rnw_free(this._ptr);
+    this._ptr = 0;
+    if (this._scope) {
+      delete M.bjnsScopes?.[this._scope];
+      delete M.bjnsPending?.[this._scope];
+    }
   }
 
   /**
@@ -1381,6 +1394,146 @@ class RaftCore {
   /** Point the node at a different log (EntryLog cannot rebase in place,
    * so both compaction paths swap it). The old log must already be quiet. */
   setLog(log) { requireModule()._rnw_set_log(this._p, log.ctx); }
+
+  // ---- files: serving and receiving a snapshot install ---------------------
+  //
+  // A node given a namespace and a snapshot store does the whole install
+  // itself (raft_node.h): it reads the generation's files to serve one,
+  // stages chunks and writes the manifest to receive one, and copies the
+  // generation onto the live filenames to adopt one. What stays here is
+  // the part C cannot do -- OPENING a file, which is asynchronous in a
+  // browser and must not be inside a synchronous C call (bjns.h).
+  //
+  // So every one of those beats is the same shape: ask C which names it
+  // will touch, open exactly those, then make ONE synchronous call.
+
+  /**
+   * Give the node a file namespace and the host's snapshot store.
+   *
+   * `open(name)` must create-if-missing and return a sync access handle;
+   * `remove(name)` unlinks. The store is BORROWED -- the same `sst` the
+   * host reads `latest` from, so that an install committing inside C
+   * moves the host's store too rather than leaving two answers to which
+   * generation is live.
+   */
+  attachFiles({ store, open, remove }) {
+    const M = requireModule();
+    if (!this._scope) this._scope = nextNsScope++;
+    const rc = M._rnw_set_ns(this._p, this._scope);
+    if (rc !== 0) throw codeError(rc, 'attachFiles');
+    M._rnw_set_snapstore(this._p, store.storeCtx);
+    this._files = { open, remove };
+  }
+
+  /** Whether this node can serve an install itself -- what a host asks to
+   * know whether it still has to. */
+  get servesSnapshots() { return requireModule()._rnw_serves_snapshots(this._p) === 1; }
+
+  set chunkBytes(n) { requireModule()._rnw_set_chunk_bytes(this._p, n); }
+
+  /** The plan buffer, as names. Copied out immediately: it is one shared
+   * scratch (raft_node_wasm.c) and the next call into C reuses it. */
+  _plan(len) {
+    if (len < 0) throw codeError(len, 'plan');
+    if (len === 0) return [];
+    const M = requireModule();
+    const ptr = M._rnw_plan_ptr();
+    return textDecoder.decode(M.HEAPU8.slice(ptr, ptr + len))
+      .split('\0').filter((s) => s.length);
+  }
+
+  /** Which files an incoming install message will touch. Pure. */
+  installPlan(bytes) {
+    const M = requireModule();
+    return this._plan(withBytes(M, bytes, (p, n) => M._rnw_install_plan(this._p, p, n)));
+  }
+
+  /** Which files an adoption will touch. Pure. */
+  adoptPlan() { return this._plan(requireModule()._rnw_adopt_plan(this._p)); }
+
+  get installing() { return requireModule()._rnw_installing(this._p) === 1; }
+  get adoptPending() { return requireModule()._rnw_adopt_pending(this._p) === 1; }
+  get adoptBoundary() { return requireModule()._rnw_adopt_boundary(this._p); }
+
+  /**
+   * Open every planned name into this node's scope table, run `fn()`,
+   * then give the handles back. C resolves names from that table rather
+   * than opening (bjns_bridge.c), which is the whole reason the opens
+   * happen out here.
+   *
+   * A name in `keep` is NOT closed: rn_adopt leaves the node holding the
+   * log file it just created, and closing that handle would pull the
+   * file out from under the log. Its handle and fd come back instead, for
+   * whoever now owns them.
+   *
+   * Deletions the call ordered are drained afterwards, because bj_ns.remove
+   * MAY BE DEFERRED here -- OPFS removeEntry returns a promise (bjns.h).
+   */
+  async withFiles(names, fn, { keep = [] } = {}) {
+    const M = requireModule();
+    const scope = this._scope;
+    const table = (M.bjnsScopes ||= {})[scope] = {};
+    const opened = [];  // { name, fd, handle }
+    const kept = new Map();
+    try {
+      for (const name of names) {
+        const handle = await this._files.open(name);
+        const fd = registerHandle(M, handle);
+        table[name] = fd;
+        opened.push({ name, fd, handle });
+      }
+      return fn();
+    } finally {
+      delete M.bjnsScopes[scope];
+      let failure = null;
+      while (opened.length) {
+        const { name, fd, handle } = opened.pop();
+        if (keep.includes(name)) { kept.set(name, { fd, handle }); continue; }
+        unregisterHandle(M, fd);
+        try { handle.flush?.(); await handle.close(); }
+        catch (err) { failure ||= err; }
+      }
+      this._kept = kept;
+      const pending = M.bjnsPending && M.bjnsPending[scope];
+      if (pending && pending.length) {
+        M.bjnsPending[scope] = [];
+        for (const f of pending) {
+          try { await this._files.remove(f); } catch { /* an orphan, not a fault */ }
+        }
+      }
+      if (failure) throw failure;
+    }
+  }
+
+  /** The handle withFiles was told to keep, by name. */
+  keptFile(name) { return this._kept?.get(name) ?? null; }
+
+  /**
+   * The flip: stale live files out, the generation's onto the live
+   * names, the log rebased onto the boundary -- one synchronous call,
+   * because between the first restored file and the last the database is
+   * neither the old one nor the new one (raft_node.h).
+   *
+   * `victims` are the live files to remove first; deciding which of them
+   * are the database's is the host's knowledge. Returns the pointer to
+   * the log this replaced, or 0 when the node had already rebased once
+   * and owns that log itself.
+   */
+  adopt(victims) {
+    const M = requireModule();
+    const joined = textEncoder.encode(victims.length ? victims.join('\0') + '\0' : '');
+    const out = M._malloc(4);
+    const p = M._malloc(joined.length || 1);
+    try {
+      if (joined.length) M.HEAPU8.set(joined, p);
+      const rc = M._rnw_adopt(this._p, p, joined.length, out);
+      if (rc !== 0) throw codeError(rc, 'adopt');
+      return readU32(M, out);
+    } finally { M._free(p); M._free(out); }
+  }
+
+  /** The log the node is using -- after adopt(), one the NODE opened. */
+  get logCtx() { return requireModule()._rnw_log(this._p); }
 
   /**
    * Adopt a member set, or throw and adopt none of it. A refusal

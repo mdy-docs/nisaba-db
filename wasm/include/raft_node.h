@@ -144,6 +144,13 @@ void rn_set_log(raft_node *n, elog *log);
 void rn_set_ns(raft_node *n, bj_ns *ns);
 void rn_set_snapstore(raft_node *n, sst *store);
 
+/* The namespace this node was given, or NULL. Read-back rather than a
+ * second copy kept by the caller: a host that has to allocate the bj_ns
+ * (the browser's does -- bjns_bridge_open builds one over a scope table)
+ * needs somewhere to find it again at free time, and the node is already
+ * the one place it is written down. Symmetric with rn_log. */
+bj_ns *rn_ns(const raft_node *n);
+
 /* Bytes per chunk. 0 restores the default. */
 void rn_set_chunk_bytes(raft_node *n, uint32_t bytes);
 

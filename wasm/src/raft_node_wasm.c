@@ -10,13 +10,18 @@
  * the outbox lives inside it -- so unlike rcw/rmw, the host holds one
  * pointer per node rather than one shared scratch. That is not
  * incidental: a shared scratch would make two nodes in one process (the
- * simulated cluster every Raft test runs) trample each other.
+ * simulated cluster every Raft test runs) trample each other. The one
+ * exception is the file-plan buffer below, and the rule it breaks is
+ * exactly the one that lets it: a plan is read in the same synchronous
+ * turn it was built, so no second node can reach it in between.
  *
  * Indices and terms become doubles, exact to 2^53 -- the ceiling
  * entrylog.h's glue has always had. raft_node.h's uint64_t is what a
  * native host gets.
  */
 #include "raft_node.h"
+#include "bjns_bridge.h"
+#include "snapstore.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -32,8 +37,107 @@
 EMSCRIPTEN_KEEPALIVE raft_node *rnw_new(double self_id, elog *log) {
     return rn_new((uint64_t)self_id, log);
 }
-EMSCRIPTEN_KEEPALIVE void rnw_free(raft_node *n) { rn_free(n); }
+EMSCRIPTEN_KEEPALIVE void rnw_free(raft_node *n) {
+    /* The namespace built below is this file's to release, and the node
+     * is where it was written down (rn_ns). Read it BEFORE rn_free, and
+     * free it after: the node holds it by pointer until it dies. */
+    bj_ns *ns = rn_ns(n);
+    rn_free(n);
+    if (ns) { bjns_bridge_free(ns); free(ns); }
+}
 EMSCRIPTEN_KEEPALIVE void rnw_set_log(raft_node *n, elog *log) { rn_set_log(n, log); }
+
+/* ---- snapshots ----------------------------------------------------------
+ *
+ * A node with a namespace and a store serves and receives installs
+ * itself (raft_node.h). Both halves obey bjns.h's discipline -- C plans,
+ * the host opens, C executes -- so every entry point here is either pure
+ * (a plan, naming what will be touched) or synchronous over handles the
+ * host already opened into the scope table.
+ *
+ * The plans come back through ONE scratch buffer shared by every node in
+ * the module. That is the exception to this file's no-shared-context
+ * rule, and it holds for a reason the outbox could not use: a plan is
+ * read by its caller in the same synchronous turn, before any other node
+ * can run. Anything that has to survive until the next call still lives
+ * in the node.
+ */
+static dbuf plan_scratch;
+
+EMSCRIPTEN_KEEPALIVE const uint8_t *rnw_plan_ptr(void) { return plan_scratch.data; }
+
+/* Build a bj_ns over `scope` (bjns_bridge.c's table of names the host
+ * pre-opened) and give it to the node. Replacing one frees the old. */
+EMSCRIPTEN_KEEPALIVE int rnw_set_ns(raft_node *n, int scope) {
+    if (!n) return BJ_ERR_STATE;
+    bj_ns *ns = (bj_ns *)calloc(1, sizeof *ns);
+    if (!ns) return BJ_ERR_OOM;
+    int e = bjns_bridge_open(scope, ns);
+    if (e) { free(ns); return e; }
+    bj_ns *old = rn_ns(n);
+    rn_set_ns(n, ns);
+    if (old) { bjns_bridge_free(old); free(old); }
+    return BJ_OK;
+}
+
+/* The store is the HOST'S (sstw_store reaches it), borrowed rather than
+ * a second one opened over the same directory: `latest` moves when an
+ * install commits, and two stores would be two answers to which
+ * generation is live. */
+EMSCRIPTEN_KEEPALIVE void rnw_set_snapstore(raft_node *n, sst *store) {
+    rn_set_snapstore(n, store);
+}
+
+EMSCRIPTEN_KEEPALIVE void rnw_set_chunk_bytes(raft_node *n, int bytes) {
+    rn_set_chunk_bytes(n, bytes < 0 ? 0 : (uint32_t)bytes);
+}
+
+EMSCRIPTEN_KEEPALIVE int rnw_serves_snapshots(const raft_node *n) {
+    return rn_serves_snapshots(n);
+}
+
+/* Which files an incoming install will touch. Returns the NUL-separated
+ * plan's length in rnw_plan_ptr(), or a negative error code. */
+EMSCRIPTEN_KEEPALIVE int rnw_install_plan(raft_node *n, const uint8_t *msg, int len) {
+    if (len < 0) return BJ_ERR_RANGE;
+    plan_scratch.len = 0;
+    int e = rn_install_plan(n, msg, (uint32_t)len, &plan_scratch);
+    return e ? e : (int)plan_scratch.len;
+}
+
+EMSCRIPTEN_KEEPALIVE int    rnw_installing(const raft_node *n) { return rn_installing(n); }
+EMSCRIPTEN_KEEPALIVE double rnw_install_boundary(const raft_node *n) {
+    return (double)rn_install_boundary(n);
+}
+
+/* Which files the adoption will touch -- same buffer, same rule. */
+EMSCRIPTEN_KEEPALIVE int rnw_adopt_plan(raft_node *n) {
+    plan_scratch.len = 0;
+    int e = rn_adopt_plan(n, &plan_scratch);
+    return e ? e : (int)plan_scratch.len;
+}
+
+/* The whole flip, in one synchronous call. The log it replaces comes
+ * back through `old` (one i32 slot) so the host can close the handle it
+ * lent -- 0 when the node had already rebased once and owned the log
+ * itself, which is not the caller's to be handed back twice. */
+EMSCRIPTEN_KEEPALIVE int rnw_adopt(raft_node *n, const char *victims, int victims_len,
+                                   int *old) {
+    if (victims_len < 0) return BJ_ERR_RANGE;
+    elog *previous = NULL;
+    int e = rn_adopt(n, victims, (size_t)victims_len, &previous);
+    if (old) *old = (int)(uintptr_t)previous;
+    return e;
+}
+
+EMSCRIPTEN_KEEPALIVE int    rnw_adopt_pending(const raft_node *n) { return rn_adopt_pending(n); }
+EMSCRIPTEN_KEEPALIVE double rnw_adopt_boundary(const raft_node *n) {
+    return (double)rn_adopt_boundary(n);
+}
+
+/* The log the node is using -- after an adoption, one the NODE opened,
+ * which the host has no other way to reach (raft_node.h). */
+EMSCRIPTEN_KEEPALIVE elog *rnw_log(const raft_node *n) { return rn_log(n); }
 
 EMSCRIPTEN_KEEPALIVE int rnw_set_members(raft_node *n, const uint8_t *members, int len) {
     if (len < 0) return BJ_ERR_RANGE;

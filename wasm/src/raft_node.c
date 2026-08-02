@@ -640,6 +640,7 @@ static int start_election(raft_node *n, int pre_vote, double random01) {
 /* ---- serving a snapshot ------------------------------------------------- */
 
 void rn_set_ns(raft_node *n, bj_ns *ns)          { if (n) n->ns = ns; }
+bj_ns *rn_ns(const raft_node *n)                 { return n ? n->ns : NULL; }
 void rn_set_snapstore(raft_node *n, sst *store)  { if (n) { n->store = store; n->snap_gen = 0; } }
 void rn_set_chunk_bytes(raft_node *n, uint32_t b) { if (n) n->chunk_bytes = b ? b : RN_DEFAULT_CHUNK; }
 

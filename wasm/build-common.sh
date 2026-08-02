@@ -297,6 +297,9 @@ NATIVE_EXCLUDE=(
   wasm/src/db_ttl_wasm.c
   wasm/src/db_bulk_wasm.c
   wasm/src/db_catalog_wasm.c
+  # Both of these build a bj_ns through bjns_bridge.c, which is itself
+  # emscripten-only (its mirror in NATIVE_EXTRA is the POSIX adapter).
+  wasm/src/raft_node_wasm.c
   wasm/src/db_wasm.c
   wasm/src/db_agg_wasm.c
   wasm/src/db_currentdate_wasm.c

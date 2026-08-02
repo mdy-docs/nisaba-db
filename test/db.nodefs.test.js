@@ -136,7 +136,90 @@ describe('db: NodeFSStorageProvider', () => {
     await expect(provider.openFile('../escape.bj', { create: true })).rejects.toThrow(/Invalid file name/);
     await expect(provider.openFile('a/b.bj', { create: true })).rejects.toThrow(/Invalid file name/);
     await expect(provider.subProvider('..')).rejects.toThrow(/Invalid database name/);
+    // Same rules dropping as making one: a name one accepts and the other
+    // refuses is a database that can be created and never removed.
+    await expect(provider.deleteSubProvider('..')).rejects.toThrow(/Invalid database name/);
+    await expect(provider.deleteSubProvider('a/b')).rejects.toThrow(/Invalid database name/);
     await provider.close();
+  });
+
+  it('listDatabases sees what is on disk, without opening or locking any of it', async () => {
+    const root = tmpRoot();
+    const provider = new NodeFSStorageProvider(root);
+    const client = await connectClient(provider);
+    await (await (await client.db('alpha')).collection('t')).insertOne({ x: 1 });
+    await (await (await client.db('beta')).collection('t')).insertOne({ x: 2 });
+    expect((await client.listDatabases()).sort()).toEqual(['alpha', 'beta']);
+    await client.close();
+    await provider.close();
+
+    // A fresh client over the same root sees them without having opened
+    // one -- the listing is the directory's, not this session's memory of
+    // what it made. And nothing was locked to find out: the lock files
+    // are gone, and listing does not put them back.
+    const again = new NodeFSStorageProvider(root);
+    const client2 = await connectClient(again);
+    expect((await client2.listDatabases()).sort()).toEqual(['alpha', 'beta']);
+    expect(fs.existsSync(path.join(root, 'alpha', '.nisaba-lock'))).toBe(false);
+    await client2.close();
+    await again.close();
+  });
+
+  it('dropDatabase deletes the directory, releases its lock, and lets the name be reused', async () => {
+    const root = tmpRoot();
+    const provider = new NodeFSStorageProvider(root);
+    const client = await connectClient(provider);
+    const beta = await client.db('beta');
+    await (await beta.collection('t')).insertOne({ from: 'beta' });
+    await (await (await client.db('alpha')).collection('t')).insertOne({ from: 'alpha' });
+    expect(fs.existsSync(path.join(root, 'beta', '.nisaba-lock'))).toBe(true);
+
+    expect(await client.dropDatabase('beta')).toBe(true);
+    expect(beta.isOpen).toBe(false);              // closed before its files went
+    expect(fs.existsSync(path.join(root, 'beta'))).toBe(false);
+    expect(await client.listDatabases()).toEqual(['alpha']);
+    expect(await client.dropDatabase('beta')).toBe(false);   // already gone
+
+    // Reusable, which is what proves the lock came back: a stale fd on
+    // the old lock file would make this the "locked by pid" refusal.
+    const remade = await client.db('beta');
+    expect(await (await remade.collection('t')).countDocuments({})).toBe(0);
+    await (await remade.collection('t')).insertOne({ from: 'beta again' });
+    expect((await (await remade.collection('t')).findOne({})).from).toBe('beta again');
+
+    // The neighbour was untouched throughout.
+    expect((await (await (await client.db('alpha')).collection('t')).findOne({})).from).toBe('alpha');
+    await client.close();
+    await provider.close();
+  });
+
+  it('refuses to drop a database somebody else has open', async () => {
+    const root = tmpRoot();
+    const provider = new NodeFSStorageProvider(root);
+    const client = await connectClient(provider);
+    await (await (await client.db('served')).collection('t')).insertOne({ x: 1 });
+    await client.close();          // this client lets go of it entirely
+    await provider.close();
+
+    // Opened DIRECTLY, the way nisaba-server opens a database directory:
+    // one process per directory, and it never came through the parent.
+    const direct = new NodeFSStorageProvider(path.join(root, 'served'));
+    const served = await connect(direct);
+
+    const other = new NodeFSStorageProvider(root);
+    const client2 = await connectClient(other);
+    await expect(client2.dropDatabase('served')).rejects.toThrow(/is locked by pid/);
+    // And the refusal left it exactly as it was -- files, and readable.
+    expect(fs.existsSync(path.join(root, 'served', '__catalog__.bj'))).toBe(true);
+    expect(await (await served.collection('t')).countDocuments({})).toBe(1);
+
+    await served.close();
+    await direct.close();
+    // Once the holder has gone, the same call succeeds.
+    expect(await client2.dropDatabase('served')).toBe(true);
+    expect(fs.existsSync(path.join(root, 'served'))).toBe(false);
+    await client2.close();
+    await other.close();
   });
 
   it('ObjectIds round-trip byte-identically through real files', async () => {

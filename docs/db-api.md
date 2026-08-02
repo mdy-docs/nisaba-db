@@ -91,7 +91,39 @@ constraints as a collection name (no `/`, no NUL byte).
 | Method | Description |
 |---|---|
 | `client.db(name)` | Open (or create) a named database as `provider.subProvider(name)`. Returns the same cached `Db` instance for repeated calls with the same name. |
+| `client.listDatabases()` | Every named database under this root. |
+| `client.dropDatabase(name)` | Close it if this client has it open, then delete it and every file in it. `false` if there was none. |
 | `client.close()` | Close every database this client has opened. |
+
+`listDatabases()` reports the storage SCOPES that exist — what the
+provider's directory says — rather than a set proven to hold a catalog.
+Proving it would mean opening each one, and opening is what a listing
+must not do: under `NodeFSStorageProvider` every open takes that
+directory's exclusive lock, so listing a thousand databases would take a
+thousand locks and fail outright on one another process legitimately
+holds. A directory a host put there itself will therefore be listed.
+
+`dropDatabase()` closes before it deletes, and that ordering is the point
+rather than tidiness: a `Db` holds engine contexts and file handles, and
+an OPFS sync access handle survives its own file being unlinked — which
+is how you get a database that reads fine and persists nothing. It only
+closes what THIS client opened.
+
+Under `NodeFSStorageProvider` it also **refuses to drop a database
+somebody else has open**, with the same "locked by pid" error opening one
+twice gives. A database can be opened directly rather than through a
+client — `nisaba-server` does exactly that, one process per database
+directory — and deleting it anyway would pull the files out from under a
+live writer. The refusal leaves everything as it was.
+
+Both need two capabilities from the provider — `listSubProviders()` and
+`deleteSubProvider(name)`, the other half of `subProvider(name)`. All
+three providers here have them; a host's own provider that does not gets
+a sentence saying so rather than a `TypeError`.
+
+**Not on the server wire yet.** `connectServer(address)` returns one
+`Db`, so these are in-process only for now
+([`steps/databases-in-the-server.md`](steps/databases-in-the-server.md)).
 
 `bin/db.js` (the `db` CLI) and `index.html`'s
 console bridge (`window.client`) both use this, one OPFS root per install/page, one

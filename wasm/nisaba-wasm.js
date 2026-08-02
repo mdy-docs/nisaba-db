@@ -2024,6 +2024,22 @@ class MemoryStorageProvider {
     }
     return child;
   }
+
+  /** Names of the nested scopes that exist -- the other half of
+   * subProvider(), and what Client.listDatabases() reports. Here the
+   * child map IS the filesystem, so a scope exists once it has been
+   * asked for. */
+  async listSubProviders() {
+    return [...this._children.keys()];
+  }
+
+  /** Remove a nested scope and everything in it; false if there was none.
+   * The caller closes whatever it had open in there FIRST -- this drops
+   * the storage, and a Db still holding handles into it is a Db reading
+   * files nothing will write again. */
+  async deleteSubProvider(name) {
+    return this._children.delete(name);
+  }
 }
 
 /**
@@ -2066,6 +2082,33 @@ class OPFSStorageProvider {
     const dir = await this._dir();
     const childDir = await dir.getDirectoryHandle(name, { create: true });
     return new OPFSStorageProvider(childDir);
+  }
+
+  /** Names of the subdirectories under this one -- the other half of
+   * subProvider(), and what Client.listDatabases() reports. The same
+   * enumeration listFiles() does, filtered the other way. */
+  async listSubProviders() {
+    const names = [];
+    for await (const [name, handle] of (await this._dir()).entries()) {
+      if (handle.kind === 'directory') names.push(name);
+    }
+    return names;
+  }
+
+  /** Remove a subdirectory and everything in it; false if there was none.
+   * The caller closes whatever it had open in there FIRST: OPFS sync
+   * access handles are exclusive, and removing a directory out from
+   * under one is the one way to get a handle to a file that no longer
+   * has a name. */
+  async deleteSubProvider(name) {
+    const dir = await this._dir();
+    try {
+      await dir.removeEntry(name, { recursive: true });
+      return true;
+    } catch (err) {
+      if (err?.name === 'NotFoundError') return false;
+      throw err;
+    }
   }
 }
 
@@ -4072,6 +4115,53 @@ class Client {
     const db = await connect(sub, this._options);
     this._dbs.set(name, db);
     return db;
+  }
+
+  /**
+   * Every named database under this root -- `Db.listCollections()` one
+   * level up, and the instance half of a pair that until now existed
+   * only at the database level.
+   *
+   * These are the storage SCOPES that exist -- what the provider's
+   * directory says -- and not a set proven to hold a catalog. Proving it
+   * would mean opening each one, and opening is exactly what a listing
+   * must not do: under NodeFSStorageProvider every open acquires that
+   * directory's exclusive lock, so listing a thousand databases would
+   * take a thousand locks and fail outright on any database another
+   * process legitimately holds. A directory listing is not a catalog,
+   * and this reports the listing.
+   */
+  async listDatabases() {
+    if (typeof this._provider.listSubProviders !== 'function') {
+      throw new Error('this provider cannot list databases: it has no listSubProviders()');
+    }
+    return this._provider.listSubProviders();
+  }
+
+  /**
+   * Delete a database and every file in it. `false` if there was none,
+   * which is `dropCollection`'s answer to the same question and for the
+   * same reason: dropping the already-gone is what a caller asked for.
+   *
+   * CLOSED FIRST, always. A `Db` this client has open holds engine
+   * contexts and file handles pointing into storage that is about to
+   * stop existing -- and under OPFS a sync access handle survives its
+   * own file being unlinked, which is how you get a database that reads
+   * fine and persists nothing. So the close is not tidiness, and it is
+   * the client's rather than the provider's: the provider does not know
+   * what a Db is.
+   */
+  async dropDatabase(name) {
+    checkDbName(name);
+    if (typeof this._provider.deleteSubProvider !== 'function') {
+      throw new Error('this provider cannot drop a database: it has no deleteSubProvider()');
+    }
+    const open = this._dbs.get(name);
+    if (open) {
+      this._dbs.delete(name);
+      if (open.isOpen) await open.close();
+    }
+    return this._provider.deleteSubProvider(name);
   }
 
   async close() {

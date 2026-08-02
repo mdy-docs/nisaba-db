@@ -184,27 +184,37 @@ after it.
    quiet should be closeable — which the in-process `Client` never has to
    do, because it caches a `Db` per name forever and a page does not have
    a thousand of them.
-4. **`listDatabases` and `dropDatabase`, which exist nowhere.** Neither
-   name appears anywhere in this repository, in any commit, on any
-   branch. It is an easy thing to misremember, because the COLLECTION
-   pair is everywhere — `Db.listCollections` / `Db.dropCollection`, both
-   on the wire, both in `bin/db.js`, both in `docs/db-example.js`. The
-   database-level pair has never been written.
+4. **`listDatabases` and `dropDatabase` on the WIRE.** The in-process
+   half is done and shipped: `Client.listDatabases()` and
+   `Client.dropDatabase(name)`, over two new provider capabilities —
+   `listSubProviders()` and `deleteSubProvider(name)`, the other half of
+   `subProvider(name)` — in all three providers
+   ([`../db-api.md`](../db-api.md)). Neither name had ever appeared in
+   this repository, in any commit, on any branch; what is easy to
+   misremember is the COLLECTION pair, which is everywhere.
 
-   They arrive here, and in BOTH halves at once: the wire ops and the
-   `Client` methods, same names, same meanings, because a `Client` method
-   that only works over a socket has missed the point of there being one
-   `Client`.
+   What that half already settled, and the wire must match rather than
+   re-decide:
 
-   Neither is free at the provider layer, and that is the part to scope
-   before starting. A provider today has `listFiles()`, which filters to
-   `kind === 'file'` (OPFS) and `isFile()` (Node) and therefore cannot
-   see a database at all, and `subProvider(name)`, which CREATES on
-   demand and so cannot answer "does this one exist". There is
-   `deleteFile(name)` and nothing that removes a subdirectory. So all
-   three providers — OPFS, Node, memory — grow two capabilities, and
-   `dropDatabase` has to decide what it means for the Node provider's
-   per-directory lock and for a `Db` the `Client` still has cached.
+   - **A listing reports SCOPES, not proven databases.** Probing each for
+     a catalog means opening it, and under `NodeFSStorageProvider` every
+     open takes that directory's exclusive lock — so listing a thousand
+     databases would take a thousand locks and fail on any one another
+     process legitimately holds. A directory listing is not a catalog,
+     and both halves say so.
+   - **Dropping closes first.** A `Db` holds engine contexts and file
+     handles, and an OPFS sync access handle survives its own file being
+     unlinked, which is how you get a database that reads fine and
+     persists nothing. The server has the same ordering to keep, with
+     `dbs_close` where `Db.close()` is.
+   - **Dropping the already-gone answers `false`**, which is
+     `dropCollection`'s answer to the same question.
+   - **Dropping one somebody else has open is REFUSED.**
+     `NodeFSStorageProvider.deleteSubProvider` checks the child's lock
+     before it closes anything, because a database can be opened directly
+     rather than through a client — `nisaba-server` does exactly that,
+     one process per database directory. The server has the same question
+     to answer for a database it is not itself serving.
 
    In C, listing needs a directory listing and **`bj_ns` deliberately
    cannot produce one** — OPFS enumeration is asynchronous, so `bjns.h`
@@ -212,6 +222,15 @@ after it.
    reads a directory today; it will need POSIX/WASI `readdir`. That
    split is correct rather than a workaround, and it is exactly why
    listing is each host's own and not the namespace's.
+
+   Under `--raft`, `dropDatabase` is also a LOGGED COMMAND that every
+   replica must perform identically — and the one that has to decide what
+   it means for a cursor open on a collection inside it, the same
+   question compaction already had to answer.
+
+   And `bin/db.js` gets `databases` and `dropdb` when the wire does, not
+   before: a CLI command that works locally and errors under `--server`
+   is half a feature.
 5. **The database axis through the session.** Cursors, change streams,
    the applied index, compaction and the orphan sweep are all keyed by
    collection name today; each becomes `(db, coll)`. Change streams are
@@ -270,10 +289,11 @@ after it.
 - **`dropDatabase` removes a DIRECTORY, and `bj_ns` has no such verb.**
   `bj_ns.remove` names one file and MAY BE DEFERRED (`bjns.h`), which is
   why nothing may order a create against a remove. Dropping a whole
-  database is the host's, and under `--raft` it is also a logged command
-  that every replica must perform identically — decide what it means when
-  a cursor is open on a collection inside it, the same way compaction
-  already had to.
+  database is the host's — `NodeFSStorageProvider.deleteSubProvider` is
+  the worked example, including the part that is not obvious: it releases
+  the child's LOCK before removing the directory, because unlinking a
+  lock file underneath a live fd leaves the next opener free to lock a
+  directory this process still believes it owns.
 
 ## Ordering
 

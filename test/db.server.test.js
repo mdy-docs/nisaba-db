@@ -651,12 +651,44 @@ for (const engine of ENGINES) {
       throw new Error(`no member took the write "${name}": ${last?.message}`);
     };
 
+    /* What this member holds. A member that has applied NOTHING yet has
+     * no `users` at all -- the collection is made by the first insert
+     * applying, so a follower polled before that answers -37 rather than
+     * an empty list, and that is "not caught up", not a failure. */
     const namesOn = async (m) => {
       const db = await connectServer(m.port);
       try {
         return (await db.collection('users').find({}, { sort: { name: 1 } }).toArray())
           .map((d) => d.name);
+      } catch (err) {
+        if (err.code === -37) return [];
+        throw err;
       } finally { await db.close(); }
+    };
+
+    /*
+     * One write, offered to every live member AT ONCE. Exactly one takes
+     * it -- that is what having a leader means -- and the refusals come
+     * back to be read.
+     *
+     * Concurrent rather than in turn, because leadership is ALLOWED to
+     * move between two requests: a test that asked one member, then
+     * another, would be asserting that it had not, and a member that had
+     * since been elected would take the write and fail the test for
+     * behaving correctly.
+     */
+    const offerToAll = async (name) => {
+      const attempts = await Promise.allSettled(nodes.filter((n) => n.alive).map(async (m) => {
+        const db = await connectServer(m.port);
+        try {
+          await db.collection('users').insertOne({ name });
+          return m.id;
+        } finally { await db.close(); }
+      }));
+      return {
+        took: attempts.filter((a) => a.status === 'fulfilled').map((a) => a.value),
+        refusals: attempts.filter((a) => a.status === 'rejected').map((a) => a.reason)
+      };
     };
 
     /* Followers are behind by their replication lag, always -- the
@@ -685,45 +717,51 @@ for (const engine of ENGINES) {
       return async () => { for (const m of nodes) await stop(m); };
     });
 
-    it('elects one leader and replicates a write to every member', async () => {
+    it('elects one leader, and only the leader takes a write', async () => {
       const leader = await write('alpha');
       expect(MEMBERS.map((m) => m.id)).toContain(leader.id);
       await agree(['alpha']);
 
-      // One leader, not one per member: every other member refuses.
-      let refusals = 0;
-      for (const m of nodes) {
-        if (m.id === leader.id) continue;
-        const db = await connectServer(m.port);
-        await expect(db.collection('users').insertOne({ name: 'nope' }))
-          .rejects.toMatchObject({ code: -63 });
-        await db.close();
-        refusals++;
-      }
-      expect(refusals).toBe(2);
+      // One leader, not one per member: offered the same write at the
+      // same moment, exactly one of the three takes it.
+      const { took, refusals } = await offerToAll('contested');
+      expect(took.length).toBe(1);
+      expect(refusals.length).toBe(2);
+      for (const r of refusals) expect(r.code).toBe(-63);
+      await agree(['alpha', 'contested']);
     });
 
     it('a follower refusing a write says who leads, and where', async () => {
-      const leader = await write('beta');
-      await agree(['alpha', 'beta']);
-      const follower = nodes.find((m) => m.id !== leader.id);
-      const db = await connectServer(follower.port);
-      try {
-        await db.collection('users').insertOne({ name: 'nope' });
-        throw new Error('a follower took a write');
-      } catch (err) {
-        expect(err.code).toBe(-63);
-        // The id alone would send a caller back to the member it just
-        // asked; the address is what makes the refusal actionable.
-        expect(err.leaderId).toBe(leader.id);
-        expect(err.leader).toMatchObject({ id: leader.id, host: '127.0.0.1',
-                                           port: leader.raftPort });
-      } finally { await db.close(); }
+      await write('beta');
+      await agree(['alpha', 'beta', 'contested']);
+
+      const { took, refusals } = await offerToAll('redirected');
+      expect(took.length).toBe(1);
+      expect(refusals.length).toBe(2);
+      const refusal = refusals[0];
+      expect(refusal.code).toBe(-63);
+
+      // It names a real member and carries THAT member's real peer
+      // address. An id alone would send a caller back to whichever
+      // member it just asked; the address is what makes a refusal
+      // something a client can act on, which is what the HTTP front end
+      // will do with it.
+      const named = MEMBERS.find((m) => m.id === refusal.leaderId);
+      expect(named).toBeDefined();
+      expect(refusal.leader).toMatchObject({
+        id: named.id, host: '127.0.0.1', port: named.raftPort
+      });
+
+      // And it named the member that actually took the write -- the two
+      // happened at once, so this is the redirect being RIGHT rather
+      // than merely populated.
+      expect(took[0]).toBe(named.id);
+      await agree(['alpha', 'beta', 'contested', 'redirected']);
     });
 
     it('survives the leader being killed, and takes writes again', async () => {
       const leader = await write('gamma');
-      await agree(['alpha', 'beta', 'gamma']);
+      await agree(['alpha', 'beta', 'contested', 'gamma', 'redirected']);
       await stop(leader);
 
       // Two of three is still a quorum. The new leader is one of the
@@ -731,7 +769,7 @@ for (const engine of ENGINES) {
       // committed -- that is what the election rules buy.
       const next = await write('delta');
       expect(next.id).not.toBe(leader.id);
-      await agree(['alpha', 'beta', 'delta', 'gamma']);
+      await agree(['alpha', 'beta', 'contested', 'delta', 'gamma', 'redirected']);
     });
 
     it('catches a restarted member up on everything it missed', async () => {
@@ -740,7 +778,7 @@ for (const engine of ENGINES) {
       // Its own files, its own log: it comes back where it left off and
       // is caught up from there, rather than starting over.
       await boot(dead);
-      const took = await agree(['alpha', 'beta', 'delta', 'gamma']);
+      const caughtUpIn = await agree(['alpha', 'beta', 'contested', 'delta', 'gamma', 'redirected']);
 
       /*
        * PROMPTLY, and that is the assertion rather than a nicety. The
@@ -752,12 +790,12 @@ for (const engine of ENGINES) {
        * Both end with the member caught up; only the clock tells them
        * apart, so the clock is what is checked.
        */
-      expect(took).toBeLessThan(2500);
+      expect(caughtUpIn).toBeLessThan(2500);
 
       // And it is a full member again, not merely a reader: a write
       // taken now still reaches it.
       await write('epsilon');
-      await agree(['alpha', 'beta', 'delta', 'epsilon', 'gamma']);
+      await agree(['alpha', 'beta', 'contested', 'delta', 'epsilon', 'gamma', 'redirected']);
     }, 30000);
   });
 

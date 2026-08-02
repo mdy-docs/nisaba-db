@@ -49,6 +49,50 @@ describe('Client (in-memory provider)', () => {
     const client = await connectClient(new MemoryStorageProvider());
     await expect(client.db('a/b')).rejects.toThrow(/Invalid database name/);
     await expect(client.db('')).rejects.toThrow(/Invalid database name/);
+    await expect(client.dropDatabase('a/b')).rejects.toThrow(/Invalid database name/);
+    await client.close();
+  });
+
+  it('listDatabases names every database under the root', async () => {
+    const client = await connectClient(new MemoryStorageProvider());
+    expect(await client.listDatabases()).toEqual([]);
+    await client.db('analytics');
+    await client.db('billing');
+    expect((await client.listDatabases()).sort()).toEqual(['analytics', 'billing']);
+    await client.close();
+  });
+
+  it('dropDatabase closes it, removes its files, and answers false the second time', async () => {
+    const client = await connectClient(new MemoryStorageProvider());
+    const analytics = await client.db('analytics');
+    const billing = await client.db('billing');
+    await (await analytics.collection('events')).insertOne({ n: 1 });
+    await (await billing.collection('invoices')).insertOne({ n: 2 });
+
+    expect(await client.dropDatabase('billing')).toBe(true);
+    // Closed BEFORE the storage went: a Db still holding engine contexts
+    // into files that no longer exist is the failure this ordering is for.
+    expect(billing.isOpen).toBe(false);
+    expect(await client.listDatabases()).toEqual(['analytics']);
+    expect(await client.dropDatabase('billing')).toBe(false);
+
+    // The neighbour is untouched, and the name is free again -- a fresh,
+    // empty database rather than the old one reappearing.
+    expect(await (await analytics.collection('events')).countDocuments({})).toBe(1);
+    const remade = await client.db('billing');
+    expect(await remade.listCollections()).toEqual([]);
+    await client.close();
+  });
+
+  it('a provider without the two capabilities says so rather than failing oddly', async () => {
+    // Every provider in this repository has them. A host's own provider
+    // may not, and "listSubProviders is not a function" is not an answer.
+    const bare = new MemoryStorageProvider();
+    bare.listSubProviders = undefined;
+    bare.deleteSubProvider = undefined;
+    const client = await connectClient(bare);
+    await expect(client.listDatabases()).rejects.toThrow(/cannot list databases/);
+    await expect(client.dropDatabase('x')).rejects.toThrow(/cannot drop a database/);
     await client.close();
   });
 });
@@ -84,6 +128,31 @@ describe.skipIf(!hasOPFS)('Client (OPFS provider)', () => {
     expect(appDir.name).toBe('app');
     expect(analyticsDir.name).toBe('analytics');
 
+    await client.close();
+  });
+
+  it('listDatabases reads the directory, and dropDatabase removes it from disk', async () => {
+    const rootName = base();
+    dirs.push(rootName);
+    const dir = await root.getDirectoryHandle(rootName, { create: true });
+
+    const client = await connectClient(new OPFSStorageProvider(dir));
+    const app = await client.db('app');
+    const analytics = await client.db('analytics');
+    await (await app.collection('users')).insertOne({ name: 'Ada' });
+    await (await analytics.collection('users')).insertOne({ name: 'Grace' });
+    expect((await client.listDatabases()).sort()).toEqual(['analytics', 'app']);
+
+    expect(await client.dropDatabase('analytics')).toBe(true);
+    expect(analytics.isOpen).toBe(false);
+    expect(await client.listDatabases()).toEqual(['app']);
+    // Really gone from OPFS, not merely forgotten by the client.
+    await expect(dir.getDirectoryHandle('analytics')).rejects.toThrow();
+    expect(await client.dropDatabase('analytics')).toBe(false);
+
+    // The neighbour still works, which is what a recursive remove of the
+    // wrong subtree would have taken with it.
+    expect((await (await app.collection('users')).find({}).toArray()).map((d) => d.name)).toEqual(['Ada']);
     await client.close();
   });
 

@@ -110,6 +110,146 @@ function client(write, onData) {
   return call;
 }
 
+/*
+ * A server that only listens. It answers each request with the least
+ * plausible thing that shape of request accepts, and keeps every request
+ * it was sent -- so a test can assert what the CLIENT put on the wire
+ * rather than what a database made of it.
+ *
+ * No engine, no artifacts, nothing to skip: the rule below is the
+ * client's, and gating it on a built server would be gating it on
+ * something it does not use.
+ */
+function recordingServer() {
+  const requests = [];
+  const reply = (req) => {
+    const n = req.docs?.length ?? req.writes?.length ?? 1;
+    const counts = {
+      acknowledged: true, insertedCount: n, matchedCount: 0,
+      modifiedCount: 0, deletedCount: 0, upsertedCount: 0, upsertedId: null
+    };
+    if (req.op === 'ping') return { ok: true, pong: true };
+    if (req.op === 'insert') return { ok: true, result: counts };
+    if (req.op === 'insertMany' || req.op === 'bulkWrite') {
+      return { ok: true, result: counts, attempted: n, upserted: null, errors: null };
+    }
+    return { ok: true };
+  };
+  const server = net.createServer((sock) => {
+    sock.on('data', framer((req) => {
+      requests.push(req);
+      sock.write(Buffer.from(encode(reply(req))));
+    }));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => resolve({
+      port: server.address().port,
+      requests,
+      close: () => new Promise((r) => server.close(r))
+    }));
+  });
+}
+
+/* Every document an insert-shaped command carries, from any of the three
+ * shapes one can arrive in. */
+function documentsIn(req) {
+  if (req.op === 'insert') return [req.doc];
+  if (req.op === 'insertMany') return req.docs;
+  if (req.op === 'bulkWrite') {
+    return req.writes.filter((w) => w.insertOne).map((w) => w.insertOne.document);
+  }
+  return [];
+}
+
+describe('nisaba-server: the client mints an _id before it sends', () => {
+  /*
+   * C will not invent an _id -- that needs a clock and randomness, which
+   * db.h keeps out of the engine deliberately, and under replication an
+   * id invented at apply time would differ on every replica. So the
+   * server REFUSES an insert whose document has none (-42), and this
+   * side is what makes sure it never sees one.
+   *
+   * That guarantee currently rests on three separate `?? new ObjectId()`
+   * expressions, one per path, with nothing asserting all three exist.
+   * The suites below would catch a missing one -- they insert documents
+   * without _ids -- but only as a refusal from a server about a field,
+   * or (because `{_id: undefined, ...doc}` is a PRESENT key with an
+   * unencodable value) as "Unsupported type: undefined" from the codec.
+   * Both are a long way from "this client stopped minting", which is
+   * what `via` below turns them into.
+   */
+  it('sends no insert-shaped command carrying a document without one', async () => {
+    const server = await recordingServer();
+    const db = await connectServer(server.port, { keepAliveMs: 0 });
+    const c = db.collection('users');
+
+    /* A path that stops minting can fail in three places -- the codec,
+     * the server, or the assertions below -- and only the last of those
+     * would say which path it was. */
+    const via = async (path, fn) => {
+      try {
+        return await fn();
+      } catch (err) {
+        throw new Error(`${path} did not mint an _id before sending: ${err.message}`);
+      }
+    };
+
+    // Not one _id between them, by any route in.
+    const one = await via('insertOne', () => c.insertOne({ name: 'Ada' }));
+    const many = await via('insertMany',
+      () => c.insertMany([{ name: 'Grace' }, { name: 'Alan' }]));
+    const bulk = await via('bulkWrite', () => c.bulkWrite([
+      { insertOne: { document: { name: 'Edsger' } } },
+      { updateOne: { filter: { name: 'Nobody' }, update: { $set: { x: 1 } }, upsert: true } }
+    ]));
+
+    await db.close();
+    await server.close();
+
+    const inserts = server.requests.filter((r) => documentsIn(r).length > 0);
+    expect(inserts.map((r) => r.op)).toEqual(['insert', 'insertMany', 'bulkWrite']);
+
+    const sent = [];
+    for (const req of inserts) {
+      for (const doc of documentsIn(req)) {
+        expect(doc, `${req.op} sent a document with no _id`).toHaveProperty('_id');
+        expect(doc._id).toBeInstanceOf(ObjectId);
+        sent.push(doc._id.toHexString());
+      }
+    }
+    expect(sent).toHaveLength(4);
+    // Distinct, which is the other half of minting: a counter that
+    // handed out the same bytes twice would satisfy everything above.
+    expect(new Set(sent).size).toBe(4);
+
+    // And the caller is told the ids that actually went, rather than
+    // being handed something the server would have had to agree to.
+    expect(one.insertedId.toHexString()).toBe(sent[0]);
+    expect(Object.values(many.insertedIds).map((i) => i.toHexString()))
+      .toEqual([sent[1], sent[2]]);
+    expect(bulk.insertedIds[0].toHexString()).toBe(sent[3]);
+    expect(bulk.insertedIds[1]).toBeUndefined();   // the upsert is not an insert
+  });
+
+  it('leaves an _id the caller chose exactly as it was', async () => {
+    // Minting is a fallback, not a policy: a document that names its own
+    // identity keeps it, and that is what makes an insert idempotent to
+    // retry from the caller's side.
+    const server = await recordingServer();
+    const db = await connectServer(server.port, { keepAliveMs: 0 });
+    const mine = new ObjectId();
+    await db.collection('users').insertOne({ _id: mine, name: 'Ada' });
+    await db.close();
+    await server.close();
+
+    const [req] = server.requests;
+    expect(req.doc._id.toHexString()).toBe(mine.toHexString());
+    // `id` rides along for the writes that only discover they need one
+    // after they have matched; for an insert it is the same bytes.
+    expect(req.id.toHexString()).toBe(mine.toHexString());
+  });
+});
+
 describe.skipIf(!have(NATIVE))('nisaba-server: frames over a pipe (native, --stdio)', () => {
   let dir, proc, call;
 

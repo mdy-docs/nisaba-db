@@ -6640,6 +6640,214 @@ TEST(raft_request_vote_runs_end_to_end_in_c) {
     follower_close(&f);
 }
 
+TEST(install_snapshot_is_a_grammar_both_hosts_can_read) {
+    /*
+     * The fifth message kind. Its HANDLER is not in this layer -- it
+     * writes files, so it belongs to whoever owns a namespace -- but its
+     * ENVELOPE was written twice, once in src/raft.js's _sendSnapshot and
+     * once in its _onInstallSnapshot, and a leader in C talking to a
+     * follower in JavaScript needs exactly one definition of it.
+     *
+     * So: build every shape a transfer produces and read each one back.
+     * The distinctions being pinned are the ones a transfer actually
+     * turns on -- an empty chunk is not an absent one, a chunk that names
+     * no file is not a chunk with no data, and only the first carries a
+     * manifest.
+     */
+
+    /* A manifest is a whole object, spliced in as it stands: what goes in
+     * it belongs to the layer that owns a snapshot store, not to the
+     * envelope. */
+    doc *mf = doc_new();
+    doc_str(mf, "config", "whatever-the-store-said");
+    uint32_t mflen; const uint8_t *mfbuf = doc_done(mf, &mflen);
+
+    const uint8_t chunk[] = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+    /* ---- the first chunk: a file, some bytes, and the manifest. */
+    {
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_install_snapshot(7, 3, 42, 5, "primary", 7, 0,
+                                             chunk, sizeof chunk, 0,
+                                             mfbuf, mflen, &msg));
+        int kind = -1;
+        CHECK_OK(rmsg_kind(msg.data, (uint32_t)msg.len, &kind));
+        CHECK_I64(kind, RAFT_MSG_INSTALL_SNAPSHOT);
+        /* The sender is read out of the message, by the same rule every
+         * other kind is read by -- never told to us by a caller. */
+        uint64_t from = 0;
+        CHECK_OK(rmsg_sender(msg.data, (uint32_t)msg.len, &from));
+        CHECK_I64((int64_t)from, 3);
+
+        raft_install in;
+        CHECK_OK(rmsg_install_read(msg.data, (uint32_t)msg.len, &in));
+        CHECK_I64((int64_t)in.term, 7);
+        CHECK_I64((int64_t)in.leader_id, 3);
+        CHECK_I64((int64_t)in.last_included_index, 42);
+        CHECK_I64((int64_t)in.last_included_term, 5);
+        CHECK_I64((int64_t)in.offset, 0);
+        CHECK_I64(in.done, 0);
+        CHECK_I64((int64_t)in.role_len, 7);
+        CHECK(in.role && memcmp(in.role, "primary", 7) == 0);
+        CHECK_I64((int64_t)in.data_len, (int64_t)sizeof chunk);
+        CHECK(in.data && memcmp(in.data, chunk, sizeof chunk) == 0);
+        /* Spliced, so it comes back byte for byte -- the receiver hands
+         * it to sst_check_files without anything having decoded it. */
+        CHECK_I64((int64_t)in.manifest_len, (int64_t)mflen);
+        CHECK(in.manifest && memcmp(in.manifest, mfbuf, mflen) == 0);
+        dbuf_free(&msg);
+    }
+
+    /* ---- a later chunk: no manifest, an offset, and `done`. */
+    {
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_install_snapshot(7, 3, 42, 5, "idx-team_1", 10, 4096,
+                                             chunk, sizeof chunk, 1,
+                                             NULL, 0, &msg));
+        raft_install in;
+        CHECK_OK(rmsg_install_read(msg.data, (uint32_t)msg.len, &in));
+        CHECK_I64((int64_t)in.offset, 4096);
+        CHECK_I64(in.done, 1);
+        CHECK(in.manifest == NULL);
+        CHECK_I64((int64_t)in.manifest_len, 0);
+        dbuf_free(&msg);
+    }
+
+    /* ---- an EMPTY chunk for a real file. Not the same as no chunk: a
+     * zero-length file gets one of its own so the receiver creates it,
+     * because "absent" and "empty" are different things to the manifest
+     * check on the other side. */
+    {
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_install_snapshot(7, 3, 42, 5, "journal", 7, 0,
+                                             NULL, 0, 1, NULL, 0, &msg));
+        raft_install in;
+        CHECK_OK(rmsg_install_read(msg.data, (uint32_t)msg.len, &in));
+        CHECK(in.role != NULL);              /* it names a file... */
+        CHECK_I64((int64_t)in.data_len, 0);  /* ...and carries nothing */
+        dbuf_free(&msg);
+    }
+
+    /* ---- and a chunk that names NO file: a snapshot with no files at
+     * all still has to carry its manifest and its boundary, which is the
+     * whole point of the transfer. */
+    {
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_install_snapshot(9, 2, 100, 8, NULL, 0, 0,
+                                             NULL, 0, 1, mfbuf, mflen, &msg));
+        raft_install in;
+        CHECK_OK(rmsg_install_read(msg.data, (uint32_t)msg.len, &in));
+        CHECK(in.role == NULL);
+        CHECK_I64((int64_t)in.role_len, 0);
+        CHECK_I64(in.done, 1);
+        CHECK(in.manifest != NULL);
+        CHECK_I64((int64_t)in.last_included_index, 100);
+        dbuf_free(&msg);
+    }
+
+    /* ---- the replies, in their three shapes. `restart` says the
+     * receiver has no install to attach a chunk to and needs the manifest
+     * again; it is omitted rather than sent false, so a reader never has
+     * to know a precedence between it and success. */
+    {
+        struct { int ok, restart; const char *want_restart; } cases[] = {
+            { 1, 0, NULL }, { 0, 0, NULL }, { 0, 1, "restart" }, { 1, 1, NULL }
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            dbuf r = {0};
+            CHECK_OK(rmsg_build_install_reply(11, cases[i].ok, cases[i].restart, &r));
+            const uint8_t *v; size_t vlen; int f = 0;
+            CHECK_OK(obj_get_field(r.data, r.len, (const uint8_t *)"success", 7, &v, &vlen, &f));
+            CHECK_I64(f, 1);
+            CHECK(vlen >= 1 && v[0] == (cases[i].ok ? BJ_TYPE_TRUE : BJ_TYPE_FALSE));
+            f = 0;
+            CHECK_OK(obj_get_field(r.data, r.len, (const uint8_t *)"restart", 7, &v, &vlen, &f));
+            CHECK_I64(f, cases[i].want_restart ? 1 : 0);
+            f = 0;
+            CHECK_OK(obj_get_field(r.data, r.len, (const uint8_t *)"term", 4, &v, &vlen, &f));
+            CHECK_I64(f, 1);
+            dbuf_free(&r);
+        }
+    }
+
+    /*
+     * ---- and the shape src/raft.js ACTUALLY sends, built here by hand
+     * exactly as _sendSnapshot builds it. This is the cross-check that
+     * matters: the round trips above would all pass with a field
+     * misspelled on both sides, and the first symptom would be a
+     * follower silently ignoring every chunk of a real transfer.
+     *
+     *   { kind, term, leaderId, lastIncludedIndex, lastIncludedTerm,
+     *     role, offset, data, done, manifest? }
+     */
+    {
+        doc *js = doc_new();
+        doc_str(js, "kind", "installSnapshot");
+        doc_int(js, "term", 4);
+        doc_int(js, "leaderId", 2);
+        doc_int(js, "lastIncludedIndex", 17);
+        doc_int(js, "lastIncludedTerm", 3);
+        doc_str(js, "role", "primary");
+        doc_int(js, "offset", 8);
+        doc_key(js, "data");
+        bj_put_binary(js->b, chunk, (uint32_t)sizeof chunk);
+        doc_key(js, "done");
+        bj_put_bool(js->b, 1);
+        doc_begin_obj(js, "manifest");
+        doc_key(js, "config");
+        bj_put_null(js->b);
+        doc_begin_arr(js, "files");
+        bj_begin_object(js->b);
+        doc_str(js, "role", "primary");
+        doc_int(js, "size", 12);
+        doc_int(js, "crc", 99);
+        bj_end_object(js->b);
+        doc_end_arr(js);
+        doc_end_obj(js);
+        uint32_t jlen; const uint8_t *jbuf = doc_done(js, &jlen);
+
+        raft_install in;
+        CHECK_OK(rmsg_install_read(jbuf, jlen, &in));
+        CHECK_I64((int64_t)in.term, 4);
+        CHECK_I64((int64_t)in.leader_id, 2);
+        CHECK_I64((int64_t)in.last_included_index, 17);
+        CHECK_I64((int64_t)in.last_included_term, 3);
+        CHECK_I64((int64_t)in.offset, 8);
+        CHECK_I64(in.done, 1);
+        CHECK(in.role && in.role_len == 7 && memcmp(in.role, "primary", 7) == 0);
+        CHECK_I64((int64_t)in.data_len, (int64_t)sizeof chunk);
+        CHECK(in.manifest != NULL);
+        /* And the manifest that comes back is a manifest -- the span is
+         * handed to sst_check_files, which reads `files` out of it. */
+        {
+            const uint8_t *v; size_t vlen; int f = 0;
+            CHECK_OK(obj_get_field(in.manifest, in.manifest_len,
+                                   (const uint8_t *)"files", 5, &v, &vlen, &f));
+            CHECK_I64(f, 1);
+        }
+        doc_free(js);
+    }
+
+    /* ---- what it refuses. A message of another kind is not an install,
+     * however well-formed, and one that names no sender cannot be
+     * answered -- 0 is "nobody" everywhere in this grammar. */
+    {
+        dbuf other = {0};
+        CHECK_OK(rmsg_build_request_vote(1, 2, 3, 4, 0, &other));
+        raft_install in;
+        CHECK_RC(rmsg_install_read(other.data, (uint32_t)other.len, &in), RAFT_ERR_MESSAGE);
+        dbuf_free(&other);
+
+        dbuf anon = {0};
+        CHECK_OK(rmsg_build_install_snapshot(7, 0, 42, 5, NULL, 0, 0,
+                                             NULL, 0, 1, NULL, 0, &anon));
+        CHECK_RC(rmsg_install_read(anon.data, (uint32_t)anon.len, &in), RAFT_ERR_MESSAGE);
+        dbuf_free(&anon);
+    }
+
+    doc_free(mf);
+}
+
 TEST(raft_append_entries_round_trips_between_two_logs) {
     /*
      * A leader frames a batch straight out of its log; a follower
@@ -8927,6 +9135,7 @@ int main(void) {
     RUN(raft_membership_derives_the_same_lists_everywhere);
     RUN(raft_membership_merge_cannot_erase_an_address);
     RUN(raft_request_vote_runs_end_to_end_in_c);
+    RUN(install_snapshot_is_a_grammar_both_hosts_can_read);
     RUN(raft_append_entries_round_trips_between_two_logs);
     RUN(election_round_ignores_votes_from_a_world_that_ended);
     RUN(replication_picks_append_snapshot_or_park);

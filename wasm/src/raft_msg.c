@@ -343,6 +343,136 @@ int rmsg_build_append_entries(elog *log, uint64_t term, uint64_t leader_id,
     return finish(b, out);
 }
 
+/* ---- InstallSnapshot ---------------------------------------------------- */
+
+/* A field's whole encoded span, or nothing. Unlike the readers above
+ * this judges nothing about the type: the manifest is an object and the
+ * chunk is binary, and both travel to their consumer as they arrived. */
+static void raw_field(const uint8_t *o, size_t len, const char *key,
+                      const uint8_t **p, uint32_t *n) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    *p = NULL; *n = 0;
+    if (obj_get_field(o, len, (const uint8_t *)key, (uint32_t)strlen(key), &v, &vlen, &found))
+        return;
+    if (!found) return;
+    *p = v;
+    *n = (uint32_t)vlen;
+}
+
+int rmsg_install_read(const uint8_t *msg, uint32_t len, raft_install *out) {
+    if (!msg || !out) return BJ_ERR_STATE;
+    memset(out, 0, sizeof *out);
+
+    int kind = -1;
+    int e = rmsg_kind(msg, len, &kind);
+    if (e) return e;
+    if (kind != RAFT_MSG_INSTALL_SNAPSHOT) return RAFT_ERR_MESSAGE;
+
+    out->term                = num_field(msg, len, "term");
+    out->last_included_index = num_field(msg, len, "lastIncludedIndex");
+    out->last_included_term  = num_field(msg, len, "lastIncludedTerm");
+    out->offset              = num_field(msg, len, "offset");
+    out->done                = bool_field(msg, len, "done");
+
+    /* The sender, by the same rule every other kind is read by -- and it
+     * is a refusal rather than a 0, because a chunk nobody can be said to
+     * have sent is a chunk nobody can answer. */
+    e = rmsg_sender(msg, len, &out->leader_id);
+    if (e) return e;
+
+    /* `role` is a string, or null/absent for a chunk that names no file.
+     * str_field refuses a null, which is exactly the ambiguity that
+     * matters here, so absence is checked first. */
+    {
+        const uint8_t *v; size_t vlen; int found = 0;
+        if (obj_get_field(msg, len, (const uint8_t *)"role", 4, &v, &vlen, &found))
+            return RAFT_ERR_MESSAGE;
+        if (found && vlen >= 1 && v[0] != BJ_TYPE_NULL) {
+            const uint8_t *s; uint32_t slen;
+            if ((e = str_field(msg, len, "role", &s, &slen))) return e;
+            out->role = (const char *)s;
+            out->role_len = slen;
+        }
+    }
+
+    /* The chunk itself: BINARY, and handed on as the span it occupies so
+     * nothing copies it on the way to the file it belongs in. */
+    {
+        const uint8_t *v; size_t vlen; int found = 0;
+        if (obj_get_field(msg, len, (const uint8_t *)"data", 4, &v, &vlen, &found))
+            return RAFT_ERR_MESSAGE;
+        if (found && vlen >= 1 && v[0] != BJ_TYPE_NULL) {
+            if (vlen < 5 || v[0] != BJ_TYPE_BINARY) return RAFT_ERR_MESSAGE;
+            uint32_t n = rdu32(v + 1);
+            if ((size_t)n + 5 != vlen) return RAFT_ERR_MESSAGE;
+            out->data = v + 5;
+            out->data_len = n;
+        }
+    }
+
+    raw_field(msg, len, "manifest", &out->manifest, &out->manifest_len);
+    /* A manifest that is present but null is no manifest -- the same
+     * distinction `role` makes, and the JS encoder emits null for an
+     * absent one in some paths. */
+    if (out->manifest && out->manifest_len >= 1 && out->manifest[0] == BJ_TYPE_NULL) {
+        out->manifest = NULL;
+        out->manifest_len = 0;
+    }
+    return BJ_OK;
+}
+
+int rmsg_build_install_snapshot(uint64_t term, uint64_t leader_id,
+                                uint64_t last_included_index,
+                                uint64_t last_included_term,
+                                const char *role, uint32_t role_len,
+                                uint64_t offset,
+                                const uint8_t *data, uint32_t data_len,
+                                int done,
+                                const uint8_t *manifest, uint32_t manifest_len,
+                                dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_object(b);
+    put_key(b, "kind");
+    bj_put_string(b, (const uint8_t *)KIND_NAME[RAFT_MSG_INSTALL_SNAPSHOT],
+                  (uint32_t)strlen(KIND_NAME[RAFT_MSG_INSTALL_SNAPSHOT]));
+    put_key(b, "term");              bj_put_int(b, (int64_t)term);
+    put_key(b, "leaderId");          bj_put_int(b, (int64_t)leader_id);
+    put_key(b, "lastIncludedIndex"); bj_put_int(b, (int64_t)last_included_index);
+    put_key(b, "lastIncludedTerm");  bj_put_int(b, (int64_t)last_included_term);
+    /* Written even when there is none: a receiver reads `role` to decide
+     * whether this chunk belongs in a file, and an absent field and an
+     * explicit null would be two spellings of one answer. */
+    put_key(b, "role");
+    if (role) bj_put_string(b, (const uint8_t *)role, role_len);
+    else      bj_put_null(b);
+    put_key(b, "offset");            bj_put_int(b, (int64_t)offset);
+    put_key(b, "data");              bj_put_binary(b, data, data_len);
+    put_key(b, "done");              bj_put_bool(b, done);
+    if (manifest && manifest_len) {
+        put_key(b, "manifest");
+        bj_put_raw(b, manifest, manifest_len);
+    }
+    bj_end_object(b);
+    return finish(b, out);
+}
+
+int rmsg_build_install_reply(uint64_t term, int ok, int restart, dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = put_key(b, "term");
+    if (!e) e = bj_put_int(b, (int64_t)term);
+    if (!e) e = put_key(b, "success");
+    if (!e) e = bj_put_bool(b, ok);
+    if (!e && !ok && restart) {
+        e = put_key(b, "restart");
+        if (!e) e = bj_put_bool(b, 1);
+    }
+    if (!e) e = bj_end_object(b);
+    return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
 /* ---- TimeoutNow, join and leave: the replies ----------------------------- */
 
 int rmsg_build_ack(uint64_t term, int ok, dbuf *out) {

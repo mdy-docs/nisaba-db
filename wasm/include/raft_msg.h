@@ -206,6 +206,76 @@ int rmsg_build_append_entries(elog *log, uint64_t term, uint64_t leader_id,
                               uint64_t leader_commit, size_t max_bytes,
                               int quiesce, uint32_t *out_count, dbuf *out);
 
+/* ---- InstallSnapshot ----------------------------------------------------
+ *
+ * The fifth kind, and the one whose HANDLER is not here: it writes files,
+ * so it belongs to whoever owns a namespace (raft_node.h). What is here
+ * is what every host needed anyway and each wrote for itself -- the
+ * envelope, in one place, so a leader in C and a follower in JavaScript
+ * cannot disagree about it.
+ *
+ * A transfer is the concatenation of a snapshot's files, cut into
+ * chunks (raft_drive.h's raft_chunk_next decides where). Each chunk
+ * names exactly one file, so a receiver writes it without knowing the
+ * layout. The FIRST carries the manifest -- what the files are, and the
+ * cluster shape at the boundary -- and the LAST is flagged `done`.
+ */
+
+/*
+ * What an installSnapshot says, as spans into `msg`. Valid for as long
+ * as `msg` is.
+ *
+ *   role == NULL      this chunk names no file: the empty stream, which
+ *                     still has to carry a manifest and a boundary.
+ *   manifest == NULL  not the first chunk of this transfer.
+ *   data_len == 0     legal, and not the same as no chunk: a zero-length
+ *                     FILE gets a chunk of its own, because "absent" and
+ *                     "empty" are different things to the manifest check
+ *                     on the other side.
+ */
+typedef struct {
+    uint64_t term, leader_id;
+    uint64_t last_included_index, last_included_term;
+    const char    *role;     uint32_t role_len;
+    uint64_t       offset;
+    const uint8_t *data;     uint32_t data_len;
+    int            done;
+    const uint8_t *manifest; uint32_t manifest_len;
+} raft_install;
+
+int rmsg_install_read(const uint8_t *msg, uint32_t len, raft_install *out);
+
+/*
+ * Encode one chunk. `manifest` is a whole binjson OBJECT, spliced in as
+ * it stands, and NULL for every chunk after the first -- what goes IN it
+ * is not this file's business (raft_node.h builds it, because it is the
+ * layer that owns a snapshot store).
+ *
+ * `role` NULL means the chunk names no file; `data` may be NULL with
+ * data_len 0.
+ */
+int rmsg_build_install_snapshot(uint64_t term, uint64_t leader_id,
+                                uint64_t last_included_index,
+                                uint64_t last_included_term,
+                                const char *role, uint32_t role_len,
+                                uint64_t offset,
+                                const uint8_t *data, uint32_t data_len,
+                                int done,
+                                const uint8_t *manifest, uint32_t manifest_len,
+                                dbuf *out);
+
+/*
+ * `{ term, success }`, plus `restart: true` when the receiver has no
+ * install to attach this chunk to and needs the manifest again -- a
+ * leader that restarted, or a staging attempt this node abandoned.
+ *
+ * `restart` is only meaningful with success false, and is omitted
+ * otherwise rather than sent as false: the sender's rule is "retry from
+ * the top", and a field that says so only sometimes is one a reader has
+ * to know the precedence of.
+ */
+int rmsg_build_install_reply(uint64_t term, int ok, int restart, dbuf *out);
+
 #ifdef __cplusplus
 }
 #endif

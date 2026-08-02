@@ -30,10 +30,12 @@ in a deployment the C server had removed it from.
 One HTTP endpoint in front of one server, or of a cluster.
 
 **Done when** `curl` can run every operation the wire has against a
-single `nisaba-server`, and — once
-[`server-as-replica.md`](server-as-replica.md) lands — against a cluster,
-with writes reaching the leader without the client knowing which member
-that is.
+single `nisaba-server`, and against a CLUSTER of them, with writes
+reaching the leader without the client knowing which member that is.
+The cluster exists now (`--raft`, `--raft-port`, `--peer`; see
+[`../db-server.md`](../db-server.md)), and a follower's refusal already
+carries the leader's id and address, so the redirect is real rather than
+anticipated.
 
 ## What it is, concretely
 
@@ -134,12 +136,14 @@ first — but doing both at once is how neither gets finished.
 
 ## Ordering
 
-Independent of everything else, and useful before the cluster exists: an
-HTTP front end over ONE server is worth having on its own, and the
-leader-following half is a small addition once
-[`server-as-replica.md`](server-as-replica.md) lands. Build it in that
-order — a redirect follower with nothing to redirect to cannot be tested
-honestly.
+Independent of everything else. An HTTP front end over ONE server is
+worth having on its own, and the leader-following half is a small
+addition on top — build it in that order even though the cluster now
+exists, because one server is the case that has to keep working. The
+redirect is testable either way: `src/db-server-client.js` puts
+`leaderId` and the leader's `leader` record on the thrown `ServerError`,
+and `test/db.server.test.js` already asserts both against three real
+processes.
 
 ## Verification
 

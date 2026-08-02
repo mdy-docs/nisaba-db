@@ -431,13 +431,17 @@ const ENGINES = [
 let portSlot = 1;
 const nextPort = () => 18000 + (portSlot++) * 1000 + (process.pid % 1000);
 
-async function startServer(engine, port, extra = [], docs = 0) {
+async function startServer(engine, port, extra = [], docs = 0, reuse = null) {
   // docs < 0: an EMPTY directory -- no catalog, no collection, nothing.
   // The server makes the database itself, which is the whole point of
   // the suite that asks for it.
-  const dir = docs < 0
+  //
+  // `reuse` is the other case, and the one a replica needs: START OVER
+  // THE SAME FILES. A restart onto a fresh directory proves nothing
+  // about recovery -- it is a first boot with extra steps.
+  const dir = reuse ?? (docs < 0
     ? fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-empty-'))
-    : await seedDb(docs);
+    : await seedDb(docs));
   const [cmd, args, opts] = engine.argv(dir, port, extra);
   const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
   // The directory comes back too: a test that wants to read the files
@@ -542,17 +546,25 @@ for (const engine of ENGINES) {
     it('replays nothing it already applied, and the JS engine reads it the same way', async () => {
       const users = db.collection('users');
       const before = await users.countDocuments({});
+      const edsgers = await users.countDocuments({ name: 'Edsger' });
       await db.close();
       proc.kill();
       await new Promise(r => proc.once('exit', r));
 
-      // Restarted over its own log and its own files. The replay floor
-      // is the DATABASE's applied index, not the log's advisory commit
-      // marker -- resuming from that one would perform committed
-      // commands a second time.
-      const restarted = await startServer(engine, port + 1, ['--raft', '1']);
-      // startServer seeds a fresh directory, so drive the original one
-      // through the JS engine instead: same files, no server.
+      // Restarted over ITS OWN log and ITS OWN files, which is the only
+      // arrangement that tests anything: the replay floor is the
+      // DATABASE's applied index, and a server that read it as zero
+      // replays a prefix it has already applied. That is not a
+      // survivable mistake -- the collection refuses an applied index it
+      // has already passed, which is not a deterministic failure, so the
+      // replica halts on the way up rather than answering.
+      const restarted = await startServer(engine, port + 1, ['--raft', '1'], 0, dir);
+      const back = await connectServer(port + 1);
+      const backUsers = back.collection('users');
+      expect(await backUsers.countDocuments({})).toBe(before);
+      expect(await backUsers.countDocuments({ name: 'Edsger' })).toBe(edsgers);
+      expect((await backUsers.listIndexes()).map(i => i.name)).toContain('team_1');
+      await back.close();
       restarted.proc.kill();
       await new Promise(r => restarted.proc.once('exit', r));
 
@@ -565,6 +577,188 @@ for (const engine of ENGINES) {
       await jsDb.close();
       await provider.close();
     });
+  });
+
+  /*
+   * docs/steps/server-as-replica.md, the last of it: three processes, no
+   * JavaScript in any of them, and a peer transport between them.
+   *
+   * This is the suite that could not be written before, and the reason
+   * is worth stating: everything up to here could be checked with one
+   * process, because one process is a whole replica minus other
+   * replicas. Leadership, replication, failover and catch-up are the
+   * four things that only exist between processes, and each of them has
+   * a failure mode that a group of one cannot have.
+   *
+   * A JavaScript test driving C processes is not a contradiction. It is
+   * a CLIENT, which is what the wire is for.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: a three-process cluster (${engine.name})`, () => {
+    const base = nextPort();
+    const MEMBERS = [1, 2, 3].map((id) => ({
+      id,
+      port: base + id - 1,
+      raftPort: base + 10 + id - 1
+    }));
+    const argsFor = (m) => [
+      '--raft', String(m.id), '--raft-port', String(m.raftPort),
+      ...MEMBERS.filter((o) => o.id !== m.id)
+        .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+    ];
+    let nodes = [];
+
+    /* Each member gets its own EMPTY directory. A cluster that had to be
+     * seeded from identical files would be hiding the thing being
+     * tested: three databases become one because the log made them, not
+     * because they started out the same. */
+    const boot = async (m) => {
+      const { proc, dir } = await startServer(engine, m.port, argsFor(m), -1, m.dir);
+      m.proc = proc;
+      m.dir = dir;
+      m.alive = true;
+      return m;
+    };
+    const stop = async (m) => {
+      if (!m.alive) return;
+      m.alive = false;
+      m.proc.kill();
+      await new Promise((r) => m.proc.once('exit', r));
+    };
+
+    /*
+     * Whichever member takes it. Only the leader will, and a follower
+     * says so rather than forwarding -- so finding the leader IS the
+     * retry loop, and a client that keeps a hint is doing exactly this
+     * with one fewer attempt.
+     */
+    const write = async (name, tries = 100) => {
+      let last = null;
+      for (let i = 0; i < tries; i++) {
+        for (const m of nodes.filter((n) => n.alive)) {
+          let db = null;
+          try {
+            db = await connectServer(m.port);
+            await db.collection('users').insertOne({ name });
+            await db.close();
+            return m;
+          } catch (err) {
+            last = err;
+            try { await db?.close(); } catch { /* it is already gone */ }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error(`no member took the write "${name}": ${last?.message}`);
+    };
+
+    const namesOn = async (m) => {
+      const db = await connectServer(m.port);
+      try {
+        return (await db.collection('users').find({}, { sort: { name: 1 } }).toArray())
+          .map((d) => d.name);
+      } finally { await db.close(); }
+    };
+
+    /* Followers are behind by their replication lag, always -- the
+     * leader answers as soon as IT has applied, which is a heartbeat
+     * before anyone else has. So agreement is waited for, and the wait
+     * is the assertion. How LONG it took comes back, because for one of
+     * these tests that is the assertion. */
+    const agree = async (expected, withinMs = 20000) => {
+      const started = Date.now();
+      let seen = null;
+      while (Date.now() - started < withinMs) {
+        seen = [];
+        for (const m of nodes.filter((n) => n.alive)) seen.push(await namesOn(m));
+        if (seen.every((names) => JSON.stringify(names) === JSON.stringify(expected))) {
+          return Date.now() - started;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      throw new Error(`members never agreed on ${JSON.stringify(expected)}: ` +
+                      JSON.stringify(seen));
+    };
+
+    beforeAll(async () => {
+      nodes = [];
+      for (const m of MEMBERS) nodes.push(await boot(m));
+      return async () => { for (const m of nodes) await stop(m); };
+    });
+
+    it('elects one leader and replicates a write to every member', async () => {
+      const leader = await write('alpha');
+      expect(MEMBERS.map((m) => m.id)).toContain(leader.id);
+      await agree(['alpha']);
+
+      // One leader, not one per member: every other member refuses.
+      let refusals = 0;
+      for (const m of nodes) {
+        if (m.id === leader.id) continue;
+        const db = await connectServer(m.port);
+        await expect(db.collection('users').insertOne({ name: 'nope' }))
+          .rejects.toMatchObject({ code: -63 });
+        await db.close();
+        refusals++;
+      }
+      expect(refusals).toBe(2);
+    });
+
+    it('a follower refusing a write says who leads, and where', async () => {
+      const leader = await write('beta');
+      await agree(['alpha', 'beta']);
+      const follower = nodes.find((m) => m.id !== leader.id);
+      const db = await connectServer(follower.port);
+      try {
+        await db.collection('users').insertOne({ name: 'nope' });
+        throw new Error('a follower took a write');
+      } catch (err) {
+        expect(err.code).toBe(-63);
+        // The id alone would send a caller back to the member it just
+        // asked; the address is what makes the refusal actionable.
+        expect(err.leaderId).toBe(leader.id);
+        expect(err.leader).toMatchObject({ id: leader.id, host: '127.0.0.1',
+                                           port: leader.raftPort });
+      } finally { await db.close(); }
+    });
+
+    it('survives the leader being killed, and takes writes again', async () => {
+      const leader = await write('gamma');
+      await agree(['alpha', 'beta', 'gamma']);
+      await stop(leader);
+
+      // Two of three is still a quorum. The new leader is one of the
+      // survivors, and its log already has everything the old one
+      // committed -- that is what the election rules buy.
+      const next = await write('delta');
+      expect(next.id).not.toBe(leader.id);
+      await agree(['alpha', 'beta', 'delta', 'gamma']);
+    });
+
+    it('catches a restarted member up on everything it missed', async () => {
+      const dead = nodes.find((m) => !m.alive);
+      expect(dead).toBeDefined();
+      // Its own files, its own log: it comes back where it left off and
+      // is caught up from there, rather than starting over.
+      await boot(dead);
+      const took = await agree(['alpha', 'beta', 'delta', 'gamma']);
+
+      /*
+       * PROMPTLY, and that is the assertion rather than a nicety. The
+       * honest path here is a heartbeat, a redial and a rewind -- a few
+       * hundred milliseconds. The dishonest one is the transport's
+       * five-second request timeout eventually noticing that a dial
+       * nobody diagnosed had stranded a correlation id, which is what
+       * happens when a refused connect is only looked for on POLLOUT.
+       * Both end with the member caught up; only the clock tells them
+       * apart, so the clock is what is checked.
+       */
+      expect(took).toBeLessThan(2500);
+
+      // And it is a full member again, not merely a reader: a write
+      // taken now still reaches it.
+      await write('epsilon');
+      await agree(['alpha', 'beta', 'delta', 'epsilon', 'gamma']);
+    }, 30000);
   });
 
   describe.skipIf(!enabled)(`nisaba-server: the JS client (${engine.name})`, () => {

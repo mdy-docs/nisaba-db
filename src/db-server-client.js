@@ -335,6 +335,14 @@ class Connection {
        * only by whoever built the list. */
       const err = new ServerError(res.code, res.msg || `error ${res.code}`);
       if (typeof res.index === 'number') err.index = res.index;
+      /* A refusal can also name WHO to ask instead. A replicated server
+       * refuses a write it cannot take with the leader's id and, when it
+       * knows one, the member record carrying its address -- an id alone
+       * would send a caller back to the member it just asked. Carried
+       * through rather than interpreted: following a redirect is the
+       * caller's decision, and this layer only declines to lose it. */
+      if (typeof res.leaderId === 'number') err.leaderId = res.leaderId;
+      if (res.leader && typeof res.leader === 'object') err.leader = res.leader;
       throw err;
     }
     return res;

@@ -25,20 +25,32 @@
  * -- however many trips that takes. The loop is dbs_step's; this side
  * only decides when to turn the handle.
  *
+ * PEERS
+ *
+ * Given a peers transport (server/peers.h) this is a member of a real
+ * group: it stands for election against the others, replicates to them,
+ * answers their requests and commits by counting them. Given NULL it is
+ * a group of one -- which is a whole replica minus other replicas, and
+ * exactly the shape peers were added to.
+ *
+ * Nothing above changed to make that true. The node has always queued
+ * its messages through an outbox rather than sending them, precisely so
+ * a host could grow sockets without the state machine noticing; this
+ * file is what empties the outbox, and that is the whole of the
+ * difference.
+ *
  * WHAT IS NOT HERE
  *
- * Peers. This is one process with one member in its group, which is a
- * whole replica minus other replicas: it elects itself, appends,
- * commits by counting only itself, applies, and answers. Adding the
- * peer transport is the next step and changes nothing above -- the node
- * has always queued its messages through an outbox rather than sending
- * them, precisely so a host can grow sockets without the state machine
- * noticing.
+ * Joining. The member set is what the process was started with, so
+ * growing a cluster means restarting its members. rn_change_membership
+ * and the join message exist and are not wired up: a joiner has to be
+ * caught up, and catching one up needs the snapshot half below.
  *
- * Snapshots. With no peers there is nobody to install one, so the log is
- * the plain WAL rather than a generation's paired log. The rule for
- * which one to open (snapstore.h's naming, and "the store's log if a
- * generation has been adopted") arrives with the peers that need it.
+ * Snapshots. Nothing compacts the log here, so no peer can fall below
+ * its base and RN_EFFECT_NEEDS_SNAPSHOT cannot fire -- it is reported
+ * and refused rather than served. The rule for which log to open
+ * (snapstore.h's naming, and "the store's log if a generation has been
+ * adopted") arrives with the compaction that needs it.
  */
 #ifndef NISABA_SERVER_REPLICA_H
 #define NISABA_SERVER_REPLICA_H
@@ -49,13 +61,16 @@
 #include "bjns.h"
 #include "dbuf.h"
 #include "db_session.h"
+#include "peers.h"
 
 typedef struct replica replica;
 
 /*
- * Open the log in `ns` and put a node over it, with `self_id` as its
- * only member. The session and the namespace are BORROWED and must
- * outlive this.
+ * Open the log in `ns` and put a node over it. The member set is
+ * `self_id` plus whatever `px` was told about, with each member's
+ * address carried in its record so a refusal can name where the leader
+ * actually is. `px` may be NULL, which is a group of one. The session,
+ * the namespace and the transport are BORROWED and must outlive this.
  *
  * `now` is the same monotonic clock replica_tick will be given. The
  * node's timers measure DIFFERENCES, so starting it at zero and then
@@ -63,7 +78,7 @@ typedef struct replica replica;
  * of however long the machine has been up -- which elects it instantly
  * and hides the fact that the timer was never running.
  */
-int  replica_open(bj_ns *ns, dbs *s, uint64_t self_id, uint64_t now,
+int  replica_open(bj_ns *ns, dbs *s, uint64_t self_id, peers *px, uint64_t now,
                   replica **out);
 void replica_close(replica *r);
 
@@ -90,8 +105,11 @@ int replica_tick(replica *r, uint64_t now);
  *  <0  no response could be built, which is the transport's problem.
  *
  * A write on a node that is not the leader is answered outright, with
- * the leader's id: forwarding is a client's business, and a server that
- * did it would be holding a request it cannot promise anything about.
+ * the leader's id AND ADDRESS: forwarding is a client's business, and a
+ * server that did it would be holding a request it cannot promise
+ * anything about. The address comes out of the member record the node
+ * already holds -- an id alone would send a client back to whichever
+ * member it just asked.
  */
 int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
                    dbuf *out);

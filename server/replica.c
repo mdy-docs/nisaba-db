@@ -7,6 +7,7 @@
 #include "binjson.h"
 #include "bjcursor.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,12 +52,43 @@ typedef struct {
 struct replica {
     bj_ns     *ns;              /* borrowed */
     dbs       *s;               /* borrowed */
+    peers     *px;              /* borrowed; NULL is a group of one */
     bj_io      log_io;
     elog      *log;
     raft_node *node;
     uint64_t   applied;
+    uint64_t   rnd;             /* the election-timeout draw's state */
+    uint64_t   answering;       /* the conversation a reply belongs to */
+    int        said_no_snapshot;
+    int        said_no_conversation;
     pending    waiting[REPLICA_MAX_PENDING];
 };
+
+/*
+ * A DIFFERENT election timeout per member.
+ *
+ * raft_node.h takes `random01` as an argument rather than drawing one --
+ * a node that reads its own random source is one the simulator cannot
+ * replay, and test/raft-harness.js's determinism is the biggest asset
+ * the port has. So the draw is the host's, and it has to be a real draw:
+ * three members that all pass 0.5 arm the same deadline, campaign in the
+ * same millisecond, split the vote, and do it again. A group of one
+ * never noticed, which is exactly why this arrived with the peers.
+ *
+ * xorshift64*, seeded from the node id and the clock it started on.
+ * Nothing here is secret -- what is needed is that two members disagree,
+ * not that nobody can predict them -- and a clock in the TRANSPORT is
+ * already allowed (server/main.c says why; db.h keeps them out of the
+ * engine, and nothing below this file learns what time it is).
+ */
+static double rnd01(replica *r) {
+    uint64_t x = r->rnd;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    r->rnd = x;
+    return (double)((x * 0x2545F4914F6CDD1DULL) >> 11) / 9007199254740992.0;
+}
 
 static void pending_release(pending *p) {
     for (uint32_t i = 0; i < p->cap; i++) dbuf_free(&p->results[i]);
@@ -96,13 +128,38 @@ static pending *pending_find(replica *r, uint64_t last) {
 
 /* ---- opening ------------------------------------------------------------ */
 
-int replica_open(bj_ns *ns, dbs *s, uint64_t self_id, uint64_t now, replica **out) {
+/* One member record: { id, host?, port? }. The address goes in because
+ * the log is where a cluster's shape is written down (raft_core.h says
+ * so) -- a separate address book would be a second copy of it, and the
+ * two would disagree the first time a member moved. */
+static int put_member(bj_builder *b, uint64_t id, const char *host, int port) {
+    int e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"id", 2);
+    if (!e) e = bj_put_int(b, (int64_t)id);
+    if (host && port > 0) {
+        if (!e) e = bj_put_key(b, (const uint8_t *)"host", 4);
+        if (!e) e = bj_put_string(b, (const uint8_t *)host, (uint32_t)strlen(host));
+        if (!e) e = bj_put_key(b, (const uint8_t *)"port", 4);
+        if (!e) e = bj_put_int(b, port);
+    }
+    if (!e) e = bj_end_object(b);
+    return e;
+}
+
+int replica_open(bj_ns *ns, dbs *s, uint64_t self_id, peers *px, uint64_t now,
+                 replica **out) {
     if (!ns || !s || !out || !self_id) return BJ_ERR_STATE;
+    if (px && peers_count(px) > rn_max_peers()) return RAFT_ERR_CAPACITY;
     *out = NULL;
     replica *r = (replica *)calloc(1, sizeof *r);
     if (!r) return BJ_ERR_OOM;
     r->ns = ns;
     r->s = s;
+    r->px = px;
+    /* Non-zero, or xorshift stays at zero forever and every member draws
+     * the same nothing -- which is the bug this exists to avoid. */
+    r->rnd = (self_id * 0x9E3779B97F4A7C15ULL) ^ (now + 0x100000001B3ULL);
+    if (!r->rnd) r->rnd = 0x9E3779B97F4A7C15ULL;
 
     int e = ns->open(ns->ctx, REPLICA_WAL, (uint32_t)strlen(REPLICA_WAL),
                      BJ_NS_CREATE, &r->log_io);
@@ -127,17 +184,21 @@ int replica_open(bj_ns *ns, dbs *s, uint64_t self_id, uint64_t now, replica **ou
     }
     rn_set_ns(r->node, ns);
 
-    /* A group of one. It elects itself, commits by counting only itself,
-     * and every message it would send has nobody to send it to -- which
-     * is a whole replica minus other replicas, and exactly the shape
-     * peers get added to. */
+    /*
+     * The group, as the process was started with it. Without peers that
+     * is one member: it elects itself, commits by counting only itself,
+     * and every message it would send has nobody to send it to.
+     *
+     * There is no join here, so this set is the whole set -- and every
+     * member has to be given the same one, because a member missing from
+     * one node's list is a vote that node will never count.
+     */
     bj_builder *b = bj_builder_new();
     if (!b) { replica_close(r); return BJ_ERR_OOM; }
     e = bj_begin_array(b);
-    if (!e) e = bj_begin_object(b);
-    if (!e) e = bj_put_key(b, (const uint8_t *)"id", 2);
-    if (!e) e = bj_put_int(b, (int64_t)self_id);
-    if (!e) e = bj_end_object(b);
+    if (!e) e = put_member(b, self_id, peers_self_host(px), peers_self_port(px));
+    for (uint32_t i = 0; !e && px && i < peers_count(px); i++)
+        e = put_member(b, peers_id_at(px, i), peers_host_at(px, i), peers_port_at(px, i));
     if (!e) e = bj_end_array(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -174,7 +235,7 @@ int replica_open(bj_ns *ns, dbs *s, uint64_t self_id, uint64_t now, replica **ou
      * election timer was never really running. (It did. wasip2, whose
      * guest clock starts near zero, is where it showed.)
      */
-    rn_start(r->node, (int64_t)now, 0.5);
+    rn_start(r->node, (int64_t)now, rnd01(r));
 
     /*
      * A group of one stands for election NOW rather than counting down
@@ -189,8 +250,8 @@ int replica_open(bj_ns *ns, dbs *s, uint64_t self_id, uint64_t now, replica **ou
      * rolling restart becomes an election storm.
      */
     if (rn_quorum(r->node) == 1) {
-        e = rn_campaign(r->node, 0.5);
-        if (!e) e = rn_tick(r->node, (int64_t)now, 0.5);
+        e = rn_campaign(r->node, rnd01(r));
+        if (!e) e = rn_tick(r->node, (int64_t)now, rnd01(r));
         rn_out_clear(r->node);
         rn_effects_clear(r->node);
         if (e) { replica_close(r); return e; }
@@ -321,11 +382,141 @@ static int propose_batch(replica *r, pending *p, const dbuf *cmds) {
     return p->n ? BJ_OK : BJ_ERR_STATE;
 }
 
-/* Build a refusal into `out`, with the leader's id when there is one. */
+/* ---- the outbox ---------------------------------------------------------
+ *
+ * Everything the node wants said, said. Requests go to the peer they are
+ * addressed to; a reply goes back on the CONVERSATION its request
+ * arrived on, which is `answering` -- rn_handle queues exactly one reply
+ * for exactly the message it was given, and nothing else in this file
+ * calls it, so the two cannot be about different requests.
+ *
+ * A peer that cannot be reached is failed HERE rather than left: the
+ * node will not replace a request it still believes is in flight, so a
+ * correlation id that produces no answer and no failure is that peer's
+ * cursor wedged for good. The failures are collected first and delivered
+ * after, because rn_on_fail mutates the node and the outbox this is
+ * walking is only valid until it does.
+ */
+static int flush_out(replica *r) {
+    uint32_t n = rn_out_count(r->node);
+    if (!r->px) { rn_out_clear(r->node); return BJ_OK; }
+
+    dbuf unreachable = {0};
+    int e = BJ_OK;
+    for (uint32_t i = 0; i < n && !e; i++) {
+        uint32_t len = 0;
+        const uint8_t *msg = rn_out_bytes(r->node, i, &len);
+        uint64_t corr = rn_out_corr(r->node, i);
+        if (!msg) continue;
+        if (rn_out_is_reply(r->node, i)) {
+            if (r->answering) { e = peers_answer(r->px, r->answering, corr, msg, len); }
+            else if (!r->said_no_conversation) {
+                /* Unreachable by construction -- a reply is queued only
+                 * by rn_handle, which is only called with a conversation
+                 * open -- and said out loud anyway, because the only
+                 * thing worse than a peer waiting for an answer that was
+                 * built is nobody knowing it was. */
+                r->said_no_conversation = 1;
+                fprintf(stderr, "replica: a reply with no conversation to send it on\n");
+                fflush(stderr);
+            }
+            continue;
+        }
+        int rc = peers_request(r->px, rn_out_peer(r->node, i), corr, msg, len);
+        if (rc < 0) { e = rc; break; }
+        if (rc > 0) e = dbuf_put(&unreachable, (const uint8_t *)&corr, sizeof corr);
+    }
+    rn_out_clear(r->node);
+    for (size_t i = 0; i + sizeof(uint64_t) <= unreachable.len; i += sizeof(uint64_t)) {
+        uint64_t corr;
+        memcpy(&corr, unreachable.data + i, sizeof corr);
+        rn_on_fail(r->node, corr);
+    }
+    dbuf_free(&unreachable);
+    return e;
+}
+
+/* Everything the peers have said. */
+static int serve_peers(replica *r) {
+    if (!r->px) return BJ_OK;
+    for (;;) {
+        peer_event ev;
+        int have = 0;
+        int e = peers_next(r->px, &ev, &have);
+        if (e) return e;
+        if (!have) return BJ_OK;
+
+        if (ev.kind == PEER_EV_REQUEST) {
+            r->answering = ev.from;
+            e = rn_handle(r->node, ev.corr, ev.bytes, ev.len, rnd01(r));
+            if (e) {
+                /* A kind this node cannot answer -- a join, a leave, an
+                 * install with no store to put it in. Refused out loud
+                 * rather than dropped, so the sender learns now instead
+                 * of at its own timeout, with that peer idle until then. */
+                peers_reject(r->px, ev.from, ev.corr, dc_strerror(e));
+            }
+            e = flush_out(r);
+            r->answering = 0;
+            if (e) return e;
+            continue;
+        }
+
+        if (ev.kind == PEER_EV_REPLY) rn_on_reply(r->node, ev.corr, ev.bytes, ev.len, rnd01(r));
+        else                          rn_on_fail(r->node, ev.corr);
+        /* RAFT_ERR_PEER from either is not an error the host acts on: it
+         * means the round that id belonged to is over. */
+        e = flush_out(r);
+        if (e) return e;
+    }
+}
+
+/*
+ * The leader's member record, as a span into the node's own adopted set.
+ * That set is where the addresses live (rn_adopted), so a refusal can
+ * name where to go instead of merely naming who -- an id alone would
+ * send a client back to whichever member it just asked. NULL while there
+ * is no leader, which is an election in progress and a "try again".
+ */
+static const uint8_t *leader_record(const replica *r, uint32_t *len) {
+    uint64_t want = replica_leader_id(r);
+    if (!want) return NULL;
+    uint32_t alen = 0;
+    const uint8_t *adopted = rn_adopted(r->node, &alen);
+    if (!adopted) return NULL;
+
+    const uint8_t *ms; size_t mslen; int found = 0;
+    if (obj_get_field(adopted, alen, (const uint8_t *)"members", 7,
+                      &ms, &mslen, &found) != BJ_OK || !found) return NULL;
+
+    cur c = { ms, mslen, 0 };
+    uint32_t n = 0;
+    if (array_begin(&c, &n) != BJ_OK) return NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c) != BJ_OK) return NULL;
+        const uint8_t *rec = c.d + start;
+        uint32_t rlen = (uint32_t)(c.pos - start);
+        const uint8_t *idv; size_t idlen; int has = 0;
+        if (obj_get_field(rec, rlen, (const uint8_t *)"id", 2, &idv, &idlen, &has) != BJ_OK ||
+            !has) continue;
+        cur ic = { idv, idlen, 0 };
+        uint64_t id = 0;
+        if (read_u64(&ic, &id) != BJ_OK || id != want) continue;
+        *len = rlen;
+        return rec;
+    }
+    return NULL;
+}
+
+/* Build a refusal into `out`, with the leader's id and record when there
+ * is one. */
 static int refuse(const replica *r, int code, dbuf *out) {
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     const char *msg = dc_strerror(code);
+    uint32_t rlen = 0;
+    const uint8_t *rec = leader_record(r, &rlen);
     int e = bj_begin_object(b);
     if (!e) e = bj_put_key(b, (const uint8_t *)"ok", 2);
     if (!e) e = bj_put_bool(b, 0);
@@ -335,6 +526,8 @@ static int refuse(const replica *r, int code, dbuf *out) {
     if (!e) e = bj_put_string(b, (const uint8_t *)msg, (uint32_t)strlen(msg));
     if (!e) e = bj_put_key(b, (const uint8_t *)"leaderId", 8);
     if (!e) e = bj_put_int(b, (int64_t)replica_leader_id(r));
+    if (!e && rec) e = bj_put_key(b, (const uint8_t *)"leader", 6);
+    if (!e && rec) e = bj_put_raw(b, rec, rlen);
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -384,7 +577,11 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
         return e;
     }
     out->len = 0;   /* the answer comes later, through replica_ready */
-    return 1;
+    /* The AppendEntries the proposal queued goes NOW, not on the next
+     * tick: a write that waits a tick for its own replication to start
+     * has added the tick interval to every write in the cluster. */
+    e = flush_out(r);
+    return e ? e : 1;
 }
 
 /*
@@ -423,7 +620,11 @@ static int lost(replica *r, pending *p) {
 
 int replica_tick(replica *r, uint64_t now) {
     if (!r) return BJ_ERR_STATE;
-    int e = rn_tick(r->node, (int64_t)now, 0.5);
+    int e = rn_tick(r->node, (int64_t)now, rnd01(r));
+    if (e) return e;
+    e = flush_out(r);            /* heartbeats, and any election it started */
+    if (e) return e;
+    e = serve_peers(r);          /* and everything the peers have said back */
     if (e) return e;
 
     /* Twice around: applying raises settlements, and a settlement can
@@ -435,18 +636,41 @@ int replica_tick(replica *r, uint64_t now) {
 
         uint32_t n = rn_effect_count(r->node);
         for (uint32_t i = 0; i < n; i++) {
-            if (rn_effect_kind_at(r->node, i) != RN_EFFECT_SETTLED) continue;
+            int kind = rn_effect_kind_at(r->node, i);
+            if (kind == RN_EFFECT_NEEDS_SNAPSHOT) {
+                /* Nothing here compacts the log, so no peer can fall
+                 * below its base and this cannot fire. If it ever does,
+                 * that peer is stuck and no message will unstick it --
+                 * so it is said out loud rather than ignored. */
+                if (!r->said_no_snapshot) {
+                    r->said_no_snapshot = 1;
+                    fprintf(stderr, "replica: peer %llu needs a snapshot and this build"
+                                    " serves none\n",
+                            (unsigned long long)rn_effect_arg(r->node, i));
+                    fflush(stderr);
+                }
+                continue;
+            }
+            if (kind != RN_EFFECT_SETTLED) continue;
             pending *p = pending_find(r, rn_effect_arg(r->node, i));
             if (!p) continue;   /* nobody is waiting on it any more */
             e = rn_effect_flag(r->node, i) ? advance(r, p) : lost(r, p);
             if (e) return e;
         }
         rn_effects_clear(r->node);
-        /* The outbox is emptied because a group of one still queues its
-         * own replies; with peers, this is where they go on the wire. */
-        rn_out_clear(r->node);
+        /* A settlement can propose the next batch of a stepped request,
+         * which is an AppendEntries with somewhere to go. */
+        e = flush_out(r);
+        if (e) return e;
     }
-    return BJ_OK;
+
+    /*
+     * An effect this node had no room to report. There is no way to
+     * recover what was not said and every kind here is actionable, so
+     * carrying on would mean acting on a picture known to be incomplete
+     * (raft_node.h's rn_effects_lost says exactly this).
+     */
+    return rn_effects_lost(r->node) ? BJ_ERR_STATE : BJ_OK;
 }
 
 int replica_ready(replica *r, uint64_t *client, dbuf *out, int *have) {

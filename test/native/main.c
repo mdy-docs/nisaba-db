@@ -2185,6 +2185,120 @@ static uint32_t array_len(const uint8_t *arr, size_t len) {
     return n;
 }
 
+TEST(a_reopened_session_knows_where_its_apply_got_to) {
+    /*
+     * The replay floor, read by a session that has just opened and has
+     * nothing open inside it. That is the only moment it is ever asked
+     * for -- a replica calls it once, on the way up, to decide which
+     * entries it still owes -- and it is the moment it was wrong: it
+     * asked dbs_collection for the side effect of opening each
+     * collection while passing NULL for the handle, which that function
+     * refuses outright. So the floor was always zero.
+     *
+     * Zero is not a safe wrong answer. It replays the whole log, and the
+     * first entry replayed hands a collection an applied index it has
+     * already passed -- which is refused (never decreases), and is not a
+     * DETERMINISTIC refusal, so the replica halts instead of starting.
+     * A three-process cluster found this by not letting a killed member
+     * come back.
+     */
+    char dir[64];
+    CHECK_FATAL(scratch_dir("nisaba-floor", dir, sizeof dir) == 0);
+    int dirfd = open(dir, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+    /* Nothing has been applied yet, and the answer is the same before
+     * and after a collection is opened -- which is what makes the floor
+     * a fact about the DATABASE rather than about this session. */
+    CHECK_I64((long long)dbs_applied_floor(s), 0);
+
+    uint64_t index = 900, last = 0;
+    dbuf replayed = {0};   /* the last command, kept to offer a second time */
+    for (int round = 0; round < 2; round++) {
+        uint8_t oid[12];
+        memset(oid, 0, sizeof oid);
+        oid[0] = 0xC0; oid[11] = (uint8_t)(round + 1);
+        doc *d = doc_new();
+        doc_oid(d, "_id", oid);
+        doc_str(d, "team", "floor");
+        uint32_t dlen; const uint8_t *body = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request_with_id("insert", "users", "doc", body, dlen, oid,
+                                         &req, &req_len);
+
+        dbuf res = {0}, cmds = {0};
+        uint64_t token = 0;
+        CHECK_OK(dbs_propose(s, 7, req, req_len, &token, &cmds, &res));
+        CHECK(token != 0);
+        uint32_t n = array_len(cmds.data, cmds.len);
+        uint64_t *ix = (uint64_t *)malloc(n * sizeof *ix);
+        applied_batch batch;
+        memset(&batch, 0, sizeof batch);
+        CHECK_FATAL(ix != NULL);
+        CHECK_FATAL(batch_apply(s, &cmds, &index, ix, &batch) == 0);
+        last = index - 1;
+        {   /* the single command that batch just applied, kept whole */
+            cur cc = { cmds.data, cmds.len, 0 };
+            uint32_t got = 0;
+            CHECK_OK(array_begin(&cc, &got));
+            CHECK_I64((long long)got, 1);
+            size_t start = cc.pos;
+            CHECK_OK(skip_value(&cc));
+            replayed.len = 0;
+            CHECK_OK(dbuf_put(&replayed, cc.d + start, cc.pos - start));
+        }
+        uint64_t more = 0;
+        dbuf again = {0};
+        CHECK_OK(dbs_step(s, token, ix, batch.r, n, &more, &again, &res));
+        CHECK_I64((long long)more, 0);
+        dbuf_free(&again); dbuf_free(&cmds); dbuf_free(&res);
+        batch_free(&batch); free(ix);
+        bj_builder_free(rb); doc_free(d);
+    }
+    CHECK_I64((long long)dbs_applied_floor(s), (long long)last);
+    dbs_close(s);
+
+    /* And again over the same files, with nothing open. This is the
+     * call a restarting replica actually makes. */
+    dbs *back = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &back) == BJ_OK);
+    CHECK_I64((long long)dbs_applied_floor(back), (long long)last);
+    /*
+     * And this is what a wrong floor costs, in the two flavours it comes
+     * in. Replay resumes at floor + 1; offering an entry that was
+     * already applied is refused by the COLLECTION, which is the one
+     * thing that knows how far it got.
+     *
+     *   at the floor      a duplicate id -- deterministic, so a replica
+     *                     reports it and carries on. Survivable.
+     *   below the floor   an applied index that has already been passed,
+     *                     which never decreases. NOT deterministic, so
+     *                     the replica halts rather than diverge -- which
+     *                     is what a floor of zero turns every restart
+     *                     into.
+     */
+    {
+        dbuf scrap = {0};
+        int at = dbs_apply(back, last, replayed.data, (uint32_t)replayed.len, &scrap);
+        CHECK(at != BJ_OK);
+        CHECK_I64(dc_is_deterministic(at), 1);
+        int below = dbs_apply(back, last - 1, replayed.data, (uint32_t)replayed.len, &scrap);
+        CHECK(below != BJ_OK);
+        CHECK_I64(dc_is_deterministic(below), 0);
+        dbuf_free(&scrap);
+    }
+    dbuf_free(&replayed);
+    dbs_close(back);
+
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(a_bulk_writes_later_operation_sees_its_earlier_ones) {
     /*
      * A bulkWrite is a LIST OF WRITES, not a batch of independent ones:
@@ -10698,6 +10812,7 @@ int main(void) {
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
     RUN(ddl_is_a_command_a_second_database_can_be_caught_up_by);
     RUN(a_replicated_write_answers_exactly_what_an_unreplicated_one_does);
+    RUN(a_reopened_session_knows_where_its_apply_got_to);
     RUN(a_bulk_writes_later_operation_sees_its_earlier_ones);
     RUN(a_database_can_be_built_from_an_empty_directory);
     RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);

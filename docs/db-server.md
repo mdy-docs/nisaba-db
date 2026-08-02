@@ -37,10 +37,60 @@ nisaba-server --stdio                              # frames on stdin/stdout
 | `--order N` | B+ tree order the files were **written** with (default 32) |
 | `--max-clients N` | connections held at once (default and ceiling 64) |
 | `--idle-timeout N` | seconds of silence before a connection's slot is taken back (default 60; 0 disables) |
+| `--raft ID` | this process is a cluster member with that node id |
+| `--raft-port N` | where the other members reach this one (loopback) |
+| `--peer ID@HOST:PORT` | another member and where to reach IT; repeat once per member |
 
 `--order` is not a preference. Open a tree with the wrong one and its
 pages read as nonsense, so it has to match whatever created the files —
 `bin/db.js --order N`, or a host passing `order` to `connect()`.
+
+## A cluster
+
+```sh
+cd node1 && nisaba-server --port 8097 --raft 1 --raft-port 9001 \
+                          --peer 2@127.0.0.1:9002 --peer 3@127.0.0.1:9003
+cd node2 && nisaba-server --port 8098 --raft 2 --raft-port 9002 \
+                          --peer 1@127.0.0.1:9001 --peer 3@127.0.0.1:9003
+cd node3 && nisaba-server --port 8099 --raft 3 --raft-port 9003 \
+                          --peer 1@127.0.0.1:9001 --peer 2@127.0.0.1:9002
+```
+
+Three directories, three processes, no JavaScript in any of them. They
+elect a leader, put every write through a log before applying it, and
+survive one of them dying — two of three is still a quorum.
+
+**Every member is told the same member set**, because there is no join
+yet: growing a cluster means restarting its members with a longer list.
+A member missing from one node's list is a vote that node will never
+count.
+
+**Only the leader takes a write.** Any other member refuses it with
+`code: -63`, its `leaderId`, and — when it knows one — a `leader` record
+carrying that member's address. It does not forward: a server holding a
+request it cannot promise anything about is worse than a refusal a
+client can act on. `src/db-server-client.js` puts both on the thrown
+`ServerError`, so following the redirect is one line.
+
+**Reads are served from the member they land on**, at that member's own
+replication lag, which is a heartbeat or so behind the leader. The
+policy is not settled
+([`steps/read-semantics-and-change-streams.md`](steps/read-semantics-and-change-streams.md));
+until it is, a client that needs its own write back reads from the
+member that took it.
+
+**Without `--raft` nothing changes**, including the file layout: a
+directory served by a single process today can be joined to a cluster
+tomorrow rather than re-created.
+
+**`--stdio` cannot join a cluster** and says so rather than half-working
+— there is no poll loop there to serve peers with, and `wasm32-wasip1`
+has no `socket()` at all.
+
+The peer wire is length-prefixed binjson, byte-identical to
+`src/raft-transport-tcp.js`, so a native member and a Node member can sit
+in one cluster. The client port and the peer port are separate listeners
+and separate grammars.
 
 ## Clients
 

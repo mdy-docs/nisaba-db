@@ -1472,9 +1472,14 @@ uint64_t dbs_applied_floor(dbs *s) {
             const uint8_t *name; uint32_t nlen;
             if (take_string(&c, &name, &nlen)) break;
             /* Opening it is what reads its staged value; a collection
-             * nothing has asked for yet has no context to ask. */
-            if (dbs_collection(s, (const char *)name, nlen, NULL) != BJ_OK) continue;
-            uint64_t at = dbs_applied_index(s, (const char *)name, nlen);
+             * nothing has asked for yet has no context to ask. The
+             * handle is wanted, not merely the side effect: dbs_collection
+             * refuses a NULL `out` outright, so asking without one
+             * opened nothing and this floor was always zero -- which is
+             * a replica replaying its whole log on every restart. */
+            dc_collection *coll = NULL;
+            if (dbs_collection(s, (const char *)name, nlen, &coll) != BJ_OK) continue;
+            uint64_t at = dc_applied_index(coll);
             if (at > floor) floor = at;
         }
     }

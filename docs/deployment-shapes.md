@@ -352,27 +352,31 @@ leader failover, restart catch-up, blank-member bootstrap — all
 implemented and tested. See [`clustering.md`](clustering.md) and
 [`replicaton-roadmap.md`](replicaton-roadmap.md) step 5.
 
-### The C server cannot do this
+### The C server does this now
 
-`server/main.c` mentions Raft **zero times**. The pieces are already in
-the binary — `raft_core.c`, `raft_msg.c`, `raft_drive.c`, `raft_node.c`
-and `entrylog.c` are all linked into `nisaba-server` — but nothing
-constructs a node, and there is no log, no peer transport and no apply
-pump in the process.
+`server/main.c` was written mentioning Raft zero times, and that is no
+longer where it stands. `nisaba-server --raft ID --raft-port N --peer
+ID@HOST:PORT` is a cluster member: a log in the process, a node over it,
+a peer transport speaking the same wire `src/raft-transport-tcp.js`
+does, and an apply pump — with the one real design change, that a write
+is PROPOSED rather than applied where it lands. Three of them elect a
+leader, replicate, survive the leader dying and catch a restarted member
+up, with no JavaScript in any of them
+([`db-server.md`](db-server.md)).
 
-So the replicated deployment that exists today is **Node processes
-hosting the WASM engine**, which is a different program from shape 4.
+So there are now two replicated deployments rather than one: **Node
+processes hosting the WASM engine**, and **C processes hosting nothing**.
 
-What is still missing on the C side, in dependency order — briefs in
-[`steps/`](steps/):
+What is still missing on the C side — briefs in [`steps/`](steps/):
 
-1. **The server becomes a replica** (`steps/server-as-replica.md`) — a
-   log, a node, a peer socket and an apply pump in `server/main.c`, and
-   the one real design change: a write is PROPOSED rather than applied
-   where it lands.
-2. **Native composition** (`steps/native-composition.md`) — seating
+1. **Native composition** (`steps/native-composition.md`) — seating
    several Raft groups over sockets in one process, and deciding what is
    policy.
+
+Plus two pieces deliberately left with the compaction they both wait on:
+snapshots in the server (nothing there compacts the log, so no
+generation exists to install) and joining (a joiner has to be caught up,
+which is the same thing). `steps/README.md` records both.
 
 **Two of these are done and retired.** Completions in C: a proposal's
 fate — applied, and still yours — is decided in the node
@@ -424,14 +428,10 @@ on this assumption and are now confirmed rather than speculative:
    Raft message kind a host had to answer is the node's.
 2. ~~`steps/completions-in-c.md`~~ — **done**, and retired: a proposal's
    fate is the node's answer.
-3. `steps/server-as-replica.md` — one server process becomes a cluster
-   member.
+3. ~~`steps/server-as-replica.md`~~ — **done**, and retired: one server
+   process IS a cluster member, log and peer transport and apply pump.
 4. `steps/native-composition.md` — several Raft groups over sockets in
    one process.
-
-Plus a log in C (`entrylog.c` is already linked into the binary and
-unused) and the apply pump, which `dbs_apply` just made possible for
-every command kind.
 
 What it makes secondary: `src/raft.js`, `src/raft-host.js`,
 `src/db-replicated.js` and the two peer transports remain correct,

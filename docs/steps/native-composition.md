@@ -67,13 +67,21 @@ record it rather than quietly implementing it in one host.
 
 ## Ordering
 
-This should come AFTER `server-as-replica.md`. Both of its own
-prerequisites are already met — the node answers all five message kinds
-since the file seam landed, and it reports a proposal's fate itself
-since completions landed — but this brief asks which of
-`RaftGroupHost`'s policies belong in C, and a native server that has
-actually needed them is a far better judge of that than a reading of the
-JavaScript.
+Its prerequisite is met: `server-as-replica.md` has landed and is
+retired. One `nisaba-server` process is a cluster member — a log, a
+node, an apply pump and a peer transport (`server/peers.h`), with three
+of them electing, replicating and failing over. That matters here
+because this brief asks which of `RaftGroupHost`'s policies belong in C,
+and a native server that has actually needed them is a far better judge
+than a reading of the JavaScript.
+
+Two of its answers are already visible. `server/peers.h` is
+group-agnostic on purpose — it moves opaque bytes between a node id and
+a socket — so seating several groups on one transport is an envelope
+(`{group, msg}`, which `src/raft-host.js` already uses) rather than a
+second transport. And the pieces a group needs beyond the node are
+exactly what `server/replica.c` turned out to be: the apply pump, the
+pending-write table, and the request fork.
 
 ## Suggested staging
 

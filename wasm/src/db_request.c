@@ -467,6 +467,61 @@ typedef struct {
     uint8_t target_id[12];
 } write_result;
 
+/* ---- the replicated fork (db_session.h) ---------------------------------
+ *
+ * Every write here is plan-then-apply. On a replica the two halves are
+ * separated by a quorum, and these three lines are the whole of the
+ * difference: take a plan (fresh, or the one this request already made),
+ * apply one command (at index 0, or at the index it committed at), and
+ * give the plan back (unless the session is holding it across the wait).
+ *
+ * Written as helpers rather than as a branch in each of the four loops
+ * because there are four of them -- run_write, insertMany, bulkWrite and
+ * DDL -- and a rule copied four times is a rule with four chances to
+ * drift.
+ */
+
+/* The plan for this write. DC_PENDING means it was built and kept: the
+ * commands belong to the log now, and nothing may be applied until they
+ * come back. */
+static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
+                     int wreq, const uint8_t *a, uint32_t a_len,
+                     const uint8_t *b, uint32_t b_len,
+                     int upsert, const uint8_t id[12], dc_wal_plan **out) {
+    if (dbs_repl_replaying(s)) {
+        *out = dbs_repl_resuming(s);
+        /* Exhausted means this run planned more than the first did, which
+         * cannot happen over the same bytes and the same catalog -- and
+         * if it ever does, it must not be papered over by planning
+         * afresh against state a quorum never saw. */
+        return *out ? BJ_OK : BJ_ERR_STATE;
+    }
+    int e = dc_wal_plan_build(c, coll, coll_len, wreq, a, a_len, b, b_len,
+                              upsert, id, out);
+    if (e) return e;
+    if (!dbs_repl_planning(s)) return BJ_OK;
+    e = dbs_repl_hold(s, *out);
+    if (e) { dc_wal_plan_free(*out); *out = NULL; return e; }
+    /* Planned and kept. The caller skips its apply loop and carries on --
+     * bulkWrite must reach its LAST operation to plan it, so this can
+     * never be an early return out of the request. */
+    return DC_PENDING;
+}
+
+/* Apply one command, staging the index it committed at. Zero on a
+ * single-process server, where there is no log and dc_wal_apply is told
+ * so. */
+static int apply_cmd(dbs *s, dc_collection *c, const uint8_t *cmd, uint32_t clen,
+                     dbuf *one) {
+    return dc_wal_apply(c, dbs_repl_next_index(s), cmd, clen, one);
+}
+
+/* Give the plan back, unless the session is holding it for a quorum --
+ * in which case it belongs to the session until the answer comes. */
+static void plan_close(dbs *s, dc_wal_plan *p) {
+    if (p && !dbs_repl_active(s)) dc_wal_plan_free(p);
+}
+
 /* Plan a write and apply every command it produced, reporting what
  * happened through *wr. Errors are the caller's to turn into a response:
  * a refusal for a single write, one entry in `errors` inside a list. */
@@ -478,8 +533,9 @@ static int run_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
     memset(wr, 0, sizeof *wr);
 
     dc_wal_plan *p = NULL;
-    int e = dc_wal_plan_build(c, coll, coll_len, wreq, a, a_len, b, b_len,
-                              upsert, id, &p);
+    int e = plan_open(s, c, coll, coll_len, wreq, a, a_len, b, b_len,
+                      upsert, id, &p);
+    if (e == DC_PENDING) return BJ_OK;   /* planned; the applies wait for a quorum */
     if (e) return e;
 
     /* The document as it was, taken before anything is applied. The
@@ -509,7 +565,7 @@ static int run_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
         /* index 0: this collection is not log-driven here, so the applied
          * index is not staged. A replicated server passes the log index
          * it committed at, and dc_wal_apply stages it with the mutation. */
-        e = dc_wal_apply(c, 0, cmd, clen, &one);
+        e = apply_cmd(s, c, cmd, clen, &one);
         if (e) goto done;
         accumulate(one.data, one.len, &wr->matched, &wr->modified, &wr->deleted);
         const uint8_t *v; size_t vlen; int found = 0;
@@ -539,7 +595,7 @@ static int run_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
 
 done:
     dbuf_free(&one);
-    dc_wal_plan_free(p);
+    plan_close(s, p);
     return e;
 }
 
@@ -677,8 +733,9 @@ static int do_insert_many(dbs *s, dc_collection *c, const char *coll, uint32_t c
     }
 
     dc_wal_plan *p = NULL;
-    e = dc_wal_plan_build(c, coll, coll_len, DC_WREQ_INSERT_MANY,
-                          docs, (uint32_t)docs_len, NULL, 0, 0, NO_ID, &p);
+    e = plan_open(s, c, coll, coll_len, DC_WREQ_INSERT_MANY,
+                  docs, (uint32_t)docs_len, NULL, 0, 0, NO_ID, &p);
+    if (e == DC_PENDING) return BJ_OK;
     if (e) return e;
 
     bj_builder *errb = bj_builder_new();
@@ -697,7 +754,7 @@ static int do_insert_many(dbs *s, dc_collection *c, const char *coll, uint32_t c
         const uint8_t *cmd = dc_wal_plan_cmd(p, i, &clen);
         if (!cmd) { e = BJ_ERR_STATE; break; }
         one.len = 0;
-        int rc = dc_wal_apply(c, 0, cmd, clen, &one);
+        int rc = apply_cmd(s, c, cmd, clen, &one);
         if (!rc && watching) {
             int ee = emit_change(s, c, coll, coll_len, cmd, clen, one.data, one.len);
             if (ee) { e = ee; break; }
@@ -712,7 +769,7 @@ static int do_insert_many(dbs *s, dc_collection *c, const char *coll, uint32_t c
         total.inserted++;
     }
     dbuf_free(&one);
-    dc_wal_plan_free(p);
+    plan_close(s, p);
 
     if (!e) {
         bj_end_array(errb);
@@ -973,14 +1030,20 @@ static int do_ddl(dbs *s, const char *coll, uint32_t coll_len, int wreq,
                   const uint8_t *b, size_t b_len,
                   dbuf *result) {
     dc_wal_plan *p = NULL;
-    int e = dc_wal_plan_build(NULL, coll, coll_len, wreq,
-                              a, (uint32_t)a_len, b, (uint32_t)b_len,
-                              0, NULL, &p);
+    int e = plan_open(s, NULL, coll, coll_len, wreq,
+                      a, (uint32_t)a_len, b, (uint32_t)b_len, 0, NULL, &p);
+    if (e == DC_PENDING) return BJ_OK;
     if (e) return e;
     uint32_t clen = 0;
     const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+    /* index 0 for DDL either way: an index build commits catalog and
+     * index files but not the primary tree, so a staged applied-index
+     * would not persist with it. dbs_repl_next_index is still consumed,
+     * because the caller proposed a command for it and the lists must
+     * stay in step. */
+    if (dbs_repl_replaying(s)) (void)dbs_repl_next_index(s);
     e = cmd ? dbs_apply(s, 0, cmd, clen, result) : BJ_ERR_STATE;
-    dc_wal_plan_free(p);
+    plan_close(s, p);
     return e;
 }
 

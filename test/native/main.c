@@ -2140,6 +2140,201 @@ TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
     close(dirfd);
 }
 
+/* Count the members of a binjson ARRAY. */
+static uint32_t array_len(const uint8_t *arr, size_t len) {
+    cur c = { arr, len, 0 };
+    uint32_t n = 0;
+    if (array_begin(&c, &n)) return 0;
+    return n;
+}
+
+TEST(a_replicated_write_answers_exactly_what_an_unreplicated_one_does) {
+    /*
+     * docs/steps/server-as-replica.md. dbs_handle plans a write and
+     * applies it in one call, because on a single-process server there
+     * is nobody to ask. A replica has to ask, so the call splits:
+     * dbs_propose stops with the commands, and dbs_complete finishes
+     * once they have committed.
+     *
+     * The claim being tested is that the SPLIT CHANGES NOTHING a client
+     * can see. Two databases, the same requests: one served whole, one
+     * served in two halves with the commands carried between them by
+     * hand -- which is all a log is. Every response must match byte for
+     * byte, because a client cannot be asked to know which kind of
+     * server it reached.
+     *
+     * Both sides are exercised: a plain write, a list of writes (whose
+     * plan produces many commands), and DDL (whose plan produces one and
+     * stages no index).
+     */
+    char a_dir[64], b_dir[64];
+    CHECK_FATAL(scratch_dir("nisaba-split-a", a_dir, sizeof a_dir) == 0);
+    CHECK_FATAL(scratch_dir("nisaba-split-b", b_dir, sizeof b_dir) == 0);
+    int afd = open(a_dir, O_RDONLY), bfd = open(b_dir, O_RDONLY);
+    CHECK_FATAL(afd >= 0 && bfd >= 0);
+    bj_ns ans, bns;
+    CHECK_FATAL(bjns_posix_open(afd, &ans) == BJ_OK);
+    CHECK_FATAL(bjns_posix_open(bfd, &bns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ans) == 0);
+    CHECK_FATAL(build_users_db(&bns) == 0);
+
+    dbs *whole = NULL, *split = NULL;
+    CHECK_FATAL(dbs_open(&ans, ORDER, 0, &whole) == BJ_OK);
+    CHECK_FATAL(dbs_open(&bns, ORDER, 0, &split) == BJ_OK);
+    const uint64_t CLIENT = 7;
+    uint64_t next_index = 100;   /* a log this test is standing in for */
+    uint64_t last_doc_index = 0; /* the last one a DOCUMENT command took */
+
+    for (int round = 0; round < 4; round++) {
+        const uint8_t *req = NULL; uint32_t req_len = 0;
+        bj_builder *rb = NULL;
+        doc *d = NULL;
+        bj_builder *docs = NULL;
+        uint8_t oid[12];
+        memset(oid, 0, sizeof oid);
+        oid[0] = 0xA0; oid[11] = (uint8_t)(round + 1);
+
+        if (round == 0) {                     /* one document */
+            d = doc_new();
+            doc_oid(d, "_id", oid);
+            doc_str(d, "team", "a");     /* the users db indexes it, unsparsely */
+            doc_int(d, "age", 30 + round);
+            uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+            rb = request_with_id("insert", "users", "doc", db_, dlen, oid, &req, &req_len);
+        } else if (round == 1) {              /* a list of them: many commands */
+            docs = bj_builder_new();
+            bj_begin_array(docs);
+            for (int i = 0; i < 3; i++) {
+                uint8_t id2[12];
+                memset(id2, 0, sizeof id2);
+                id2[0] = 0xB0; id2[11] = (uint8_t)i;
+                bj_begin_object(docs);
+                bj_put_key(docs, (const uint8_t *)"_id", 3);
+                bj_put_oid(docs, id2);
+                bj_put_key(docs, (const uint8_t *)"team", 4);
+                bj_put_string(docs, (const uint8_t *)"b", 1);
+                bj_put_key(docs, (const uint8_t *)"age", 3);
+                bj_put_int(docs, 40 + i);
+                bj_end_object(docs);
+            }
+            bj_end_array(docs);
+            size_t alen = 0; const uint8_t *arr = bj_builder_data(docs, &alen);
+            rb = request_with_id("insertMany", "users", "docs", arr, alen, oid, &req, &req_len);
+        } else if (round == 2) {              /* DDL: one command, no index staged */
+            d = doc_new();
+            doc_int(d, "age", 1);
+            uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+            rb = request_with_id("createIndex", "users", "keys", db_, dlen, oid, &req, &req_len);
+        } else {                              /* a read: nothing to replicate */
+            rb = request_with_id("count", "users", NULL, NULL, 0, oid, &req, &req_len);
+        }
+
+        /* The whole server, in one call. */
+        dbuf a_res = {0};
+        CHECK_OK(dbs_handle(whole, CLIENT, req, req_len, &a_res));
+
+        /* The split server, in two -- with the commands going the long
+         * way round, which is the only difference there is. */
+        dbuf b_res = {0}, cmds = {0};
+        uint64_t token = 0;
+        CHECK_OK(dbs_propose(split, CLIENT, req, req_len, &token, &cmds, &b_res));
+
+        if (round == 3) {
+            /* A read plans nothing and is already answered. */
+            CHECK_I64((long long)token, 0);
+            CHECK_I64((long long)dbs_inflight(split), 0);
+        } else {
+            CHECK(token != 0);
+            CHECK_I64((long long)dbs_inflight(split), 1);
+            uint32_t n = array_len(cmds.data, cmds.len);
+            CHECK(n >= 1);
+            if (round == 1) CHECK_I64((long long)n, 3);   /* one per document */
+
+            uint64_t *indices = (uint64_t *)malloc(n * sizeof *indices);
+            CHECK_FATAL(indices != NULL);
+            for (uint32_t i = 0; i < n; i++) indices[i] = next_index++;
+            if (round != 2) last_doc_index = next_index - 1;   /* round 2 is DDL */
+            CHECK_OK(dbs_complete(split, token, indices, n, &b_res));
+            free(indices);
+            /* And the slot is back: a completed request holds nothing. */
+            CHECK_I64((long long)dbs_inflight(split), 0);
+        }
+
+        /* Byte for byte. Not "the same fields" -- a client reads bytes. */
+        CHECK_I64((long long)b_res.len, (long long)a_res.len);
+        CHECK(a_res.len && b_res.len &&
+              memcmp(a_res.data, b_res.data, a_res.len) == 0);
+        CHECK_I64(response_ok(&a_res), 1);
+
+        dbuf_free(&a_res); dbuf_free(&b_res); dbuf_free(&cmds);
+        if (rb) bj_builder_free(rb);
+        if (docs) bj_builder_free(docs);
+        if (d) doc_free(d);
+    }
+
+    /*
+     * And the split one recorded WHERE IT GOT TO. dc_wal_apply stages
+     * the log index with the mutation, atomically, so a replica's
+     * applied floor is durable with the data it describes rather than
+     * beside it -- which is what makes replay from floor+1 exact. The
+     * whole-server side stages nothing, because it has no log: zero is
+     * how dc_wal_apply is told so.
+     */
+    {
+        dbuf res = {0};
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "users", NULL, NULL, 0, &req, &req_len);
+        CHECK_OK(dbs_handle(split, CLIENT, req, req_len, &res));   /* opens it */
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+    CHECK_I64((long long)dbs_applied_index(split, "users", 5), (long long)last_doc_index);
+    CHECK_I64((long long)dbs_applied_index(whole, "users", 5), 0);
+    /* Not the LAST index -- the last DOCUMENT one. DDL stages nothing on
+     * purpose: an index build commits catalog and index files but not
+     * the primary tree, so a staged value would not persist with it, and
+     * its replay is bounded by the next snapshot's compaction instead. */
+    CHECK(last_doc_index < next_index - 1);
+
+    /* Both databases hold the same thing afterwards, which is the point
+     * of having carried the commands at all. */
+    for (int side = 0; side < 2; side++) {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("count", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf res = {0};
+        CHECK_OK(dbs_handle(side ? split : whole, CLIENT, req, req_len, &res));
+        CHECK_I64(response_ok(&res), 1);
+        dbuf_free(&res); bj_builder_free(rb);
+    }
+
+    /* A request nobody collects is released with its client, not leaked
+     * until the session closes. */
+    {
+        doc *d = doc_new();
+        uint8_t oid[12];
+        memset(oid, 0, sizeof oid);
+        oid[0] = 0xC0; oid[11] = 3;
+        doc_oid(d, "_id", oid);
+        doc_str(d, "team", "c");
+        uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request_with_id("insert", "users", "doc", db_, dlen, oid, &req, &req_len);
+        dbuf res = {0}, cmds = {0};
+        uint64_t token = 0;
+        CHECK_OK(dbs_propose(split, CLIENT, req, req_len, &token, &cmds, &res));
+        CHECK(token != 0);
+        CHECK_I64((long long)dbs_inflight(split), 1);
+        dbs_drop_client(split, CLIENT);
+        CHECK_I64((long long)dbs_inflight(split), 0);
+        dbuf_free(&res); dbuf_free(&cmds); bj_builder_free(rb); doc_free(d);
+    }
+
+    dbs_close(whole);
+    dbs_close(split);
+    bjns_posix_free(&ans);
+    bjns_posix_free(&bns);
+    close(afd); close(bfd);
+}
+
 TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
     /*
      * The DDL three used to be the one thing this server did that left
@@ -10316,6 +10511,7 @@ int main(void) {
     RUN(ttl_cutoff_and_filter);
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
     RUN(ddl_is_a_command_a_second_database_can_be_caught_up_by);
+    RUN(a_replicated_write_answers_exactly_what_an_unreplicated_one_does);
     RUN(a_database_can_be_built_from_an_empty_directory);
     RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);
     RUN(a_list_of_writes_is_one_request_and_reports_every_member);

@@ -52,6 +52,7 @@
 #include "bjns.h"
 #include "dbuf.h"
 #include "db.h"
+#include "db_wal.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -72,6 +73,12 @@ extern "C" {
 #define DBS_MAX_STREAMS     16
 #define DBS_STREAM_EVENTS   256
 #define DBS_STREAM_BYTES    (1u * 1024u * 1024u)
+/* Planned writes awaiting replication (dbs_propose). One per connection
+ * is the shape the transport already has -- a connection is served one
+ * request at a time and is not read from while it owes bytes -- so this
+ * is server/main.c's MAX_CLIENTS, and a request over it is refused
+ * rather than queued. */
+#define DBS_MAX_INFLIGHT    64
 
 /* No catalog entry of that name. Distinct from "the entry is unusable"
  * (DC_ERR_CATALOG_ENTRY) because a caller answers them differently: one
@@ -517,6 +524,77 @@ void dbs_close(dbs *s);
  */
 int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                dbuf *out);
+
+/* ---- the replicated fork (db_request.c) ---------------------------------
+ *
+ * dbs_handle plans a write and applies it in one call, because on a
+ * single-process server there is nobody to ask. A REPLICA has to ask:
+ * the commands its plan produced are the log's to carry, and they may
+ * not touch a file until a quorum holds them.
+ *
+ *     dbs_propose(s, client, req, len, &token, &cmds, &out)
+ *         *token == 0  -- nothing to replicate. The answer is in `out`
+ *                         already: a read, a ping, or a refusal.
+ *         *token != 0  -- `cmds` is a binjson ARRAY of commands, in the
+ *                         order they must be applied. Propose them.
+ *     ... a quorum, some time later ...
+ *     dbs_complete(s, token, indices, n, &out)
+ *
+ * PLANNING IS WHERE NONDETERMINISM DIES. An upsert's id and a
+ * $currentDate are resolved once, by the node that took the request, and
+ * travel in the command -- which is why the REQUEST is never what gets
+ * replicated. Two replicas planning the same request separately would
+ * resolve them differently and have forked.
+ *
+ * dbs_complete re-runs the request over the plan this session kept, so
+ * the response is built by exactly the code that builds it on a
+ * single-process server. `indices` are the log indices the commands
+ * committed at, in the same order; dc_wal_apply stages each with its
+ * mutation, so a replica's applied floor is durable with the data it
+ * describes rather than beside it.
+ *
+ * A DETERMINISTIC FAILURE IS STILL AN ANSWER. A duplicate key refused at
+ * apply is a result every replica computes identically (dc_is_deterministic,
+ * db_validate.h), and it comes back in `out` like any other.
+ *
+ * BOUNDED, like every other table here: DBS_MAX_INFLIGHT requests may be
+ * waiting at once and a further one is DC_ERR_TOO_MANY_CLIENTS -- a
+ * refusal the caller can act on, rather than a plan nobody will finish.
+ * dbs_abandon releases one whose client has gone; dbs_drop_client does
+ * it for every request that client had in flight.
+ */
+int  dbs_propose(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
+                 uint64_t *token, dbuf *cmds, dbuf *out);
+int  dbs_complete(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
+                  dbuf *out);
+void dbs_abandon(dbs *s, uint64_t token);
+
+/* How many planned requests are waiting to be completed. */
+uint32_t dbs_inflight(const dbs *s);
+
+/* How far a collection's applied index has got, or 0 if it is not open.
+ * The replay floor -- what a restarting replica resumes from, and the
+ * one thing about an apply that outlives the response. */
+uint64_t dbs_applied_index(dbs *s, const char *coll, size_t coll_len);
+
+/* ---- what db_request.c uses to implement the two above ------------------
+ *
+ * Not a host's to call. They are here rather than in a private header
+ * because db_request.c and db_session.c are one component in two files,
+ * and a third file for four functions would be filing rather than
+ * design.
+ */
+int          dbs_repl_planning(const dbs *s);   /* dbs_propose's pass  */
+int          dbs_repl_replaying(const dbs *s);  /* dbs_complete's pass */
+int          dbs_repl_active(const dbs *s);     /* either of the two   */
+int          dbs_repl_hold(dbs *s, dc_wal_plan *p);
+dc_wal_plan *dbs_repl_resuming(dbs *s);
+uint64_t     dbs_repl_next_index(dbs *s);
+
+/* Not an error: a write whose commands were planned and kept, waiting
+ * for a quorum. Positive, so every `if (e)` in the write paths still
+ * treats it as "not BJ_OK" while the three that must know can. */
+#define DC_PENDING 1
 
 /*
  * Append the refusal { ok:false, code, msg } for `code`, with no request

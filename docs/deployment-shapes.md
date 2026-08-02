@@ -367,14 +367,17 @@ up, with no JavaScript in any of them
 So there are now two replicated deployments rather than one: **Node
 processes hosting the WASM engine**, and **C processes hosting nothing**.
 
+**A native cluster can be grown and shrunk without restarting it**,
+which retired the brief for it. `nisaba-server --raft 4 --raft-port 9004
+--join 127.0.0.1:9001` joins knowing one ADDRESS: it follows the
+redirect to the leader, enters as a learner, is caught up from the log
+and is promoted to a voter once its match index proves it current.
+`--leave ID` removes one. Argv became a BOOTSTRAP and the log became the
+member set, so a restart needs neither flag.
+
 What is still missing on the C side — briefs in [`steps/`](steps/):
 
-1. **Joining a native cluster**
-   (`steps/joining-a-native-cluster.md`) — growing a cluster without
-   restarting its members. The node already answers a join; nothing in C
-   has ever asked one.
-
-Plus the log growing without bound, which is the real reason to want
+The log growing without bound, which is the real reason to want
 compaction and a snapshot store in the process. A joiner does not need
 them — nothing compacts, so an empty joiner is caught up by plain
 AppendEntries — but a long-lived member's `__wal__.bj` is every write it

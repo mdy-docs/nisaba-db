@@ -1813,32 +1813,6 @@ static int defer(raft_node *n, uint64_t peer, uint64_t corr) {
     return BJ_OK;
 }
 
-/* Copy `record` with `voting` forced to `voting_flag`, dropping any
- * voting the record carried. */
-static int record_with_voting(const uint8_t *record, uint32_t len, int voting_flag,
-                              bj_builder *b) {
-    cur c = { record, len, 0 };
-    uint32_t count;
-    int e = object_begin(&c, &count);
-    if (e) return e;
-    e = bj_begin_object(b);
-    for (uint32_t i = 0; i < count && !e; i++) {
-        const uint8_t *k; uint32_t klen;
-        e = take_key(&c, &k, &klen);
-        if (e) break;
-        size_t start = c.pos;
-        e = skip_value(&c);
-        if (e) break;
-        if (klen == 6 && memcmp(k, "voting", 6) == 0) continue;   /* ours to say */
-        e = bj_put_key(b, k, klen);
-        if (!e) e = bj_put_raw(b, record + start, (uint32_t)(c.pos - start));
-    }
-    if (!e) e = bj_put_key(b, (const uint8_t *)"voting", 6);
-    if (!e) e = bj_put_bool(b, voting_flag);
-    if (!e) e = bj_end_object(b);
-    return e;
-}
-
 /*
  * A join: the applicant's record, upserted into the member set.
  *
@@ -1906,7 +1880,7 @@ static int handle_join(raft_node *n, uint64_t corr, const uint8_t *msg, uint32_t
             }
         }
     }
-    if (!e) e = record_with_voting(rec, rlen, voting, b);
+    if (!e) e = rmsg_record_with_voting(rec, rlen, voting, b);
     if (!e) e = bj_end_array(b);
     uint64_t at = 0;
     if (!e) {

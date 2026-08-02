@@ -2,6 +2,7 @@
 #include "replica.h"
 
 #include "raft_node.h"
+#include "raft_msg.h"      /* the member-record grammar; this file reads it */
 #include "db_validate.h"   /* dc_strerror, and the two routing codes */
 #include "entrylog.h"
 #include "binjson.h"
@@ -29,6 +30,25 @@
 #define REPLICA_APPLY_BYTES (256u * 1024u)
 
 /*
+ * Peer requests whose ANSWER has not been built yet.
+ *
+ * Nearly every message is answered inside the rn_handle that took it, so
+ * nearly every entry here lives for the length of one call. A JOIN or a
+ * LEAVE is the exception and the reason this is a table at all: its
+ * answer is a fact about a CONFIG entry that does not exist yet, so the
+ * node parks the requester and the reply arrives later -- when that
+ * entry applies, or when this node stops leading. The conversation it
+ * came in on has to outlive the call, or the answer is built and lost.
+ *
+ * Bigger than the node's own parking bay (RN_MAX_PENDING, 16), so the
+ * two cannot disagree about who is waiting: the node settles every one
+ * of its entries, and each settlement needs a conversation here to go
+ * out on. The spare slots are the in-flight ordinary requests, which
+ * come and go within a call.
+ */
+#define REPLICA_MAX_CONV 24
+
+/*
  * One client's write, somewhere between planned and answered.
  *
  * `last` is the index whose settlement finishes the batch in flight.
@@ -49,6 +69,26 @@ typedef struct {
     dbuf     answer;
 } pending;
 
+/*
+ * One peer request, from the moment it arrives to the moment its answer
+ * goes out.
+ *
+ * `mine` is the correlation id rn_handle was GIVEN, and it is minted
+ * here rather than taken off the wire. Two peers -- or two joiners, both
+ * of which send id 0, because a one-shot call to an address has nothing
+ * to correlate against -- can perfectly well use the same id at the same
+ * time, and a table keyed by theirs would answer one of them on the
+ * other's socket. `theirs` is what goes back on the wire, because that
+ * is what the sender is matching on. (src/raft.js mints its own the same
+ * way, for the same reason.)
+ */
+typedef struct {
+    int      used;
+    uint64_t mine;
+    uint64_t theirs;
+    uint64_t from;              /* the conversation, peers.h's */
+} conversation;
+
 struct replica {
     bj_ns     *ns;              /* borrowed */
     dbi       *inst;            /* borrowed */
@@ -58,11 +98,35 @@ struct replica {
     raft_node *node;
     uint64_t   applied;
     uint64_t   rnd;             /* the election-timeout draw's state */
-    uint64_t   answering;       /* the conversation a reply belongs to */
+    uint64_t   self_id;
+    uint64_t   next_corr;       /* inbound ids, minted here */
+    uint64_t   config_index;    /* the CONFIG entry in force */
     int        said_no_snapshot;
     int        said_no_conversation;
+    int        said_no_address;
+    conversation conv[REPLICA_MAX_CONV];
     pending    waiting[REPLICA_MAX_PENDING];
 };
+
+static conversation *conv_open(replica *r, uint64_t theirs, uint64_t from) {
+    for (int i = 0; i < REPLICA_MAX_CONV; i++) {
+        if (r->conv[i].used) continue;
+        r->conv[i].used = 1;
+        r->conv[i].mine = ++r->next_corr;
+        r->conv[i].theirs = theirs;
+        r->conv[i].from = from;
+        return &r->conv[i];
+    }
+    return NULL;
+}
+
+static conversation *conv_find(replica *r, uint64_t mine) {
+    for (int i = 0; i < REPLICA_MAX_CONV; i++)
+        if (r->conv[i].used && r->conv[i].mine == mine) return &r->conv[i];
+    return NULL;
+}
+
+static void conv_close(conversation *c) { memset(c, 0, sizeof *c); }
 
 /*
  * A DIFFERENT election timeout per member.
@@ -126,6 +190,278 @@ static pending *pending_find(replica *r, uint64_t last) {
     return NULL;
 }
 
+/* ---- the member set -----------------------------------------------------
+ *
+ * ONE OWNER. The set, the voter list and the addresses are all the
+ * node's -- rn_adopted is where they are written down, normalized once,
+ * and everything here reads them back rather than keeping a copy. A
+ * second address book would disagree with the log the first time a
+ * member moved, and the disagreement would be invisible: a member with a
+ * stale address is a member that silently never receives an entry.
+ */
+
+/* The `members` ARRAY inside the adopted set: the records themselves. */
+static const uint8_t *members_of(const replica *r, uint32_t *len) {
+    uint32_t alen = 0;
+    const uint8_t *adopted = rn_adopted(r->node, &alen);
+    *len = 0;
+    if (!adopted) return NULL;
+    const uint8_t *ms; size_t mslen; int found = 0;
+    if (obj_get_field(adopted, alen, (const uint8_t *)"members", 7,
+                      &ms, &mslen, &found) != BJ_OK || !found) return NULL;
+    *len = (uint32_t)mslen;
+    return ms;
+}
+
+static uint64_t record_id(const uint8_t *rec, uint32_t len) {
+    const uint8_t *v; uint32_t vlen;
+    if (rmsg_record_field(rec, len, "id", &v, &vlen) != BJ_OK || !v) return 0;
+    cur c = { v, vlen, 0 };
+    uint64_t id = 0;
+    return read_u64(&c, &id) == BJ_OK ? id : 0;
+}
+
+/* The host and port a record carries, if it carries both. */
+static int record_address(const uint8_t *rec, uint32_t len,
+                          char *host, size_t cap, int *port) {
+    const uint8_t *v; uint32_t vlen;
+    if (rmsg_record_field(rec, len, "host", &v, &vlen) != BJ_OK || !v) return -1;
+    cur hc = { v, vlen, 0 };
+    const uint8_t *s; uint32_t slen;
+    if (take_string(&hc, &s, &slen) != BJ_OK || (size_t)slen >= cap) return -1;
+    memcpy(host, s, slen);
+    host[slen] = '\0';
+
+    if (rmsg_record_field(rec, len, "port", &v, &vlen) != BJ_OK || !v) return -1;
+    cur pc = { v, vlen, 0 };
+    uint64_t p = 0;
+    if (read_u64(&pc, &p) != BJ_OK || !p || p > 65535) return -1;
+    *port = (int)p;
+    return 0;
+}
+
+/*
+ * The transport's address table, made to say what the member set says.
+ *
+ * This is the step whose absence is silent. A member added by a CONFIG
+ * entry that the transport has no address for is a member the leader
+ * cannot reach: peers_request answers "not a member here", the node is
+ * told the request failed, and the picture from outside is a follower
+ * that is simply always behind.
+ */
+static int sync_peers(replica *r) {
+    if (!r->px) return BJ_OK;
+    uint32_t mlen = 0;
+    const uint8_t *ms = members_of(r, &mlen);
+    if (!ms) return BJ_OK;
+
+    uint64_t named[PEERS_MAX + 1];
+    uint32_t n_named = 0;
+    cur c = { ms, mlen, 0 };
+    uint32_t count = 0;
+    if (array_begin(&c, &count) != BJ_OK) return RAFT_ERR_MEMBER;
+
+    int e = BJ_OK;
+    for (uint32_t i = 0; i < count && !e; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c) != BJ_OK) return RAFT_ERR_MEMBER;
+        const uint8_t *rec = c.d + start;
+        uint32_t rlen = (uint32_t)(c.pos - start);
+        uint64_t id = record_id(rec, rlen);
+        if (!id || id == r->self_id) continue;
+        if (n_named < sizeof named / sizeof named[0]) named[n_named++] = id;
+
+        char host[PEERS_HOST_MAX];
+        int port = 0;
+        if (record_address(rec, rlen, host, sizeof host, &port) != 0) {
+            /* A member nothing can reach. Not fatal -- the rest of the
+             * cluster still works -- but never silent, because from the
+             * outside it is indistinguishable from a slow follower. */
+            if (!r->said_no_address) {
+                r->said_no_address = 1;
+                fprintf(stderr, "replica: member %llu has no address in the log;"
+                                " nothing can replicate to it\n",
+                        (unsigned long long)id);
+                fflush(stderr);
+            }
+            continue;
+        }
+        e = peers_set(r->px, id, host, port);
+        if (e) {
+            /*
+             * The transport holds fewer members than the node will
+             * accept (PEERS_MAX bounds a pollfd array; rn_max_peers is
+             * larger), so a set that fits there can still not fit here.
+             * It reaches the apply pump as an error and halts this
+             * member -- which is the only honest answer to a committed
+             * entry it cannot carry out -- so it says which member it
+             * ran out of room at rather than only that it stopped.
+             */
+            fprintf(stderr, "replica: no room for member %llu: this build holds"
+                            " %d other members\n",
+                    (unsigned long long)id, PEERS_MAX);
+            fflush(stderr);
+        }
+    }
+
+    /* And nobody the set does not name. A departed member left behind
+     * here is a socket redialled forever. */
+    for (uint32_t i = 0; !e && i < peers_count(r->px); ) {
+        uint64_t id = peers_id_at(r->px, i);
+        int keep = 0;
+        for (uint32_t k = 0; k < n_named; k++) if (named[k] == id) { keep = 1; break; }
+        if (keep) { i++; continue; }
+        e = peers_remove(r->px, id);   /* it compacts: do not advance */
+    }
+    return e;
+}
+
+/* Whether the set in force still counts this node -- read off the
+ * node's own normalized voter list rather than re-derived, which is the
+ * same rule the addresses follow. */
+static int self_is_voter(const replica *r) {
+    uint32_t alen = 0;
+    const uint8_t *adopted = rn_adopted(r->node, &alen);
+    if (!adopted) return 1;
+    const uint8_t *vs; size_t vslen; int found = 0;
+    if (obj_get_field(adopted, alen, (const uint8_t *)"voters", 6,
+                      &vs, &vslen, &found) != BJ_OK || !found) return 1;
+    cur c = { vs, vslen, 0 };
+    uint32_t n = 0;
+    if (array_begin(&c, &n) != BJ_OK) return 1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t id = 0;
+        if (read_u64(&c, &id) != BJ_OK) return 1;
+        if (id == r->self_id) return 1;
+    }
+    return 0;
+}
+
+/*
+ * A CONFIG entry taking effect: `{ members: [records] }`.
+ *
+ * A set the node REFUSES (malformed, or larger than this build holds)
+ * reaches the apply pump as an error, and the pump halts on it. That is
+ * the honest answer rather than a lenient one: every replica refuses the
+ * same entry for the same reason, so the cluster stops together instead
+ * of one member quietly replicating to a different membership than the
+ * rest. rn_change_membership refuses such a set where a caller is still
+ * standing, so reaching here means it arrived some other way.
+ */
+static int adopt_config(replica *r, const uint8_t *payload, uint32_t len,
+                        uint64_t index) {
+    const uint8_t *ms; size_t mslen; int found = 0;
+    if (obj_get_field(payload, len, (const uint8_t *)"members", 7,
+                      &ms, &mslen, &found) != BJ_OK || !found) return RAFT_ERR_MEMBER;
+    int e = rn_set_members(r->node, ms, (uint32_t)mslen);
+    if (e) return e;
+    r->config_index = index;
+    /*
+     * Applied our own removal, or our own demotion to learner. As leader
+     * we committed the entry first, so the new set has it -- and a node
+     * that goes on leading a cluster it is not in would be counting a
+     * vote nobody else counts.
+     */
+    if (!self_is_voter(r) && rn_role(r->node) != RAFT_FOLLOWER)
+        rn_step_down(r->node, elog_current_term(r->log), rnd01(r));
+    return sync_peers(r);
+}
+
+/*
+ * The last CONFIG entry in the log, adopted over whatever argv said.
+ *
+ * THE LOG IS THE TRUTH AND ARGV IS A BOOTSTRAP. Once membership is
+ * written down, a member restarted with a stale --peer list must not
+ * overwrite what the cluster agreed -- and a member that joined has no
+ * --peer list at all, so its own log is the only place its cluster is
+ * described.
+ *
+ * Every entry rather than the committed prefix, and the LAST one wins:
+ * a config takes effect when it is appended, not when it commits (the
+ * paper's rule, and src/raft.js's restart scan does exactly this). The
+ * state machine's applied floor may already sit past a CONFIG entry it
+ * never recorded, so the apply pump alone cannot be relied on to find
+ * them.
+ */
+static int adopt_from_log(replica *r) {
+    uint64_t last = elog_last_index(r->log);
+    uint64_t found = 0;
+    for (uint64_t i = elog_base_index(r->log) + 1; i <= last; i++) {
+        uint64_t term = 0;
+        int type = 0;
+        const uint8_t *p = NULL;
+        size_t plen = 0;
+        if (elog_get(r->log, i, &term, &type, &p, &plen) != BJ_OK) return BJ_ERR_STATE;
+        if (type == EL_CONFIG) found = i;
+    }
+    if (!found) return BJ_OK;
+
+    uint64_t term = 0;
+    int type = 0;
+    const uint8_t *p = NULL;
+    size_t plen = 0;
+    int e = elog_get(r->log, found, &term, &type, &p, &plen);
+    if (e) return e;
+    /* The log owns that pointer only until the next operation on the
+     * log, and adopting is not one -- but nothing downstream promises
+     * that, so it is copied. */
+    dbuf payload = {0};
+    e = dbuf_put(&payload, p, plen);
+    if (!e) e = adopt_config(r, payload.data, (uint32_t)payload.len, found);
+    dbuf_free(&payload);
+    return e;
+}
+
+/*
+ * A learner the node says has caught up: the same set with that one
+ * record's voting flag lifted.
+ *
+ * THE DECISION IS NOT HERE. The node raised the effect, on match index,
+ * and it raises it again on the next successful append while the peer is
+ * still a learner -- so a moment when the change cannot be made (another
+ * one in flight, leadership just lost) needs no retry of its own. This
+ * only carries out what was decided, which is why it can only ever WIDEN
+ * the electorate, and only with a replica proven current.
+ *
+ * Explicitly voting:true rather than dropping the key: raft_members_merge
+ * fills an absent field from the record it already knows, so an omission
+ * would re-inherit the voting:false being lifted.
+ */
+static int promote(replica *r, uint64_t peer) {
+    if (!replica_is_leader(r) || rn_config_in_flight(r->node)) return BJ_OK;
+    uint32_t mlen = 0;
+    const uint8_t *ms = members_of(r, &mlen);
+    if (!ms) return BJ_OK;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    cur c = { ms, mlen, 0 };
+    uint32_t count = 0;
+    int e = array_begin(&c, &count);
+    if (!e) e = bj_begin_array(b);
+    for (uint32_t i = 0; i < count && !e; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c) != BJ_OK) { e = RAFT_ERR_MEMBER; break; }
+        const uint8_t *rec = c.d + start;
+        uint32_t rlen = (uint32_t)(c.pos - start);
+        e = record_id(rec, rlen) == peer ? rmsg_record_with_voting(rec, rlen, 1, b)
+                                         : bj_put_raw(b, rec, rlen);
+    }
+    if (!e) e = bj_end_array(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *d = bj_builder_data(b, &len);
+        uint64_t at = 0;
+        e = d ? rn_change_membership(r->node, d, (uint32_t)len, &at) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    /* Busy, or no longer the leader: both are "not now", and the node
+     * will say so again while it still holds. */
+    if (e == RAFT_ERR_BUSY || e == BJ_ERR_STATE) e = BJ_OK;
+    return e;
+}
+
 /* ---- opening ------------------------------------------------------------ */
 
 /* One member record: { id, host?, port? }. The address goes in because
@@ -146,8 +482,9 @@ static int put_member(bj_builder *b, uint64_t id, const char *host, int port) {
     return e;
 }
 
-int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px, uint64_t now,
-                 replica **out) {
+int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
+                 const uint8_t *members, uint32_t members_len,
+                 uint64_t now, replica **out) {
     if (!ns || !inst || !out || !self_id) return BJ_ERR_STATE;
     if (px && peers_count(px) > rn_max_peers()) return RAFT_ERR_CAPACITY;
     *out = NULL;
@@ -156,6 +493,7 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px, uint64_t now
     r->ns = ns;
     r->inst = inst;
     r->px = px;
+    r->self_id = self_id;
     /* Non-zero, or xorshift stays at zero forever and every member draws
      * the same nothing -- which is the bug this exists to avoid. */
     r->rnd = (self_id * 0x9E3779B97F4A7C15ULL) ^ (now + 0x100000001B3ULL);
@@ -185,28 +523,45 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px, uint64_t now
     rn_set_ns(r->node, ns);
 
     /*
-     * The group, as the process was started with it. Without peers that
-     * is one member: it elects itself, commits by counting only itself,
-     * and every message it would send has nobody to send it to.
+     * The group to BOOTSTRAP with: the set a join came back with when
+     * there is one, and otherwise the process's own argv. Without either
+     * that is one member -- it elects itself, commits by counting only
+     * itself, and every message it would send has nobody to send it to.
      *
-     * There is no join here, so this set is the whole set -- and every
-     * member has to be given the same one, because a member missing from
-     * one node's list is a vote that node will never count.
+     * A --peer list has to be the same on every member, because a member
+     * missing from one node's list is a vote that node will never count.
+     * That is the cost of bootstrapping by argv, and the reason it stops
+     * mattering the moment the log has a CONFIG entry of its own.
      */
-    bj_builder *b = bj_builder_new();
-    if (!b) { replica_close(r); return BJ_ERR_OOM; }
-    e = bj_begin_array(b);
-    if (!e) e = put_member(b, self_id, peers_self_host(px), peers_self_port(px));
-    for (uint32_t i = 0; !e && px && i < peers_count(px); i++)
-        e = put_member(b, peers_id_at(px, i), peers_host_at(px, i), peers_port_at(px, i));
-    if (!e) e = bj_end_array(b);
-    if (!e) e = bj_builder_error(b);
-    if (!e) {
-        size_t len = 0;
-        const uint8_t *d = bj_builder_data(b, &len);
-        e = d ? rn_set_members(r->node, d, (uint32_t)len) : BJ_ERR_STATE;
+    if (members && members_len) {
+        e = rn_set_members(r->node, members, members_len);
+    } else {
+        bj_builder *b = bj_builder_new();
+        if (!b) { replica_close(r); return BJ_ERR_OOM; }
+        e = bj_begin_array(b);
+        if (!e) e = put_member(b, self_id, peers_self_host(px), peers_self_port(px));
+        for (uint32_t i = 0; !e && px && i < peers_count(px); i++)
+            e = put_member(b, peers_id_at(px, i), peers_host_at(px, i), peers_port_at(px, i));
+        if (!e) e = bj_end_array(b);
+        if (!e) e = bj_builder_error(b);
+        if (!e) {
+            size_t len = 0;
+            const uint8_t *d = bj_builder_data(b, &len);
+            e = d ? rn_set_members(r->node, d, (uint32_t)len) : BJ_ERR_STATE;
+        }
+        bj_builder_free(b);
     }
-    bj_builder_free(b);
+    if (e) { replica_close(r); return e; }
+
+    /*
+     * ...and then the log, which outranks it. Before the timers are
+     * armed, because what this finds decides whether this node is a
+     * voter at all -- and a member that campaigned on a bootstrap set of
+     * one before reading its own log would elect itself into a cluster
+     * that already has a leader.
+     */
+    e = adopt_from_log(r);
+    if (!e) e = sync_peers(r);      /* the bootstrap set's addresses, if the log had none */
     if (e) { replica_close(r); return e; }
 
     /*
@@ -276,6 +631,23 @@ void replica_close(replica *r) {
 int      replica_is_leader(const replica *r) { return r && rn_role(r->node) == RAFT_LEADER; }
 uint64_t replica_leader_id(const replica *r) { return r ? rn_leader_id(r->node) : 0; }
 
+uint32_t replica_peer_count(const replica *r) {
+    if (!r) return 0;
+    uint32_t mlen = 0;
+    const uint8_t *ms = members_of(r, &mlen);
+    if (!ms) return 0;
+    cur c = { ms, mlen, 0 };
+    uint32_t n = 0;
+    if (array_begin(&c, &n) != BJ_OK) return 0;
+    uint32_t others = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c) != BJ_OK) return others;
+        if (record_id(c.d + start, (uint32_t)(c.pos - start)) != r->self_id) others++;
+    }
+    return others;
+}
+
 /* ---- the clock ---------------------------------------------------------- */
 
 /*
@@ -322,6 +694,22 @@ static int apply_committed(replica *r) {
         payload.len = 0;
         e = dbuf_put(&payload, p, plen);
         if (e) break;
+
+        /*
+         * A membership change taking effect. The index guard skips one
+         * OLDER than the set in force -- the startup scan adopts the
+         * last CONFIG in the log, which may sit above the applied floor,
+         * and replaying an earlier one would regress the cluster's shape.
+         */
+        if (type == EL_CONFIG && index >= r->config_index) {
+            e = adopt_config(r, payload.data, (uint32_t)payload.len, index);
+            if (e) break;
+            /* Whoever just arrived has to be caught up, and the entry
+             * that put them here is already behind us. */
+            if (replica_is_leader(r))
+                for (uint32_t i = 0; i < peers_count(r->px); i++)
+                    rn_replicate(r->node, peers_id_at(r->px, i));
+        }
 
         if (type == EL_NORMAL) {
             /* Into whoever proposed it, if that was a client of this
@@ -386,9 +774,12 @@ static int propose_batch(replica *r, pending *p, const dbuf *cmds) {
  *
  * Everything the node wants said, said. Requests go to the peer they are
  * addressed to; a reply goes back on the CONVERSATION its request
- * arrived on, which is `answering` -- rn_handle queues exactly one reply
- * for exactly the message it was given, and nothing else in this file
- * calls it, so the two cannot be about different requests.
+ * arrived on, looked up by the correlation id this file minted for it.
+ *
+ * Looked up rather than remembered from the call, because a reply is not
+ * necessarily the answer to the message being handled right now: a join
+ * parked seconds ago is settled by the CONFIG entry applying, in a call
+ * that is handling nothing at all.
  *
  * A peer that cannot be reached is failed HERE rather than left: the
  * node will not replace a request it still believes is in flight, so a
@@ -409,13 +800,17 @@ static int flush_out(replica *r) {
         uint64_t corr = rn_out_corr(r->node, i);
         if (!msg) continue;
         if (rn_out_is_reply(r->node, i)) {
-            if (r->answering) { e = peers_answer(r->px, r->answering, corr, msg, len); }
-            else if (!r->said_no_conversation) {
-                /* Unreachable by construction -- a reply is queued only
-                 * by rn_handle, which is only called with a conversation
-                 * open -- and said out loud anyway, because the only
-                 * thing worse than a peer waiting for an answer that was
-                 * built is nobody knowing it was. */
+            conversation *c = conv_find(r, corr);
+            if (c) {
+                e = peers_answer(r->px, c->from, c->theirs, msg, len);
+                conv_close(c);
+            } else if (!r->said_no_conversation) {
+                /* Unreachable by construction -- every id the node can
+                 * reply on was minted by conv_open, and a conversation is
+                 * closed only by the reply that ends it -- and said out
+                 * loud anyway, because the only thing worse than a peer
+                 * waiting for an answer that was built is nobody knowing
+                 * it was. */
                 r->said_no_conversation = 1;
                 fprintf(stderr, "replica: a reply with no conversation to send it on\n");
                 fflush(stderr);
@@ -447,17 +842,25 @@ static int serve_peers(replica *r) {
         if (!have) return BJ_OK;
 
         if (ev.kind == PEER_EV_REQUEST) {
-            r->answering = ev.from;
-            e = rn_handle(r->node, ev.corr, ev.bytes, ev.len, rnd01(r));
+            conversation *c = conv_open(r, ev.corr, ev.from);
+            if (!c) {
+                /* Every slot is a question this node still owes an
+                 * answer for. Refused explicitly, like every other
+                 * bounded table here -- and retryable, which is what a
+                 * seed loop makes of it (server/join.h). */
+                peers_reject(r->px, ev.from, ev.corr, "too many peer requests at once");
+                continue;
+            }
+            e = rn_handle(r->node, c->mine, ev.bytes, ev.len, rnd01(r));
             if (e) {
-                /* A kind this node cannot answer -- a join, a leave, an
-                 * install with no store to put it in. Refused out loud
-                 * rather than dropped, so the sender learns now instead
-                 * of at its own timeout, with that peer idle until then. */
+                /* A kind this node cannot answer -- an install with no
+                 * store to put it in. Refused out loud rather than
+                 * dropped, so the sender learns now instead of at its own
+                 * timeout, with that peer idle until then. */
                 peers_reject(r->px, ev.from, ev.corr, dc_strerror(e));
+                conv_close(c);
             }
             e = flush_out(r);
-            r->answering = 0;
             if (e) return e;
             continue;
         }
@@ -649,6 +1052,11 @@ int replica_tick(replica *r, uint64_t now) {
                             (unsigned long long)rn_effect_arg(r->node, i));
                     fflush(stderr);
                 }
+                continue;
+            }
+            if (kind == RN_EFFECT_PROMOTE) {
+                e = promote(r, rn_effect_arg(r->node, i));
+                if (e) return e;
                 continue;
             }
             if (kind != RN_EFFECT_SETTLED) continue;

@@ -579,3 +579,99 @@ int rmsg_leave_id(const uint8_t *msg, uint32_t len, uint64_t *id) {
     *id = num_field(msg, len, "id");
     return *id ? BJ_OK : RAFT_ERR_MESSAGE;
 }
+
+int rmsg_record_with_voting(const uint8_t *record, uint32_t len, int voting_flag,
+                            bj_builder *b) {
+    cur c = { record, len, 0 };
+    uint32_t count;
+    int e = object_begin(&c, &count);
+    if (e) return e;
+    e = bj_begin_object(b);
+    for (uint32_t i = 0; i < count && !e; i++) {
+        const uint8_t *k; uint32_t klen;
+        e = take_key(&c, &k, &klen);
+        if (e) break;
+        size_t start = c.pos;
+        e = skip_value(&c);
+        if (e) break;
+        if (klen == 6 && memcmp(k, "voting", 6) == 0) continue;   /* ours to say */
+        e = bj_put_key(b, k, klen);
+        if (!e) e = bj_put_raw(b, record + start, (uint32_t)(c.pos - start));
+    }
+    if (!e) e = bj_put_key(b, (const uint8_t *)"voting", 6);
+    if (!e) e = bj_put_bool(b, voting_flag);
+    if (!e) e = bj_end_object(b);
+    return e;
+}
+
+/* ---- asking for a membership change ------------------------------------ */
+
+int rmsg_build_join(const uint8_t *record, uint32_t record_len, dbuf *out) {
+    if (!record || !record_len) return RAFT_ERR_MESSAGE;
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = put_key(b, "kind");
+    if (!e) e = bj_put_string(b, (const uint8_t *)"join", 4);
+    if (!e) e = put_key(b, "member");
+    if (!e) e = bj_put_raw(b, record, record_len);
+    if (!e) e = bj_end_object(b);
+    return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
+int rmsg_build_leave(uint64_t id, dbuf *out) {
+    if (!id) return RAFT_ERR_MESSAGE;
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = put_key(b, "kind");
+    if (!e) e = bj_put_string(b, (const uint8_t *)"leave", 5);
+    if (!e) e = put_key(b, "id");
+    if (!e) e = bj_put_int(b, (int64_t)id);
+    if (!e) e = bj_end_object(b);
+    return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
+int rmsg_read_membership_reply(const uint8_t *msg, uint32_t len, rmsg_membership *out) {
+    memset(out, 0, sizeof(*out));
+    const uint8_t *v; size_t vlen; int found = 0;
+
+    if (obj_get_field(msg, len, (const uint8_t *)"ok", 2, &v, &vlen, &found) != BJ_OK ||
+        !found) return RAFT_ERR_MESSAGE;
+    {
+        cur c = { v, vlen, 0 };
+        if (read_bool(&c, &out->ok) != BJ_OK) return RAFT_ERR_MESSAGE;
+    }
+    if (out->ok) {
+        /* An adopted set with no records is not an answer -- it would
+         * leave a joiner booting into a cluster of nobody. */
+        if (obj_get_field(msg, len, (const uint8_t *)"members", 7, &v, &vlen, &found) != BJ_OK ||
+            !found || !vlen || v[0] != BJ_TYPE_ARRAY) return RAFT_ERR_MESSAGE;
+        out->members = v;
+        out->members_len = (uint32_t)vlen;
+        return BJ_OK;
+    }
+
+    if (obj_get_field(msg, len, (const uint8_t *)"error", 5, &v, &vlen, &found) == BJ_OK && found) {
+        cur c = { v, vlen, 0 };
+        if (take_string(&c, &out->error, &out->error_len) != BJ_OK) return RAFT_ERR_MESSAGE;
+        return BJ_OK;
+    }
+    out->retry = bool_field(msg, len, "retry");
+    if (out->retry) return BJ_OK;
+
+    out->leader_id = num_field(msg, len, "leaderId");
+    if (obj_get_field(msg, len, (const uint8_t *)"leaderAddress", 13,
+                      &v, &vlen, &found) == BJ_OK && found && vlen && v[0] == BJ_TYPE_OBJECT) {
+        const uint8_t *h; size_t hlen; int has = 0;
+        if (obj_get_field(v, vlen, (const uint8_t *)"host", 4, &h, &hlen, &has) == BJ_OK && has) {
+            cur c = { h, hlen, 0 };
+            if (take_string(&c, &out->leader_host, &out->leader_host_len) != BJ_OK) {
+                out->leader_host = NULL;
+                out->leader_host_len = 0;
+            }
+        }
+        out->leader_port = (int)num_field(v, vlen, "port");
+    }
+    return BJ_OK;
+}

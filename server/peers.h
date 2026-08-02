@@ -58,6 +58,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "dbuf.h"
+
 typedef struct peers peers;
 
 /* Other members this build can hold. Must not exceed rn_max_peers(),
@@ -103,6 +105,26 @@ void peers_free(peers *p);
 /* A member and where to reach it. RAFT_ERR-free: BJ_ERR_STATE when the
  * table is full or the id is already there. */
 int  peers_add(peers *p, uint64_t id, const char *host, int port);
+
+/*
+ * ...and the same, for a table that has to FOLLOW something. A member
+ * set is not fixed at startup any more (a join adds one, a leave takes
+ * one away), and a member the transport has no address for is a member
+ * nothing can replicate to -- a failure that is silent and looks exactly
+ * like a slow follower.
+ *
+ * peers_set upserts: an id already here with the same address is left
+ * alone, and one whose address CHANGED loses its connection, because the
+ * socket goes to where that member used to be. peers_remove closes and
+ * forgets. Both fail everything outstanding on the connection they drop,
+ * for the reason every other drop here does.
+ *
+ * The caller is the one holding the member set (server/replica.c reads
+ * it back off the node); this keeps no opinion about who ought to be
+ * here.
+ */
+int  peers_set(peers *p, uint64_t id, const char *host, int port);
+int  peers_remove(peers *p, uint64_t id);
 
 /* Start serving peer requests. Without this a node can call out but
  * cannot be called, which is a member that can never be replicated to. */
@@ -164,5 +186,27 @@ int peers_answer(peers *p, uint64_t from, uint64_t corr,
  * sender left waiting for its own timeout is a peer cursor idle for five
  * seconds over a message we knew immediately we could not serve. */
 int peers_reject(peers *p, uint64_t from, uint64_t corr, const char *error);
+
+/* ---- one call, to an address ---------------------------------------------
+ *
+ * Dial, send, await one answer, hang up -- src/raft-transport-tcp.js's
+ * callAddress, and the same wire as everything above.
+ *
+ * This is how a process reaches a cluster it is not a member of: a
+ * joiner has SEEDS, which are addresses, and ids only arrive later in
+ * the member records. Everything else here needs an id in the peer
+ * table, which is exactly what a joiner does not have.
+ *
+ * IT BLOCKS, alone among the calls in this file, and only because of
+ * where it is used: before the poll loop exists, by a process that has
+ * nothing else to do until it has an answer. Nothing in the steady state
+ * may call it -- that is what the pooled path is for.
+ *
+ *   0   answered; `reply` holds the message bytes
+ *   1   the far end refused, and `err` holds the sentence it gave
+ *  <0   no answer: unreachable, timed out, or unframeable
+ */
+int peers_call(const char *host, int port, const uint8_t *msg, uint32_t len,
+               int timeout_ms, dbuf *reply, char *err, size_t err_cap);
 
 #endif /* NISABA_SERVER_PEERS_H */

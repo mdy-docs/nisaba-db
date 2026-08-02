@@ -114,6 +114,7 @@
 #include "replica.h"
 #include "root.h"
 #include "peers.h"
+#include "join.h"
 #include "db_names.h"
 #include "db_validate.h"   /* dc_strerror: a refusal says why, even here */
 #include "bjio_posix.h"
@@ -318,6 +319,21 @@ typedef struct {
     dbuf out;
     size_t out_off;
     uint64_t quiet_since;   /* monotonic ms; the idle timer's zero */
+    /*
+     * A request whose answer is not built yet -- a replicated write,
+     * waiting on the log. While one is outstanding this connection is
+     * not read from at all.
+     *
+     * ORDERING IS THE CONTRACT. src/db-server-client.js pairs answers
+     * with requests by ARRIVAL ORDER, because there is no request id on
+     * the wire and none is needed while every answer is built by the
+     * call that took the request. A deferred one breaks exactly that:
+     * the next request would be answered first, and the client would
+     * hand a ping's `{ok:true}` back to whoever was waiting on the
+     * write. (It did. A keepalive ping, twenty seconds into a write
+     * that could not commit, came back as the insert's answer.)
+     */
+    int owed;
 } conn;
 
 /* Forget what a slot held WITHOUT freeing it: for the slot a live
@@ -403,19 +419,23 @@ static int conn_flush(conn *c) {
  * finished with the request by then either way, so a slow reader delays
  * nobody but itself.
  */
-static int conn_readable(dbi *inst, replica *rep, conn *c) {
-    uint8_t chunk[8192];
-    ssize_t r = read(c->fd, chunk, sizeof chunk);
-    if (r == 0) return -1;                            /* clean EOF */
-    if (r < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return 0;
-        return -1;
-    }
-    if (conn_reserve(c, c->in_len + (size_t)r)) return -1;
-    memcpy(c->in + c->in_len, chunk, (size_t)r);
-    c->in_len += (size_t)r;
-
+/*
+ * Every whole request already in the buffer, answered, and the answers
+ * started on their way.
+ *
+ * Separate from the read because it is also what has to happen when a
+ * DEFERRED answer finally arrives: the requests behind it were read long
+ * ago -- a client is entitled to pipeline, and the two frames can share
+ * one TCP segment -- and nothing would ever wake this connection again
+ * if they were left sitting there. That was a hang, not a delay: the
+ * client is waiting for the answer to a request the server is holding
+ * and will not look at.
+ */
+static int conn_serve(dbi *inst, replica *rep, conn *c) {
     for (;;) {
+        /* One deferred answer at a time, and nothing behind it: the next
+         * request must not be answered before this one is. */
+        if (c->owed) break;
         size_t total = 0;
         int m = frame_total(c->in, c->in_len, &total);
         if (m > 0) break;                             /* wait for more */
@@ -429,6 +449,7 @@ static int conn_readable(dbi *inst, replica *rep, conn *c) {
         int e = rep ? replica_submit(rep, c->client, c->in, total, &c->out)
                     : dbi_handle(inst, c->client, c->in, total, &c->out);
         if (e < 0) return -1;                         /* no response was built */
+        if (e == 1) c->owed = 1;
         c->quiet_since = now_ms();                    /* it asked something */
 
         c->in_len -= total;
@@ -440,6 +461,20 @@ static int conn_readable(dbi *inst, replica *rep, conn *c) {
         c->in_cap = 0;
     }
     return conn_flush(c);
+}
+
+static int conn_readable(dbi *inst, replica *rep, conn *c) {
+    uint8_t chunk[8192];
+    ssize_t r = read(c->fd, chunk, sizeof chunk);
+    if (r == 0) return -1;                            /* clean EOF */
+    if (r < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return -1;
+    }
+    if (conn_reserve(c, c->in_len + (size_t)r)) return -1;
+    memcpy(c->in + c->in_len, chunk, (size_t)r);
+    c->in_len += (size_t)r;
+    return conn_serve(inst, rep, c);
 }
 
 /*
@@ -509,7 +544,12 @@ static int serve_forever(dbi *inst, replica *rep, peers *px, int srv,
         pf[0].revents = 0;
         for (int i = 0; i < n; i++) {
             pf[i + 1].fd = cs[i].fd;
-            pf[i + 1].events = (cs[i].out.len > cs[i].out_off) ? POLLOUT : POLLIN;
+            /* Neither, while a deferred answer is outstanding: the bytes
+             * stay in the kernel's buffer, which is where backpressure
+             * belongs. POLLHUP and POLLERR arrive whatever is asked for,
+             * so a client that hangs up meanwhile is still noticed. */
+            pf[i + 1].events = (cs[i].out.len > cs[i].out_off) ? POLLOUT
+                             : (cs[i].owed ? 0 : POLLIN);
             pf[i + 1].revents = 0;
         }
         /* The peers, after the clients: their indices are the
@@ -696,8 +736,12 @@ static int serve_forever(dbi *inst, replica *rep, peers *px, int srv,
                  * write was in the log. The entries still committed and
                  * still applied -- that is what committed means. */
                 if (found >= 0) {
-                    if (dbuf_put(&cs[found].out, answer.data, answer.len) == 0 &&
-                        conn_flush(&cs[found]) != 0) {
+                    cs[found].owed = 0;      /* it can be asked things again */
+                    /* The answer, and then whatever was pipelined behind
+                     * it and has been waiting for exactly this. */
+                    int dead = dbuf_put(&cs[found].out, answer.data, answer.len) != 0;
+                    if (!dead) dead = conn_serve(inst, rep, &cs[found]) != 0;
+                    if (dead) {
                         conn_gone(inst, rep, &cs[found]);
                         cs[found] = cs[n - 1];
                         conn_clear(&cs[n - 1]);
@@ -738,16 +782,24 @@ static void usage(const char *me) {
             "usage: %s [--stdio] [--port N] [--order N] [--max-clients N]\n"
             "           [--idle-timeout SECONDS] [--raft NODE_ID]\n"
             "           [--raft-port N] [--peer ID@HOST:PORT ...]\n"
+            "           [--join HOST:PORT ...] [--leave NODE_ID]\n"
             "  serves the database in the preopened directory \".\"\n"
             "  --raft replicates every write through a log before applying it\n"
             "  --raft-port is where the other members reach this one\n"
-            "  --peer names a member and where to reach IT; repeat per member\n", me);
+            "  --peer names a member and where to reach IT; repeat per member\n"
+            "  --join asks a RUNNING cluster to admit this node, knowing only a\n"
+            "         seed address; repeat for more seeds. Use INSTEAD of --peer\n"
+            "  --leave asks that cluster to remove NODE_ID, then exits without\n"
+            "         serving; it needs --join to say who to ask\n", me);
 }
 
 /*
- * `ID@HOST:PORT`. One member and where to reach it, which is the whole
- * of what this process is told about the cluster: there is no join here,
- * so the set every member is started with has to be the same set.
+ * `ID@HOST:PORT`. One member and where to reach it -- the BOOTSTRAP set,
+ * for a cluster that has no log yet. Every member has to be given the
+ * same one, because a member missing from one node's list is a vote that
+ * node will never count; after the first CONFIG entry the log is the
+ * member set and this stops being consulted. `--join` is the other way
+ * in, and the two are refused together.
  */
 static int parse_peer(const char *spec, uint64_t *id, char *host, size_t host_cap,
                       int *port) {
@@ -766,6 +818,28 @@ static int parse_peer(const char *spec, uint64_t *id, char *host, size_t host_ca
     if (p <= 0 || p > 65535) return -1;
     *id = (uint64_t)n;
     *port = p;
+    return 0;
+}
+
+/*
+ * `HOST:PORT`. A seed, which is an address and NOT an id -- a joiner
+ * does not know the ids of the cluster it is asking to be let into, and
+ * would have no way to check one if it were given.
+ *
+ * It has to be a DIRECT address. A load balancer in front of a member
+ * breaks node identity: the answer to a join comes from the node that
+ * parked it, and a redirect names a member rather than a service.
+ */
+static int parse_seed(const char *spec, seed_addr *out) {
+    const char *colon = strrchr(spec, ':');
+    if (!colon || colon == spec) return -1;
+    size_t hlen = (size_t)(colon - spec);
+    if (hlen >= sizeof out->host) return -1;
+    memcpy(out->host, spec, hlen);
+    out->host[hlen] = '\0';
+    int p = atoi(colon + 1);
+    if (p <= 0 || p > 65535) return -1;
+    out->port = p;
     return 0;
 }
 
@@ -789,6 +863,12 @@ int main(int argc, char **argv) {
     int raft_port = 0;
     const char *peer_spec[PEERS_MAX];
     int n_peers = 0;
+    /* Seeds: addresses of members already running, for a node that wants
+     * IN and has no member list of its own. --leave uses the same seeds
+     * to say who to ask. */
+    seed_addr seeds[JOIN_MAX_SEEDS];
+    int n_seeds = 0;
+    uint64_t leave_id = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdio") == 0) use_stdio = 1;
@@ -826,11 +906,70 @@ int main(int argc, char **argv) {
             }
             peer_spec[n_peers++] = argv[++i];
         }
+        else if (strcmp(argv[i], "--join") == 0 && i + 1 < argc) {
+            if (n_seeds >= JOIN_MAX_SEEDS) {
+                fprintf(stderr, "at most %d seeds\n", JOIN_MAX_SEEDS);
+                return 2;
+            }
+            if (parse_seed(argv[++i], &seeds[n_seeds]) != 0) {
+                fprintf(stderr, "bad --join %s (want HOST:PORT)\n", argv[i]);
+                return 2;
+            }
+            n_seeds++;
+        }
+        else if (strcmp(argv[i], "--leave") == 0 && i + 1 < argc) {
+            long long n = atoll(argv[++i]);
+            if (n <= 0) { fprintf(stderr, "--leave needs a positive node id\n"); return 2; }
+            leave_id = (uint64_t)n;
+        }
         else { usage(argv[0]); return 2; }
     }
 
-    if ((raft_port || n_peers) && node_id <= 0) {
-        fprintf(stderr, "--raft-port and --peer need --raft NODE_ID\n");
+    /*
+     * --leave is not a server at all: it asks a running cluster to drop
+     * a member and exits. Nothing below this needs to have happened --
+     * no directory, no instance, no log -- so it is answered first, and
+     * a directory it was pointed at is left untouched.
+     */
+    if (leave_id) {
+        if (!n_seeds) {
+            fprintf(stderr, "--leave needs --join HOST:PORT: somebody has to be asked\n");
+            return 2;
+        }
+        dbuf members = {0};
+        char why[256];
+        int rc = leave_cluster(seeds, n_seeds, leave_id, &members, why, sizeof why);
+        dbuf_free(&members);
+        if (rc != BJ_OK) {
+            fprintf(stderr, "could not remove node %llu: %s\n",
+                    (unsigned long long)leave_id, why);
+            return 1;
+        }
+        fprintf(stderr, "nisaba: node %llu removed\n", (unsigned long long)leave_id);
+        return 0;
+    }
+
+    if ((raft_port || n_peers || n_seeds) && node_id <= 0) {
+        fprintf(stderr, "--raft-port, --peer and --join need --raft NODE_ID\n");
+        return 2;
+    }
+    /*
+     * BOTH IS A CONTRADICTION, refused rather than resolved by argv
+     * order. --peer states the whole member set from outside; --join
+     * asks the cluster what the set IS. A node given both would boot
+     * with one answer and then be told another, and which it ended up
+     * with would depend on how the flags happened to be typed.
+     */
+    if (n_peers && n_seeds) {
+        fprintf(stderr, "--peer and --join are two ways to learn the same thing:"
+                        " use one\n");
+        return 2;
+    }
+    /* A joiner announces an address, and it is the one the others will
+     * use forever after -- it goes into the log with its record. */
+    if (n_seeds && !raft_port) {
+        fprintf(stderr, "--join needs --raft-port: it is the address this node"
+                        " announces\n");
         return 2;
     }
     /* A member that cannot be reached is a member nothing can replicate
@@ -841,7 +980,7 @@ int main(int argc, char **argv) {
     }
     /* --stdio is one client and no poll loop, so nothing would ever read
      * a peer socket. Refused rather than half-working. */
-    if ((raft_port || n_peers) && use_stdio) {
+    if ((raft_port || n_peers || n_seeds) && use_stdio) {
         fprintf(stderr, "--stdio cannot join a cluster: there is no poll loop to"
                         " serve peers with\n");
         return 2;
@@ -922,9 +1061,42 @@ int main(int argc, char **argv) {
         }
     }
 
+    /*
+     * Asking to be let in, before there is a node to be let in WITH.
+     *
+     * The set that comes back is what this node boots with, and that
+     * ordering is the point rather than an accident: a joiner that
+     * started as a group of one would elect itself, at a term of its own
+     * choosing, and then meet a cluster that already has a leader. It
+     * boots knowing it is a learner among voters instead.
+     *
+     * After peers_listen, so the leader's first AppendEntries -- which
+     * can arrive the instant the CONFIG entry commits -- has somewhere
+     * to land.
+     */
+    dbuf members = {0};
+    if (n_seeds) {
+        char why[256];
+        e = join_cluster(seeds, n_seeds, (uint64_t)node_id, "127.0.0.1", raft_port,
+                         &members, why, sizeof why);
+        if (e != BJ_OK) {
+            fprintf(stderr, "could not join: %s\n", why);
+            dbuf_free(&members);
+            peers_free(px);
+            dbi_close(inst);
+            root_free(rst);
+            bjns_posix_free(&ns);
+            return 1;
+        }
+        fprintf(stderr, "nisaba: node %d admitted, as a learner until it catches up\n",
+                node_id);
+        fflush(stderr);
+    }
+
     replica *rep = NULL;
     if (node_id > 0) {
-        e = replica_open(&ns, inst, (uint64_t)node_id, px, now_ms(), &rep);
+        e = replica_open(&ns, inst, (uint64_t)node_id, px,
+                         members.data, (uint32_t)members.len, now_ms(), &rep);
         if (e != BJ_OK) {
             fprintf(stderr, "cannot open the log: %s\n", dc_strerror(e));
             peers_free(px);
@@ -933,10 +1105,18 @@ int main(int argc, char **argv) {
             bjns_posix_free(&ns);
             return 1;
         }
-        fprintf(stderr, "nisaba: node %d, replicating (%u peer(s))\n",
-                node_id, peers_count(px));
+        /* What the LOG says, which is not necessarily what argv said: a
+         * restarted member's cluster comes from its own CONFIG entries,
+         * and a --peer list that disagrees has already lost. */
+        uint32_t others = replica_peer_count(rep);
+        fprintf(stderr, "nisaba: node %d, replicating (%u peer(s))\n", node_id, others);
+        if (others && !px) {
+            fprintf(stderr, "nisaba: the log names %u other member(s) and there is no"
+                            " --raft-port to reach them with\n", others);
+        }
         fflush(stderr);
     }
+    dbuf_free(&members);
 
     int rc = 0;
     if (use_stdio) {

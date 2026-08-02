@@ -39,12 +39,21 @@
  * file is what empties the outbox, and that is the whole of the
  * difference.
  *
- * WHAT IS NOT HERE
+ * MEMBERSHIP
  *
- * Joining. The member set is what the process was started with, so
- * growing a cluster means restarting its members. rn_change_membership
- * and the join message exist and are not wired up: a joiner has to be
- * caught up, and catching one up needs the snapshot half below.
+ * The member set is the LOG's, not argv's. argv bootstraps a cluster
+ * that has none; after that the last CONFIG entry wins, at startup and
+ * every time one applies -- so a member restarted with a stale --peer
+ * list cannot overwrite what the cluster agreed, and a member that
+ * joined needs no --peer list at all.
+ *
+ * The transport's address table FOLLOWS that set. A member with no
+ * address here is a member nothing can replicate to, and the failure is
+ * silent -- it looks exactly like a slow follower -- so the addresses
+ * are read back off the node (rn_adopted, which is where they live)
+ * rather than kept a second time.
+ *
+ * WHAT IS NOT HERE
  *
  * Snapshots. Nothing compacts the log here, so no peer can fall below
  * its base and RN_EFFECT_NEEDS_SNAPSHOT cannot fire -- it is reported
@@ -67,11 +76,21 @@
 typedef struct replica replica;
 
 /*
- * Open the log in `ns` and put a node over it. The member set is
- * `self_id` plus whatever `px` was told about, with each member's
- * address carried in its record so a refusal can name where the leader
- * actually is. `px` may be NULL, which is a group of one. The instance,
- * the namespace and the transport are BORROWED and must outlive this.
+ * Open the log in `ns` and put a node over it.
+ *
+ * The BOOTSTRAP member set is `members` (a binjson ARRAY of records --
+ * what a join came back with) when one is given, and otherwise `self_id`
+ * plus whatever `px` was told about, with each member's address carried
+ * in its record so a refusal can name where the leader actually is. `px`
+ * may be NULL, which is a group of one.
+ *
+ * Bootstrap is all it is. If the log already carries a CONFIG entry that
+ * set is adopted instead, and the transport's addresses are set from it
+ * -- which is what makes a restart need no --peer list and a stale one
+ * harmless.
+ *
+ * The instance, the namespace and the transport are BORROWED and must
+ * outlive this.
  *
  * `ns` is the ROOT's namespace -- the log sits beside the database
  * directories, because there is ONE log for the whole instance. Which
@@ -84,13 +103,19 @@ typedef struct replica replica;
  * of however long the machine has been up -- which elects it instantly
  * and hides the fact that the timer was never running.
  */
-int  replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px, uint64_t now,
-                  replica **out);
+int  replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
+                  const uint8_t *members, uint32_t members_len,
+                  uint64_t now, replica **out);
 void replica_close(replica *r);
 
 /* Whether this node can take a write right now. */
 int      replica_is_leader(const replica *r);
 uint64_t replica_leader_id(const replica *r);
+
+/* Members other than this one, as the set in force names them -- what a
+ * startup check asks to find out whether the log describes a cluster
+ * this process has no way of reaching. */
+uint32_t replica_peer_count(const replica *r);
 
 /*
  * How long the transport may sleep before this needs the clock again, in

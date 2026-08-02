@@ -164,6 +164,51 @@ int rmsg_term(const uint8_t *msg, uint32_t len, uint64_t *term);
 int rmsg_record_field(const uint8_t *record, uint32_t len, const char *key,
                       const uint8_t **v, uint32_t *vlen);
 
+/*
+ * `record` again, with `voting` forced to `voting_flag` and whatever
+ * `voting` it carried dropped. Appended to `b`, which is mid-array.
+ *
+ * Explicitly SET rather than merely omitted: raft_members_merge fills an
+ * absent key from the known record, so a promotion that just dropped the
+ * flag would re-inherit the voting:false it is trying to lift.
+ */
+int rmsg_record_with_voting(const uint8_t *record, uint32_t len, int voting_flag,
+                            bj_builder *b);
+
+/*
+ * A join, and a leave -- the two messages a node ANSWERS and, until a
+ * native member could grow a cluster, nothing in C ever sent. `record`
+ * is the applicant's `{ id, host, port }`, spliced in as it stands.
+ *
+ * Neither names a sender, and that is the grammar rather than an
+ * omission: both come from outside the cluster, where there is no id to
+ * name yet (rmsg_sender refuses them for exactly this reason).
+ */
+int rmsg_build_join(const uint8_t *record, uint32_t record_len, dbuf *out);
+int rmsg_build_leave(uint64_t id, dbuf *out);
+
+/*
+ * ...and that answer, read back. Every span points into `msg` and dies
+ * with it.
+ *
+ * The four shapes are mutually exclusive and each means something
+ * different to a seed loop: `ok` is done, `error` will never heal, a
+ * redirect says where to ask instead, and `retry` says ask again. A
+ * reader that collapsed any two of them would either give up on a
+ * cluster mid-election or retry a malformed request forever.
+ */
+typedef struct {
+    int            ok;
+    const uint8_t *members;     uint32_t members_len;      /* ok        */
+    const uint8_t *error;       uint32_t error_len;        /* refused   */
+    int            retry;                                  /* busy      */
+    uint64_t       leader_id;                              /* redirect  */
+    const uint8_t *leader_host; uint32_t leader_host_len;
+    int            leader_port;
+} rmsg_membership;
+
+int rmsg_read_membership_reply(const uint8_t *msg, uint32_t len, rmsg_membership *out);
+
 /* `{ term, ok }` -- TimeoutNow's answer. */
 int rmsg_build_ack(uint64_t term, int ok, dbuf *out);
 

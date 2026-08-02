@@ -361,9 +361,18 @@ void rn_wake(raft_node *n, int64_t now, double random01);
  * state it wrongly, which is how the outbox's "every entry is addressed"
  * invariant gets broken from the outside.
  *
- * Only the two hot kinds are answered here (RequestVote, AppendEntries);
- * anything else is RAFT_ERR_MESSAGE, because answering it needs host
- * resources -- see the note at the top.
+ * Answered here: RequestVote, AppendEntries, TimeoutNow, join and leave
+ * -- and InstallSnapshot once this node has been given a namespace and a
+ * store to stage one into. Anything else is RAFT_ERR_MESSAGE.
+ *
+ * A JOIN OR A LEAVE MAY BE ANSWERED LATER THAN IT IS HANDLED. The answer
+ * is a fact about a CONFIG entry that does not exist yet, so the node
+ * parks the requester and queues nothing; the reply comes out of a later
+ * call -- the one where that entry applies, or where this node stops
+ * leading. A host that assumes rn_handle always leaves a reply in the
+ * outbox will lose it, which means the conversation it arrived on has to
+ * outlive the call (server/replica.c keeps a table; src/raft.js holds a
+ * promise).
  */
 int rn_handle(raft_node *n, uint64_t corr,
               const uint8_t *msg, uint32_t len, double random01);

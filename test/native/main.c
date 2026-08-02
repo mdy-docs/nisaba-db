@@ -7251,6 +7251,197 @@ TEST(raft_membership_merge_cannot_erase_an_address) {
     bj_builder_free(i); bj_builder_free(k);
 }
 
+TEST(the_membership_grammar_round_trips_in_c) {
+    /*
+     * The two messages a node ANSWERS and, until a native member could
+     * grow a cluster, nothing in C ever SENT -- and the four shapes of
+     * the answer, read back.
+     *
+     * Written twice, this would be the join bug waiting to happen: a
+     * seed loop that built its own request or classified its own reply
+     * would be a second opinion about a grammar the node already owns,
+     * and the two would agree right up until one of them was changed.
+     * So the builders and the reader live beside the parsers, and this
+     * drives the pair against each other.
+     *
+     * The four shapes are what a seed loop TURNS ON. Collapse any two of
+     * them and it either gives up on a cluster that is merely
+     * mid-election or retries a malformed request until it runs out of
+     * attempts, so each is pinned separately.
+     */
+    bj_builder *rec = bj_builder_new();
+    bj_begin_object(rec);
+    bj_put_key(rec, (const uint8_t *)"id", 2);   bj_put_int(rec, 7);
+    bj_put_key(rec, (const uint8_t *)"host", 4); bj_put_string(rec, (const uint8_t *)"10.0.0.9", 8);
+    bj_put_key(rec, (const uint8_t *)"port", 4); bj_put_int(rec, 9007);
+    bj_end_object(rec);
+    size_t reclen; const uint8_t *recbuf = bj_builder_data(rec, &reclen);
+
+    /* ---- a join, and the record it carries, arriving intact. */
+    {
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_join(recbuf, (uint32_t)reclen, &msg));
+        int kind = -1;
+        CHECK_OK(rmsg_kind(msg.data, (uint32_t)msg.len, &kind));
+        CHECK_I64(kind, RAFT_MSG_JOIN);
+        /* It names no sender, and that is the grammar rather than an
+         * omission: an applicant has no id in this cluster yet. */
+        uint64_t from = 0;
+        CHECK_RC(rmsg_sender(msg.data, (uint32_t)msg.len, &from), RAFT_ERR_MESSAGE);
+
+        const uint8_t *got; uint32_t gotlen; uint64_t id = 0;
+        CHECK_OK(rmsg_join_member(msg.data, (uint32_t)msg.len, &got, &gotlen, &id));
+        CHECK_I64(id, 7);
+        const uint8_t *h; uint32_t hlen;
+        CHECK_OK(rmsg_record_field(got, gotlen, "host", &h, &hlen));
+        CHECK(hlen && find_bytes(h, hlen, "10.0.0.9", 8) != NULL);
+        dbuf_free(&msg);
+    }
+
+    /* ---- a leave, which is an id and nothing else. */
+    {
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_leave(7, &msg));
+        int kind = -1;
+        CHECK_OK(rmsg_kind(msg.data, (uint32_t)msg.len, &kind));
+        CHECK_I64(kind, RAFT_MSG_LEAVE);
+        uint64_t id = 0;
+        CHECK_OK(rmsg_leave_id(msg.data, (uint32_t)msg.len, &id));
+        CHECK_I64(id, 7);
+        dbuf_free(&msg);
+        /* 0 is "nobody" everywhere in this grammar, so it cannot be
+         * asked for. */
+        dbuf bad = {0};
+        CHECK_RC(rmsg_build_leave(0, &bad), RAFT_ERR_MESSAGE);
+        dbuf_free(&bad);
+    }
+
+    /* ---- adopted: the records come back whole. */
+    {
+        bj_builder *ms = bj_builder_new();
+        bj_begin_array(ms);
+        bj_put_raw(ms, recbuf, (uint32_t)reclen);
+        bj_end_array(ms);
+        size_t mslen; const uint8_t *msbuf = bj_builder_data(ms, &mslen);
+
+        dbuf reply = {0};
+        CHECK_OK(rmsg_build_membership_reply(1, msbuf, (uint32_t)mslen, NULL, 0,
+                                             0, NULL, 0, &reply));
+        rmsg_membership m;
+        CHECK_OK(rmsg_read_membership_reply(reply.data, (uint32_t)reply.len, &m));
+        CHECK_I64(m.ok, 1);
+        CHECK_I64(arr_count(m.members, m.members_len), 1);
+        CHECK(find_bytes(m.members, m.members_len, "10.0.0.9", 8) != NULL);
+        CHECK_I64(m.retry, 0);
+        CHECK(m.error == NULL);
+        dbuf_free(&reply);
+        bj_builder_free(ms);
+    }
+
+    /* ---- refused: a sentence, and it will never heal by being asked
+     * again. */
+    {
+        dbuf reply = {0};
+        CHECK_OK(rmsg_build_membership_reply(0, NULL, 0, "join requires member", 0,
+                                             0, NULL, 0, &reply));
+        rmsg_membership m;
+        CHECK_OK(rmsg_read_membership_reply(reply.data, (uint32_t)reply.len, &m));
+        CHECK_I64(m.ok, 0);
+        CHECK_I64(m.retry, 0);
+        CHECK_I64(m.leader_id, 0);
+        CHECK_FATAL(m.error != NULL);
+        CHECK(m.error_len == 20 && memcmp(m.error, "join requires member", 20) == 0);
+        dbuf_free(&reply);
+    }
+
+    /* ---- busy: ask again. NOT a refusal, and not a redirect. */
+    {
+        dbuf reply = {0};
+        CHECK_OK(rmsg_build_membership_reply(0, NULL, 0, NULL, 1, 0, NULL, 0, &reply));
+        rmsg_membership m;
+        CHECK_OK(rmsg_read_membership_reply(reply.data, (uint32_t)reply.len, &m));
+        CHECK_I64(m.ok, 0);
+        CHECK_I64(m.retry, 1);
+        CHECK(m.error == NULL);
+        dbuf_free(&reply);
+    }
+
+    /* ---- a redirect, carrying the ADDRESS out of the leader's record.
+     * An id alone would send a joiner back to the seed it just asked --
+     * it has no way to turn an id into somewhere to dial. */
+    {
+        dbuf reply = {0};
+        CHECK_OK(rmsg_build_membership_reply(0, NULL, 0, NULL, 0,
+                                             7, recbuf, (uint32_t)reclen, &reply));
+        rmsg_membership m;
+        CHECK_OK(rmsg_read_membership_reply(reply.data, (uint32_t)reply.len, &m));
+        CHECK_I64(m.ok, 0);
+        CHECK_I64(m.retry, 0);
+        CHECK_I64(m.leader_id, 7);
+        CHECK_I64(m.leader_port, 9007);
+        CHECK_FATAL(m.leader_host != NULL);
+        CHECK(m.leader_host_len == 8 && memcmp(m.leader_host, "10.0.0.9", 8) == 0);
+        dbuf_free(&reply);
+    }
+
+    /* ---- an election in progress: a redirect that names nobody, which
+     * is "there is no leader to send you to yet" and is also a retry. */
+    {
+        dbuf reply = {0};
+        CHECK_OK(rmsg_build_membership_reply(0, NULL, 0, NULL, 0, 0, NULL, 0, &reply));
+        rmsg_membership m;
+        CHECK_OK(rmsg_read_membership_reply(reply.data, (uint32_t)reply.len, &m));
+        CHECK_I64(m.leader_id, 0);
+        CHECK(m.leader_host == NULL);
+        CHECK(m.error == NULL);
+        dbuf_free(&reply);
+    }
+
+    /*
+     * ---- and the promotion edit: the same record with `voting` SET.
+     * Set rather than merely dropped, because raft_members_merge fills
+     * an absent key from the record it already knows -- an omission
+     * would re-inherit the voting:false being lifted.
+     */
+    {
+        bj_builder *learner = bj_builder_new();
+        bj_begin_array(learner);
+        CHECK_OK(rmsg_record_with_voting(recbuf, (uint32_t)reclen, 0, learner));
+        bj_end_array(learner);
+        size_t llen; const uint8_t *lbuf = bj_builder_data(learner, &llen);
+        cur lc = { lbuf, llen, 0 };
+        uint32_t n = 0;
+        CHECK_OK(array_begin(&lc, &n));
+        CHECK_I64(n, 1);
+        size_t start = lc.pos;
+        CHECK_OK(skip_value(&lc));
+        const uint8_t *v; uint32_t vlen;
+        CHECK_OK(rmsg_record_field(lbuf + start, (uint32_t)(lc.pos - start), "voting", &v, &vlen));
+        CHECK_FATAL(v != NULL);
+        CHECK_I64(v[0], BJ_TYPE_FALSE);
+
+        bj_builder *voter = bj_builder_new();
+        bj_begin_array(voter);
+        CHECK_OK(rmsg_record_with_voting(lbuf + start, (uint32_t)(lc.pos - start), 1, voter));
+        bj_end_array(voter);
+        size_t vlen2; const uint8_t *vbuf = bj_builder_data(voter, &vlen2);
+        cur vc = { vbuf, vlen2, 0 };
+        CHECK_OK(array_begin(&vc, &n));
+        size_t vstart = vc.pos;
+        CHECK_OK(skip_value(&vc));
+        const uint8_t *v2; uint32_t v2len;
+        CHECK_OK(rmsg_record_field(vbuf + vstart, (uint32_t)(vc.pos - vstart), "voting", &v2, &v2len));
+        CHECK_FATAL(v2 != NULL);
+        CHECK_I64(v2[0], BJ_TYPE_TRUE);
+        /* Exactly one `voting`, and the address it carried survived. */
+        CHECK(find_bytes(vbuf, vlen2, "10.0.0.9", 8) != NULL);
+        bj_builder_free(voter);
+        bj_builder_free(learner);
+    }
+
+    bj_builder_free(rec);
+}
+
 /* ---- the RPC handlers, end to end in C (raft_msg.h) ------------------- */
 
 /* A follower with `n` entries at term 1, hard state at `term`. */
@@ -10994,6 +11185,7 @@ int main(void) {
     RUN(raft_quorum_counts_voters_only);
     RUN(raft_membership_derives_the_same_lists_everywhere);
     RUN(raft_membership_merge_cannot_erase_an_address);
+    RUN(the_membership_grammar_round_trips_in_c);
     RUN(raft_request_vote_runs_end_to_end_in_c);
     RUN(install_snapshot_is_a_grammar_both_hosts_can_read);
     RUN(raft_append_entries_round_trips_between_two_logs);

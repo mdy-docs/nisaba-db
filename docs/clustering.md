@@ -6,6 +6,17 @@ its id, its own listen address, and one seed address — and everything
 else flows through the replicated log. (Replication roadmap step 5d;
 the consensus layer itself is documented in `src/raft.js`.)
 
+**The native server does all of this too**, through flags rather than a
+JavaScript API: `--raft ID --raft-port N --join HOST:PORT` is the three
+facts, `--leave ID` is `leaveGroup`, and `server/replica.c` reads the
+member set back off the node exactly as `onConfig` does
+([`db-server.md`](db-server.md)). Every rule below is the same rule,
+because the decisions are the same `raft_node`'s — one implementation
+with two hosts around it. Where the two genuinely differ is the
+envelope: a native member hosts one group and wraps nothing, so
+`joinGroup(transport, null, …)` is how a Node member joins a native
+cluster.
+
 ## The one design rule: the log is the address book
 
 Cluster membership travels through the log as CONFIG entries whose

@@ -28,6 +28,7 @@ import { connectServer, ServerError, WIRE_OPS, ChangeStreamOverflowError } from 
 import { BPlusTree, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { TcpRaftTransport } from '../src/raft-transport-tcp.js';
+import { joinGroup, leaveGroup } from '../src/raft-host.js';
 
 await ready();
 
@@ -1033,6 +1034,527 @@ for (const engine of ENGINES) {
       await jsDb.close();
       await provider.close();
     });
+  });
+
+  /*
+   * A member set that is the LOG's rather than argv's.
+   *
+   * The three things being checked, and they are different things. That
+   * a process knowing one ADDRESS can be admitted -- it has no ids, and
+   * the cluster's shape is not on its command line. That what it is
+   * admitted as is a LEARNER, promoted only once its match index proves
+   * it caught up, so admitting it never thins the failure margin between
+   * the moment it arrives and the moment it can help. And that once the
+   * log carries a CONFIG entry, argv has stopped mattering: a restart
+   * with no --peer list at all rejoins nothing and is simply still a
+   * member.
+   *
+   * The joiner is deliberately given ONE seed and it is not necessarily
+   * the leader, because following a redirect is most of what a seed loop
+   * is for.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: joining a cluster (${engine.name})`, () => {
+    const base = nextPort();
+    const SEEDS = [1, 2].map((id) => ({
+      id, port: base + id - 1, raftPort: base + 10 + id - 1
+    }));
+    const JOINER = { id: 3, port: base + 2, raftPort: base + 12 };
+    const ALL = [...SEEDS, JOINER];
+
+    const seedArgs = (m) => [
+      '--raft', String(m.id), '--raft-port', String(m.raftPort),
+      ...SEEDS.filter((o) => o.id !== m.id)
+        .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+    ];
+    let nodes = [];
+
+    const boot = async (m, extra) => {
+      const { proc, dir } = await startServer(engine, m.port, extra, -1, m.dir);
+      m.proc = proc;
+      m.dir = dir;
+      m.alive = true;
+      /* Everything it says, kept: some of what this suite checks is
+       * whether a member had to complain. */
+      m.err = m.err ?? '';
+      proc.stderr.on('data', (d) => { m.err += String(d); });
+      if (!nodes.includes(m)) nodes.push(m);
+      return m;
+    };
+    const stop = async (m) => {
+      if (!m.alive) return;
+      m.alive = false;
+      m.proc.kill();
+      await new Promise((r) => m.proc.once('exit', r));
+    };
+
+    /* Run the server binary as a one-shot COMMAND rather than a server:
+     * --leave asks and exits, and it needs no directory of its own. */
+    const runOnce = (args, dir) => new Promise((resolve) => {
+      const [cmd, argv, opts] = engine.argv(dir ?? os.tmpdir(), 0, args);
+      // --port is meaningless here and never bound; drop it so a stray
+      // 0 cannot be mistaken for a request to listen.
+      const cleaned = argv.filter((a, i) => a !== '--port' && argv[i - 1] !== '--port');
+      const proc = spawn(cmd, cleaned, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+      let err = '';
+      proc.stderr.on('data', (d) => { err += String(d); });
+      proc.once('exit', (code) => resolve({ code, err }));
+    });
+
+    const write = async (name, tries = 100) => {
+      let last = null;
+      for (let i = 0; i < tries; i++) {
+        for (const m of nodes.filter((n) => n.alive)) {
+          let db = null;
+          try {
+            db = (await connectServer(m.port)).db(DB);
+            await db.collection('users').insertOne({ name });
+            await db.close();
+            return m;
+          } catch (err) {
+            last = err;
+            try { await db?.close(); } catch { /* already gone */ }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error(`no member took the write "${name}": ${last?.message}`);
+    };
+
+    const namesOn = async (m) => {
+      const db = (await connectServer(m.port)).db(DB);
+      try {
+        return (await db.collection('users').find({}, { sort: { name: 1 } }).toArray())
+          .map((d) => d.name);
+      } catch (err) {
+        if (err.code === -37) return [];
+        throw err;
+      } finally { await db.close(); }
+    };
+
+    const agree = async (members, expected, withinMs = 20000) => {
+      const started = Date.now();
+      let seen = null;
+      while (Date.now() - started < withinMs) {
+        seen = [];
+        for (const m of members.filter((n) => n.alive)) seen.push(await namesOn(m));
+        if (seen.every((names) => JSON.stringify(names) === JSON.stringify(expected))) {
+          return Date.now() - started;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      throw new Error(`members never agreed on ${JSON.stringify(expected)}: ` +
+                      JSON.stringify(seen));
+    };
+
+    /*
+     * Whether a write can still be committed, in bounded time. This is
+     * the only honest way to ask about the quorum from outside: a member
+     * that CANNOT commit is a member that never answers, and "never" has
+     * to be measured.
+     *
+     * The short keepalive is deliberate and this is a second assertion
+     * hiding in the first. ORDERING IS THE CONTRACT: answers are paired
+     * with requests by arrival order, because nothing on the wire
+     * identifies them. A server that answered the keepalive PING while
+     * the write ahead of it was still in the log would hand the ping's
+     * `{ok:true}` back as the insert's answer, and this would read
+     * "committed" for a write that never happened. (It did.)
+     */
+    const canCommit = async (m, name, withinMs = 4000) => {
+      const db = (await connectServer(m.port, { keepAliveMs: 500 })).db(DB);
+      try {
+        const answered = await Promise.race([
+          db.collection('users').insertOne({ name }).then(() => 'committed', (e) => e),
+          new Promise((r) => setTimeout(() => r('waiting'), withinMs))
+        ]);
+        return answered;
+      } finally { await db.close(); }
+    };
+
+    beforeAll(async () => {
+      nodes = [];
+      for (const m of SEEDS) await boot(m, seedArgs(m));
+      return async () => { for (const m of ALL) await stop(m); };
+    });
+
+    it('admits a process that knows one address, and catches it up on the past',
+       async () => {
+      const leader = await write('before-it-existed');
+      await agree(SEEDS, ['before-it-existed']);
+
+      /*
+       * ONE seed, and the one that is NOT the leader whenever that is
+       * knowable -- so the path under test is dial, be redirected, ask
+       * the address the redirect named. No --peer at all: everything
+       * this member learns about the cluster it learns from the answer.
+       */
+      const seed = SEEDS.find((m) => m.id !== leader.id) ?? SEEDS[0];
+      await boot(JOINER, [
+        '--raft', String(JOINER.id), '--raft-port', String(JOINER.raftPort),
+        '--join', `127.0.0.1:${seed.raftPort}`
+      ]);
+
+      // A write made before it existed, which it can only have from the
+      // log: its directory started empty.
+      await agree(ALL, ['before-it-existed']);
+      // And it takes new ones like any other member.
+      await write('after');
+      await agree(ALL, ['after', 'before-it-existed']);
+
+      /*
+       * AND NOBODY HAD TO COMPLAIN, which is a separate claim and the
+       * one with nothing else watching it.
+       *
+       * A join's answer is DEFERRED: the node parks the requester,
+       * queues nothing, and builds the reply later -- when the CONFIG
+       * entry applies, in a call that is handling no message at all. If
+       * the conversation it arrived on did not outlive the call that
+       * took it, that reply is built and then dropped, and the node
+       * says so out loud rather than losing it silently.
+       *
+       * Everything above would still pass. The joiner's own retry is
+       * idempotent, so a SECOND join of an identical record is answered
+       * on the spot and it gets in anyway, a call timeout later. This
+       * line is the difference between that and the answer arriving.
+       */
+      for (const m of nodes) {
+        expect(m.err, `${m.id} said: ${m.err}`).not.toMatch(/no conversation/);
+      }
+    }, 60000);
+
+    it('is promoted to a voter, so two of the three can commit without the third',
+       async () => {
+      /*
+       * The assertion is arithmetic. Three members, one of them the
+       * joiner: if it is a VOTER the quorum is two and the cluster
+       * survives losing one. If it were still a learner the quorum
+       * would be two of the ORIGINAL two, and losing either would stop
+       * the cluster dead.
+       *
+       * So: stop a seed, and require a write to go through anyway. The
+       * survivors are one seed and the joiner, which is only a quorum if
+       * the joiner counts.
+       */
+      const victim = SEEDS[0];
+      await stop(victim);
+      const took = await write('needs-the-joiner');
+      expect(took.id).not.toBe(victim.id);
+      await agree(ALL, ['after', 'before-it-existed', 'needs-the-joiner']);
+
+      await boot(victim, seedArgs(victim));
+      await agree(ALL, ['after', 'before-it-existed', 'needs-the-joiner']);
+    }, 60000);
+
+    it('comes back a member with no --peer list and no second join', async () => {
+      /*
+       * ARGV IS A BOOTSTRAP AND THE LOG IS THE TRUTH. Restarted with
+       * neither a member list nor a seed, this member's own CONFIG
+       * entries are the only place its cluster is written down -- and a
+       * member that read nothing there would boot as a group of one,
+       * elect itself at a term of its own choosing, and disrupt a
+       * cluster that already has a leader.
+       */
+      await stop(JOINER);
+      await write('while-it-was-down');
+      await boot(JOINER, ['--raft', String(JOINER.id), '--raft-port', String(JOINER.raftPort)]);
+
+      const expected = ['after', 'before-it-existed', 'needs-the-joiner', 'while-it-was-down'];
+      await agree(ALL, expected);
+
+      // Still a VOTER, not merely a reader: the same arithmetic as
+      // before, against a member whose voting status survived a restart
+      // only because the log carried it.
+      const victim = SEEDS[1];
+      await stop(victim);
+      await write('still-a-voter');
+      await agree(ALL, [...expected, 'still-a-voter'].sort());
+      await boot(victim, seedArgs(victim));
+      await agree(ALL, [...expected, 'still-a-voter'].sort());
+    }, 60000);
+
+    it('takes a re-join of the same member as the no-op it is', async () => {
+      /*
+       * A joiner that treats a lost reply as failure asks again, and the
+       * node answers an IDENTICAL record with the current set and
+       * changes nothing. Restarting with --join is that retry, made
+       * deliberately.
+       */
+      await stop(JOINER);
+      await boot(JOINER, [
+        '--raft', String(JOINER.id), '--raft-port', String(JOINER.raftPort),
+        '--join', `127.0.0.1:${SEEDS[0].raftPort}`
+      ]);
+      const expected = ['after', 'before-it-existed', 'needs-the-joiner',
+                        'still-a-voter', 'while-it-was-down'];
+      await agree(ALL, expected);
+      await write('after-the-rejoin');
+      await agree(ALL, [...expected, 'after-the-rejoin'].sort());
+    }, 60000);
+
+    it('removes a member, and the survivors\' quorum changes with it', async () => {
+      /*
+       * The arithmetic again, run backwards. Three voters need two;
+       * remove one and the remaining two still need two, so stopping
+       * either of THEM must stop the cluster. That is the whole
+       * observable difference between a member that left and a member
+       * that is merely down, and it is the reason removing one is worth
+       * being able to do.
+       */
+      const [a, b] = SEEDS;
+      const left = await runOnce(['--leave', String(JOINER.id),
+                                  '--join', `127.0.0.1:${a.raftPort}`,
+                                  '--join', `127.0.0.1:${b.raftPort}`]);
+      expect(left.code).toBe(0);
+      expect(left.err).toMatch(new RegExp(`node ${JOINER.id} removed`));
+      await stop(JOINER);
+
+      // Two voters left. Stop one: the other cannot reach a quorum, and
+      // a write offered to it is never answered rather than refused --
+      // it is the leader, it just cannot commit.
+      const victim = (await write('two-left')).id === a.id ? b : a;
+      const survivor = victim === a ? b : a;
+      await stop(victim);
+      expect(await canCommit(survivor, 'no-quorum')).toBe('waiting');
+
+      // ...and it comes back the moment the second voter does.
+      await boot(victim, seedArgs(victim));
+      const took = await write('quorum-again');
+      expect([a.id, b.id]).toContain(took.id);
+    }, 60000);
+
+    it('says why, rather than starting, when the flags contradict each other',
+       async () => {
+      /* Not zero, rather than 2: wasmtime reports any non-zero guest
+       * exit as 1, so the CODE only says "it refused" and the SENTENCE
+       * is what says which refusal it was. */
+      const both = await runOnce(['--raft', '9', '--raft-port', String(base + 30),
+                                  '--peer', `1@127.0.0.1:${base + 31}`,
+                                  '--join', `127.0.0.1:${base + 32}`]);
+      expect(both.code).not.toBe(0);
+      expect(both.err).toMatch(/--peer and --join are two ways to learn the same thing/);
+
+      const noPort = await runOnce(['--raft', '9', '--join', `127.0.0.1:${base + 32}`]);
+      expect(noPort.code).not.toBe(0);
+      expect(noPort.err).toMatch(/--join needs --raft-port/);
+
+      const noSeed = await runOnce(['--leave', '9']);
+      expect(noSeed.code).not.toBe(0);
+      expect(noSeed.err).toMatch(/--leave needs --join/);
+
+      const stdio = await runOnce(['--stdio', '--raft', '9', '--raft-port', String(base + 30),
+                                   '--join', `127.0.0.1:${base + 32}`]);
+      expect(stdio.code).not.toBe(0);
+      expect(stdio.err).toMatch(/--stdio cannot join a cluster/);
+    }, 30000);
+
+    it('gives up out loud on a seed that is not there', async () => {
+      // Nothing is listening on this port. Twenty rounds at a quarter
+      // second is the budget; what matters is that it ENDS, and says
+      // which address never answered.
+      const dead = await runOnce(['--raft', '9', '--raft-port', String(base + 30),
+                                  '--join', `127.0.0.1:${base + 40}`]);
+      expect(dead.code).toBe(1);
+      expect(dead.err).toMatch(/could not join/);
+      expect(dead.err).toMatch(new RegExp(`127\\.0\\.0\\.1:${base + 40} did not answer`));
+    }, 60000);
+  });
+
+  /*
+   * The other direction across the two hosts: a member running in Node
+   * that JOINS a C cluster, knowing one C address and nothing else.
+   *
+   * The existing mixed-cluster suite proves the steady-state framing.
+   * This proves the one exchange that is not steady state, and it is the
+   * one with the most room to disagree: a join's answer is DEFERRED --
+   * built when a CONFIG entry applies, seconds after the call that asked
+   * -- so C has to hold a conversation open across calls, and JavaScript
+   * has to hold a promise. Neither end can be tested against itself for
+   * that.
+   *
+   * It is also where the { group, msg } envelope had to stop: a native
+   * member hosts one group and wraps nothing, so joinGroup is given a
+   * null group id and sends the message bare.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: a Node member joins a C cluster (${engine.name})`, () => {
+    const base = nextPort();
+    const C_MEMBERS = [1, 2].map((id) => ({
+      id, port: base + id - 1, raftPort: base + 10 + id - 1
+    }));
+    const NODE = { id: 3, raftPort: base + 12 };
+    const argsFor = (m) => [
+      '--raft', String(m.id), '--raft-port', String(m.raftPort),
+      ...C_MEMBERS.filter((o) => o.id !== m.id)
+        .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+    ];
+
+    class RecordingMachine {
+      constructor() { this.applied = 0; this.count = 0; }
+      appliedIndex() { return this.applied; }
+      async apply(entry) { this.count++; this.applied = entry.index; }
+    }
+
+    let cNodes = [];
+    let node = null, transport = null, log = null, machine = null, ticker = null;
+    let admitted = null;
+
+    const stopC = async (m) => {
+      if (!m.alive) return;
+      m.alive = false;
+      m.proc.kill();
+      await new Promise((r) => m.proc.once('exit', r));
+    };
+    const bootC = async (m) => {
+      const { proc, dir } = await startServer(engine, m.port, argsFor(m), -1, m.dir);
+      Object.assign(m, { proc, dir, alive: true });
+      return m;
+    };
+    const until = async (pred, ms = 20000) => {
+      const started = Date.now();
+      while (Date.now() - started < ms) {
+        if (await pred()) return Date.now() - started;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      throw new Error('condition never held');
+    };
+    /* Leadership somewhere a client can reach. The Node member is a
+     * full voter and entitled to WIN, and a leader with no database is
+     * a leader no client can send a write to -- so it hands leadership
+     * back rather than being prevented from taking it. */
+    const ensureCLeads = async () => {
+      if (!node) return;
+      await until(() => node.role === 'leader' ||
+                        cNodes.some((m) => m.alive && m.id === node.leaderId));
+      if (node.role !== 'leader') return;
+      await node.transferLeadership(cNodes.find((m) => m.alive).id);
+      await until(() => node.role !== 'leader');
+    };
+    const writeToC = async (name, tries = 100) => {
+      await ensureCLeads();
+      let last = null;
+      for (let i = 0; i < tries; i++) {
+        for (const m of cNodes.filter((n) => n.alive)) {
+          let db = null;
+          try {
+            db = (await connectServer(m.port)).db(DB);
+            await db.collection('users').insertOne({ name });
+            await db.close();
+            return m;
+          } catch (err) {
+            last = err;
+            try { await db?.close(); } catch { /* already gone */ }
+          }
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      throw new Error(`no C member took "${name}": ${last?.message}`);
+    };
+
+    beforeAll(async () => {
+      cNodes = [];
+      for (const m of C_MEMBERS) {
+        const { proc, dir } = await startServer(engine, m.port, argsFor(m), -1);
+        cNodes.push(Object.assign(m, { proc, dir, alive: true }));
+      }
+      // A write before the Node member exists, so what reaches it later
+      // is the log rather than live traffic.
+      await writeToC('before-the-node-member');
+
+      log = new EntryLog(new MemoryHandle());
+      await log.open();
+      machine = new RecordingMachine();
+      transport = new TcpRaftTransport({
+        listenPort: NODE.raftPort,
+        onMessage: (env) => node.handleMessage(env),
+        requestTimeoutMs: 1000
+      });
+      await transport.start();
+
+      // One seed, no ids, no member list -- and a NULL group, because a
+      // native member wraps nothing around the message.
+      admitted = await joinGroup(transport, null,
+        { id: NODE.id, host: '127.0.0.1', port: NODE.raftPort },
+        { seeds: C_MEMBERS.map((m) => ({ host: '127.0.0.1', port: m.raftPort })) });
+
+      node = new RaftNode({ id: NODE.id, peers: admitted, log, stateMachine: machine, transport });
+      await node.start(Date.now());
+      ticker = setInterval(() => node.tick(Date.now()), 20);
+      ticker.unref?.();
+
+      return async () => {
+        clearInterval(ticker);
+        for (const m of cNodes) await stopC(m);
+        await node?.stop();   /* the last test stops it: it has left */
+        await transport.stop();
+        await log.close();
+      };
+    });
+
+    it('is admitted by a C leader, as a learner among the voters it names', () => {
+      // The adopted records, decided by C and read by JavaScript: every
+      // member with the address the cluster holds for it, and the
+      // applicant NOT a voter, whatever it asked for.
+      expect(admitted.map((m) => m.id).sort()).toEqual([1, 2, 3]);
+      for (const m of C_MEMBERS) {
+        expect(admitted.find((r) => r.id === m.id)).toMatchObject({
+          host: '127.0.0.1', port: m.raftPort
+        });
+      }
+      expect(admitted.find((r) => r.id === NODE.id)).toMatchObject({ voting: false });
+    });
+
+    it('is caught up from the log, and then promoted by the C leader', async () => {
+      // Entries it never saw happen, arriving over the wire it just
+      // joined on.
+      await until(() => machine.count >= 1);
+
+      // And the promotion is C's own decision, on match index -- watched
+      // from the other side of the wire, in the member records this
+      // node adopts as the CONFIG entry applies.
+      await until(() => node.memberInfo.find((m) => m.id === NODE.id)?.voting !== false);
+      expect(node.voters.sort()).toEqual([1, 2, 3]);
+    }, 60000);
+
+    it('is what the quorum needs once it is a voter', async () => {
+      await stopC(cNodes.find((m) => m.alive));
+      expect(cNodes.filter((m) => m.alive).length).toBe(1);
+      const before = log.lastIndex;
+      const took = await writeToC('needs-the-node-member');
+      await until(() => log.lastIndex > before);
+      expect(node.leaderId).toBe(took.id);
+    }, 60000);
+
+    it('leaves, and the two C members left are the whole electorate', async () => {
+      // Both C members back first, so what is being measured afterwards
+      // is the departure and not the outage.
+      await bootC(cNodes.find((m) => !m.alive));
+      await writeToC('both-back');
+
+      const left = await leaveGroup(transport, null, NODE.id,
+        { seeds: cNodes.map((m) => ({ host: '127.0.0.1', port: m.raftPort })) });
+      // The adopted set, decided by C: this member is gone from it.
+      expect(left.map((m) => m.id).sort()).toEqual([1, 2]);
+      clearInterval(ticker);
+      await node.stop();
+      node = null;
+
+      /*
+       * Two voters need two. Find whichever C member leads, stop the
+       * other, and the leader is left unable to commit anything -- a
+       * write it is not refusing, because it IS the leader, and not
+       * answering, because it cannot reach a quorum. Before the leave
+       * there were three voters and this would have gone through.
+       */
+      const leader = await writeToC('two-of-two');
+      await stopC(cNodes.find((m) => m.alive && m.id !== leader.id));
+      const db = (await connectServer(leader.port, { keepAliveMs: 500 })).db(DB);
+      try {
+        const outcome = await Promise.race([
+          db.collection('users').insertOne({ name: 'alone' }).then(() => 'committed', (e) => e),
+          new Promise((r) => setTimeout(() => r('waiting'), 4000))
+        ]);
+        expect(outcome).toBe('waiting');
+      } finally { await db.close(); }
+    }, 60000);
   });
 
   /*

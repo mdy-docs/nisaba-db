@@ -44,7 +44,7 @@ mkdir -p wasm/lib
 
 SOURCES=()
 while IFS= read -r src; do SOURCES+=("$src"); done < <(all_sources native)
-SOURCES+=(server/main.c server/replica.c server/peers.c server/root.c)
+SOURCES+=(server/main.c server/replica.c server/peers.c server/root.c server/join.c)
 
 FLAGS=(-std=c11 -O2 -Wall -Wextra -Werror "${INCLUDE_FLAGS[@]}")
 # Libraries go AFTER the sources: GNU ld resolves left to right and drops

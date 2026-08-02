@@ -13,13 +13,12 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [joining-a-native-cluster.md](joining-a-native-cluster.md) | Growing a cluster without restarting its members. The node already answers a join; nothing in C has ever asked. |
-| 2 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
-| 3 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
-| 4 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
+| 1 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
+| 2 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
+| 3 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
 
-1 is the last thing about a cluster that argv decides; 2 is how a client
-reaches one; 3 is a feature; 4 is the coverage all of it rests on.
+1 is how a client reaches a cluster; 2 is a feature; 3 is the coverage
+all of it rests on.
 
 **They are load-bearing rather than speculative.** They were written
 assuming the C server would one day be the cluster member; that is
@@ -27,7 +26,40 @@ decided ([`../deployment-shapes.md`](../deployment-shapes.md),
 Decision A). One program covers "a persistent server" and "a replicated
 server".
 
-**Five briefs retired recently, which is why they are not listed.**
+**Six briefs retired recently, which is why they are not listed.**
+
+**A native cluster can be JOINED**, which is why that brief is gone.
+`nisaba-server --raft 4 --raft-port 9004 --join 127.0.0.1:9001` is a
+member of a running cluster, knowing one ADDRESS and nothing else: it
+follows the redirect to the leader, is admitted as a LEARNER, is caught
+up by ordinary `AppendEntries`, and is promoted to a voter by the
+leader's own bookkeeping once its match index proves it current.
+`--leave ID` removes one and exits.
+
+The node had answered `join` and `leave` since before the server was a
+replica; what was missing was a caller. Three things had to be built and
+one of them was a real gap: a one-shot call to a bare address
+(`peers_call` — a joiner has seeds, not ids), the seed loop in C
+(`server/join.c`), and **a conversation that outlives its request**. A
+join's answer is a fact about a `CONFIG` entry that does not exist yet,
+so `rn_handle` parks the requester and queues nothing; the reply comes
+out of a later call. `server/replica.c` keeps a bounded correlation
+table for it, keyed on ids it mints itself rather than the sender's,
+because two joiners both send id 0.
+
+**Argv is now a bootstrap and the log is the truth.** The last `CONFIG`
+entry wins at startup and at every apply, so a member restarted with a
+stale `--peer` list cannot overwrite what the cluster agreed and a
+joined member needs no list at all — and the transport's address table
+follows the adopted set rather than being a second copy of it. A member
+whose address the transport lacks is a member nothing can replicate to,
+and the failure is silent: it looks exactly like a slow follower.
+
+Snapshots are still not needed for this and that is worth repeating:
+nothing compacts the log, so the leader's base stays at zero and an
+empty joiner is caught up from index 1. What makes them mandatory is the
+log growing without bound — a standing debt, and a cluster that can be
+joined has one more reason to want it paid.
 
 **The server holds an INSTANCE**, which is why that brief is gone. One
 process, one root directory, a subdirectory per database, and one
@@ -75,7 +107,7 @@ What it was mistaken for is the MongoDB shape — one connection to an
 instance, `client.db(name)` switching between databases over it — which
 is a different thing from a seat, and which is now BUILT (above). The
 rest of the retired brief's inventory (the seed loop, the deferred
-reply) is brief 1, where it belongs.
+reply) went to the joining brief, and is built.
 
 **The server is a cluster member**, which is why its brief is gone.
 `nisaba-server --raft ID --raft-port N --peer ID@HOST:PORT` is a Raft
@@ -102,14 +134,9 @@ waiting on the same thing rather than on a decision:
   asks for ("the store's paired log if a generation has been adopted,
   otherwise the WAL", written down only in `src/db-wal.js`) belongs with
   the compaction that needs it.
-- **Joining.** The member set is what each process was started with, so
-  growing a cluster means restarting its members. This is now brief 2,
-  and the reason given here when the brief was retired was wrong: a
-  joiner does NOT need the snapshot half. Nothing compacts the log, so
-  the leader's base stays at zero and an empty joiner is caught up by
-  plain `AppendEntries` from index 1 — O(the whole history), and
-  correct. What makes snapshots mandatory is the log growing without
-  bound, which is the first item, not this one.
+- ~~**Joining.**~~ Built, above. The reason given here when the brief was
+  retired was wrong and is worth leaving on the record: a joiner does
+  NOT need the snapshot half.
 
 **Completions in C is done.** A proposal's fate — applied, and still
 yours — is `rn_await` / `rn_applied` / `RN_EFFECT_SETTLED`, decided in

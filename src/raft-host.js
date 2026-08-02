@@ -221,6 +221,15 @@ export class RaftGroupHost {
  * elections. `targets` starts as the seeds; a redirect that names the
  * leader's address jumps the queue. Resolves with the reply's adopted
  * member records.
+ *
+ * `groupId` NULL sends the message BARE, with no { group, msg } around
+ * it. The envelope exists because RaftGroupHost multiplexes many groups
+ * over one transport; a member that hosts one group has nothing to
+ * multiplex and no envelope, which is the shape a native member speaks
+ * (server/peers.h: the frame's `env` is the message and nothing around
+ * it). It is the same distinction as groupTransport() versus handing a
+ * node the raw transport, applied to the one message a joiner sends
+ * before it is a member of anything.
  */
 async function seedRequest(transport, groupId, msg, { seeds, attempts = 20, delayMs = 250 }) {
   if (typeof transport.callAddress !== 'function') {
@@ -238,7 +247,10 @@ async function seedRequest(transport, groupId, msg, { seeds, attempts = 20, dela
         // Messages cross as bytes -- the transport frames, it does not
         // interpret (raft_msg.h). This helper is the one place that has
         // to look inside a reply, so it decodes here.
-        reply = decode(await transport.callAddress(addr, { group: groupId, msg: encode(msg) }));
+        const envelope = groupId === null
+          ? encode(msg)
+          : { group: groupId, msg: encode(msg) };
+        reply = decode(await transport.callAddress(addr, envelope));
       } catch (err) {
         lastError = err;
         continue; // seed down; try the next
@@ -273,6 +285,11 @@ async function seedRequest(transport, groupId, msg, { seeds, attempts = 20, dela
  * Idempotent (a retry after a lost reply re-joins harmlessly), and a
  * RESTART needs no join at all: the node's own log carries the last
  * CONFIG entry, and onConfig rebuilds the peer table from it.
+ *
+ * `groupId` null joins a cluster that hosts ONE group and wraps nothing
+ * — which is what a native member (server/main.c's --join) is. The reply
+ * is decided by the same rn_handle either way; only the envelope
+ * differs. See seedRequest.
  */
 export async function joinGroup(transport, groupId, member, options) {
   const members = await seedRequest(transport, groupId, { kind: 'join', member }, options);

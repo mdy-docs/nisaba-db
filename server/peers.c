@@ -19,6 +19,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -399,6 +400,49 @@ int peers_add(peers *p, uint64_t id, const char *host, int port) {
     return BJ_OK;
 }
 
+static peer_slot *peer_by_id(peers *p, uint64_t id) {
+    for (uint32_t i = 0; i < p->n; i++) if (p->p[i].id == id) return &p->p[i];
+    return NULL;
+}
+
+/* The watch list describes the table as it was; anything that moves a
+ * slot invalidates it. It cannot bite in the server's loop -- peers_watch
+ * runs at the top of a pass and every peers_ready before the membership
+ * is ever looked at -- and dropping one pass of readiness would be
+ * harmless anyway, because poll is level-triggered and says so again. */
+static void watch_invalidate(peers *p) { p->n_w = 0; }
+
+int peers_set(peers *p, uint64_t id, const char *host, int port) {
+    if (!p || !id || !host || port <= 0 || port > 65535) return BJ_ERR_STATE;
+    if (strlen(host) >= PEERS_HOST_MAX) return BJ_ERR_STATE;
+    peer_slot *pe = peer_by_id(p, id);
+    if (!pe) return peers_add(p, id, host, port);
+    if (pe->port == port && strcmp(pe->host, host) == 0) return BJ_OK;
+    /* It moved. The socket goes to where it used to be, so it is no more
+     * use than a socket to a member that is down. */
+    int e = peer_drop(p, pe, p->now);
+    snprintf(pe->host, sizeof pe->host, "%s", host);
+    pe->port = port;
+    watch_invalidate(p);
+    return e;
+}
+
+int peers_remove(peers *p, uint64_t id) {
+    if (!p || !id) return BJ_ERR_STATE;
+    peer_slot *pe = peer_by_id(p, id);
+    if (!pe) return BJ_OK;
+    int e = peer_drop(p, pe, 0);
+    /* The last one moves into the hole and its old slot owns nothing --
+     * the same shape server/main.c's connection table uses, arrived at
+     * for the same reason. */
+    *pe = p->p[p->n - 1];
+    memset(&p->p[p->n - 1], 0, sizeof p->p[p->n - 1]);
+    chan_init(&p->p[p->n - 1].c);
+    p->n--;
+    watch_invalidate(p);
+    return e;
+}
+
 int peers_listen(peers *p, const char *host, int port) {
     if (!p || p->srv >= 0 || !host || port <= 0 || port > 65535) return BJ_ERR_STATE;
     if (strlen(host) >= PEERS_HOST_MAX) return BJ_ERR_STATE;
@@ -774,6 +818,120 @@ int peers_reject(peers *p, uint64_t from, uint64_t corr, const char *error) {
     return answer_frame(p, from, corr, NULL, 0, error ? error : "refused");
 }
 
+/* ---- one call, to an address -------------------------------------------- */
+
+/* Wait for `fd`, or give up. EINTR restarts the whole timeout, which is
+ * honest enough here: this runs before the poll loop exists, in a process
+ * with nothing else going on. */
+static int wait_for(int fd, short events, int timeout_ms) {
+    for (;;) {
+        struct pollfd pf;
+        pf.fd = fd;
+        pf.events = events;
+        pf.revents = 0;
+        int r = poll(&pf, 1, timeout_ms);
+        if (r < 0 && errno == EINTR) continue;
+        return r > 0 ? 0 : -1;
+    }
+}
+
+int peers_call(const char *host, int port, const uint8_t *msg, uint32_t len,
+               int timeout_ms, dbuf *reply, char *err, size_t err_cap) {
+    if (err && err_cap) err[0] = '\0';
+    if (!host || !msg || !reply || port <= 0 || port > 65535) return BJ_ERR_STATE;
+
+    struct in_addr a;
+    if (inet_pton(AF_INET, host, &a) != 1) return BJ_ERR_STATE;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return BJ_ERR_STATE;
+    if (set_nonblocking(fd) != 0) { close(fd); return BJ_ERR_STATE; }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    addr.sin_addr = a;
+
+    int r = connect(fd, (struct sockaddr *)&addr, sizeof addr);
+    if (r != 0 && errno != EINPROGRESS && errno != EINTR) { close(fd); return BJ_ERR_STATE; }
+    if (r != 0) {
+        /* Any readiness at all, then SO_ERROR -- a refused connect is
+         * reported on macOS as POLLIN|POLLHUP with no POLLOUT, and
+         * waiting for writable waits for the whole timeout instead of
+         * learning immediately that nobody is there. */
+        if (wait_for(fd, POLLOUT | POLLIN, timeout_ms) != 0) { close(fd); return BJ_ERR_STATE; }
+        int se = 0;
+        socklen_t slen = sizeof se;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &se, &slen) != 0 || se != 0) {
+            close(fd);
+            return BJ_ERR_STATE;
+        }
+    }
+
+    chan c;
+    chan_init(&c);
+    c.fd = fd;
+
+    dbuf body = {0};
+    int e = build_req(0, msg, len, &body);
+    if (!e) e = chan_put(&c, body.data, body.len);
+    dbuf_free(&body);
+    if (e) { chan_close(&c); return e; }
+
+    while (c.out_off < c.out.len) {
+        if (chan_flush(&c) != 0) { chan_close(&c); return BJ_ERR_STATE; }
+        if (c.out_off >= c.out.len) break;
+        if (wait_for(c.fd, POLLOUT, timeout_ms) != 0) { chan_close(&c); return BJ_ERR_STATE; }
+    }
+
+    const uint8_t *frame = NULL;
+    uint32_t flen = 0;
+    for (;;) {
+        int got = chan_frame(&c, &frame, &flen);
+        if (got == 0) break;
+        if (got < 0) { chan_close(&c); return BJ_ERR_STATE; }
+        if (wait_for(c.fd, POLLIN, timeout_ms) != 0) { chan_close(&c); return BJ_ERR_STATE; }
+        if (chan_read(&c) != 0) { chan_close(&c); return BJ_ERR_STATE; }
+    }
+
+    uint64_t corr = 0;
+    int rc = BJ_ERR_STATE;
+    if (frame_kind(frame, flen) == 1 && frame_u64(frame, flen, "id", &corr) == 0 && corr == 0) {
+        const uint8_t *okv; size_t oklen; int found = 0, ok = 0;
+        if (obj_get_field(frame, flen, (const uint8_t *)"ok", 2, &okv, &oklen, &found) == BJ_OK &&
+            found) {
+            cur oc = { okv, oklen, 0 };
+            if (read_bool(&oc, &ok) == BJ_OK) {
+                const uint8_t *v = NULL;
+                uint32_t vlen = 0;
+                if (ok && frame_binary(frame, flen, "value", &v, &vlen) == 0) {
+                    rc = dbuf_put(reply, v, vlen);
+                } else if (!ok) {
+                    /* A refusal is an ANSWER: the far end heard the
+                     * question and said no, which is a different fact
+                     * from not having reached it. */
+                    if (err && err_cap) {
+                        const uint8_t *s; size_t slen; int has = 0;
+                        if (obj_get_field(frame, flen, (const uint8_t *)"error", 5,
+                                          &s, &slen, &has) == BJ_OK && has) {
+                            cur ec = { s, slen, 0 };
+                            const uint8_t *t; uint32_t tlen;
+                            if (take_string(&ec, &t, &tlen) == BJ_OK) {
+                                size_t n = tlen < err_cap - 1 ? tlen : err_cap - 1;
+                                memcpy(err, t, n);
+                                err[n] = '\0';
+                            }
+                        }
+                    }
+                    rc = 1;
+                }
+            }
+        }
+    }
+    chan_close(&c);
+    return rc;
+}
+
 #else /* !NISABA_SOCKETS */
 
 /*
@@ -790,6 +948,10 @@ void peers_free(peers *p) { (void)p; }
 int  peers_add(peers *p, uint64_t id, const char *host, int port) {
     (void)p; (void)id; (void)host; (void)port; return BJ_ERR_STATE;
 }
+int  peers_set(peers *p, uint64_t id, const char *host, int port) {
+    (void)p; (void)id; (void)host; (void)port; return BJ_ERR_STATE;
+}
+int  peers_remove(peers *p, uint64_t id) { (void)p; (void)id; return BJ_ERR_STATE; }
 int  peers_listen(peers *p, const char *host, int port) {
     (void)p; (void)host; (void)port; return BJ_ERR_STATE;
 }
@@ -818,6 +980,12 @@ int peers_answer(peers *p, uint64_t from, uint64_t corr, const uint8_t *m, uint3
 }
 int peers_reject(peers *p, uint64_t from, uint64_t corr, const char *e) {
     (void)p; (void)from; (void)corr; (void)e; return BJ_OK;
+}
+int peers_call(const char *host, int port, const uint8_t *msg, uint32_t len,
+               int timeout_ms, dbuf *reply, char *err, size_t err_cap) {
+    (void)host; (void)port; (void)msg; (void)len; (void)timeout_ms; (void)reply;
+    if (err && err_cap) err[0] = '\0';
+    return BJ_ERR_STATE;
 }
 
 #endif /* NISABA_SOCKETS */

@@ -56,6 +56,8 @@ data and reporting nothing wrong.
 | `--raft ID` | this process is a cluster member with that node id |
 | `--raft-port N` | where the other members reach this one (loopback) |
 | `--peer ID@HOST:PORT` | another member and where to reach IT; repeat once per member |
+| `--join HOST:PORT` | ask a RUNNING cluster to admit this node, knowing only a seed address; repeat for more seeds. Use **instead of** `--peer` |
+| `--leave ID` | ask that cluster to remove member `ID`, then exit without serving; needs `--join` to say who to ask |
 
 `--order` is not a preference. Open a tree with the wrong one and its
 pages read as nonsense, so it has to match whatever created the files —
@@ -87,10 +89,64 @@ every database's, and a halt in one halts all of them. Per-database
 placement is not available and is not planned — it was a tenancy
 requirement, and tenancy is a layer above this repository.
 
-**Every member is told the same member set**, because there is no join
-yet: growing a cluster means restarting its members with a longer list.
-A member missing from one node's list is a vote that node will never
-count.
+**`--peer` bootstraps; after that the LOG is the member set.** Every
+member of a cluster started this way has to be given the same list,
+because a member missing from one node's list is a vote that node will
+never count. That stops mattering the moment the log carries a `CONFIG`
+entry of its own: a member restarted with a stale `--peer` list cannot
+overwrite what the cluster agreed, and a member that joined needs no
+list at all.
+
+## Growing and shrinking one
+
+```sh
+cd node4 && nisaba-server --port 8100 --raft 4 --raft-port 9004 \
+                          --join 127.0.0.1:9001 --join 127.0.0.1:9002
+```
+
+One address, no ids, no member list. It asks; if that seed is not the
+leader it is redirected to the one that is, and the reply comes back
+when the leader's `CONFIG` entry has committed and applied — which is
+also the moment this node becomes a member. Give more than one seed and
+a seed that is down costs one dial rather than the whole attempt.
+
+**It enters as a LEARNER**, whatever it asked for: it replicates and
+applies, it does not vote, and it counts for nothing in the quorum until
+the leader's own bookkeeping proves its log has caught up. That is not
+politeness. A cluster of three that admitted a fourth as a voter
+immediately would need a quorum of three, one of them a member with an
+empty log that cannot help. Promotion is automatic and is the node's
+decision, on match index; nothing on the host side has an opinion about
+when.
+
+**A restart needs no `--join` and no `--peer`** — `nisaba-server --raft 4
+--raft-port 9004` is enough, because the member's own log says who its
+cluster is. Passing `--join` again is harmless: a re-join naming an
+identical record is answered with the current set and changes nothing,
+which is what makes a retried join safe.
+
+**`--peer` and `--join` together are refused**, rather than resolved by
+whichever was typed first. They are two ways to learn the same thing.
+
+```sh
+nisaba-server --leave 4 --join 127.0.0.1:9001
+```
+
+Removes a member and exits. It is an ordinary client of the cluster —
+it needs no directory and serves nothing — so it works equally for a
+node decommissioning itself and for an administrator removing one that
+is never coming back. The survivors' quorum arithmetic changes with it:
+three voters need two, and two voters still need two.
+
+**One change at a time.** A join or leave while another is in flight is
+told to ask again, and does. That is a safety rule rather than a
+policy — a single-server change is safe precisely because it commits
+under the old quorum, which requires that the next one cannot start
+until this one has.
+
+**Seeds must be DIRECT addresses.** A load balancer in front of a member
+breaks node identity: the answer to a join comes from the node that
+parked it, and a redirect names a member rather than a service.
 
 **Only the leader takes a write.** Any other member refuses it with
 `code: -63`, its `leaderId`, and — when it knows one — a `leader` record
@@ -129,7 +185,10 @@ already-encoded message, and the receiving host passes it to
 `test/db.server.test.js` proves it: two C members and one `RaftNode` over
 `src/raft-transport-tcp.js`, electing, replicating, and — with one C
 member stopped — unable to commit anything without the Node member's
-vote and acks.
+vote and acks. It can JOIN one too, with `joinGroup(transport, null, …)`
+from `src/raft-host.js`; the `null` is the group id, because a native
+member hosts one group and wraps no `{ group, msg }` envelope around
+anything.
 
 What that does and does not show is worth stating. The Node member's
 `RaftNode` wraps `RaftCore`, which is the SAME C `raft_node` compiled to

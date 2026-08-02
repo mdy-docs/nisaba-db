@@ -366,11 +366,18 @@ hosting the WASM engine**, which is a different program from shape 4.
 What is still missing on the C side, in dependency order — briefs in
 [`steps/`](steps/):
 
-1. **Completions in C** (`steps/completions-in-c.md`) — answering a
-   proposal without a promise. Small.
+1. **The server becomes a replica** (`steps/server-as-replica.md`) — a
+   log, a node, a peer socket and an apply pump in `server/main.c`, and
+   the one real design change: a write is PROPOSED rather than applied
+   where it lands.
 2. **Native composition** (`steps/native-composition.md`) — seating
    several Raft groups over sockets in one process, and deciding what is
    policy.
+
+**Two of these are done and retired.** Completions in C: a proposal's
+fate — applied, and still yours — is decided in the node
+(`rn_await`/`rn_applied`/`RN_EFFECT_SETTLED`), and `src/raft.js` reads
+the answer rather than re-deriving the term rule.
 
 **InstallSnapshot in C is done** and its brief is retired. All five Raft
 message kinds are the node's now: it serves an install, receives one,
@@ -415,8 +422,11 @@ on this assumption and are now confirmed rather than speculative:
 
 1. ~~`steps/install-snapshot-in-c.md`~~ — **done**, and retired: the last
    Raft message kind a host had to answer is the node's.
-2. `steps/completions-in-c.md` — answering a proposal without a promise.
-3. `steps/native-composition.md` — several Raft groups over sockets in
+2. ~~`steps/completions-in-c.md`~~ — **done**, and retired: a proposal's
+   fate is the node's answer.
+3. `steps/server-as-replica.md` — one server process becomes a cluster
+   member.
+4. `steps/native-composition.md` — several Raft groups over sockets in
    one process.
 
 Plus a log in C (`entrylog.c` is already linked into the binary and
@@ -432,7 +442,8 @@ to production clustering and become the embedded-Node story.
 
 Not in C, and not the parent project's problem. A thin HTTP front end in
 this repo, over `src/db-server-client.js` — which already speaks all 31
-operations with no engine in the process.
+operations with no engine in the process. Briefed in
+[`steps/http-front-end.md`](steps/http-front-end.md).
 
 ```
    browser / REST client
@@ -446,9 +457,9 @@ operations with no engine in the process.
    nisaba-server (C)                   unchanged
 ```
 
-**The revert stands.** `server/main.c` stays frame-only, and the HTTP
-subset written for it stays on `wip/http-transport` as a record of what
-that path costs — chiefly session identity, since HTTP has no stable
+**The revert stands.** `server/main.c` stays frame-only for CLIENTS, and
+the HTTP subset written for it stays on `wip/http-transport` as a record
+of what that path costs — chiefly session identity, since HTTP has no stable
 connection for a cursor or a change stream to belong to. A Node front end
 has the same problem to solve and a much easier place to solve it: it
 holds one real socket per session and can keep them.

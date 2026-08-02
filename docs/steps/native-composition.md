@@ -67,11 +67,13 @@ record it rather than quietly implementing it in one host.
 
 ## Ordering
 
-This should come AFTER `completions-in-c.md`. A seat that cannot tell a
-client its write finished is not a server, and that changes the surface
-a seat sits on. The other prerequisite is already met: the node answers
-all five message kinds, InstallSnapshot included, since the file seam
-landed (`wasm/include/raft_node.h`).
+This should come AFTER `server-as-replica.md`. Both of its own
+prerequisites are already met — the node answers all five message kinds
+since the file seam landed, and it reports a proposal's fate itself
+since completions landed — but this brief asks which of
+`RaftGroupHost`'s policies belong in C, and a native server that has
+actually needed them is a far better judge of that than a reading of the
+JavaScript.
 
 ## Suggested staging
 

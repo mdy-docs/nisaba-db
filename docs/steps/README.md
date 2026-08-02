@@ -13,19 +13,28 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [completions-in-c.md](completions-in-c.md) | Answering a proposal without a promise. |
-| 2 | [native-composition.md](native-composition.md) | Seating several Raft groups over sockets, and deciding what is policy. Sits on top of the server; wants 1 done. |
-| 3 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
-| 4 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
+| 1 | [server-as-replica.md](server-as-replica.md) | `nisaba-server` gets a log, a node and an apply pump — one process becomes a cluster member. |
+| 2 | [native-composition.md](native-composition.md) | Seating several Raft groups over sockets, and deciding what is policy. Sits on top of 1. |
+| 3 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
+| 4 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
+| 5 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
 
-1 is the C pushdown's remaining substance; 2 turns one server into a
-cluster; 3 is a feature; 4 is the coverage all of it rests on.
+1 and 2 turn the C server into a cluster member; 3 is how a client
+reaches one; 4 is a feature; 5 is the coverage all of it rests on.
 
 **They are load-bearing rather than speculative.** They were written
 assuming the C server would one day be the cluster member; that is
 decided ([`../deployment-shapes.md`](../deployment-shapes.md),
 Decision A). One program covers "a persistent server" and "a replicated
 server".
+
+**Two briefs retired recently, which is why they are not listed.**
+
+**Completions in C is done.** A proposal's fate — applied, and still
+yours — is `rn_await` / `rn_applied` / `RN_EFFECT_SETTLED`, decided in
+the node. `src/raft.js` reads the answer back rather than re-deriving
+the term rule, which was the last piece of `propose()` a host had to
+re-implement.
 
 **InstallSnapshot in C is done**, which is why its brief is gone. The
 node serves an install, receives one, verifies it and adopts it —

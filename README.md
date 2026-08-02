@@ -124,6 +124,10 @@ Deliberate scope limits, stated up front rather than discovered late:
 
 ## Documentation
 
+- [`docs/deployment-shapes.md`](docs/deployment-shapes.md) — the five ways
+  this is meant to run, from a browser tab to a replicated cluster: what
+  runs where in each, what is built, and the forks that are still open.
+  Start here if you are deciding *how* to deploy it.
 - [`docs/db-api.md`](docs/db-api.md) — complete JS-facing API reference.
 - [`docs/db-example.js`](docs/db-example.js) — a runnable, narrated tour of
   most of that API (`node docs/db-example.js`).

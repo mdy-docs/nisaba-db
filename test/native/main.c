@@ -29,6 +29,7 @@
 #include "db_wal.h"
 #include "db_session.h"
 #include "snapstore.h"
+#include "bjfile.h"    /* bjfile_crc32: what a snapshot manifest records per file */
 #include "raft_core.h"
 #include "raft_msg.h"
 #include "raft_drive.h"
@@ -8467,6 +8468,498 @@ TEST(a_single_voter_group_commits_the_moment_it_elects_itself) {
     memfs_free(fs);
 }
 
+/*
+ * A snapshot generation on disk, committed: `len` bytes under the role
+ * "primary" plus an EMPTY "journal", then the manifest, which is what
+ * makes the generation real (snapstore.h's commit protocol writes it
+ * last). Returns an sst that has adopted it.
+ */
+static sst *make_snapshot(bj_ns *ns, const uint8_t *content, uint32_t len,
+                          uint64_t index, uint64_t term, dbuf *manifest_out) {
+    sst *store = sst_new("snap", 4);
+    if (!store) return NULL;
+    dbuf name = {0};
+    bj_io io;
+
+    if (sst_data_name(store, 1, "primary", 7, &name)) goto fail;
+    if (ns->open(ns->ctx, (const char *)name.data, (uint32_t)name.len,
+                 BJ_NS_CREATE | BJ_NS_TRUNC, &io)) goto fail;
+    if (len && io.write(io.ctx, 0, content, len)) goto fail;
+    if (io.close) io.close(io.ctx);
+    name.len = 0;
+
+    if (sst_data_name(store, 1, "journal", 7, &name)) goto fail;
+    if (ns->open(ns->ctx, (const char *)name.data, (uint32_t)name.len,
+                 BJ_NS_CREATE | BJ_NS_TRUNC, &io)) goto fail;
+    if (io.close) io.close(io.ctx);
+    dbuf_free(&name);
+
+    {
+        bj_builder *fb = bj_builder_new();
+        bj_begin_array(fb);
+        files_entry(fb, "primary", "snap-1-primary.bj", len, (int64_t)bjfile_crc32(0, content, len));
+        files_entry(fb, "journal", "snap-1-journal.bj", 0, 0);
+        bj_end_array(fb);
+        size_t flen; const uint8_t *fbuf = bj_builder_data(fb, &flen);
+        int e = sst_manifest_encode(index, term, NULL, 0, fbuf, (uint32_t)flen, manifest_out);
+        bj_builder_free(fb);
+        if (e) goto fail;
+    }
+    if (sst_manifest_name(store, 1, &name)) goto fail;
+    if (ns->open(ns->ctx, (const char *)name.data, (uint32_t)name.len,
+                 BJ_NS_CREATE | BJ_NS_TRUNC, &io)) goto fail;
+    if (io.write(io.ctx, 0, manifest_out->data, (uint32_t)manifest_out->len)) goto fail;
+    if (io.close) io.close(io.ctx);
+    dbuf_free(&name);
+
+    {
+        dirlist l;
+        memset(&l, 0, sizeof(l));
+        dirlist_add(&l, "snap-1.manifest.bj", (double)manifest_out->len);
+        dirlist_add(&l, "snap-1-primary.bj", (double)len);
+        dirlist_add(&l, "snap-1-journal.bj", 0);
+        int adopted = -1;
+        if (sst_scan(store, l.names.data, (uint32_t)l.names.len) == BJ_OK) {
+            manifest_src srcs[] = { { "snap-1.manifest.bj", manifest_out } };
+            adopted = run_open(store, &l, srcs, 1);
+        }
+        dirlist_free(&l);
+        if (adopted != 0) goto fail;
+    }
+    return store;
+fail:
+    dbuf_free(&name);
+    sst_free(store);
+    return NULL;
+}
+
+TEST(an_install_crosses_two_c_nodes_and_nothing_else) {
+    /*
+     * docs/steps/install-snapshot-in-c.md, the receive side -- and the
+     * brief's own "done when", short of the adoption that stage four
+     * adds: a leader streams, a follower stages, verifies and commits,
+     * with no JavaScript in the process and two real directories.
+     *
+     * The follower's half used to be src/raft.js's _onInstallSnapshot
+     * plus the adapter in src/db-replicated.js: begin a generation,
+     * create a file per role, write chunks, check the staged bytes,
+     * write the manifest. Five motions and one RULE -- and the rule
+     * (sst_check_files) was already C's, with the JS store's verify(),
+     * the replicated install path and the Raft harness each holding a
+     * copy of the motions.
+     *
+     * What is NOT here is adoption: the follower ends with a valid
+     * generation on disk and says so (RN_EFFECT_INSTALLED), because
+     * closing and reopening the database stays the host's permanently.
+     */
+    char ldir[64], fdir[64];
+    CHECK_FATAL(scratch_dir("nisaba-inst-l", ldir, sizeof ldir) == 0);
+    CHECK_FATAL(scratch_dir("nisaba-inst-f", fdir, sizeof fdir) == 0);
+    int lfd = open(ldir, O_RDONLY), ffd = open(fdir, O_RDONLY);
+    CHECK_FATAL(lfd >= 0 && ffd >= 0);
+    bj_ns lns, fns;
+    CHECK_FATAL(bjns_posix_open(lfd, &lns) == BJ_OK);
+    CHECK_FATAL(bjns_posix_open(ffd, &fns) == BJ_OK);
+
+    static const uint32_t SIZE = 500;
+    uint8_t *content = (uint8_t *)malloc(SIZE);
+    CHECK_FATAL(content != NULL);
+    for (uint32_t i = 0; i < SIZE; i++) content[i] = (uint8_t)(i * 31 + 5);
+
+    dbuf lman = {0};
+    sst *lstore = make_snapshot(&lns, content, SIZE, 40, 6, &lman);
+    CHECK_FATAL(lstore != NULL);
+
+    /* ---- the leader, as in the send-side test. */
+    bj_io lio;
+    CHECK_OK(lns.open(lns.ctx, "raft.bj", 7, BJ_NS_CREATE | BJ_NS_TRUNC, &lio));
+    elog *llog = elog_create_at(&lio, 40, 6);
+    CHECK_FATAL(llog != NULL);
+    raft_node *leader = rn_new(1, llog);
+    CHECK_FATAL(leader != NULL);
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    bj_begin_object(members);
+    bj_put_key(members, (const uint8_t *)"id", 2); bj_put_int(members, 1);
+    bj_end_object(members);
+    bj_begin_object(members);
+    bj_put_key(members, (const uint8_t *)"id", 2); bj_put_int(members, 2);
+    bj_put_key(members, (const uint8_t *)"voting", 6); bj_put_bool(members, 0);
+    bj_end_object(members);
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+    CHECK_OK(rn_set_members(leader, mbuf, (uint32_t)mlen));
+    rn_set_ns(leader, &lns);
+    rn_set_snapstore(leader, lstore);
+    rn_set_chunk_bytes(leader, 96);
+    rn_start(leader, 0, 0.0);
+    for (int64_t t = 0; t <= 2000 && rn_role(leader) != RAFT_LEADER; t += 10)
+        rn_tick(leader, t, 0.0);
+    CHECK_FATAL(rn_role(leader) == RAFT_LEADER);
+
+    /* ---- the follower: an empty directory, an empty store, an empty
+     * log. Everything it ends up with, it is about to be sent. */
+    bj_io fio;
+    CHECK_OK(fns.open(fns.ctx, "raft.bj", 7, BJ_NS_CREATE | BJ_NS_TRUNC, &fio));
+    elog *flog = elog_create(&fio);
+    CHECK_FATAL(flog != NULL);
+    raft_node *follower = rn_new(2, flog);
+    CHECK_FATAL(follower != NULL);
+    sst *fstore = sst_new("snap", 4);
+    CHECK_FATAL(fstore != NULL);
+    CHECK_OK(sst_scan(fstore, (const uint8_t *)"", 0));
+    rn_set_ns(follower, &fns);
+    rn_set_snapstore(follower, fstore);
+    CHECK_I64(sst_has_latest(fstore), 0);
+
+    /* Back the leader off past its own base, as an empty follower's
+     * first rejection would. */
+    {
+        int backed_off = 0;
+        for (int pass = 0; pass < 20 && !backed_off; pass++) {
+            uint32_t count = rn_out_count(leader);
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t len = 0;
+                const uint8_t *bytes = rn_out_bytes(leader, i, &len);
+                uint64_t corr = rn_out_corr(leader, i);
+                int kind = -1;
+                CHECK_OK(rmsg_kind(bytes, len, &kind));
+                if (kind != RAFT_MSG_APPEND_ENTRIES) continue;
+                doc *r = doc_new();
+                doc_int(r, "term", (int64_t)elog_current_term(llog));
+                doc_key(r, "success"); bj_put_bool(r->b, 0);
+                doc_int(r, "hintIndex", 0);
+                uint32_t rlen; const uint8_t *rbuf = doc_done(r, &rlen);
+                rn_out_clear(leader);
+                CHECK_OK(rn_on_reply(leader, corr, rbuf, rlen, 0.0));
+                doc_free(r);
+                backed_off = 1;
+                break;
+            }
+            if (!backed_off) { rn_out_clear(leader); rn_tick(leader, 50 + pass * 60, 0.0); }
+        }
+        CHECK_I64(backed_off, 1);
+    }
+
+    /* ---- and now the transfer, one message at a time, with nothing in
+     * the middle but this loop. */
+    int chunks = 0, installed_effect = 0;
+    uint64_t installed_at = 0;
+    for (int pass = 0; pass < 60; pass++) {
+        uint32_t count = rn_out_count(leader);
+        if (!count) { rn_tick(leader, 500 + pass * 60, 0.0); continue; }
+
+        uint32_t len = 0;
+        const uint8_t *bytes = rn_out_bytes(leader, 0, &len);
+        uint64_t corr = rn_out_corr(leader, 0);
+        int kind = -1;
+        CHECK_OK(rmsg_kind(bytes, len, &kind));
+        if (kind != RAFT_MSG_INSTALL_SNAPSHOT) { rn_out_clear(leader); continue; }
+        chunks++;
+
+        /* C plans, the host opens, C executes. Under POSIX the open is
+         * on demand so this loop only has to ASK -- but asking is the
+         * discipline, and a browser host would open exactly these. */
+        dbuf names = {0};
+        CHECK_OK(rn_install_plan(follower, bytes, len, &names));
+        CHECK(names.len > 0);
+
+        /* Copy the message: it lives in the leader's outbox, which the
+         * follower's own queueing is about to disturb. */
+        dbuf held = {0};
+        CHECK_OK(dbuf_put(&held, bytes, len));
+        rn_out_clear(leader);
+        CHECK_OK(rn_handle(follower, 77, held.data, (uint32_t)held.len, 0.0));
+        dbuf_free(&held);
+        dbuf_free(&names);
+
+        for (uint32_t i = 0; i < rn_effect_count(follower); i++) {
+            if (rn_effect_kind_at(follower, i) != RN_EFFECT_INSTALLED) continue;
+            installed_effect = 1;
+            installed_at = rn_effect_arg(follower, i);
+        }
+        rn_effects_clear(follower);
+
+        /* The follower's reply, handed back to the leader. */
+        CHECK_I64((int64_t)rn_out_count(follower), 1);
+        uint32_t rlen = 0;
+        const uint8_t *rbytes = rn_out_bytes(follower, 0, &rlen);
+        dbuf reply = {0};
+        CHECK_OK(dbuf_put(&reply, rbytes, rlen));
+        rn_out_clear(follower);
+        CHECK_OK(rn_on_reply(leader, corr, reply.data, (uint32_t)reply.len, 0.0));
+        dbuf_free(&reply);
+
+        if (installed_effect) break;
+    }
+
+    /* ---- the follower committed a generation, and said so. */
+    CHECK(chunks >= 5);                        /* 500/96 = 6, plus the empty file */
+    CHECK_I64(installed_effect, 1);
+    CHECK_I64((int64_t)installed_at, 40);
+    CHECK_I64(rn_installing(follower), 0);     /* staging is over, not abandoned */
+
+    /* Its store now answers for the generation, so a second install
+     * cannot be handed the same number. */
+    CHECK_I64(sst_has_latest(fstore), 1);
+    CHECK_I64((long long)sst_latest_gen(fstore), 1);
+    CHECK((long long)sst_next_gen(fstore) > 1);
+
+    /* And the bytes on the follower's disk are the leader's, exactly --
+     * which is the only claim that matters. */
+    {
+        dbuf name = {0};
+        CHECK_OK(sst_data_name(fstore, 1, "primary", 7, &name));
+        bj_io io;
+        CHECK_OK(fns.open(fns.ctx, (const char *)name.data, (uint32_t)name.len, 0, &io));
+        CHECK_I64((int64_t)io.size(io.ctx), (int64_t)SIZE);
+        uint8_t *got = (uint8_t *)malloc(SIZE);
+        CHECK_FATAL(got != NULL);
+        CHECK_I64(io.read(io.ctx, 0, got, SIZE), (int64_t)SIZE);
+        CHECK(memcmp(got, content, SIZE) == 0);
+        free(got);
+        if (io.close) io.close(io.ctx);
+        dbuf_free(&name);
+
+        /* The empty file exists rather than being absent -- the two are
+         * different things to sst_check_files, which is why the chunk
+         * walk gives a zero-length file a chunk of its own. */
+        name.len = 0;
+        CHECK_OK(sst_data_name(fstore, 1, "journal", 7, &name));
+        CHECK_OK(fns.open(fns.ctx, (const char *)name.data, (uint32_t)name.len, 0, &io));
+        CHECK_I64((int64_t)io.size(io.ctx), 0);
+        if (io.close) io.close(io.ctx);
+        dbuf_free(&name);
+    }
+
+    /* ---- the leader, for its part, considers the peer caught up. */
+    CHECK_I64((int64_t)rn_match(leader, 2), 40);
+
+    free(content);
+    bj_builder_free(members);
+    rn_free(follower); rn_free(leader);
+    elog_free(flog); elog_free(llog);
+    if (fio.close) fio.close(fio.ctx);
+    if (lio.close) lio.close(lio.ctx);
+    dbuf_free(&lman);
+    sst_free(fstore); sst_free(lstore);
+    bjns_posix_free(&fns); bjns_posix_free(&lns);
+    close(ffd); close(lfd);
+}
+
+TEST(a_staged_install_adopts_nothing_unless_every_byte_checks_out) {
+    /*
+     * The half of an install that matters when something goes wrong.
+     * docs/steps/install-snapshot-in-c.md states both rules:
+     *
+     *   "A checksum mismatch must adopt nothing and ask the leader to
+     *    restart."
+     *   "Chunk-order validation (offset === written) currently lives in
+     *    the JS adapter. Keep it, in C."
+     *
+     * Driven with hand-built messages rather than a real leader, because
+     * a correct leader cannot produce any of these -- which is the point:
+     * a follower must not depend on the sender being correct.
+     */
+    char dir[64];
+    CHECK_FATAL(scratch_dir("nisaba-inst-bad", dir, sizeof dir) == 0);
+    int dfd = open(dir, O_RDONLY);
+    CHECK_FATAL(dfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dfd, &ns) == BJ_OK);
+
+    bj_io io;
+    CHECK_OK(ns.open(ns.ctx, "raft.bj", 7, BJ_NS_CREATE | BJ_NS_TRUNC, &io));
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(2, log);
+    CHECK_FATAL(n != NULL);
+    sst *store = sst_new("snap", 4);
+    CHECK_FATAL(store != NULL);
+    CHECK_OK(sst_scan(store, (const uint8_t *)"", 0));
+    rn_set_ns(n, &ns);
+    rn_set_snapstore(n, store);
+
+    static const uint8_t GOOD[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+
+    /* The manifest a leader would send: one file, 8 bytes, and the CRC
+     * of exactly those bytes. */
+    dbuf manifest = {0};
+    {
+        doc *m = doc_new();
+        doc_key(m, "config"); bj_put_null(m->b);
+        doc_begin_arr(m, "files");
+        bj_begin_object(m->b);
+        doc_str(m, "role", "primary");
+        doc_int(m, "size", 8);
+        doc_int(m, "crc", (int64_t)bjfile_crc32(0, GOOD, 8));
+        bj_end_object(m->b);
+        doc_end_arr(m);
+        uint32_t mlen; const uint8_t *mbuf = doc_done(m, &mlen);
+        CHECK_OK(dbuf_put(&manifest, mbuf, mlen));
+        doc_free(m);
+    }
+
+    /* Reads `success` and `restart` out of whatever the node queued. */
+    struct { int ok, restart; } ans;
+    #define TAKE_REPLY()                                                      \
+        do {                                                                  \
+            CHECK_I64((int64_t)rn_out_count(n), 1);                           \
+            uint32_t rl = 0;                                                  \
+            const uint8_t *rb = rn_out_bytes(n, 0, &rl);                      \
+            const uint8_t *v; size_t vlen; int f = 0;                         \
+            ans.ok = 0; ans.restart = 0;                                      \
+            CHECK_OK(obj_get_field(rb, rl, (const uint8_t *)"success", 7, &v, &vlen, &f)); \
+            ans.ok = f && vlen >= 1 && v[0] == BJ_TYPE_TRUE;                  \
+            f = 0;                                                            \
+            CHECK_OK(obj_get_field(rb, rl, (const uint8_t *)"restart", 7, &v, &vlen, &f)); \
+            ans.restart = f && vlen >= 1 && v[0] == BJ_TYPE_TRUE;             \
+            rn_out_clear(n);                                                  \
+            rn_effects_clear(n);                                              \
+        } while (0)
+
+    /* ---- a chunk for an install nobody started. */
+    {
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_install_snapshot(1, 1, 40, 6, "primary", 7, 0,
+                                             GOOD, 8, 1, NULL, 0, &msg));
+        CHECK_OK(rn_handle(n, 1, msg.data, (uint32_t)msg.len, 0.0));
+        TAKE_REPLY();
+        CHECK_I64(ans.ok, 0);
+        CHECK_I64(ans.restart, 1);       /* "send me the manifest again" */
+        CHECK_I64(sst_has_latest(store), 0);
+        dbuf_free(&msg);
+    }
+
+    /* ---- a chunk that skips a byte. The manifest starts an install,
+     * then a chunk arrives at an offset that is not what has been
+     * written: a stream that lost or reordered one. Staging it would
+     * make a file that passes a SIZE check and no checksum. */
+    {
+        dbuf first = {0};
+        CHECK_OK(rmsg_build_install_snapshot(1, 1, 40, 6, "primary", 7, 0,
+                                             GOOD, 4, 0,
+                                             manifest.data, (uint32_t)manifest.len, &first));
+        CHECK_OK(rn_handle(n, 2, first.data, (uint32_t)first.len, 0.0));
+        TAKE_REPLY();
+        CHECK_I64(ans.ok, 1);
+        CHECK_I64(rn_installing(n), 1);
+        dbuf_free(&first);
+
+        /* NOT the last chunk, deliberately: if this were `done` the
+         * checksum would catch it a moment later and the order check
+         * would look redundant. It is not -- it catches the break HERE,
+         * before more bytes are staged on top of a hole. */
+        dbuf skipped = {0};
+        CHECK_OK(rmsg_build_install_snapshot(1, 1, 40, 6, "primary", 7, 5 /* not 4 */,
+                                             GOOD + 5, 2, 0, NULL, 0, &skipped));
+        CHECK_OK(rn_handle(n, 3, skipped.data, (uint32_t)skipped.len, 0.0));
+        TAKE_REPLY();
+        CHECK_I64(ans.ok, 0);
+        CHECK_I64(ans.restart, 1);
+        CHECK_I64(rn_installing(n), 0);      /* abandoned, not carried on with */
+        CHECK_I64(sst_has_latest(store), 0);
+        dbuf_free(&skipped);
+    }
+
+    /* ---- a chunk from a DIFFERENT install than the one being staged.
+     * The leader restarted and snapshotted again, so its chunks now
+     * carry a new boundary; staging them into the generation opened for
+     * the old one would build a file out of two snapshots. Neither the
+     * role lookup nor the checksum catches this -- only the boundary
+     * does, which is why it is checked. */
+    {
+        dbuf first = {0};
+        CHECK_OK(rmsg_build_install_snapshot(1, 1, 40, 6, "primary", 7, 0,
+                                             GOOD, 4, 0,
+                                             manifest.data, (uint32_t)manifest.len, &first));
+        CHECK_OK(rn_handle(n, 6, first.data, (uint32_t)first.len, 0.0));
+        TAKE_REPLY();
+        CHECK_I64(ans.ok, 1);
+        CHECK_I64((int64_t)rn_install_boundary(n), 40);
+        dbuf_free(&first);
+
+        dbuf other = {0};
+        CHECK_OK(rmsg_build_install_snapshot(1, 1, 50 /* a newer snapshot */, 6,
+                                             "primary", 7, 4, GOOD + 4, 4, 1,
+                                             NULL, 0, &other));
+        CHECK_OK(rn_handle(n, 7, other.data, (uint32_t)other.len, 0.0));
+        TAKE_REPLY();
+        CHECK_I64(ans.ok, 0);
+        CHECK_I64(ans.restart, 1);
+        CHECK_I64(sst_has_latest(store), 0);
+        dbuf_free(&other);
+        /* The install staged at 40 is still staged: a chunk that does
+         * not belong to it is not a reason to throw it away. */
+        CHECK_I64(rn_installing(n), 1);
+        CHECK_I64((int64_t)rn_install_boundary(n), 40);
+    }
+
+    /* ---- and a transfer that arrives in order, in full, and WRONG.
+     * Every offset is right and the total size is right; two bytes are
+     * not what the leader had. Only the checksum can tell, which is the
+     * whole reason the manifest carries one. */
+    {
+        uint8_t corrupt[8];
+        memcpy(corrupt, GOOD, 8);
+        corrupt[3] ^= 0xFF;
+        corrupt[6] ^= 0x01;
+
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_install_snapshot(1, 1, 40, 6, "primary", 7, 0,
+                                             corrupt, 8, 1,
+                                             manifest.data, (uint32_t)manifest.len, &msg));
+        CHECK_OK(rn_handle(n, 4, msg.data, (uint32_t)msg.len, 0.0));
+        TAKE_REPLY();
+        CHECK_I64(ans.ok, 0);
+        CHECK_I64(ans.restart, 1);
+        CHECK_I64(rn_installing(n), 0);
+        /* NOTHING was adopted. The staged file is on disk with no
+         * manifest naming it, which makes it an orphan rather than a
+         * generation -- snapstore.h's ordering, which is what lets a
+         * failure anywhere leave the old generation live. */
+        CHECK_I64(sst_has_latest(store), 0);
+        dbuf_free(&msg);
+    }
+
+    /* ---- the same transfer, correct, adopts. Asserted last so the
+     * three refusals above cannot be passing because the node was broken
+     * all along. */
+    {
+        dbuf msg = {0};
+        CHECK_OK(rmsg_build_install_snapshot(1, 1, 40, 6, "primary", 7, 0,
+                                             GOOD, 8, 1,
+                                             manifest.data, (uint32_t)manifest.len, &msg));
+        CHECK_OK(rn_handle(n, 5, msg.data, (uint32_t)msg.len, 0.0));
+        CHECK_I64((int64_t)rn_out_count(n), 1);
+        {
+            uint32_t rl = 0;
+            const uint8_t *rb = rn_out_bytes(n, 0, &rl);
+            const uint8_t *v; size_t vlen; int f = 0;
+            CHECK_OK(obj_get_field(rb, rl, (const uint8_t *)"success", 7, &v, &vlen, &f));
+            CHECK(f && vlen >= 1 && v[0] == BJ_TYPE_TRUE);
+        }
+        int announced = 0;
+        for (uint32_t i = 0; i < rn_effect_count(n); i++)
+            if (rn_effect_kind_at(n, i) == RN_EFFECT_INSTALLED &&
+                rn_effect_arg(n, i) == 40) announced = 1;
+        CHECK_I64(announced, 1);
+        CHECK_I64(sst_has_latest(store), 1);
+        rn_out_clear(n);
+        rn_effects_clear(n);
+        dbuf_free(&msg);
+    }
+
+    #undef TAKE_REPLY
+    dbuf_free(&manifest);
+    rn_free(n);
+    elog_free(log);
+    if (io.close) io.close(io.ctx);
+    sst_free(store);
+    bjns_posix_free(&ns);
+    close(dfd);
+}
+
 TEST(a_leader_streams_its_own_snapshot_with_no_host_to_read_the_files) {
     /*
      * docs/steps/install-snapshot-in-c.md, the send side.
@@ -9418,6 +9911,8 @@ int main(void) {
     RUN(effects_coalesce_rather_than_pile_up_and_a_loss_is_never_silent);
     RUN(join_leave_and_timeout_now_are_answered_without_a_host);
     RUN(a_leader_streams_its_own_snapshot_with_no_host_to_read_the_files);
+    RUN(an_install_crosses_two_c_nodes_and_nothing_else);
+    RUN(a_staged_install_adopts_nothing_unless_every_byte_checks_out);
     RUN(a_reply_goes_to_whoever_the_message_says_sent_it);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);

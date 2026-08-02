@@ -124,32 +124,57 @@ does its work BETWEEN the host's close and reopen, which is exactly
 
 Each step should land green on its own.
 
-1. **`rn_set_ns(n, bj_ns *)`, optional.** Without a namespace the node
-   refuses installs exactly as today and every existing host path keeps
-   working. No behaviour change. A native test that the node resolves a
-   name through it.
-2. **Send side in C.** `RN_EFFECT_NEEDS_SNAPSHOT` stops being something
-   the host acts on and becomes C queueing chunks. Retires
-   `_sendSnapshot`.
-3. **Receive-side staging.** A pure "which files will this install need"
-   beat so the host can pre-open, then `rn_handle` stages chunks and
-   verifies through `sst_check_files`.
+1. ~~**`rn_set_ns(n, bj_ns *)`, optional.**~~ **Done**, as the message
+   GRAMMAR instead (`rmsg_install_read` / `rmsg_build_install_snapshot` /
+   `rmsg_build_install_reply`). Both sides need it and neither can be
+   written without it, whereas a namespace with no caller is a field on a
+   struct. `rn_set_ns` landed with stage 2, its first user.
+2. ~~**Send side in C.**~~ **Done.** `raft_repl_decide`'s `has_snapshot`
+   became a fact about the node rather than a hardcoded 0, so a node with
+   a namespace and a store streams its own chunks through the outbox and
+   consumes replies through `rn_on_reply`; one without still emits
+   `RN_EFFECT_NEEDS_SNAPSHOT` and the host serves it. `_sendSnapshot` is
+   not retired yet — that is stage 5, when the host stops being the one
+   with the files.
+3. ~~**Receive-side staging.**~~ **Done.** `rn_install_plan` is the pure
+   "which files will this need" beat; `rn_handle` answers
+   `RAFT_MSG_INSTALL_SNAPSHOT` when it has a namespace and a store,
+   stages each chunk, checks the order, and verifies through
+   `sst_check_files` before writing the manifest that commits the
+   generation. It then raises `RN_EFFECT_INSTALLED` — because adoption
+   is the host's, permanently (see "What moves").
 4. **Adopt and log rebase.** One synchronous call between the host's close
    and reopen. `rebaseLog` disappears wherever a namespace is present.
 5. **Retire the `snapshotter` object**, or keep it as the no-namespace
    fallback, and update `ReplicatedDb` and the test harness.
 
-## The decision this brief deliberately does not make
+## The decision this brief deliberately did not make — now made
 
-Whether `test/raft-harness.js` (the deterministic simulator: `KvMachine`,
-`KvSnapshotter`, `MemoryHandle`-backed logs) gets a namespace too.
+> Whether `test/raft-harness.js` (the deterministic simulator: `KvMachine`,
+> `KvSnapshotter`, `MemoryHandle`-backed logs) gets a namespace too.
 
-If it does not, the JS suite stops covering the new path, which would be
-the worst available outcome — that harness is where partitions, crashes
-and multi-chunk installs are actually tested. `test/native/memfs.h`
-already describes itself as "the seed of what becomes `bjns_mem.c` once
-bj_ns lands"; a memory adapter is probably the answer for both the
-harness and the native tests. Decide it explicitly and write down why.
+**Not yet, and the JS suite has not stopped covering anything.**
+
+The worry was that moving the install into C would leave the harness —
+where partitions, crashes and multi-chunk installs are actually tested —
+exercising a path nothing uses. That has not happened, because the C
+receive side only activates when a node has *both* a namespace and a
+store. `src/raft.js` gives it neither, so it still routes
+`installSnapshot` to `_onInstallSnapshot` and the harness still covers
+exactly what it covered before. The JS suite is unchanged at 535 through
+all three landings.
+
+What that costs is that two implementations of the install exist at once,
+and only one of them is under the simulator. That is a real cost and it
+is bounded: it ends at stage 5, when the `snapshotter` object retires and
+`src/raft.js` starts setting a namespace. **The harness needs a memory
+`bj_ns` at that point, not before** — and `test/native/memfs.h` already
+describes itself as "the seed of what becomes `bjns_mem.c` once bj_ns
+lands", so the adapter is a known quantity rather than a design question.
+
+Deciding it now would have meant building a JS-side memory namespace to
+cover a path the JS side does not yet take. Deciding it at stage 5 means
+building it when it is the only thing left to build.
 
 ## Invariants that must hold
 

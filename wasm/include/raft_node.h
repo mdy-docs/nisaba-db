@@ -151,6 +151,34 @@ void rn_set_chunk_bytes(raft_node *n, uint32_t bytes);
  * know whether it still has to. */
 int rn_serves_snapshots(const raft_node *n);
 
+/*
+ * RECEIVING one. rn_handle answers RAFT_MSG_INSTALL_SNAPSHOT itself once
+ * this node has a namespace and a store -- and refuses it exactly as
+ * before without them, so a host that serves installs itself keeps
+ * working untouched.
+ *
+ * C PLANS, THE HOST OPENS, C EXECUTES (bjns.h). A browser cannot open a
+ * file inside a synchronous call, so before handing a chunk to rn_handle
+ * the host asks which files it will touch and opens those. Under WASI
+ * and native the plan is pure bookkeeping -- openat is already
+ * synchronous -- but the discipline is the same in both, which is the
+ * whole point of having one.
+ *
+ *     rn_install_plan(n, msg, len, &names)   NUL-separated, pure
+ *     ... host opens each name ...
+ *     rn_handle(n, corr, msg, len, random01)
+ *
+ * The names are the store's own (snapstore.h decides them); a caller
+ * only passes them back through. An empty plan means the message needs
+ * no file -- it is not an install, or it is one this node will refuse.
+ */
+int rn_install_plan(raft_node *n, const uint8_t *msg, uint32_t len, dbuf *out);
+
+/* Is an install being staged right now, and what boundary does it carry?
+ * For a host deciding whether a close/reopen is owed, and for tests. */
+int      rn_installing(const raft_node *n);
+uint64_t rn_install_boundary(const raft_node *n);
+
 /* The most files one snapshot may have. A generation past this is
  * refused with RAFT_ERR_CAPACITY when a transfer would start, rather
  * than being streamed half-way: the bound exists so the chunk walk can
@@ -320,7 +348,20 @@ typedef enum {
     RN_EFFECT_PROMOTE       = 3, /* learner is caught up; arg = peer     */
     RN_EFFECT_REACHABLE     = 4, /* peer reachability changed; arg = peer*/
     RN_EFFECT_TRUNCATED     = 5, /* our log was cut back; arg = from     */
-    RN_EFFECT_ELECTION      = 6  /* standing for `arg`; flag = pre-vote  */
+    RN_EFFECT_ELECTION      = 6, /* standing for `arg`; flag = pre-vote  */
+    /*
+     * A snapshot install landed: its files are staged, verified against
+     * the leader's manifest and committed, and `arg` is the boundary
+     * index it covers.
+     *
+     * The host owes the ADOPTION -- closing the database, letting C swap
+     * the generation onto the live files, reopening. That half stays the
+     * host's permanently, because reopening rebuilds collection handles
+     * and, in a browser, needs asynchronous opens; C does its work
+     * between the close and the reopen, which is dc_compact_execute's
+     * bargain exactly.
+     */
+    RN_EFFECT_INSTALLED     = 7  /* an install committed; arg = boundary */
 } rn_effect_kind;
 
 uint32_t rn_effect_count(const raft_node *n);

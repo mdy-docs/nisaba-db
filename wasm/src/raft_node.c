@@ -5,6 +5,7 @@
 #include "raft_drive.h"
 #include "raft_msg.h"
 #include "bjcursor.h"
+#include "bjfile.h"   /* bjfile_crc32: a staged file is checksummed as it lands */
 
 #include <stdlib.h>
 #include <string.h>
@@ -101,6 +102,28 @@ struct raft_node {
     dbuf     snap_manifest;    /* exactly what goes on the wire          */
     uint64_t snap_sizes[RN_MAX_SNAP_FILES];
     uint32_t snap_nfiles;
+
+    /*
+     * An install being STAGED into a new generation. The leader's
+     * manifest is kept verbatim because it is what the staged bytes are
+     * checked against at the end -- by sst_check_files, which is the one
+     * place that rule lives (the JS store's verify(), the replicated
+     * install path and the Raft harness each used to have a copy).
+     *
+     * `written` is per file and is also the chunk-order check: a chunk
+     * whose offset is not exactly what has been written is a stream that
+     * lost or reordered one, and staging it would produce a file that
+     * passes no checksum but might pass a size.
+     */
+    struct {
+        int      active;
+        uint64_t gen;
+        uint64_t index, term;
+        dbuf     manifest;
+        uint32_t nfiles;
+        uint64_t written[RN_MAX_SNAP_FILES];
+        uint32_t crc[RN_MAX_SNAP_FILES];
+    } recv;
 
     int      role;
     uint64_t leader_id;
@@ -284,6 +307,7 @@ void rn_free(raft_node *n) {
     for (uint32_t i = 0; i < RN_MAX_OUT; i++) dbuf_free(&n->out[i].bytes);
     dbuf_free(&n->adopted);
     dbuf_free(&n->snap_manifest);
+    dbuf_free(&n->recv.manifest);
     free(n);
 }
 
@@ -876,6 +900,396 @@ static int on_install_reply(raft_node *n, rn_peer *p,
     return e;
 }
 
+/* ---- receiving a snapshot ----------------------------------------------- */
+
+/*
+ * Walk a manifest's `files`, handing each entry's span to `visit` with
+ * its index. Stops at the first non-zero return, which is the visitor's
+ * to interpret -- snapstore.h has the same shape internally, for the
+ * same reason: a manifest is walked from four places and a fourth copy
+ * of the walk is a fourth place to get the array's shape wrong.
+ */
+typedef int (*mf_visit_fn)(void *ctx, uint32_t i, const uint8_t *el, size_t el_len);
+
+static int manifest_files(const uint8_t *manifest, uint32_t len,
+                          mf_visit_fn visit, void *ctx) {
+    uint32_t files_len = 0;
+    const uint8_t *files = rec_raw(manifest, len, "files", &files_len);
+    if (!files) return RAFT_ERR_MESSAGE;
+    cur c = { files, files_len, 0 };
+    uint32_t count = 0;
+    int e = array_begin(&c, &count);
+    if (e) return RAFT_ERR_MESSAGE;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c)) return RAFT_ERR_MESSAGE;
+        e = visit(ctx, i, c.d + start, c.pos - start);
+        if (e) return e;
+    }
+    return BJ_OK;
+}
+
+/* The role of entry `el`, as the string it holds. */
+static const char *entry_role(const uint8_t *el, size_t el_len, uint32_t *len) {
+    uint32_t rlen = 0;
+    const uint8_t *r = rec_raw(el, el_len, "role", &rlen);
+    *len = 0;
+    if (!r || rlen < 5 || r[0] != BJ_TYPE_STRING) return NULL;
+    uint32_t n = rdu32(r + 1);
+    if ((size_t)n + 5 != rlen) return NULL;
+    *len = n;
+    return (const char *)(r + 5);
+}
+
+typedef struct { const char *role; uint32_t role_len; int found; uint32_t index; } find_ctx;
+
+static int find_role(void *vctx, uint32_t i, const uint8_t *el, size_t el_len) {
+    find_ctx *f = (find_ctx *)vctx;
+    uint32_t rlen = 0;
+    const char *r = entry_role(el, el_len, &rlen);
+    if (r && rlen == f->role_len && memcmp(r, f->role, rlen) == 0) {
+        f->found = 1;
+        f->index = i;
+        return 1;    /* stop */
+    }
+    return 0;
+}
+
+/* Which file in the staged manifest a role is, or 0. */
+static int recv_index_of(const raft_node *n, const char *role, uint32_t role_len,
+                         uint32_t *out) {
+    find_ctx f = { role, role_len, 0, 0 };
+    manifest_files(n->recv.manifest.data, (uint32_t)n->recv.manifest.len, find_role, &f);
+    if (!f.found) return RAFT_ERR_MESSAGE;
+    *out = f.index;
+    return BJ_OK;
+}
+
+static int count_files(void *vctx, uint32_t i, const uint8_t *el, size_t el_len) {
+    (void)el; (void)el_len;
+    *(uint32_t *)vctx = i + 1;
+    return 0;
+}
+
+/* Forget a staging attempt. The files it made are left on disk with no
+ * manifest naming them: an orphan the next sweep collects, which is the
+ * ordering snapstore.h's commit protocol depends on -- the manifest is
+ * written LAST, so anything without one never existed. */
+static void install_abort(raft_node *n) {
+    n->recv.active = 0;
+    n->recv.gen = 0;
+    n->recv.nfiles = 0;
+    n->recv.manifest.len = 0;
+}
+
+/* The name of generation `gen`'s file for `el`'s role, appended to `out`
+ * with its NUL. */
+typedef struct { raft_node *n; uint64_t gen; dbuf *out; } name_ctx;
+
+static int append_name(void *vctx, uint32_t i, const uint8_t *el, size_t el_len) {
+    name_ctx *c = (name_ctx *)vctx;
+    (void)i;
+    uint32_t rlen = 0;
+    const char *r = entry_role(el, el_len, &rlen);
+    if (!r) return RAFT_ERR_MESSAGE;
+    dbuf name = {0};
+    int e = sst_data_name(c->n->store, c->gen, r, rlen, &name);
+    if (!e) e = dbuf_put(c->out, name.data, name.len);
+    if (!e) e = dbuf_put(c->out, (const uint8_t *)"", 1);
+    dbuf_free(&name);
+    return e;
+}
+
+int rn_install_plan(raft_node *n, const uint8_t *msg, uint32_t len, dbuf *out) {
+    if (!n || !msg || !out) return BJ_ERR_STATE;
+    if (!n->ns || !n->store) return BJ_OK;      /* this node will refuse it */
+
+    raft_install in;
+    if (rmsg_install_read(msg, len, &in) != BJ_OK) return BJ_OK;
+
+    uint64_t gen;
+    int e = BJ_OK;
+    if (in.manifest) {
+        /* A manifest supersedes whatever was staged, so the generation
+         * is the next one -- computed here and again in the handler,
+         * from the same store, which is why they agree. */
+        gen = sst_next_gen(n->store);
+        name_ctx c = { n, gen, out };
+        e = manifest_files(in.manifest, in.manifest_len, append_name, &c);
+        if (e) return e;
+    } else {
+        if (!n->recv.active) return BJ_OK;      /* answered `restart` */
+        gen = n->recv.gen;
+        if (in.role) {
+            name_ctx c = { n, gen, out };
+            dbuf name = {0};
+            e = sst_data_name(n->store, gen, in.role, in.role_len, &name);
+            if (!e) e = dbuf_put(out, name.data, name.len);
+            if (!e) e = dbuf_put(out, (const uint8_t *)"", 1);
+            dbuf_free(&name);
+            (void)c;
+            if (e) return e;
+        }
+    }
+    /* The manifest file is written when the last chunk lands, which may
+     * be this one -- including the first, for a one-chunk install. */
+    if (in.done) {
+        dbuf name = {0};
+        e = sst_manifest_name(n->store, gen, &name);
+        if (!e) e = dbuf_put(out, name.data, name.len);
+        if (!e) e = dbuf_put(out, (const uint8_t *)"", 1);
+        dbuf_free(&name);
+    }
+    return e;
+}
+
+int      rn_installing(const raft_node *n)       { return n && n->recv.active; }
+uint64_t rn_install_boundary(const raft_node *n) { return n ? n->recv.index : 0; }
+
+/* Create every file the manifest names, so one that never receives a
+ * byte still exists: an absent file and an empty one are different
+ * things to sst_check_files. */
+static int create_staged(void *vctx, uint32_t i, const uint8_t *el, size_t el_len) {
+    name_ctx *c = (name_ctx *)vctx;
+    (void)i;
+    uint32_t rlen = 0;
+    const char *r = entry_role(el, el_len, &rlen);
+    if (!r) return RAFT_ERR_MESSAGE;
+    dbuf name = {0};
+    int e = sst_data_name(c->n->store, c->gen, r, rlen, &name);
+    if (!e) {
+        bj_io io;
+        e = c->n->ns->open(c->n->ns->ctx, (const char *)name.data, (uint32_t)name.len,
+                           BJ_NS_CREATE | BJ_NS_TRUNC, &io);
+        if (!e && io.close) io.close(io.ctx);
+    }
+    dbuf_free(&name);
+    return e;
+}
+
+/* Every staged file as {role, size, crc} -- what sst_check_files
+ * compares against the leader's manifest -- and, with `names`, the
+ * {role, name, size, crc} the store's own manifest records. */
+typedef struct { raft_node *n; bj_builder *b; int names; int e; } actual_ctx;
+
+static int put_actual(void *vctx, uint32_t i, const uint8_t *el, size_t el_len) {
+    actual_ctx *a = (actual_ctx *)vctx;
+    uint32_t rlen = 0;
+    const char *r = entry_role(el, el_len, &rlen);
+    if (!r || i >= RN_MAX_SNAP_FILES) return RAFT_ERR_MESSAGE;
+    int e = bj_begin_object(a->b);
+    if (!e) e = bj_put_key(a->b, (const uint8_t *)"role", 4);
+    if (!e) e = bj_put_string(a->b, (const uint8_t *)r, rlen);
+    if (!e && a->names) {
+        dbuf name = {0};
+        e = sst_data_name(a->n->store, a->n->recv.gen, r, rlen, &name);
+        if (!e) e = bj_put_key(a->b, (const uint8_t *)"name", 4);
+        if (!e) e = bj_put_string(a->b, name.data, (uint32_t)name.len);
+        dbuf_free(&name);
+    }
+    if (!e) e = bj_put_key(a->b, (const uint8_t *)"size", 4);
+    if (!e) e = bj_put_int(a->b, (int64_t)a->n->recv.written[i]);
+    if (!e) e = bj_put_key(a->b, (const uint8_t *)"crc", 3);
+    if (!e) e = bj_put_int(a->b, (int64_t)a->n->recv.crc[i]);
+    if (!e) e = bj_end_object(a->b);
+    return e;
+}
+
+static int staged_files(raft_node *n, int names, dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    actual_ctx a = { n, b, names, 0 };
+    int e = bj_begin_array(b);
+    if (!e) e = manifest_files(n->recv.manifest.data, (uint32_t)n->recv.manifest.len,
+                               put_actual, &a);
+    if (!e) e = bj_end_array(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *d = bj_builder_data(b, &len);
+        if (!d) e = BJ_ERR_STATE;
+        else e = dbuf_put(out, d, len);
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+/*
+ * The last chunk landed: check the staged bytes against the leader's
+ * manifest, and if they are what it said, write OUR manifest -- which is
+ * the commit, and the only irreversible step in the whole transfer.
+ *
+ * A mismatch adopts nothing. The staged files stay on disk with no
+ * manifest naming them, which makes them orphans rather than a
+ * generation, and the leader is asked to start over.
+ */
+static int install_commit(raft_node *n) {
+    dbuf actual = {0};
+    int e = staged_files(n, 0, &actual);
+    if (!e) {
+        const uint8_t *bad = NULL; uint32_t bad_len = 0;
+        e = sst_check_files(n->recv.manifest.data, (uint32_t)n->recv.manifest.len,
+                            actual.data, (uint32_t)actual.len, &bad, &bad_len);
+    }
+    dbuf_free(&actual);
+    if (e) return e;
+
+    dbuf files = {0};
+    e = staged_files(n, 1, &files);
+    if (e) { dbuf_free(&files); return e; }
+
+    uint32_t config_len = 0;
+    const uint8_t *config = rec_raw(n->recv.manifest.data, (uint32_t)n->recv.manifest.len,
+                                    "config", &config_len);
+    /* An absent config and an explicit null are the same thing to the
+     * store, and the leader sends the latter. */
+    if (config && config_len && config[0] == BJ_TYPE_NULL) { config = NULL; config_len = 0; }
+
+    dbuf manifest = {0};
+    e = sst_manifest_encode(n->recv.index, n->recv.term, config, config_len,
+                            files.data, (uint32_t)files.len, &manifest);
+    dbuf_free(&files);
+    if (!e) {
+        dbuf name = {0};
+        e = sst_manifest_name(n->store, n->recv.gen, &name);
+        if (!e) {
+            bj_io io;
+            e = n->ns->open(n->ns->ctx, (const char *)name.data, (uint32_t)name.len,
+                            BJ_NS_CREATE | BJ_NS_TRUNC, &io);
+            if (!e) {
+                e = io.write(io.ctx, 0, manifest.data, (uint32_t)manifest.len);
+                /* Durable before it counts: a manifest in a buffer is a
+                 * generation that adopts after a crash and has no files. */
+                if (!e && io.sync) e = io.sync(io.ctx);
+                if (io.close) io.close(io.ctx);
+            }
+        }
+        dbuf_free(&name);
+    }
+    if (!e) {
+        /* The store learns about it so its next generation number does
+         * not hand this one out twice. The previous generation's files
+         * are NOT deleted here: the live database is still using them
+         * until the host adopts, which is the next effect's business. */
+        dbuf sweep = {0};
+        e = sst_adopt_committed(n->store, n->recv.gen, manifest.data,
+                                (uint32_t)manifest.len, &sweep);
+        dbuf_free(&sweep);
+        n->snap_gen = 0;    /* what we would serve has changed */
+    }
+    dbuf_free(&manifest);
+    return e;
+}
+
+/*
+ * One chunk. The term rules are rn_observe_leader's, exactly as they
+ * were when this handler lived in the host -- what has moved is the
+ * staging, which needed files.
+ */
+static int handle_install(raft_node *n, uint64_t corr,
+                          const uint8_t *msg, uint32_t len, double random01) {
+    raft_install in;
+    int e = rmsg_install_read(msg, len, &in);
+    if (e) return e;
+
+    uint64_t term = elog_current_term(n->log);
+    if (!rn_observe_leader(n, in.term, in.leader_id, random01)) {
+        dbuf reply = {0};
+        e = rmsg_build_install_reply(term, 0, 0, &reply);
+        if (!e) e = queue(n, in.leader_id, corr, 1, reply.data, reply.len);
+        dbuf_free(&reply);
+        return e;
+    }
+    term = elog_current_term(n->log);
+
+    int ok = 0, restart = 0;
+    if (in.manifest) {
+        install_abort(n);
+        uint32_t nfiles = 0;
+        e = manifest_files(in.manifest, in.manifest_len, count_files, &nfiles);
+        if (!e && nfiles > RN_MAX_SNAP_FILES) e = RAFT_ERR_CAPACITY;
+        if (!e) {
+            n->recv.manifest.len = 0;
+            e = dbuf_put(&n->recv.manifest, in.manifest, in.manifest_len);
+        }
+        if (!e) {
+            n->recv.gen = sst_next_gen(n->store);
+            name_ctx c = { n, n->recv.gen, NULL };
+            e = manifest_files(in.manifest, in.manifest_len, create_staged, &c);
+        }
+        if (!e) {
+            n->recv.active = 1;
+            n->recv.index = in.last_included_index;
+            n->recv.term = in.last_included_term;
+            n->recv.nfiles = nfiles;
+            memset(n->recv.written, 0, sizeof n->recv.written);
+            memset(n->recv.crc, 0, sizeof n->recv.crc);
+        } else {
+            install_abort(n);
+        }
+    }
+
+    if (!e && (!n->recv.active ||
+               n->recv.index != in.last_included_index ||
+               n->recv.term != in.last_included_term)) {
+        /* A chunk for an install we never started -- the leader
+         * restarted, or we abandoned this one. Ask for the manifest. */
+        restart = 1;
+    } else if (!e) {
+        uint32_t idx = 0;
+        if (in.role && recv_index_of(n, in.role, in.role_len, &idx) != BJ_OK) {
+            restart = 1;
+        } else if (in.role && in.offset != n->recv.written[idx]) {
+            /* A stream that lost or reordered a chunk. Staging it would
+             * make a file that passes a size check and no checksum. */
+            install_abort(n);
+            restart = 1;
+        } else if (in.role && in.data_len) {
+            dbuf name = {0};
+            e = sst_data_name(n->store, n->recv.gen, in.role, in.role_len, &name);
+            if (!e) {
+                bj_io io;
+                e = n->ns->open(n->ns->ctx, (const char *)name.data, (uint32_t)name.len,
+                                BJ_NS_CREATE, &io);
+                if (!e) {
+                    e = io.write(io.ctx, in.offset, in.data, in.data_len);
+                    if (!e && io.sync) e = io.sync(io.ctx);
+                    if (io.close) io.close(io.ctx);
+                }
+            }
+            dbuf_free(&name);
+            if (!e) {
+                n->recv.written[idx] += in.data_len;
+                n->recv.crc[idx] = bjfile_crc32(n->recv.crc[idx], in.data, in.data_len);
+            }
+        }
+        if (!e && !restart) {
+            ok = 1;
+            if (in.done) {
+                int ce = install_commit(n);
+                if (ce) {
+                    /* Verification failed, or the commit could not be
+                     * written. Nothing was adopted; start over. */
+                    install_abort(n);
+                    ok = 0;
+                    restart = 1;
+                } else {
+                    uint64_t boundary = n->recv.index;
+                    install_abort(n);
+                    emit(n, RN_EFFECT_INSTALLED, boundary, 0);
+                }
+            }
+        }
+    }
+    if (e) return e;
+
+    dbuf reply = {0};
+    e = rmsg_build_install_reply(term, ok, restart, &reply);
+    if (!e) e = queue(n, in.leader_id, corr, 1, reply.data, reply.len);
+    dbuf_free(&reply);
+    return e;
+}
+
 /* ---- replication -------------------------------------------------------- */
 
 static int replicate_to(raft_node *n, rn_peer *p) {
@@ -1292,9 +1706,16 @@ int rn_handle(raft_node *n, uint64_t corr,
         e = rmsg_handle_request_vote(n->log, &st, msg, len, &eff, &reply);
     } else if (kind == RAFT_MSG_APPEND_ENTRIES) {
         e = rmsg_handle_append_entries(n->log, &st, msg, len, &eff, &reply);
+    } else if (kind == RAFT_MSG_INSTALL_SNAPSHOT && n->ns && n->store) {
+        /* Answered here now: the files it writes go through the
+         * namespace this node was given, over names the host pre-opened
+         * from rn_install_plan. */
+        dbuf_free(&reply);
+        return handle_install(n, corr, msg, len, random01);
     } else {
-        /* InstallSnapshot alone is left: it writes FILES, and this layer
-         * has no namespace to write them through. See raft_node.h. */
+        /* An install with no namespace to write through. Refused
+         * exactly as before, so a host that serves them itself is
+         * untouched by any of this. */
         dbuf_free(&reply);
         return RAFT_ERR_MESSAGE;
     }

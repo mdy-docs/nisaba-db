@@ -87,21 +87,55 @@ typedef struct {
  * then built by exactly the code that builds it on a single-process
  * server, rather than by a second assembler that could disagree with it.
  */
+/*
+ * One command that has already been applied, and what applying it said.
+ *
+ * A stepped request runs its whole dispatch again for every trip to the
+ * log, so the same command is walked past several times -- and a
+ * database is not a pure function: applying one twice inserts it twice.
+ * The result is kept the first time and handed back on every later pass,
+ * so the accumulators that build the response see exactly the sequence
+ * they saw when it happened.
+ */
+typedef struct {
+    dbuf result;
+    int  rc;
+    int  done;
+} dbs_applied;
+
 typedef struct {
     uint64_t      token;
     uint64_t      client;
     dbuf          req;
-    /* PLANS, plural: bulkWrite plans each of its operations separately,
-     * so one request can hold several. They are consumed on the way back
-     * in the order they were made, which is the order the dispatch
-     * produces them -- the same dispatch, over the same bytes. */
+    /*
+     * PLANS, plural, and made ONE AT A TIME.
+     *
+     * bulkWrite is a list of writes rather than a batch of them:
+     * operation two runs against a database operation one has already
+     * changed. That is what MongoDB does, and what both other
+     * implementations here do -- do_bulk_write plans each operation
+     * after applying the last, and runBulkWrite (wasm/nisaba-wasm.js)
+     * dispatches each to its own logged method, awaited.
+     *
+     * A replica cannot cheat that by planning the list up front, because
+     * operation two would resolve its filter against a document
+     * operation one has not inserted yet. So each pass applies what is
+     * already planned and plans exactly ONE more thing: a bulkWrite of
+     * three operations takes three trips to the log, and every other
+     * write takes one.
+     */
     dc_wal_plan **plans;
     uint32_t      nplans, plan_cap, at_plan;
+    dbs_applied  *applied;              /* one per command, across all plans */
+    uint32_t      napplied, applied_cap, at_applied;
+    int           more;                 /* this pass planned something new */
 } dbs_pending;
 
 static void pending_release(dbs_pending *p) {
     for (uint32_t i = 0; i < p->nplans; i++) dc_wal_plan_free(p->plans[i]);
     free(p->plans);
+    for (uint32_t i = 0; i < p->napplied; i++) dbuf_free(&p->applied[i].result);
+    free(p->applied);
     dbuf_free(&p->req);
     memset(p, 0, sizeof *p);
 }
@@ -128,10 +162,9 @@ struct dbs {
      */
     dbs_pending pending[DBS_MAX_INFLIGHT];
     uint64_t    next_token;
-    /* The one being planned or resumed right now, and where the resume
-     * has got to in its caller's index list. Never nested: dbs_propose
-     * and dbs_complete each run one request to completion. */
-    int         planning;
+    /* The request being run right now, and where this pass has got to in
+     * its caller's index list. Never nested: dbs_propose and dbs_step
+     * each run one pass of one request to completion. */
     dbs_pending    *resuming;
     const uint64_t *indices;
     uint32_t        nindices, at_index;
@@ -1679,9 +1712,7 @@ void dbs_close(dbs *s) {
  * resuming, and which log index does the next command go in at.
  */
 
-int dbs_repl_planning(const dbs *s)  { return s && s->planning; }
-int dbs_repl_replaying(const dbs *s) { return s && s->resuming && !s->planning; }
-int dbs_repl_active(const dbs *s)    { return s && s->resuming != NULL; }
+int dbs_repl_active(const dbs *s) { return s && s->resuming != NULL; }
 
 /* Keep a plan. The slot is already chosen -- dbs_propose takes one
  * before dispatching, because a request that cannot be held is one that
@@ -1689,6 +1720,7 @@ int dbs_repl_active(const dbs *s)    { return s && s->resuming != NULL; }
 int dbs_repl_hold(dbs *s, dc_wal_plan *p) {
     if (!s || !s->resuming) return BJ_ERR_STATE;
     dbs_pending *e = s->resuming;
+    e->more = 1;
     if (e->nplans == e->plan_cap) {
         uint32_t cap = e->plan_cap ? e->plan_cap * 2 : 4;
         dc_wal_plan **grown = (dc_wal_plan **)realloc(e->plans, cap * sizeof *grown);
@@ -1700,15 +1732,52 @@ int dbs_repl_hold(dbs *s, dc_wal_plan *p) {
     return BJ_OK;
 }
 
-/* The next plan this request made, on the way back. NULL while planning
- * (nothing has been made yet) and NULL once they are exhausted, which is
- * a request whose second run planned more than its first -- refused
- * below rather than quietly re-planned. */
+/* The next plan this request already made. NULL means there is none yet
+ * at this point in the dispatch, so plan one. */
 dc_wal_plan *dbs_repl_resuming(dbs *s) {
-    if (!s || !s->resuming || s->planning) return NULL;
+    if (!s || !s->resuming) return NULL;
     dbs_pending *e = s->resuming;
     if (e->at_plan >= e->nplans) return NULL;
     return e->plans[e->at_plan++];
+}
+
+/*
+ * What applying this command said, if an earlier pass already applied
+ * it. NULL means apply it for real.
+ *
+ * The cursor advances either way, so the Nth command of the request is
+ * always the Nth slot, however many passes it takes to get there.
+ */
+const dbuf *dbs_repl_replay(dbs *s, int *rc) {
+    if (!s || !s->resuming) return NULL;
+    dbs_pending *e = s->resuming;
+    if (e->at_applied >= e->napplied || !e->applied[e->at_applied].done) return NULL;
+    dbs_applied *a = &e->applied[e->at_applied++];
+    *rc = a->rc;
+    return &a->result;
+}
+
+/* Remember what applying it said, for the passes that come after. */
+int dbs_repl_record(dbs *s, const dbuf *result, int rc) {
+    if (!s || !s->resuming) return BJ_OK;
+    dbs_pending *e = s->resuming;
+    if (e->napplied == e->applied_cap) {
+        uint32_t cap = e->applied_cap ? e->applied_cap * 2 : 8;
+        dbs_applied *grown = (dbs_applied *)realloc(e->applied, cap * sizeof *grown);
+        if (!grown) return BJ_ERR_OOM;
+        memset(grown + e->applied_cap, 0, (cap - e->applied_cap) * sizeof *grown);
+        e->applied = grown;
+        e->applied_cap = cap;
+    }
+    /* Appended at the cursor, which is where this pass has got to. */
+    if (e->at_applied != e->napplied) return BJ_ERR_STATE;
+    dbs_applied *a = &e->applied[e->napplied++];
+    a->result.len = 0;
+    int err = result ? dbuf_put(&a->result, result->data, result->len) : BJ_OK;
+    a->rc = rc;
+    a->done = 1;
+    e->at_applied = e->napplied;
+    return err;
 }
 
 /*
@@ -1743,23 +1812,41 @@ void dbs_abandon(dbs *s, uint64_t token) {
     if (p) pending_release(p);
 }
 
-/* Every command every held plan produced, as one array, in apply order.
- * Flat, because the log carries commands and does not care which plan
- * made which -- the plans are what put them back together. */
-static int plan_commands(const dbs_pending *pd, dbuf *out, uint32_t *total) {
+/*
+ * Run the request once more: apply everything already planned -- from
+ * the cache, so nothing is applied twice -- plan at most one more thing,
+ * and stop.
+ *
+ * The response it builds is only worth keeping on the LAST pass, when
+ * nothing new was planned. Any earlier one describes applies that have
+ * not happened yet, as zeroes, and a client must never see those.
+ */
+static int pass(dbs *s, dbs_pending *slot, dbuf *out) {
+    const size_t out_was = out->len;
+    slot->at_plan = slot->at_applied = 0;
+    slot->more = 0;
+    s->resuming = slot;
+    int e = dbs_handle(s, slot->client, slot->req.data, slot->req.len, out);
+    s->resuming = NULL;
+    if (!e && slot->more) out->len = out_was;
+    return e;
+}
+
+/* The commands of the plan this pass just made -- the only ones that
+ * still need replicating. Everything before them is applied already, and
+ * proposing it again would apply it twice. */
+static int pass_commands(const dbs_pending *pd, dbuf *out) {
+    const dc_wal_plan *p = pd->plans[pd->nplans - 1];
+    out->len = 0;
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     int e = bj_begin_array(b);
-    *total = 0;
-    for (uint32_t k = 0; !e && k < pd->nplans; k++) {
-        uint32_t n = dc_wal_plan_count(pd->plans[k]);
-        for (uint32_t i = 0; !e && i < n; i++) {
-            uint32_t clen = 0;
-            const uint8_t *cmd = dc_wal_plan_cmd(pd->plans[k], i, &clen);
-            if (!cmd) { e = BJ_ERR_STATE; break; }
-            e = bj_put_raw(b, cmd, clen);
-            (*total)++;
-        }
+    uint32_t n = dc_wal_plan_count(p);
+    for (uint32_t i = 0; !e && i < n; i++) {
+        uint32_t clen = 0;
+        const uint8_t *cmd = dc_wal_plan_cmd(p, i, &clen);
+        if (!cmd) { e = BJ_ERR_STATE; break; }
+        e = bj_put_raw(b, cmd, clen);
     }
     if (!e) e = bj_end_array(b);
     if (!e) e = bj_builder_error(b);
@@ -1789,52 +1876,58 @@ int dbs_propose(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     slot->token  = ++s->next_token;
     slot->client = client;
 
-    const size_t out_was = out->len;
-    s->planning = 1;
-    s->resuming = slot;
-    e = dbs_handle(s, client, slot->req.data, slot->req.len, out);
-    s->planning = 0;
-    s->resuming = NULL;
-
     /* No plan means nothing to replicate: a read, a ping, or a refusal,
      * and the answer is already in `out`. */
-    if (e || !slot->nplans) { pending_release(slot); return e; }
-
-    /* A plan means the response this pass built described applies that
-     * never happened -- zeroes, and a client must never see them. The
-     * real one is dbs_complete's, built by the same code once the
-     * commands are back. */
-    out->len = out_was;
-
-    uint32_t total = 0;
-    e = plan_commands(slot, cmds, &total);
+    e = pass(s, slot, out);
+    if (e || !slot->more) { pending_release(slot); return e; }
+    e = pass_commands(slot, cmds);
     if (e) { pending_release(slot); return e; }
     *token = slot->token;
     return BJ_OK;
 }
 
-int dbs_complete(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
-                 dbuf *out) {
-    if (!s || !out || !token) return BJ_ERR_STATE;
+int dbs_step(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
+             uint64_t *next, dbuf *cmds, dbuf *out) {
+    if (!s || !out || !token || !next || !cmds) return BJ_ERR_STATE;
+    *next = 0;
     dbs_pending *slot = pending_find(s, token);
     if (!slot || !slot->nplans) return BJ_ERR_STATE;
-    /* One index per command, or the caller replicated something other
-     * than what it was given. Refusing beats staging a zero and coming
-     * back believing nothing was applied. */
-    uint32_t want = 0;
-    for (uint32_t i = 0; i < slot->nplans; i++) want += dc_wal_plan_count(slot->plans[i]);
-    if (n != want) { pending_release(slot); return BJ_ERR_RANGE; }
+    /* One index per command of the plan that was handed out, or the
+     * caller replicated something other than what it was given. Refusing
+     * beats staging a zero and coming back believing nothing was
+     * applied. */
+    if (n != dc_wal_plan_count(slot->plans[slot->nplans - 1])) {
+        pending_release(slot);
+        return BJ_ERR_RANGE;
+    }
 
-    slot->at_plan = 0;
-    s->resuming  = slot;
-    s->indices   = indices;
-    s->nindices  = n;
-    s->at_index  = 0;
-    int e = dbs_handle(s, slot->client, slot->req.data, slot->req.len, out);
-    s->resuming  = NULL;
-    s->indices   = NULL;
-    s->nindices  = s->at_index = 0;
+    s->indices  = indices;
+    s->nindices = n;
+    s->at_index = 0;
+    int e = pass(s, slot, out);
+    s->indices  = NULL;
+    s->nindices = s->at_index = 0;
+    if (e) { pending_release(slot); return e; }
 
+    if (slot->more) {                 /* another operation: another trip */
+        e = pass_commands(slot, cmds);
+        if (e) { pending_release(slot); return e; }
+        *next = slot->token;
+        return BJ_OK;
+    }
     pending_release(slot);
+    return BJ_OK;
+}
+
+/* The two-call shape, for a caller with nothing to step: it refuses a
+ * request that turned out to need more than one trip rather than
+ * answering half of one. */
+int dbs_complete(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
+                 dbuf *out) {
+    uint64_t next = 0;
+    dbuf cmds = {0};
+    int e = dbs_step(s, token, indices, n, &next, &cmds, out);
+    dbuf_free(&cmds);
+    if (!e && next) { dbs_abandon(s, next); return BJ_ERR_STATE; }
     return e;
 }

@@ -565,6 +565,8 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
  */
 int  dbs_propose(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                  uint64_t *token, dbuf *cmds, dbuf *out);
+int  dbs_step(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
+              uint64_t *next, dbuf *cmds, dbuf *out);
 int  dbs_complete(dbs *s, uint64_t token, const uint64_t *indices, uint32_t n,
                   dbuf *out);
 void dbs_abandon(dbs *s, uint64_t token);
@@ -584,12 +586,12 @@ uint64_t dbs_applied_index(dbs *s, const char *coll, size_t coll_len);
  * and a third file for four functions would be filing rather than
  * design.
  */
-int          dbs_repl_planning(const dbs *s);   /* dbs_propose's pass  */
-int          dbs_repl_replaying(const dbs *s);  /* dbs_complete's pass */
-int          dbs_repl_active(const dbs *s);     /* either of the two   */
+int          dbs_repl_active(const dbs *s);     /* mid-propose/step    */
 int          dbs_repl_hold(dbs *s, dc_wal_plan *p);
 dc_wal_plan *dbs_repl_resuming(dbs *s);
 uint64_t     dbs_repl_next_index(dbs *s);
+const dbuf  *dbs_repl_replay(dbs *s, int *rc);
+int          dbs_repl_record(dbs *s, const dbuf *result, int rc);
 
 /* Not an error: a write whose commands were planned and kept, waiting
  * for a quorum. Positive, so every `if (e)` in the write paths still

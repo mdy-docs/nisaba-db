@@ -488,23 +488,20 @@ static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
                      int wreq, const uint8_t *a, uint32_t a_len,
                      const uint8_t *b, uint32_t b_len,
                      int upsert, const uint8_t id[12], dc_wal_plan **out) {
-    if (dbs_repl_replaying(s)) {
+    if (dbs_repl_active(s)) {
+        /* A plan this request already made, on an earlier pass. */
         *out = dbs_repl_resuming(s);
-        /* Exhausted means this run planned more than the first did, which
-         * cannot happen over the same bytes and the same catalog -- and
-         * if it ever does, it must not be papered over by planning
-         * afresh against state a quorum never saw. */
-        return *out ? BJ_OK : BJ_ERR_STATE;
+        if (*out) return BJ_OK;
     }
     int e = dc_wal_plan_build(c, coll, coll_len, wreq, a, a_len, b, b_len,
                               upsert, id, out);
     if (e) return e;
-    if (!dbs_repl_planning(s)) return BJ_OK;
+    if (!dbs_repl_active(s)) return BJ_OK;
     e = dbs_repl_hold(s, *out);
     if (e) { dc_wal_plan_free(*out); *out = NULL; return e; }
-    /* Planned and kept. The caller skips its apply loop and carries on --
-     * bulkWrite must reach its LAST operation to plan it, so this can
-     * never be an early return out of the request. */
+    /* Planned and kept, and that is as far as this pass goes: whatever
+     * comes after it must be planned against a database this has already
+     * changed, and it has not been applied yet. */
     return DC_PENDING;
 }
 
@@ -513,7 +510,19 @@ static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
  * so. */
 static int apply_cmd(dbs *s, dc_collection *c, const uint8_t *cmd, uint32_t clen,
                      dbuf *one) {
-    return dc_wal_apply(c, dbs_repl_next_index(s), cmd, clen, one);
+    /* Already applied, on an earlier trip to the log. A stepped request
+     * walks its whole dispatch again each time, and a database is not a
+     * pure function: applying this twice would insert it twice. */
+    int rc = 0;
+    const dbuf *had = dbs_repl_replay(s, &rc);
+    if (had) {
+        one->len = 0;
+        int e = dbuf_put(one, had->data, had->len);
+        return e ? e : rc;
+    }
+    rc = dc_wal_apply(c, dbs_repl_next_index(s), cmd, clen, one);
+    int e = dbs_repl_record(s, one, rc);
+    return e ? e : rc;
 }
 
 /* Give the plan back, unless the session is holding it for a quorum --
@@ -1041,7 +1050,7 @@ static int do_ddl(dbs *s, const char *coll, uint32_t coll_len, int wreq,
      * would not persist with it. dbs_repl_next_index is still consumed,
      * because the caller proposed a command for it and the lists must
      * stay in step. */
-    if (dbs_repl_replaying(s)) (void)dbs_repl_next_index(s);
+    if (dbs_repl_active(s)) (void)dbs_repl_next_index(s);
     e = cmd ? dbs_apply(s, 0, cmd, clen, result) : BJ_ERR_STATE;
     plan_close(s, p);
     return e;

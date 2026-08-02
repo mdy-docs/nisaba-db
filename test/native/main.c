@@ -2148,6 +2148,145 @@ static uint32_t array_len(const uint8_t *arr, size_t len) {
     return n;
 }
 
+TEST(a_bulk_writes_later_operation_sees_its_earlier_ones) {
+    /*
+     * A bulkWrite is a LIST OF WRITES, not a batch of independent ones:
+     * operation two runs against a database operation one has already
+     * changed. That is what MongoDB does, and it is what both other
+     * implementations here do -- do_bulk_write plans each operation
+     * after applying the last, and runBulkWrite (wasm/nisaba-wasm.js)
+     * dispatches each to its own logged method, awaited, so a
+     * WalCollection proposes and applies them one at a time.
+     *
+     * A replica must do the same, and the tempting shortcut says
+     * otherwise: nothing may be applied before a quorum, so it is very
+     * easy to plan the whole list up front and replicate it in one go.
+     * Then operation two resolves its filter against a document
+     * operation one has not inserted yet, matches nothing, and the same
+     * request answers differently depending on which kind of server took
+     * it. This is the test that forbids that.
+     */
+    char a_dir[64], b_dir[64];
+    CHECK_FATAL(scratch_dir("nisaba-bulk-a", a_dir, sizeof a_dir) == 0);
+    CHECK_FATAL(scratch_dir("nisaba-bulk-b", b_dir, sizeof b_dir) == 0);
+    int afd = open(a_dir, O_RDONLY), bfd = open(b_dir, O_RDONLY);
+    CHECK_FATAL(afd >= 0 && bfd >= 0);
+    bj_ns ans, bns;
+    CHECK_FATAL(bjns_posix_open(afd, &ans) == BJ_OK);
+    CHECK_FATAL(bjns_posix_open(bfd, &bns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ans) == 0);
+    CHECK_FATAL(build_users_db(&bns) == 0);
+
+    dbs *whole = NULL, *split = NULL;
+    CHECK_FATAL(dbs_open(&ans, ORDER, 0, &whole) == BJ_OK);
+    CHECK_FATAL(dbs_open(&bns, ORDER, 0, &split) == BJ_OK);
+    const uint64_t CLIENT = 11;
+
+    uint8_t oid[12];
+    memset(oid, 0, sizeof oid);
+    oid[0] = 0xD0; oid[11] = 1;
+
+    /* [ insertOne {_id, team, n:1}, updateOne({_id}, {$set:{n:2}}) ].
+     * The second one can only match if the first one has landed. */
+    bj_builder *wb = bj_builder_new();
+    bj_begin_array(wb);
+      bj_begin_object(wb);
+        bj_put_key(wb, (const uint8_t *)"insertOne", 9);
+        bj_begin_object(wb);
+          bj_put_key(wb, (const uint8_t *)"document", 8);
+          bj_begin_object(wb);
+            bj_put_key(wb, (const uint8_t *)"_id", 3);  bj_put_oid(wb, oid);
+            bj_put_key(wb, (const uint8_t *)"team", 4); bj_put_string(wb, (const uint8_t *)"z", 1);
+            bj_put_key(wb, (const uint8_t *)"n", 1);    bj_put_int(wb, 1);
+          bj_end_object(wb);
+        bj_end_object(wb);
+      bj_end_object(wb);
+      bj_begin_object(wb);
+        bj_put_key(wb, (const uint8_t *)"updateOne", 9);
+        bj_begin_object(wb);
+          bj_put_key(wb, (const uint8_t *)"filter", 6);
+          bj_begin_object(wb);
+            bj_put_key(wb, (const uint8_t *)"_id", 3); bj_put_oid(wb, oid);
+          bj_end_object(wb);
+          bj_put_key(wb, (const uint8_t *)"update", 6);
+          bj_begin_object(wb);
+            bj_put_key(wb, (const uint8_t *)"$set", 4);
+            bj_begin_object(wb);
+              bj_put_key(wb, (const uint8_t *)"n", 1); bj_put_int(wb, 2);
+            bj_end_object(wb);
+          bj_end_object(wb);
+        bj_end_object(wb);
+      bj_end_object(wb);
+    bj_end_array(wb);
+    size_t wlen = 0; const uint8_t *writes = bj_builder_data(wb, &wlen);
+
+    const uint8_t *req; uint32_t req_len;
+    bj_builder *rb = request_with_id("bulkWrite", "users", "writes", writes, wlen,
+                                     oid, &req, &req_len);
+
+    dbuf a_res = {0};
+    CHECK_OK(dbs_handle(whole, CLIENT, req, req_len, &a_res));
+    CHECK_I64(response_ok(&a_res), 1);
+
+    /* The split server, stepping through the log the way a replica does:
+     * propose what it is given, apply it, ask what comes next. */
+    dbuf b_res = {0};
+    uint64_t index = 500;
+    uint64_t token = 0;
+    dbuf cmds = {0};
+    CHECK_OK(dbs_propose(split, CLIENT, req, req_len, &token, &cmds, &b_res));
+    int rounds = 0;
+    while (token) {
+        uint32_t n = array_len(cmds.data, cmds.len);
+        uint64_t *ix = (uint64_t *)malloc((n ? n : 1) * sizeof *ix);
+        CHECK_FATAL(ix != NULL);
+        for (uint32_t i = 0; i < n; i++) ix[i] = index++;
+        cmds.len = 0;
+        b_res.len = 0;
+        CHECK_OK(dbs_step(split, token, ix, n, &token, &cmds, &b_res));
+        free(ix);
+        CHECK(++rounds < 8);
+    }
+    dbuf_free(&cmds);
+
+    /* One trip to the log per operation, not one for the list: the
+     * second cannot be planned until the first is applied. */
+    CHECK_I64(rounds, 2);
+
+    /* Byte for byte, as always. */
+    CHECK_I64((long long)b_res.len, (long long)a_res.len);
+    CHECK(a_res.len && memcmp(a_res.data, b_res.data, a_res.len) == 0);
+
+    /* And it really did match: matchedCount 1, not 0 -- which is the
+     * whole difference between "the second operation saw the first" and
+     * "it ran against a database that did not have it yet". */
+    {
+        const uint8_t *r; size_t rlen; int f = 0;
+        CHECK_OK(obj_get_field(b_res.data, b_res.len, (const uint8_t *)"result", 6,
+                               &r, &rlen, &f));
+        CHECK_I64(f, 1);
+        const uint8_t *v; size_t vlen; double m = -1;
+        f = 0;
+        CHECK_OK(obj_get_field(r, rlen, (const uint8_t *)"matchedCount", 12, &v, &vlen, &f));
+        CHECK_I64(f, 1);
+        cur c = { v, vlen, 0 };
+        CHECK_OK(read_number(&c, &m));
+        CHECK_I64((long long)m, 1);
+        f = 0;
+        CHECK_OK(obj_get_field(r, rlen, (const uint8_t *)"insertedCount", 13, &v, &vlen, &f));
+        cur c2 = { v, vlen, 0 };
+        double ins = -1;
+        CHECK_OK(read_number(&c2, &ins));
+        CHECK_I64((long long)ins, 1);
+    }
+
+    dbuf_free(&a_res); dbuf_free(&b_res);
+    bj_builder_free(rb); bj_builder_free(wb);
+    dbs_close(whole); dbs_close(split);
+    bjns_posix_free(&ans); bjns_posix_free(&bns);
+    close(afd); close(bfd);
+}
+
 TEST(a_replicated_write_answers_exactly_what_an_unreplicated_one_does) {
     /*
      * docs/steps/server-as-replica.md. dbs_handle plans a write and
@@ -10512,6 +10651,7 @@ int main(void) {
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
     RUN(ddl_is_a_command_a_second_database_can_be_caught_up_by);
     RUN(a_replicated_write_answers_exactly_what_an_unreplicated_one_does);
+    RUN(a_bulk_writes_later_operation_sees_its_earlier_ones);
     RUN(a_database_can_be_built_from_an_empty_directory);
     RUN(compact_over_the_wire_reclaims_and_refuses_while_a_cursor_reads);
     RUN(a_list_of_writes_is_one_request_and_reports_every_member);

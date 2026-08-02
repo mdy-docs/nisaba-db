@@ -431,7 +431,22 @@ typedef enum {
      * between the close and the reopen, which is dc_compact_execute's
      * bargain exactly.
      */
-    RN_EFFECT_INSTALLED     = 7  /* an install committed; arg = boundary */
+    RN_EFFECT_INSTALLED     = 7, /* an install committed; arg = boundary */
+    /*
+     * A proposal this node owes an answer for has finished: arg is its
+     * index, flag is 1 if the entry there is STILL THE ONE THAT WAS
+     * PROPOSED and 0 if a new leader overwrote it.
+     *
+     * The flag is the whole point and the reason this is not the host's
+     * arithmetic. An index being applied does not mean YOUR entry was
+     * applied there: a conflicting entry at the same index can replace
+     * an uncommitted one before it commits, and the proposer has to be
+     * told its write did not happen. Reported leniently, that is a lost
+     * write reported as a success -- so the rule (elog_term_at(index) ==
+     * the term it was proposed at) lives here, once, rather than in
+     * every host.
+     */
+    RN_EFFECT_SETTLED       = 8  /* a proposal finished; arg = index     */
 } rn_effect_kind;
 
 uint32_t rn_effect_count(const raft_node *n);
@@ -489,17 +504,55 @@ int rn_installed(raft_node *n, uint64_t peer, uint64_t boundary);
 
 /*
  * Append one entry at the current term, make it durable, and replicate
- * it -- the leader's half of a proposal. The host owns the promise that
- * settles when it applies; this owns everything up to that.
+ * it -- the leader's half of a proposal. The host owns whatever it
+ * ANSWERS with (a promise, a socket write); this owns everything else,
+ * the completion included.
  *
  * The commit check runs here too, because a single-voter group reaches a
  * quorum without sending anything: no reply will ever arrive to trigger
  * it, and such a group would otherwise append forever and commit
  * nothing. BJ_ERR_STATE if this node is not the leader -- the host
  * refuses first with a routing error the caller can act on.
+ *
+ * The completion is REGISTERED HERE, not by the caller: the index and
+ * the term are both known at this line and nowhere else at once, and a
+ * caller that has to remember to register is a caller that can forget.
+ * RAFT_ERR_CAPACITY if this node already owes more answers than it can
+ * hold (RN_MAX_AWAIT) -- and the entry is not appended, because a
+ * proposal nobody will ever be told the fate of is worse than a refused
+ * one.
  */
 int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
                uint64_t *out_index);
+
+/* ---- completions --------------------------------------------------------
+ *
+ * What a client is actually waiting for is not "committed" but "applied,
+ * and still mine". The node cannot see the second half happen -- the
+ * apply pump is the host's, because applying needs a state machine -- so
+ * the host reports the floor and the node reports what that settles.
+ *
+ *     rn_applied(n, index)         after each entry the pump applies
+ *     ... RN_EFFECT_SETTLED per proposal it finished ...
+ *
+ * EVERY REGISTERED WAIT TERMINATES. Step-down and stop settle everything
+ * outstanding as overwritten, because a node that is no longer the
+ * leader cannot promise anything about entries it has not applied. A
+ * client left holding a request forever is the failure this exists to
+ * prevent, not to relocate.
+ */
+void rn_applied(raft_node *n, uint64_t index);
+
+/*
+ * Owe an answer for `index`, proposed at `term`. rn_propose does this
+ * itself; this is for a host re-registering across a restart, or for one
+ * that appended some other way. RAFT_ERR_CAPACITY when full.
+ */
+int rn_await(raft_node *n, uint64_t index, uint64_t term);
+
+/* How many answers this node currently owes -- for a host bounding its
+ * own intake, and for tests. */
+uint32_t rn_awaiting(const raft_node *n);
 
 /*
  * Seed the commit index at startup from the log's persisted (advisory)

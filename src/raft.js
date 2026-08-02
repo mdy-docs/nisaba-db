@@ -287,7 +287,10 @@ export class RaftNode {
      * `role` getter always asks C. */
     this._role = ROLE.FOLLOWER;
     this._needsSnapshot = new Set(); // peers parked for want of files to serve
-    this._waiters = [];              // propose() promises: {index, term, resolve, reject}
+    /** propose() promises, by index. The node decides WHEN each is
+     * answered and WHETHER the entry there is still the one proposed
+     * (RN_EFFECT_SETTLED); this map is only the callback. */
+    this._waiters = new Map();
     this._applyChain = Promise.resolve();
     this._exclusive = null;          // runExclusive gate promise, or null
     this._transfer = null;           // in-flight transfer: {targetId, deadline, sent, resolve, reject}
@@ -591,9 +594,7 @@ export class RaftNode {
     } catch (err) {
       return Promise.reject(err);
     }
-    const promise = new Promise((resolve, reject) => {
-      this._waiters.push({ index, term, resolve, reject });
-    });
+    const promise = this._waitFor(index, term);
     this._flush();
     return promise;
   }
@@ -701,9 +702,7 @@ export class RaftNode {
     // resolves when it APPLIES, like any other proposal.
     const term = this.term;
     const index = this._core.changeMembership(members);
-    const promise = new Promise((resolve, reject) => {
-      this._waiters.push({ index, term, resolve, reject });
-    });
+    const promise = this._waitFor(index, term);
     this._flush();
     return promise;
   }
@@ -819,6 +818,8 @@ export class RaftNode {
         return this._emit('election', { preVote: eff.flag, forTerm: eff.arg });
       case RN_EFFECT.INSTALLED:
         return this._onInstalled(eff.arg);
+      case RN_EFFECT.SETTLED:
+        return this._onSettled(eff.arg, eff.flag);
       default:
         return undefined;
     }
@@ -846,6 +847,8 @@ export class RaftNode {
         this._emit('transfer', { phase: 'finished', target: t.targetId });
         t.resolve();
       }
+      // The node has already settled them (it steps itself down); this
+      // catches anything registered without one, and settles once.
       this._rejectWaiters(new NotLeaderError(this.leaderId));
     }
     this._emit('role', { role, leaderId: this.leaderId, wasLeader });
@@ -1121,7 +1124,12 @@ export class RaftNode {
         // replaying them would regress membership; see _configIndex.
         else if (e.type === ENTRYLOG_TYPE.CONFIG && e.index >= this._configIndex) this._adoptConfig(decode(e.payload).members, e.index);
         this.lastApplied = e.index;
-        this._settleWaiters();
+        // The node decides what this finishes, and whether each finished
+        // proposal is still the caller's entry. Reporting the floor is
+        // the host's whole share of it: the pump is here, because
+        // applying needs a state machine.
+        this._core.applied(e.index);
+        this._flush();
       }
     }
   }
@@ -1151,22 +1159,41 @@ export class RaftNode {
     this._flush();
   }
 
-  _settleWaiters() {
-    if (this._waiters.length === 0) return;
-    const rest = [];
-    for (const w of this._waiters) {
-      if (w.index > this.lastApplied) { rest.push(w); continue; }
-      // Applied at that index — but was it OUR entry, or did a new
-      // leader's conflicting entry overwrite it before commit?
-      if (this._log.termAt(w.index) === w.term) w.resolve({ index: w.index, term: w.term });
-      else w.reject(new NotLeaderError(this.leaderId));
-    }
-    this._waiters = rest;
+  /**
+   * The promise a proposal at `index` resolves with. The node was told to
+   * owe an answer for it inside rn_propose; this is the other end.
+   */
+  _waitFor(index, term) {
+    return new Promise((resolve, reject) => {
+      this._waiters.set(index, { term, resolve, reject });
+    });
   }
 
+  /**
+   * The node answered one. `kept` is the rule that used to live here —
+   * an entry at your index is not your entry, and a new leader's
+   * conflicting entry can replace an uncommitted one before it commits.
+   * Reading it back rather than re-deriving it is the point: a host that
+   * computed it leniently would report a lost write as a success.
+   */
+  _onSettled(index, kept) {
+    const w = this._waiters.get(index);
+    if (!w) return;
+    this._waiters.delete(index);
+    if (kept) w.resolve({ index, term: w.term });
+    else w.reject(new NotLeaderError(this.leaderId));
+  }
+
+  /**
+   * Everything still outstanding, rejected with one error. The node
+   * settles its own waits at step-down and stop; this is for the case it
+   * cannot see — a halt, which is a fact about the state machine — and
+   * it is idempotent against the node's report because a promise settles
+   * once.
+   */
   _rejectWaiters(err) {
     const waiters = this._waiters;
-    this._waiters = [];
-    for (const w of waiters) w.reject(err);
+    this._waiters = new Map();
+    for (const [, w] of waiters) w.reject(err);
   }
 }

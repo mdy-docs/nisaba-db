@@ -246,6 +246,9 @@ _rnw_replicate
 _rnw_installed
 _rnw_propose
 _rnw_seed_commit
+_rnw_applied
+_rnw_await
+_rnw_awaiting
 _rnw_campaign
 _rnw_observe_leader
 _rnw_step_down

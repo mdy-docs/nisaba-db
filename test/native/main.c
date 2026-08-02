@@ -8591,6 +8591,113 @@ static void deferred_wrap(deferred_ns *d, bj_ns *out) {
     out->sync = dns_sync;
 }
 
+/* The settlement this node reported for `index`, or -1 if it did not. */
+static int settled_flag(const raft_node *n, uint64_t index) {
+    for (uint32_t i = 0; i < rn_effect_count(n); i++) {
+        if (rn_effect_kind_at(n, i) != RN_EFFECT_SETTLED) continue;
+        if (rn_effect_arg(n, i) != index) continue;
+        return rn_effect_flag(n, i);
+    }
+    return -1;
+}
+
+TEST(an_entry_overwritten_at_your_index_is_not_your_entry) {
+    /*
+     * docs/steps/completions-in-c.md. What a client waits for is not
+     * "committed" but "applied, AND STILL MINE".
+     *
+     * The lenient answer is the dangerous one. An index being applied
+     * does not mean the entry proposed at it survived: a new leader's
+     * conflicting entry can replace an uncommitted one before it
+     * commits, and a proposer told "kept" there has been told a write
+     * happened that no replica holds.
+     *
+     * The simulator already produces this through a partition and a
+     * heal. This is the same fact with no cluster, no network and no
+     * JavaScript: propose at one term, overwrite the index at a higher
+     * one, apply, and read what the node says it owes.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "raft.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(1, log);
+    CHECK_FATAL(n != NULL);
+
+    /* One voter, so a proposal commits without anyone to ask. */
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    bj_begin_object(members);
+    bj_put_key(members, (const uint8_t *)"id", 2);
+    bj_put_int(members, 1);
+    bj_end_object(members);
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+    CHECK_OK(rn_set_members(n, mbuf, (uint32_t)mlen));
+    rn_start(n, 0, 0.0);
+    for (int64_t t = 0; t <= 1000 && rn_role(n) != RAFT_LEADER; t += 10)
+        rn_tick(n, t, 0.5);
+    CHECK_I64(rn_role(n), RAFT_LEADER);
+
+    /* A real proposal. The node registers the wait itself -- the index
+     * and the term are known together at exactly one line, and a caller
+     * that has to remember to register is a caller that can forget. */
+    uint64_t kept_at = 0;
+    uint64_t term = elog_current_term(log);
+    CHECK_OK(rn_propose(n, EL_NORMAL, (const uint8_t *)"a", 1, &kept_at));
+    CHECK_I64((long long)rn_awaiting(n), 1);
+
+    /*
+     * And one that does not survive. It has to be an UNCOMMITTED entry:
+     * a committed one is never overwritten, which entrylog.h enforces
+     * outright (elog_truncate_from refuses at or below the commit
+     * index), and a lone voter commits the instant it appends.
+     *
+     * So the wait is registered the way rn_propose would have, and the
+     * index is then filled by an entry of a LATER term -- which is what
+     * a new leader's AppendEntries leaves behind after the conflict
+     * rule cuts this node's log back. Doing it directly keeps the test
+     * about the completion rule rather than about a cluster.
+     */
+    uint64_t doomed_at = kept_at + 1;
+    CHECK_OK(rn_await(n, doomed_at, term));
+    CHECK_I64((long long)rn_awaiting(n), 2);
+    rn_effects_clear(n);
+
+    /* A log never holds an entry above its own current term, so adopt
+     * the newer one first -- which is exactly what this node would do on
+     * hearing from the leader that wrote it. */
+    uint64_t replaced_at = 0;
+    CHECK_OK(elog_set_hard_state(log, term + 1, 0));
+    CHECK_OK(elog_append(log, term + 1, EL_NORMAL, (const uint8_t *)"c", 1, &replaced_at));
+    CHECK_OK(elog_sync(log));
+    CHECK_I64((long long)replaced_at, (long long)doomed_at);
+
+    /* The pump reaches both indices. */
+    rn_applied(n, replaced_at);
+
+    CHECK_I64((long long)rn_awaiting(n), 0);
+    CHECK_I64(settled_flag(n, kept_at), 1);      /* untouched: still ours */
+    CHECK_I64(settled_flag(n, doomed_at), 0);    /* overwritten: not ours */
+
+    /* And nobody is left holding one. A node that stops answers what it
+     * still owes, or the client waits forever. */
+    rn_effects_clear(n);
+    uint64_t orphan = 0;
+    CHECK_OK(rn_propose(n, EL_NORMAL, (const uint8_t *)"d", 1, &orphan));
+    CHECK_I64((long long)rn_awaiting(n), 1);
+    rn_stop(n);
+    CHECK_I64((long long)rn_awaiting(n), 0);
+    CHECK_I64(settled_flag(n, orphan), 0);
+
+    bj_builder_free(members);
+    rn_free(n);
+    elog_free(log);
+    memfs_free(fs);
+}
+
 TEST(adopting_an_install_puts_its_files_where_the_database_looks) {
     /*
      * docs/steps/install-snapshot-in-c.md stage 4. A committed
@@ -10150,6 +10257,7 @@ int main(void) {
     RUN(join_leave_and_timeout_now_are_answered_without_a_host);
     RUN(a_leader_streams_its_own_snapshot_with_no_host_to_read_the_files);
     RUN(adopting_an_install_puts_its_files_where_the_database_looks);
+    RUN(an_entry_overwritten_at_your_index_is_not_your_entry);
     RUN(an_install_crosses_two_c_nodes_and_nothing_else);
     RUN(a_staged_install_adopts_nothing_unless_every_byte_checks_out);
     RUN(a_reply_goes_to_whoever_the_message_says_sent_it);

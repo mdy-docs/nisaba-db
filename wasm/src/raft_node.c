@@ -32,7 +32,22 @@
  * the premise. It was 64 -- smaller than the 64 NEEDS_SNAPSHOT a single
  * tick can raise on a full cluster.
  */
-#define RN_MAX_EFF   (RN_MAX_PEERS * 3 + 16)
+/*
+ * How many proposals this node will owe an answer for at once.
+ *
+ * Bounded on purpose, like every other table here: a leader that accepts
+ * unbounded work in flight fails by growing until something else does,
+ * which is the failure nobody can attribute. Full is RAFT_ERR_CAPACITY
+ * at rn_propose, where a caller is still standing and can back off.
+ */
+#define RN_MAX_AWAIT 256
+
+/* ... and the queue has to hold the settlements they turn into. One
+ * apply pass can finish every one of them, and unlike the per-peer
+ * kinds a settlement cannot coalesce: two indices are two answers to two
+ * different clients. So the term above is added rather than assumed to
+ * fit -- the arithmetic is the contract. */
+#define RN_MAX_EFF   (RN_MAX_PEERS * 3 + 16 + RN_MAX_AWAIT)
 
 /* Bytes per snapshot chunk -- the same figure src/raft.js defaults its
  * snapshotChunkBytes to, so a transfer is cut the same way whichever
@@ -212,19 +227,29 @@ struct raft_node {
     int      config_in_flight;
     struct { uint64_t peer, corr; } pending[RN_MAX_PENDING];
     uint32_t npending;
+
+    /*
+     * Proposals this node owes an answer for. The TERM is what makes it
+     * a table rather than a counter: an index alone cannot tell a
+     * committed entry from one a new leader wrote over.
+     */
+    struct { uint64_t index, term; } await[RN_MAX_AWAIT];
+    uint32_t nawait;
 };
 
 /* The coalescing argument above, as arithmetic the compiler checks:
  * three actionable slots per peer, plus headroom for the transitions
  * one call can raise. If a new per-peer effect kind arrives, this fails
  * here rather than in production. */
-_Static_assert(RN_MAX_EFF >= RN_MAX_PEERS * 3 + 8,
-               "effect queue must hold every peer's actionable effects at once");
+_Static_assert(RN_MAX_EFF >= RN_MAX_PEERS * 3 + 8 + RN_MAX_AWAIT,
+               "effect queue must hold every peer's actionable effects and "
+               "every completion one apply pass can produce, at once");
 
 /* ---- small helpers ------------------------------------------------------ */
 
 /* Answers everyone waiting on a membership change; see its definition. */
 static void flush_pending(raft_node *n, int ok);
+static void settle_all_lost(raft_node *n);
 
 static rn_peer *peer_of(raft_node *n, uint64_t id) {
     for (uint32_t i = 0; i < n->npeers; i++)
@@ -369,6 +394,10 @@ void rn_start(raft_node *n, int64_t now, double random01) {
 void rn_stop(raft_node *n) {
     n->running = 0;
     n->election_deadline = INT64_MAX;
+    /* A stopped node answers nothing further, so anything it still owes
+     * is owed now or never (raft_node.h's "every registered wait
+     * terminates"). The host drains after this call like any other. */
+    settle_all_lost(n);
 }
 
 /* ---- membership --------------------------------------------------------- */
@@ -533,9 +562,12 @@ static void become_follower(raft_node *n, uint64_t term, uint64_t leader_id,
     arm_election(n, random01);
     /* Whatever membership change this node was carrying, it is not the
      * one who can finish it now. Everyone waiting gets a redirect rather
-     * than a promise nobody will keep. */
+     * than a promise nobody will keep -- and the same goes for every
+     * ordinary proposal in flight: a node that has stopped leading can
+     * promise nothing about entries it has not applied. */
     n->config_in_flight = 0;
     flush_pending(n, 0);
+    settle_all_lost(n);
 }
 
 static int replicate_to(raft_node *n, rn_peer *p);
@@ -2286,13 +2318,67 @@ int rn_config_in_flight(const raft_node *n) { return n->config_in_flight; }
 
 /* ---- what the host still owns ------------------------------------------- */
 
+/* ---- completions -------------------------------------------------------- */
+
+int rn_await(raft_node *n, uint64_t index, uint64_t term) {
+    if (!n) return BJ_ERR_STATE;
+    if (n->nawait >= RN_MAX_AWAIT) return RAFT_ERR_CAPACITY;
+    n->await[n->nawait].index = index;
+    n->await[n->nawait].term  = term;
+    n->nawait++;
+    return BJ_OK;
+}
+
+uint32_t rn_awaiting(const raft_node *n) { return n ? n->nawait : 0; }
+
+/*
+ * Answer everything at or below `floor`, and keep the rest.
+ *
+ * `kept` is read from the LOG, not assumed from the fact that the index
+ * applied: an entry at your index is not your entry. Compacted away is
+ * the same answer as overwritten -- a log based past the index cannot
+ * vouch for what was there, and vouching anyway is precisely the lenient
+ * direction that turns a lost write into a reported success.
+ */
+static void settle_through(raft_node *n, uint64_t floor) {
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < n->nawait; i++) {
+        uint64_t index = n->await[i].index;
+        if (index > floor) { n->await[keep++] = n->await[i]; continue; }
+        uint64_t at_term = 0;
+        int kept = elog_term_at(n->log, index, &at_term) == BJ_OK &&
+                   at_term == n->await[i].term;
+        emit(n, RN_EFFECT_SETTLED, index, kept);
+    }
+    n->nawait = keep;
+}
+
+/* Nobody is left holding a request this node can no longer finish. A
+ * step-down or a stop makes every outstanding proposal unanswerable
+ * here, whatever its index says. */
+static void settle_all_lost(raft_node *n) {
+    for (uint32_t i = 0; i < n->nawait; i++)
+        emit(n, RN_EFFECT_SETTLED, n->await[i].index, 0);
+    n->nawait = 0;
+}
+
+void rn_applied(raft_node *n, uint64_t index) {
+    if (n) settle_through(n, index);
+}
+
 int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
                uint64_t *out_index) {
     if (n->role != RAFT_LEADER) return BJ_ERR_STATE;
+    /* Before the append, not after: an entry in the log that nobody will
+     * ever be told the fate of is worse than a proposal refused while
+     * its caller is still standing. */
+    if (n->nawait >= RN_MAX_AWAIT) return RAFT_ERR_CAPACITY;
 
+    uint64_t term = elog_current_term(n->log);
     uint64_t at = 0;
-    int e = elog_append(n->log, elog_current_term(n->log), type, payload, len, &at);
+    int e = elog_append(n->log, term, type, payload, len, &at);
     if (e) return e;
+    rn_await(n, at, term);
     /* Durable before it counts toward anything: the leader counting
      * itself is the same ack a follower gives, and it must mean the same
      * thing. */

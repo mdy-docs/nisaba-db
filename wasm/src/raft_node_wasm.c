@@ -302,6 +302,19 @@ EMSCRIPTEN_KEEPALIVE int rnw_propose(raft_node *n, int type, const uint8_t *payl
 EMSCRIPTEN_KEEPALIVE void rnw_seed_commit(raft_node *n, double index) {
     rn_seed_commit(n, (uint64_t)index);
 }
+
+/* The applied floor moved; whatever that settles comes back as
+ * RN_EFFECT_SETTLED effects on the next drain. */
+EMSCRIPTEN_KEEPALIVE void rnw_applied(raft_node *n, double index) {
+    rn_applied(n, (uint64_t)index);
+}
+EMSCRIPTEN_KEEPALIVE int rnw_await(raft_node *n, double index, double term) {
+    if (index < 0 || term < 0) return BJ_ERR_RANGE;
+    return rn_await(n, (uint64_t)index, (uint64_t)term);
+}
+EMSCRIPTEN_KEEPALIVE int rnw_awaiting(const raft_node *n) {
+    return (int)rn_awaiting(n);
+}
 EMSCRIPTEN_KEEPALIVE int rnw_campaign(raft_node *n, double random01) {
     return rn_campaign(n, random01);
 }

@@ -1341,7 +1341,7 @@ const raftDrive = {
 const RAFT_ROLE = Object.freeze({ FOLLOWER: 0, CANDIDATE: 1, LEADER: 2 });
 const RN_EFFECT = Object.freeze({
   ROLE: 0, COMMIT: 1, NEEDS_SNAPSHOT: 2, PROMOTE: 3, REACHABLE: 4, TRUNCATED: 5,
-  ELECTION: 6, INSTALLED: 7
+  ELECTION: 6, INSTALLED: 7, SETTLED: 8
 });
 
 class RaftCore {
@@ -1697,6 +1697,25 @@ class RaftCore {
 
   /** The request with this correlation id will never be answered. */
   onFail(corr) { return requireModule()._rnw_on_fail(this._p, corr); }
+
+  /**
+   * The apply pump reached `index`. Whatever proposals that finishes come
+   * back as SETTLED effects on the next drain, each carrying whether the
+   * entry at that index is STILL the one that was proposed -- the rule
+   * this side used to own, and the one that decides whether a client is
+   * told its write happened (raft_node.h).
+   */
+  applied(index) { requireModule()._rnw_applied(this._p, index); }
+
+  /** Owe an answer for an index proposed at a term. propose() does this
+   * itself; this is for re-registering across a restart. */
+  await_(index, term) {
+    const rc = requireModule()._rnw_await(this._p, index, term);
+    if (rc !== 0) throw codeError(rc, 'await');
+  }
+
+  /** How many answers this node still owes. */
+  get awaiting() { return requireModule()._rnw_awaiting(this._p); }
 
   /**
    * Everything queued, as plain objects, and the queue is cleared. The

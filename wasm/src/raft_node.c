@@ -33,6 +33,11 @@
  */
 #define RN_MAX_EFF   (RN_MAX_PEERS * 3 + 16)
 
+/* Bytes per snapshot chunk -- the same figure src/raft.js defaults its
+ * snapshotChunkBytes to, so a transfer is cut the same way whichever
+ * host is serving it. */
+#define RN_DEFAULT_CHUNK (64u * 1024u)
+
 typedef struct {
     uint64_t id;
     int      voting;
@@ -41,6 +46,24 @@ typedef struct {
     int64_t  ack_at;     /* when it last answered without deposing us */
     int      reachable;  /* edge-triggered; -1 = never tried          */
     uint64_t inflight;   /* correlation id outstanding, 0 = none      */
+
+    /*
+     * A snapshot transfer in flight to this peer. `installing` is what
+     * tells rn_on_reply which kind of reply it is holding -- the
+     * correlation id alone cannot say, and reading an install's answer
+     * as an AppendEntries' would advance a match index on the strength
+     * of a chunk.
+     *
+     * The cursor is the chunk walk's (raft_drive.h), carried back from
+     * the last chunk rather than derived: offset + len cannot tell "sent
+     * the empty file" from "have not", which is an infinite loop on any
+     * snapshot whose last file is empty.
+     */
+    int      installing;
+    uint64_t install_term;   /* our term when it started; a change voids it */
+    uint32_t cursor_file;
+    uint64_t cursor_offset;
+    int      chunk_done;     /* the chunk outstanding was the last one      */
 } rn_peer;
 
 typedef struct {
@@ -59,6 +82,25 @@ typedef struct {
 struct raft_node {
     uint64_t self_id;
     elog    *log;
+
+    /*
+     * Serving snapshots (raft_node.h). Both borrowed; both NULL means
+     * the host serves them and this node only says who needs one.
+     *
+     * The manifest and the file sizes are cached per GENERATION rather
+     * than per peer: three followers bootstrapping at once are three
+     * cursors over one snapshot, and re-encoding the manifest for each
+     * chunk of each of them would be the only expensive thing in the
+     * transfer.
+     */
+    bj_ns   *ns;
+    sst     *store;
+    uint32_t chunk_bytes;
+    uint64_t snap_gen;         /* 0 = nothing cached                     */
+    uint64_t snap_index, snap_term;
+    dbuf     snap_manifest;    /* exactly what goes on the wire          */
+    uint64_t snap_sizes[RN_MAX_SNAP_FILES];
+    uint32_t snap_nfiles;
 
     int      role;
     uint64_t leader_id;
@@ -231,6 +273,7 @@ raft_node *rn_new(uint64_t self_id, elog *log) {
     n->max_election = 300;
     n->heartbeat_ms = 50;
     n->max_batch_bytes = 65536;
+    n->chunk_bytes = RN_DEFAULT_CHUNK;
     n->election_deadline = INT64_MAX;
     n->last_leader_contact = INT64_MIN;
     return n;
@@ -240,6 +283,7 @@ void rn_free(raft_node *n) {
     if (!n) return;
     for (uint32_t i = 0; i < RN_MAX_OUT; i++) dbuf_free(&n->out[i].bytes);
     dbuf_free(&n->adopted);
+    dbuf_free(&n->snap_manifest);
     free(n);
 }
 
@@ -535,13 +579,324 @@ static int start_election(raft_node *n, int pre_vote, double random01) {
     return e;
 }
 
+/* ---- serving a snapshot ------------------------------------------------- */
+
+void rn_set_ns(raft_node *n, bj_ns *ns)          { if (n) n->ns = ns; }
+void rn_set_snapstore(raft_node *n, sst *store)  { if (n) { n->store = store; n->snap_gen = 0; } }
+void rn_set_chunk_bytes(raft_node *n, uint32_t b) { if (n) n->chunk_bytes = b ? b : RN_DEFAULT_CHUNK; }
+
+int rn_serves_snapshots(const raft_node *n) {
+    return n && n->ns && n->store && sst_has_latest(n->store);
+}
+
+/* A number out of a record, or 0. */
+static uint64_t rec_num(const uint8_t *o, size_t len, const char *key) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(o, len, (const uint8_t *)key, (uint32_t)strlen(key), &v, &vlen, &found))
+        return 0;
+    if (!found) return 0;
+    cur c = { v, vlen, 0 };
+    double d;
+    if (read_number(&c, &d) != BJ_OK || d < 0) return 0;
+    return (uint64_t)d;
+}
+
+/* A field's whole encoded span, or NULL. */
+static const uint8_t *rec_raw(const uint8_t *o, size_t len, const char *key, uint32_t *n_out) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    *n_out = 0;
+    if (obj_get_field(o, len, (const uint8_t *)key, (uint32_t)strlen(key), &v, &vlen, &found))
+        return NULL;
+    if (!found) return NULL;
+    *n_out = (uint32_t)vlen;
+    return v;
+}
+
+/*
+ * Cache what a transfer of the store's latest generation needs: the
+ * manifest exactly as it goes on the wire, and the file sizes the chunk
+ * walk works over.
+ *
+ * The manifest is a PROJECTION of the store's own -- {config, files:
+ * [{role, size, crc}], members} -- and not the store's manifest itself,
+ * which also carries each file's NAME. The receiver names its own files;
+ * telling it ours would be telling it something it must not use.
+ *
+ * `members` comes from this node's adopted set, not from a caller. A
+ * bootstrapped follower's log holds no CONFIG history, so the install is
+ * the only thing that can tell it the cluster's shape, and the node is
+ * the one place that shape is written down.
+ */
+static int snap_refresh(raft_node *n) {
+    if (!n->store || !sst_has_latest(n->store)) return RAFT_ERR_CAPACITY;
+    uint64_t gen = sst_latest_gen(n->store);
+    if (n->snap_gen == gen && n->snap_manifest.len) return BJ_OK;
+
+    dbuf latest = {0};
+    int has = 0;
+    int e = sst_latest(n->store, &latest, &has);
+    if (e || !has) { dbuf_free(&latest); return e ? e : RAFT_ERR_CAPACITY; }
+
+    uint64_t index = rec_num(latest.data, latest.len, "lastIncludedIndex");
+    uint64_t term  = rec_num(latest.data, latest.len, "lastIncludedTerm");
+    uint32_t config_len = 0;
+    const uint8_t *config = rec_raw(latest.data, latest.len, "config", &config_len);
+    uint32_t files_len = 0;
+    const uint8_t *files = rec_raw(latest.data, latest.len, "files", &files_len);
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&latest); return BJ_ERR_OOM; }
+    uint32_t nfiles = 0;
+    e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"config", 6);
+    if (!e) e = config ? bj_put_raw(b, config, config_len) : bj_put_null(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"files", 5);
+    if (!e) e = bj_begin_array(b);
+    if (!e && files) {
+        cur c = { files, files_len, 0 };
+        uint32_t count = 0;
+        e = array_begin(&c, &count);
+        for (uint32_t i = 0; !e && i < count; i++) {
+            size_t start = c.pos;
+            e = skip_value(&c);
+            if (e) break;
+            const uint8_t *el = c.d + start;
+            size_t el_len = c.pos - start;
+            if (nfiles >= RN_MAX_SNAP_FILES) { e = RAFT_ERR_CAPACITY; break; }
+
+            uint32_t role_len = 0;
+            const uint8_t *role = rec_raw(el, el_len, "role", &role_len);
+            uint32_t size_len = 0, crc_len = 0;
+            const uint8_t *size = rec_raw(el, el_len, "size", &size_len);
+            const uint8_t *crc  = rec_raw(el, el_len, "crc",  &crc_len);
+            if (!role || !size) { e = RAFT_ERR_MESSAGE; break; }
+
+            n->snap_sizes[nfiles++] = rec_num(el, el_len, "size");
+
+            e = bj_begin_object(b);
+            if (!e) e = bj_put_key(b, (const uint8_t *)"role", 4);
+            if (!e) e = bj_put_raw(b, role, role_len);
+            if (!e) e = bj_put_key(b, (const uint8_t *)"size", 4);
+            if (!e) e = bj_put_raw(b, size, size_len);
+            if (!e && crc) {
+                e = bj_put_key(b, (const uint8_t *)"crc", 3);
+                if (!e) e = bj_put_raw(b, crc, crc_len);
+            }
+            if (!e) e = bj_end_object(b);
+        }
+    }
+    if (!e) e = bj_end_array(b);
+    if (!e) {
+        uint32_t mlen = 0;
+        const uint8_t *m = members_span(n, &mlen);
+        if (m) {
+            e = bj_put_key(b, (const uint8_t *)"members", 7);
+            if (!e) e = bj_put_raw(b, m, mlen);
+        }
+    }
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *d = bj_builder_data(b, &len);
+        if (!d) e = BJ_ERR_STATE;
+        else {
+            n->snap_manifest.len = 0;
+            e = dbuf_put(&n->snap_manifest, d, len);
+        }
+    }
+    bj_builder_free(b);
+    dbuf_free(&latest);
+    if (e) { n->snap_gen = 0; n->snap_manifest.len = 0; return e; }
+
+    n->snap_gen = gen;
+    n->snap_index = index;
+    n->snap_term = term;
+    n->snap_nfiles = nfiles;
+    return BJ_OK;
+}
+
+/* The role of file `i` in the cached manifest, as a span into it. */
+static const char *snap_role(const raft_node *n, uint32_t i, uint32_t *len) {
+    *len = 0;
+    uint32_t files_len = 0;
+    const uint8_t *files = rec_raw(n->snap_manifest.data, n->snap_manifest.len,
+                                   "files", &files_len);
+    if (!files) return NULL;
+    cur c = { files, files_len, 0 };
+    uint32_t count = 0;
+    if (array_begin(&c, &count) || i >= count) return NULL;
+    for (uint32_t k = 0; k <= i; k++) {
+        size_t start = c.pos;
+        if (skip_value(&c)) return NULL;
+        if (k != i) continue;
+        const uint8_t *el = c.d + start;
+        size_t el_len = c.pos - start;
+        uint32_t rlen = 0;
+        const uint8_t *r = rec_raw(el, el_len, "role", &rlen);
+        /* A STRING: tag, u32 length, bytes. */
+        if (!r || rlen < 5 || r[0] != BJ_TYPE_STRING) return NULL;
+        *len = rdu32(r + 1);
+        if ((size_t)*len + 5 != rlen) { *len = 0; return NULL; }
+        return (const char *)(r + 5);
+    }
+    return NULL;
+}
+
+/*
+ * Queue the next chunk to `p`, or finish the transfer.
+ *
+ * One chunk is one message with one correlation id, and the reply
+ * arrives through rn_on_reply like any other. That is the whole
+ * difference from the JavaScript version, which awaited each chunk
+ * inside a loop: a loop cannot survive a leader stepping down mid-
+ * transfer, so every iteration re-checked the role, the term and the
+ * running flag by hand.
+ */
+static int install_send(raft_node *n, rn_peer *p) {
+    if (n->role != RAFT_LEADER || !p->installing) return BJ_OK;
+
+    raft_chunk ch;
+    if (!raft_chunk_next(n->snap_sizes, n->snap_nfiles, n->chunk_bytes,
+                         p->cursor_file, p->cursor_offset, &ch)) {
+        /* The walk is exhausted without a `done` chunk having been
+         * acknowledged. Nothing to do but stop; the next heartbeat
+         * starts over. */
+        p->installing = 0;
+        return BJ_OK;
+    }
+
+    uint8_t *buf = NULL;
+    uint32_t role_len = 0;
+    const char *role = NULL;
+    int e = BJ_OK;
+
+    if (ch.len || n->snap_nfiles) role = snap_role(n, ch.file_index, &role_len);
+    if (ch.len) {
+        if (!role) return RAFT_ERR_MESSAGE;
+        dbuf name = {0};
+        e = sst_data_name(n->store, n->snap_gen, role, role_len, &name);
+        if (e) { dbuf_free(&name); return e; }
+        bj_io io;
+        e = n->ns->open(n->ns->ctx, (const char *)name.data, (uint32_t)name.len, 0, &io);
+        dbuf_free(&name);
+        if (e) return e;
+        buf = (uint8_t *)malloc(ch.len);
+        if (!buf) { if (io.close) io.close(io.ctx); return BJ_ERR_OOM; }
+        int64_t got = io.read(io.ctx, ch.offset, buf, ch.len);
+        if (io.close) io.close(io.ctx);
+        /* A short read means the file is not the size the manifest
+         * claims, which is a snapshot this leader cannot serve rather
+         * than a chunk to send anyway. */
+        if (got < 0 || (uint32_t)got != ch.len) { free(buf); return SST_ERR_CHECKSUM; }
+    }
+
+    dbuf msg = {0};
+    e = rmsg_build_install_snapshot(elog_current_term(n->log), n->self_id,
+                                    n->snap_index, n->snap_term,
+                                    role, role_len, ch.offset,
+                                    buf, ch.len, ch.is_done,
+                                    ch.is_first ? n->snap_manifest.data : NULL,
+                                    ch.is_first ? (uint32_t)n->snap_manifest.len : 0,
+                                    &msg);
+    free(buf);
+    if (!e) {
+        uint64_t corr = fresh_corr(n);
+        e = queue(n, p->id, corr, 0, msg.data, msg.len);
+        if (!e) {
+            p->inflight = corr;
+            p->chunk_done = ch.is_done;
+            p->cursor_file = ch.next_file;
+            p->cursor_offset = ch.next_offset;
+        }
+    }
+    dbuf_free(&msg);
+    return e;
+}
+
+/* Begin one, from the top. Restarting is always safe: the receiver
+ * supersedes whatever it had staged when a manifest arrives. */
+static int install_start(raft_node *n, rn_peer *p) {
+    int e = snap_refresh(n);
+    if (e) return e;
+    p->installing = 1;
+    p->install_term = elog_current_term(n->log);
+    p->cursor_file = 0;
+    p->cursor_offset = 0;
+    p->chunk_done = 0;
+    return install_send(n, p);
+}
+
+/*
+ * A chunk's answer. The term rules are the same ones every reply obeys;
+ * what is different is that success means "send the next one" rather
+ * than "advance the match index" -- until the chunk that carried `done`
+ * is acknowledged, at which point the peer stands at the boundary and
+ * ordinary replication resumes.
+ */
+static int on_install_reply(raft_node *n, rn_peer *p,
+                            const uint8_t *reply, uint32_t len, double random01) {
+    int was_done = p->chunk_done;
+    p->chunk_done = 0;
+
+    if (p->reachable != 1) { p->reachable = 1; emit(n, RN_EFFECT_REACHABLE, p->id, 0); }
+    p->ack_at = n->now;
+
+    uint64_t their_term = 0;
+    if (rmsg_term(reply, len, &their_term) == BJ_OK &&
+        their_term > elog_current_term(n->log)) {
+        p->installing = 0;
+        return rn_step_down(n, their_term, random01);
+    }
+    /* An election, or a step down and back up, happened under this
+     * transfer. Its chunks were addressed from a term we no longer hold,
+     * so the peer is entitled to have refused them; start over. */
+    if (n->role != RAFT_LEADER || p->install_term != elog_current_term(n->log)) {
+        p->installing = 0;
+        return BJ_OK;
+    }
+
+    const uint8_t *v; size_t vlen; int found = 0;
+    int ok = 0;
+    if (!obj_get_field(reply, len, (const uint8_t *)"success", 7, &v, &vlen, &found))
+        ok = found && vlen >= 1 && v[0] == BJ_TYPE_TRUE;
+
+    if (!ok) {
+        /* Refused, restart asked for, or a reply we cannot read: all the
+         * same answer, because the only remedy for any of them is to
+         * begin again from the manifest. The next heartbeat does. */
+        p->installing = 0;
+        return BJ_OK;
+    }
+    if (!was_done) return install_send(n, p);
+
+    p->installing = 0;
+    int e = rn_installed(n, p->id, n->snap_index);
+    if (!e) e = replicate_to(n, p);   /* whatever it is short of, now */
+    return e;
+}
+
 /* ---- replication -------------------------------------------------------- */
 
 static int replicate_to(raft_node *n, rn_peer *p) {
     if (n->role != RAFT_LEADER || p->inflight) return BJ_OK;
 
     uint64_t base = elog_base_index(n->log);
-    int action = raft_repl_decide(p->next, base, 0 /* the host serves snapshots */);
+    /* Whether a snapshot can be served is now a fact about this node
+     * rather than an assumption: with a namespace and a store it serves
+     * its own, and without them it still says who needs one and the host
+     * serves it (raft_node.h). */
+    int action = raft_repl_decide(p->next, base, rn_serves_snapshots(n));
+    if (action == RAFT_REPL_SNAPSHOT) {
+        int e = install_start(n, p);
+        if (!e) return BJ_OK;
+        /* Could not read our own snapshot. Say so the way we would have
+         * without a store at all, so a host that can serve one still
+         * can, rather than leaving the peer parked in silence. */
+        p->installing = 0;
+        emit(n, RN_EFFECT_NEEDS_SNAPSHOT, p->id, 0);
+        return BJ_OK;
+    }
     if (action != RAFT_REPL_APPEND) {
         emit(n, RN_EFFECT_NEEDS_SNAPSHOT, p->id, 0);
         return BJ_OK;
@@ -1061,6 +1416,11 @@ int rn_on_reply(raft_node *n, uint64_t corr, const uint8_t *reply, uint32_t len,
     rn_peer *p = peer_by_corr(n, corr);
     if (p) {
         p->inflight = 0;
+        /* Which kind of reply this is cannot be read off the correlation
+         * id -- the peer's own state is what says so. Reading an
+         * install's answer as an AppendEntries' would advance a match
+         * index on the strength of a chunk. */
+        if (p->installing) return on_install_reply(n, p, reply, len, random01);
         return on_append_reply(n, p, reply, len, random01);
     }
     /* Not an append: the only other thing we send is a vote request, and
@@ -1073,6 +1433,10 @@ int rn_on_fail(raft_node *n, uint64_t corr) {
     rn_peer *p = peer_by_corr(n, corr);
     if (!p) return BJ_OK;   /* a vote request nobody answered; the timer retries */
     p->inflight = 0;
+    /* A transfer whose chunk never arrived is a transfer to abandon: the
+     * next heartbeat decides again, from the manifest. */
+    p->installing = 0;
+    p->chunk_done = 0;
     if (p->reachable != 0) { p->reachable = 0; emit(n, RN_EFFECT_REACHABLE, p->id, 0); }
     return BJ_OK;
 }

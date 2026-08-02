@@ -8467,6 +8467,277 @@ TEST(a_single_voter_group_commits_the_moment_it_elects_itself) {
     memfs_free(fs);
 }
 
+TEST(a_leader_streams_its_own_snapshot_with_no_host_to_read_the_files) {
+    /*
+     * docs/steps/install-snapshot-in-c.md, the send side.
+     *
+     * A peer whose next index the log no longer holds cannot be caught
+     * up by AppendEntries at any rewind. WHICH peer and WHEN were
+     * already decided in C; SENDING was not, for one reason -- it means
+     * reading files -- so the node raised RN_EFFECT_NEEDS_SNAPSHOT and
+     * src/raft.js's _sendSnapshot did the transfer, awaiting each chunk
+     * inside a loop that had to re-check the role, the term and the
+     * running flag by hand on every iteration.
+     *
+     * Here the node has a namespace and a store, and does it itself:
+     * chunks queue through the outbox and their replies arrive through
+     * rn_on_reply, tied together by a correlation id rather than by a
+     * loop that has to survive an election.
+     *
+     * Everything below runs over a REAL directory through
+     * bjns_posix_open, with no JavaScript in the process -- which is the
+     * whole claim.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-install", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+
+    /* ---- a snapshot on disk: one file with bytes in it, and one that
+     * is EMPTY. The empty one is not a detail -- it gets a chunk of its
+     * own so the receiver creates it, and "absent" and "empty" are
+     * different things to the manifest check on the other side. */
+    static const uint32_t PRIMARY = 300;
+    uint8_t *content = (uint8_t *)malloc(PRIMARY);
+    CHECK_FATAL(content != NULL);
+    for (uint32_t i = 0; i < PRIMARY; i++) content[i] = (uint8_t)(i * 7 + 1);
+
+    sst *store = sst_new("snap", 4);
+    CHECK_FATAL(store != NULL);
+    {
+        dbuf name = {0};
+        CHECK_OK(sst_data_name(store, 1, "primary", 7, &name));
+        bj_io io;
+        CHECK_OK(ns.open(ns.ctx, (const char *)name.data, (uint32_t)name.len,
+                         BJ_NS_CREATE | BJ_NS_TRUNC, &io));
+        CHECK_OK(io.write(io.ctx, 0, content, PRIMARY));
+        if (io.close) io.close(io.ctx);
+        dbuf_free(&name);
+
+        name.len = 0;
+        CHECK_OK(sst_data_name(store, 1, "journal", 7, &name));
+        CHECK_OK(ns.open(ns.ctx, (const char *)name.data, (uint32_t)name.len,
+                         BJ_NS_CREATE | BJ_NS_TRUNC, &io));
+        if (io.close) io.close(io.ctx);   /* left at zero bytes, on purpose */
+        dbuf_free(&name);
+    }
+
+    /* The manifest, written last, which is what makes the generation
+     * real (snapstore.h's commit protocol). */
+    dbuf manifest = {0};
+    {
+        bj_builder *fb = bj_builder_new();
+        bj_begin_array(fb);
+        files_entry(fb, "primary", "snap-1-primary.bj", PRIMARY, 0x1111);
+        files_entry(fb, "journal", "snap-1-journal.bj", 0, 0x2222);
+        bj_end_array(fb);
+        size_t flen; const uint8_t *fbuf = bj_builder_data(fb, &flen);
+        CHECK_OK(sst_manifest_encode(40, 6, NULL, 0, fbuf, (uint32_t)flen, &manifest));
+        dbuf mname = {0};
+        CHECK_OK(sst_manifest_name(store, 1, &mname));
+        bj_io io;
+        CHECK_OK(ns.open(ns.ctx, (const char *)mname.data, (uint32_t)mname.len,
+                         BJ_NS_CREATE | BJ_NS_TRUNC, &io));
+        CHECK_OK(io.write(io.ctx, 0, manifest.data, (uint32_t)manifest.len));
+        if (io.close) io.close(io.ctx);
+        dbuf_free(&mname);
+        bj_builder_free(fb);
+    }
+
+    /* Adopt it, the way a host opening a database does: scan the
+     * listing, try the newest manifest, confirm the files are the sizes
+     * it claims. */
+    {
+        dirlist l;
+        memset(&l, 0, sizeof(l));
+        dirlist_add(&l, "snap-1.manifest.bj", (double)manifest.len);
+        dirlist_add(&l, "snap-1-primary.bj", (double)PRIMARY);
+        dirlist_add(&l, "snap-1-journal.bj", 0);
+        CHECK_OK(sst_scan(store, l.names.data, (uint32_t)l.names.len));
+        manifest_src srcs[] = { { "snap-1.manifest.bj", &manifest } };
+        CHECK_I64(run_open(store, &l, srcs, 1), 0);
+        CHECK_I64(sst_has_latest(store), 1);
+        dirlist_free(&l);
+    }
+
+    /* ---- a leader whose log begins ABOVE what the peer needs, which is
+     * the only situation an install exists for. */
+    bj_io lio;
+    CHECK_OK(ns.open(ns.ctx, "raft.bj", 7, BJ_NS_CREATE | BJ_NS_TRUNC, &lio));
+    elog *log = elog_create_at(&lio, 40, 6);
+    CHECK_FATAL(log != NULL);
+
+    raft_node *n = rn_new(1, log);
+    CHECK_FATAL(n != NULL);
+    /* Two members, and the second is a LEARNER -- which is not a
+     * convenience for the test but the case an install exists for: a new
+     * member joins carrying nothing, so it cannot be caught up from a
+     * log that begins above index 40. It also means this node reaches a
+     * quorum of one and can elect itself with nobody answering. */
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    bj_begin_object(members);
+    bj_put_key(members, (const uint8_t *)"id", 2); bj_put_int(members, 1);
+    bj_end_object(members);
+    bj_begin_object(members);
+    bj_put_key(members, (const uint8_t *)"id", 2); bj_put_int(members, 2);
+    bj_put_key(members, (const uint8_t *)"voting", 6); bj_put_bool(members, 0);
+    bj_end_object(members);
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+    CHECK_OK(rn_set_members(n, mbuf, (uint32_t)mlen));
+    CHECK_I64(rn_quorum(n), 1);
+
+    /* Without a namespace it still only SAYS who needs one -- the
+     * behaviour every existing host depends on, asserted before the
+     * namespace is attached so it cannot rot. */
+    CHECK_I64(rn_serves_snapshots(n), 0);
+
+    rn_set_ns(n, &ns);
+    rn_set_snapstore(n, store);
+    rn_set_chunk_bytes(n, 128);      /* 300 bytes => three chunks, then the empty file */
+    CHECK_I64(rn_serves_snapshots(n), 1);
+
+    rn_start(n, 0, 0.0);
+    for (int64_t t = 0; t <= 2000 && rn_role(n) != RAFT_LEADER; t += 10)
+        rn_tick(n, t, 0.0);
+    CHECK_FATAL(rn_role(n) == RAFT_LEADER);
+
+    /*
+     * ---- the follower's half, by hand: take each chunk, write it where
+     * it says, answer. This is what stage three moves into C; here it is
+     * a stand-in whose only job is to prove the LEADER's side.
+     */
+    /* The learner's log is EMPTY, so the leader's first AppendEntries
+     * fails its consistency check and the leader backs off -- straight
+     * past the base of a log that begins at 40, which is the moment an
+     * install becomes the only way to catch this peer up. Answering that
+     * first heartbeat the way a real empty follower would is what puts
+     * the node in that state; nothing here reaches into it. */
+    {
+        int backed_off = 0;
+        for (int pass = 0; pass < 20 && !backed_off; pass++) {
+            uint32_t count = rn_out_count(n);
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t len = 0;
+                const uint8_t *bytes = rn_out_bytes(n, i, &len);
+                uint64_t corr = rn_out_corr(n, i);
+                int kind = -1;
+                CHECK_OK(rmsg_kind(bytes, len, &kind));
+                if (kind != RAFT_MSG_APPEND_ENTRIES) continue;
+                doc *r = doc_new();
+                doc_int(r, "term", (int64_t)elog_current_term(log));
+                doc_key(r, "success"); bj_put_bool(r->b, 0);
+                doc_int(r, "hintIndex", 0);      /* "I have nothing at all" */
+                uint32_t rlen; const uint8_t *rbuf = doc_done(r, &rlen);
+                rn_out_clear(n);
+                CHECK_OK(rn_on_reply(n, corr, rbuf, rlen, 0.0));
+                doc_free(r);
+                backed_off = 1;
+                break;
+            }
+            if (!backed_off) { rn_out_clear(n); rn_tick(n, 50 + pass * 60, 0.0); }
+        }
+        CHECK_I64(backed_off, 1);
+    }
+
+    uint8_t received[512];
+    memset(received, 0, sizeof received);
+    uint64_t high_water = 0;
+    int chunks = 0, saw_manifest = 0, saw_journal = 0, saw_done = 0;
+    uint64_t seen_index = 0, seen_term = 0;
+
+    for (int pass = 0; pass < 40; pass++) {
+        uint32_t count = rn_out_count(n);
+        if (!count) { rn_tick(n, 100 + pass * 10, 0.0); continue; }
+
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t len = 0;
+            const uint8_t *bytes = rn_out_bytes(n, i, &len);
+            uint64_t corr = rn_out_corr(n, i);
+            int kind = -1;
+            CHECK_OK(rmsg_kind(bytes, len, &kind));
+            if (kind != RAFT_MSG_INSTALL_SNAPSHOT) continue;   /* heartbeats */
+
+            raft_install in;
+            CHECK_OK(rmsg_install_read(bytes, len, &in));
+            chunks++;
+            seen_index = in.last_included_index;
+            seen_term = in.last_included_term;
+
+            /* The manifest rides the FIRST chunk and no other. */
+            if (chunks == 1) {
+                CHECK(in.manifest != NULL);
+                saw_manifest = 1;
+                /* And it carries the cluster's shape, which a
+                 * bootstrapped follower cannot get anywhere else -- its
+                 * log holds no CONFIG history. */
+                const uint8_t *v; size_t vlen; int f = 0;
+                CHECK_OK(obj_get_field(in.manifest, in.manifest_len,
+                                       (const uint8_t *)"members", 7, &v, &vlen, &f));
+                CHECK_I64(f, 1);
+                /* The store's own manifest names each file; the wire's
+                 * must not -- the receiver names its own. */
+                f = 0;
+                CHECK_OK(obj_get_field(in.manifest, in.manifest_len,
+                                       (const uint8_t *)"files", 5, &v, &vlen, &f));
+                CHECK_I64(f, 1);
+                CHECK(find_bytes(v, vlen, "snap-1-primary.bj", 17) == NULL);
+            } else {
+                CHECK(in.manifest == NULL);
+            }
+
+            if (in.role && in.role_len == 7 && memcmp(in.role, "primary", 7) == 0) {
+                CHECK(in.offset + in.data_len <= sizeof received);
+                memcpy(received + in.offset, in.data, in.data_len);
+                if (in.offset + in.data_len > high_water) high_water = in.offset + in.data_len;
+            } else if (in.role && in.role_len == 7 && memcmp(in.role, "journal", 7) == 0) {
+                saw_journal = 1;
+                CHECK_I64((int64_t)in.data_len, 0);   /* empty, and still sent */
+            }
+            if (in.done) saw_done = 1;
+
+            dbuf reply = {0};
+            CHECK_OK(rmsg_build_install_reply(elog_current_term(log), 1, 0, &reply));
+            rn_out_clear(n);
+            CHECK_OK(rn_on_reply(n, corr, reply.data, (uint32_t)reply.len, 0.0));
+            dbuf_free(&reply);
+            goto next_pass;   /* one message per pass: the outbox moved */
+        }
+        rn_out_clear(n);
+next_pass:
+        if (saw_done) break;
+    }
+
+    /* Every byte of the real file arrived, at the offsets it was sent
+     * with -- and the empty file arrived too. */
+    CHECK_I64(saw_manifest, 1);
+    CHECK_I64(saw_journal, 1);
+    CHECK_I64(saw_done, 1);
+    CHECK_I64((int64_t)high_water, (int64_t)PRIMARY);
+    CHECK(memcmp(received, content, PRIMARY) == 0);
+    CHECK(chunks >= 4);                       /* 300/128 = 3, plus the empty file */
+    CHECK_I64((int64_t)seen_index, 40);       /* the boundary the manifest declares */
+    CHECK_I64((int64_t)seen_term, 6);
+
+    /* And the peer now stands at the boundary: what an install is FOR.
+     * raft_repl_installed decides that, not this file. */
+    CHECK_I64((int64_t)rn_match(n, 2), 40);
+    CHECK_I64((int64_t)rn_next(n, 2), 41);
+
+    free(content);
+    bj_builder_free(members);
+    rn_free(n);
+    elog_free(log);
+    if (lio.close) lio.close(lio.ctx);
+    dbuf_free(&manifest);
+    sst_free(store);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
 TEST(a_reply_goes_to_whoever_the_message_says_sent_it) {
     /*
      * The host used to be asked who a message came from, and the JS one
@@ -9146,6 +9417,7 @@ int main(void) {
     RUN(a_member_set_is_adopted_whole_or_refused_whole);
     RUN(effects_coalesce_rather_than_pile_up_and_a_loss_is_never_silent);
     RUN(join_leave_and_timeout_now_are_answered_without_a_host);
+    RUN(a_leader_streams_its_own_snapshot_with_no_host_to_read_the_files);
     RUN(a_reply_goes_to_whoever_the_message_says_sent_it);
     RUN(snapshot_names_round_trip_through_the_scanner);
     RUN(snapshot_adopts_the_newest_generation_that_committed);

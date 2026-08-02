@@ -68,6 +68,8 @@
 #include "binjson.h"
 #include "dbuf.h"
 #include "entrylog.h"
+#include "bjns.h"
+#include "snapstore.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -114,6 +116,47 @@ void       rn_free(raft_node *n);
  * before it closed it.
  */
 void rn_set_log(raft_node *n, elog *log);
+
+/* ---- serving a snapshot -------------------------------------------------
+ *
+ * A peer whose next index the log no longer holds cannot be caught up by
+ * AppendEntries at any rewind, so it has to be sent a snapshot instead.
+ * WHICH peer and WHEN were already decided here (raft_drive.h's
+ * raft_repl_decide). What was not here is the sending, for one reason:
+ * sending means reading FILES.
+ *
+ * Give the node a namespace and a snapshot store and it streams them
+ * itself. Chunks queue through the outbox like every other message and
+ * their replies arrive through rn_on_reply like every other reply -- the
+ * correlation id ties one to the other, so nothing is suspended
+ * mid-transfer and no closure has to survive an election.
+ *
+ * Without them NOTHING CHANGES: the node emits RN_EFFECT_NEEDS_SNAPSHOT
+ * and the host serves the transfer itself, exactly as src/raft.js does.
+ * That is what lets a C node grow this without a working host noticing.
+ *
+ * Both are BORROWED, like the log. The STORE is the host's to build
+ * because scanning one needs a directory listing, and bj_ns deliberately
+ * cannot produce one -- OPFS enumeration is asynchronous, so listings
+ * are passed in (bjns.h says why). The node reads the store; it does not
+ * scan it.
+ */
+void rn_set_ns(raft_node *n, bj_ns *ns);
+void rn_set_snapstore(raft_node *n, sst *store);
+
+/* Bytes per chunk. 0 restores the default. */
+void rn_set_chunk_bytes(raft_node *n, uint32_t bytes);
+
+/* Whether this node can serve an install itself -- what a host asks to
+ * know whether it still has to. */
+int rn_serves_snapshots(const raft_node *n);
+
+/* The most files one snapshot may have. A generation past this is
+ * refused with RAFT_ERR_CAPACITY when a transfer would start, rather
+ * than being streamed half-way: the bound exists so the chunk walk can
+ * work over a fixed array, and a server that quietly sent part of a
+ * snapshot would be worse than one that says it cannot. */
+#define RN_MAX_SNAP_FILES 256
 
 /*
  * Adopt a member set: a binjson ARRAY of records ({ id, voting? }), the

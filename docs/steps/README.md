@@ -13,13 +13,15 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [native-composition.md](native-composition.md) | Seating several Raft groups over sockets in one process, and deciding what is policy. |
-| 2 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
-| 3 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
-| 4 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
+| 1 | [databases-in-the-server.md](databases-in-the-server.md) | One executable, one root folder, many databases beneath it — the shape `Client.db(name)` already writes and the server cannot yet serve. |
+| 2 | [joining-a-native-cluster.md](joining-a-native-cluster.md) | Growing a cluster without restarting its members. The node already answers a join; nothing in C has ever asked. |
+| 3 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
+| 4 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
+| 5 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
 
-1 puts several clusters in one process; 2 is how a client reaches one;
-3 is a feature; 4 is the coverage all of it rests on.
+1 and 2 are independent of each other and both sit on the server that
+exists; 3 is how a client reaches it; 4 is a feature; 5 is the coverage
+all of it rests on.
 
 **They are load-bearing rather than speculative.** They were written
 assuming the C server would one day be the cluster member; that is
@@ -27,7 +29,27 @@ decided ([`../deployment-shapes.md`](../deployment-shapes.md),
 Decision A). One program covers "a persistent server" and "a replicated
 server".
 
-**Three briefs retired recently, which is why they are not listed.**
+**Four briefs retired recently, which is why they are not listed.**
+
+**`native-composition.md` is gone, and not because it was built.** It
+asked for a SEAT: N independent Raft groups in one process, each with its
+own log, member set and leader, multiplexed over one transport with a
+`{group, msg}` envelope, with idle groups quiesced. That came from
+roadmap step 4 — one Raft group per tenant database, where mostly-idle
+tenants make quiescence the design rather than an optimization — and
+**tenancy is a layer above this repository**. With tenants excluded, an
+always-on instance quiesces nothing and places nothing, and almost
+nothing of the brief survived the constraint.
+
+What it was mistaken for is now brief 1: `instance -> databases ->
+collections`, one executable over one root folder. That is a different
+thing — one cluster serving several named databases, rather than several
+clusters sharing a process — and it is much cheaper, because under one
+log for the instance Raft does not change at all. Brief 1's first
+deliverable is deciding whether that is the right shape or whether a log
+per database is; the argument is written out there. The rest of the
+retired brief's inventory (the seed loop, the deferred reply) is brief 2,
+where it belongs.
 
 **The server is a cluster member**, which is why its brief is gone.
 `nisaba-server --raft ID --raft-port N --peer ID@HOST:PORT` is a Raft
@@ -36,9 +58,12 @@ processes elect a leader, replicate every write through the log before
 applying it, survive the leader being killed, and catch a restarted
 member up — with no JavaScript in any of them
 ([`docs/db-server.md`](../db-server.md)). The peer wire is
-byte-identical to `src/raft-transport-tcp.js`, so a native member and a
-Node member can sit in one cluster. Without the flag nothing changes,
-file layout included.
+`src/raft-transport-tcp.js`'s — a 4-byte length, then
+`{ t, id, env }` — with one known discrepancy still to fix: JavaScript
+puts the raft message in `env` as a BINARY blob (it hands the transport
+encoded bytes) and C splices it as a nested object, so C-to-C is
+self-consistent and C-to-Node is not yet. Without the flag nothing
+changes, file layout included.
 
 Two things the brief listed are deliberately NOT built, and both are
 waiting on the same thing rather than on a decision:
@@ -53,10 +78,13 @@ waiting on the same thing rather than on a decision:
   otherwise the WAL", written down only in `src/db-wal.js`) belongs with
   the compaction that needs it.
 - **Joining.** The member set is what each process was started with, so
-  growing a cluster means restarting its members. `rn_change_membership`
-  and the join message both exist; what is missing is that a joiner has
-  to be CAUGHT UP, and catching one up from an empty log is the snapshot
-  half above.
+  growing a cluster means restarting its members. This is now brief 2,
+  and the reason given here when the brief was retired was wrong: a
+  joiner does NOT need the snapshot half. Nothing compacts the log, so
+  the leader's base stays at zero and an empty joiner is caught up by
+  plain `AppendEntries` from index 1 — O(the whole history), and
+  correct. What makes snapshots mandatory is the log growing without
+  bound, which is the first item, not this one.
 
 **Completions in C is done.** A proposal's fate — applied, and still
 yours — is `rn_await` / `rn_applied` / `RN_EFFECT_SETTLED`, decided in
@@ -88,8 +116,8 @@ one process per database directory, binjson over sockets, as a
 `wasm32-wasip2` command, documented in
 [`docs/db-server.md`](../db-server.md). It delivered
 `wasm/include/db_session.h` — resolving a collection by name in C — which
-is the piece 1 and 2 were both blocked on, and it is what 3 sits on top
-of. It has since grown a bounded `poll()` multiplexer with idle
+is what made the server a replica at all, and what every brief above
+sits on. It has since grown a bounded `poll()` multiplexer with idle
 reclamation, paged cursors, creation and schema, compaction and sweeps,
 lists of writes, aggregation, and change streams — thirty-one
 operations, which is everything the in-process `Collection` and `Db`
@@ -143,9 +171,9 @@ So solving multi-tab differently buys the removal of one JS file and one
 discipline; it does not buy back plan/execute. Making the browser a
 client *only* would have: every remaining host would be POSIX-shaped,
 `bj_ns.open` would be `openat`, and C could own the file lifecycle end
-to end — which is precisely what brief 1 wants and cannot have. That
-trade was refused above, so brief 1 must work within plan/execute rather
-than waiting for it to go away.
+to end — which is precisely what the C-pushdown effort wants and cannot
+have. That trade was refused above, so every brief here works within
+plan/execute rather than waiting for it to go away.
 
 ## Standing debts
 

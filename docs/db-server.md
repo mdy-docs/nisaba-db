@@ -87,10 +87,20 @@ tomorrow rather than re-created.
 — there is no poll loop there to serve peers with, and `wasm32-wasip1`
 has no `socket()` at all.
 
-The peer wire is length-prefixed binjson, byte-identical to
-`src/raft-transport-tcp.js`, so a native member and a Node member can sit
-in one cluster. The client port and the peer port are separate listeners
-and separate grammars.
+The peer wire is `src/raft-transport-tcp.js`'s: a 4-byte little-endian
+length, then a binjson `{ t: "req"|"res", id, env|value|error }`, with
+`id` the sender's correlation id echoed back. The client port and the
+peer port are separate listeners and separate grammars.
+
+**One known discrepancy, not yet fixed.** JavaScript hands its transport
+already-encoded bytes, so `env` arrives on the wire as a binjson BINARY
+blob; C splices the message as a nested OBJECT instead. C-to-C is
+self-consistent and works, and C-to-Node does not — a Node member would
+hand `handleMessage` an object where it expects bytes. So "a native
+member and a Node member in one cluster" is the intent and not yet the
+fact. The fix is `bj_put_binary` on the way out and unwrapping the BINARY
+on the way in, plus a test that actually joins a Node node to C nodes,
+which is the only thing that would have caught it.
 
 ## Clients
 

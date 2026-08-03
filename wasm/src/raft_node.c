@@ -40,6 +40,16 @@
  * which is the failure nobody can attribute. Full is RAFT_ERR_CAPACITY
  * at rn_propose, where a caller is still standing and can back off.
  */
+/*
+ * Read barriers outstanding at once. One per client connection is the
+ * bound the server imposes -- a connection is served one request at a
+ * time and is not read from while it owes an answer -- so this matches
+ * MAX_CLIENTS and DBS_MAX_INFLIGHT, and a further one is refused rather
+ * than queued. They all share one heartbeat round, so the number costs
+ * bookkeeping and not messages.
+ */
+#define RN_MAX_READS 64
+
 #define RN_MAX_AWAIT 256
 
 /* ... and the queue has to hold the settlements they turn into. One
@@ -62,6 +72,20 @@ typedef struct {
     int64_t  ack_at;     /* when it last answered without deposing us */
     int      reachable;  /* edge-triggered; -1 = never tried          */
     uint64_t inflight;   /* correlation id outstanding, 0 = none      */
+    /*
+     * When the request now outstanding was SENT, and how far back an
+     * answer to it proves this peer still follows us.
+     *
+     * A read barrier turns on this distinction and nothing else does.
+     * An ack proves the peer had not moved to a higher term at the
+     * moment it PROCESSED the request -- which is at or after the send,
+     * and says nothing about any earlier instant. So a barrier taken at
+     * T is covered by an ack only if the request it answers went out at
+     * or after T; `ack_at` (when the answer arrived) is the wrong stamp
+     * and would confirm a barrier with evidence predating it.
+     */
+    int64_t  sent_at;
+    int64_t  ack_covers;
 
     /*
      * A snapshot transfer in flight to this peer. `installing` is what
@@ -229,6 +253,21 @@ struct raft_node {
     uint32_t npending;
 
     /*
+     * Read barriers. `started` is the instant the barrier was taken, and
+     * confirming it means a quorum of voters has since been shown to
+     * still follow us (rn_peer's ack_covers). `state` is 0 waiting,
+     * 1 confirmed, -1 lost -- and an entry stays until the host releases
+     * it, because the host is what turns a state into an answer.
+     */
+    struct {
+        int      used;
+        int      state;
+        uint64_t token;
+        int64_t  started;
+    } reads[RN_MAX_READS];
+    uint64_t read_seq;
+
+    /*
      * Proposals this node owes an answer for. The TERM is what makes it
      * a table rather than a counter: an index alone cannot tell a
      * committed entry from one a new leader wrote over.
@@ -249,6 +288,7 @@ _Static_assert(RN_MAX_EFF >= RN_MAX_PEERS * 3 + 8 + RN_MAX_AWAIT,
 
 /* Answers everyone waiting on a membership change; see its definition. */
 static void flush_pending(raft_node *n, int ok);
+static void lose_reads(raft_node *n);
 static void settle_all_lost(raft_node *n);
 
 static rn_peer *peer_of(raft_node *n, uint64_t id) {
@@ -398,6 +438,7 @@ void rn_stop(raft_node *n) {
      * is owed now or never (raft_node.h's "every registered wait
      * terminates"). The host drains after this call like any other. */
     settle_all_lost(n);
+    lose_reads(n);
 }
 
 /* ---- membership --------------------------------------------------------- */
@@ -568,10 +609,86 @@ static void become_follower(raft_node *n, uint64_t term, uint64_t leader_id,
     n->config_in_flight = 0;
     flush_pending(n, 0);
     settle_all_lost(n);
+    /* A read this node was proving is a read it can no longer prove. */
+    lose_reads(n);
 }
 
 static int replicate_to(raft_node *n, rn_peer *p);
 static void advance_commit(raft_node *n);
+
+/* ---- read barriers (section 6.4) ---------------------------------------- */
+
+/*
+ * Has a quorum of voters been shown to still follow us since `since`?
+ *
+ * Self counts when self is a voter -- we follow ourselves by
+ * construction -- which is exactly what lets a single-voter group
+ * confirm a barrier without sending anything.
+ *
+ * `ack_covers` and not `ack_at`: the question is not when an answer
+ * ARRIVED but how far back it vouches for, which is when the request it
+ * answers went out.
+ */
+static int quorum_covers(const raft_node *n, int64_t since) {
+    uint32_t live = n->self_voting ? 1u : 0u;
+    for (uint32_t i = 0; i < n->npeers; i++) {
+        if (!n->peers[i].voting) continue;
+        if (n->peers[i].ack_covers >= since) live++;
+    }
+    return live >= rn_quorum(n);
+}
+
+/*
+ * Confirm what can be confirmed, and ask again wherever that is what is
+ * missing.
+ *
+ * The nudge is not an optimization at the margin: without it a barrier
+ * waits for the heartbeat timer, which puts up to a heartbeat interval
+ * on EVERY read. A peer with a request already in flight is skipped by
+ * replicate_to, and its answer will cover a send that predates the
+ * barrier -- so it takes the reply, and then this, to close it.
+ */
+static int check_reads(raft_node *n) {
+    int waiting = 0;
+    int64_t oldest = 0;
+    for (uint32_t i = 0; i < RN_MAX_READS; i++) {
+        if (!n->reads[i].used || n->reads[i].state) continue;
+        if (quorum_covers(n, n->reads[i].started)) { n->reads[i].state = 1; continue; }
+        if (!waiting || n->reads[i].started < oldest) oldest = n->reads[i].started;
+        waiting = 1;
+    }
+    if (!waiting || n->role != RAFT_LEADER) return BJ_OK;
+
+    int first = BJ_OK;
+    for (uint32_t i = 0; i < n->npeers; i++) {
+        rn_peer *p = &n->peers[i];
+        if (!p->voting || p->inflight || p->ack_covers >= oldest) continue;
+        int e = replicate_to(n, p);
+        if (e && !first) first = e;
+    }
+    return first;
+}
+
+/* Nobody is left holding a read. Step-down and stop settle every
+ * barrier the same way every other registered wait here is settled. */
+static void lose_reads(raft_node *n) {
+    for (uint32_t i = 0; i < RN_MAX_READS; i++)
+        if (n->reads[i].used && !n->reads[i].state) n->reads[i].state = -1;
+}
+
+/*
+ * A barrier a quorum never answered. Raft does not depose a leader that
+ * has lost contact -- it just stops being able to commit -- so without
+ * this a partitioned leader holds a read forever. An election timeout is
+ * the bound because by then a reachable majority has had time to elect
+ * somebody else.
+ */
+static void expire_reads(raft_node *n) {
+    for (uint32_t i = 0; i < RN_MAX_READS; i++) {
+        if (!n->reads[i].used || n->reads[i].state) continue;
+        if (n->now - n->reads[i].started >= n->max_election) n->reads[i].state = -1;
+    }
+}
 
 /* Replicate to everyone, keeping the FIRST failure. A message that could
  * not be queued is a message the host will never send, so the caller
@@ -597,6 +714,8 @@ static int become_leader(raft_node *n) {
         n->peers[i].match = 0;
         /* Acks from a previous term say nothing about this one. */
         n->peers[i].ack_at = INT64_MIN;
+        n->peers[i].sent_at = INT64_MIN;
+        n->peers[i].ack_covers = INT64_MIN;
         n->peers[i].inflight = 0;
     }
     set_role(n, RAFT_LEADER);
@@ -896,6 +1015,7 @@ static int install_send(raft_node *n, rn_peer *p) {
         e = queue(n, p->id, corr, 0, msg.data, msg.len);
         if (!e) {
             p->inflight = corr;
+            p->sent_at = n->now;
             p->chunk_done = ch.is_done;
             p->cursor_file = ch.next_file;
             p->cursor_offset = ch.next_offset;
@@ -1652,7 +1772,7 @@ static int replicate_to(raft_node *n, rn_peer *p) {
     if (!e) {
         uint64_t corr = fresh_corr(n);
         e = queue(n, p->id, corr, 0, msg.data, msg.len);
-        if (!e) p->inflight = corr;
+        if (!e) { p->inflight = corr; p->sent_at = n->now; }
     }
     dbuf_free(&msg);
     return e;
@@ -1707,11 +1827,17 @@ int rn_tick(raft_node *n, int64_t now, double random01) {
     if (n->quiesced) return BJ_OK;
 
     if (n->role == RAFT_LEADER) {
+        /* Reads first: a barrier nobody answered has to end, and one a
+         * heartbeat is about to confirm should not wait a further tick
+         * to be noticed. */
+        expire_reads(n);
+        int r = check_reads(n);
         if (now >= n->heartbeat_due) {
             n->heartbeat_due = now + n->heartbeat_ms;
-            return replicate_to_all(n);
+            int e = replicate_to_all(n);
+            return e ? e : r;
         }
-        return BJ_OK;
+        return r;
     }
 
     if (now >= n->election_deadline) {
@@ -2130,12 +2256,22 @@ int rn_on_reply(raft_node *n, uint64_t corr, const uint8_t *reply, uint32_t len,
     rn_peer *p = peer_by_corr(n, corr);
     if (p) {
         p->inflight = 0;
+        /* Whatever this answer turns out to say, it answers a request
+         * sent at `sent_at` -- which is how far back it can vouch for
+         * this peer still following us. Recorded before the handlers,
+         * which may step us down and clear everything. */
+        p->ack_covers = p->sent_at;
         /* Which kind of reply this is cannot be read off the correlation
          * id -- the peer's own state is what says so. Reading an
          * install's answer as an AppendEntries' would advance a match
          * index on the strength of a chunk. */
-        if (p->installing) return on_install_reply(n, p, reply, len, random01);
-        return on_append_reply(n, p, reply, len, random01);
+        int e = p->installing ? on_install_reply(n, p, reply, len, random01)
+                              : on_append_reply(n, p, reply, len, random01);
+        /* This answer may be the one a read was waiting for. Checked
+         * here rather than inside the handlers so there is one place
+         * where "a peer spoke" becomes "a barrier is confirmed". */
+        int c = check_reads(n);
+        return e ? e : c;
     }
     /* Not an append: the only other thing we send is a vote request, and
      * those are not tracked per peer because the round tallies them --
@@ -2363,6 +2499,61 @@ int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
     e = replicate_to_all(n);
     advance_commit(n);   /* single-voter groups: see become_leader */
     return e;
+}
+
+int rn_read_barrier(raft_node *n, uint64_t *token, uint64_t *read_index) {
+    if (!n || !token || !read_index) return BJ_ERR_STATE;
+    *token = 0;
+    *read_index = 0;
+    /* A node that does not lead cannot say what is committed, so there
+     * is nothing to take a barrier against. The host refuses with a
+     * routing error the caller can act on. */
+    if (!n->running || n->role != RAFT_LEADER) return BJ_ERR_STATE;
+
+    int slot = -1;
+    for (uint32_t i = 0; i < RN_MAX_READS; i++)
+        if (!n->reads[i].used) { slot = (int)i; break; }
+    if (slot < 0) return RAFT_ERR_CAPACITY;
+
+    n->reads[slot].used = 1;
+    n->reads[slot].state = 0;
+    n->reads[slot].token = ++n->read_seq;
+    n->reads[slot].started = n->now;
+    *token = n->reads[slot].token;
+    /*
+     * The commit index AS OF NOW. Everything committed before this
+     * barrier is at or below it, which is what the confirmation will
+     * prove -- so a caller serving state at or above this index has
+     * served every write that finished before it asked.
+     */
+    *read_index = n->commit_index;
+    return check_reads(n);
+}
+
+int rn_read_state(const raft_node *n, uint64_t token) {
+    if (!n || !token) return -1;
+    for (uint32_t i = 0; i < RN_MAX_READS; i++)
+        if (n->reads[i].used && n->reads[i].token == token) return n->reads[i].state;
+    /* Released, or never issued. Lost is the safe answer either way: the
+     * caller refuses rather than serving on the strength of a barrier
+     * nobody is holding. */
+    return -1;
+}
+
+void rn_read_release(raft_node *n, uint64_t token) {
+    if (!n || !token) return;
+    for (uint32_t i = 0; i < RN_MAX_READS; i++) {
+        if (!n->reads[i].used || n->reads[i].token != token) continue;
+        memset(&n->reads[i], 0, sizeof n->reads[i]);
+        return;
+    }
+}
+
+uint32_t rn_reads_outstanding(const raft_node *n) {
+    uint32_t c = 0;
+    if (!n) return 0;
+    for (uint32_t i = 0; i < RN_MAX_READS; i++) if (n->reads[i].used) c++;
+    return c;
 }
 
 void rn_seed_commit(raft_node *n, uint64_t index) {

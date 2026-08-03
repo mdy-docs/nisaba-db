@@ -155,12 +155,37 @@ request it cannot promise anything about is worse than a refusal a
 client can act on. `src/db-server-client.js` puts both on the thrown
 `ServerError`, so following the redirect is one line.
 
-**Reads are served from the member they land on**, at that member's own
-replication lag, which is a heartbeat or so behind the leader. The
-policy is not settled
-([`steps/read-semantics-and-change-streams.md`](steps/read-semantics-and-change-streams.md));
-until it is, a client that needs its own write back reads from the
-member that took it.
+**Only the leader serves a READ, too**, and it serves one only after a
+quorum has confirmed it still leads. Every read is linearizable: it sees
+everything committed before it was asked, and a client always reads its
+own writes without having to think about which member took them.
+
+A follower refuses a read with the same `-63` and the same address it
+refuses a write with, because it is behind by at least a round trip and
+cannot tell by how much — answering would present staleness as
+authority. A leader whose quorum has gone quiet refuses with `-66`,
+which is a different problem and a different answer: not "ask somebody
+else" but "there may be nobody to ask". Raft does not depose such a
+leader, so without the check it would go on answering from a log a newer
+leader may already have moved past.
+
+What that costs: a read on a leader waits for one heartbeat round to a
+quorum, concurrent reads share it, and `getMore` pays it per batch. A
+server without `--raft`, and a `--raft` group of one, pay nothing —
+there is nobody to hear from.
+
+**`ping` is what a follower still answers**, and on a replica it says
+what the member is: `{ pong, role, leaderId, applied, commit }`. It is
+how you watch a cluster replicate now that followers do not serve data.
+Those numbers report and promise nothing — `applied` is that member's
+own floor when it was asked, which is precisely the number that may not
+be used to serve a read.
+
+Reads that scale by adding members are a different thing: an
+asynchronous replica tier outside consensus, explicitly not
+linearizable, deferred to its own brief
+([`steps/read-semantics-and-change-streams.md`](steps/read-semantics-and-change-streams.md)
+records the decision and what was rejected).
 
 **Without `--raft` nothing changes**, including the file layout: a
 directory served by a single process today can be joined to a cluster
@@ -297,7 +322,7 @@ none of those (`listCollections` and `ping`).
 
 | Request | Response |
 | --- | --- |
-| `{op:'ping'}` | `{ok:true, pong:true}` |
+| `{op:'ping'}` | `{ok:true, pong:true}`, and on a `--raft` member also `{role, leaderId, applied, commit}` |
 | `{op:'listCollections'}` | `{ok:true, collections:[...]}` |
 | `{op:'find', coll, filter, opts:{sort,projection,skip,limit,batchSize}}` | `{ok:true, docs:[...]}`, or with `batchSize`: `{ok:true, docs:[...], cursor}` |
 | `{op:'getMore', cursor, opts:{batchSize}}` | `{ok:true, docs:[...], cursor}` |

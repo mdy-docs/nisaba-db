@@ -154,6 +154,19 @@ int dbi_handle(dbi *i, uint64_t client, const uint8_t *req, size_t req_len,
                dbuf *out);
 
 /*
+ * What this request does, before it is performed: db_session.h's
+ * dbs_request_kind with the instance's own three ops in front of it.
+ *
+ * `dropDatabase` is a WRITE and is classified as one, which is what
+ * makes a follower refuse it. It is NOT yet replicated -- it is answered
+ * outright by whichever member takes it, so on a leader it removes a
+ * directory the followers keep. That is a real gap and it is written
+ * down rather than hidden by the classification: see
+ * docs/steps/README.md.
+ */
+void dbi_request_kind(const uint8_t *req, size_t req_len, int *kind);
+
+/*
  * The replicated fork (db_session.h's dbs_propose / dbs_step), with one
  * addition: every command comes back WRAPPED.
  *

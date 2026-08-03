@@ -807,7 +807,7 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_NO_DATABASE, DC_ERR_TOO_MANY_CLIENTS, DC_ERR_IDLE_TIMEOUT,
         DC_ERR_NO_CURSOR, DC_ERR_TOO_MANY_CURSORS, DC_ERR_CURSOR_SORTED,
         DC_ERR_NO_STREAM, DC_ERR_TOO_MANY_STREAMS,
-        DC_ERR_NOT_LEADER, DC_ERR_WRITE_LOST,
+        DC_ERR_NOT_LEADER, DC_ERR_WRITE_LOST, DC_ERR_NOT_CURRENT,
         DC_ERR_CURSORS_OPEN, DC_ERR_FORMAT_NEWER, DC_ERR_INDEX_EXISTS,
         DC_ERR_NO_INDEX, DC_ERR_INDEX_KIND, DC_ERR_INDEX_ARITY,
         /* The consensus layer's refusals reach a host the same way, and
@@ -11082,6 +11082,213 @@ TEST(a_stale_prevote_grant_cannot_elect_the_real_round) {
     memfs_free(fs);
 }
 
+TEST(a_read_barrier_needs_a_quorum_and_always_ends) {
+    /*
+     * Section 6.4's ReadIndex, at the rule rather than through a cluster.
+     *
+     * The thing being pinned is the one a cluster test cannot show
+     * cheaply: RAFT DOES NOT DEPOSE A LEADER THAT HAS LOST CONTACT. It
+     * simply stops being able to commit -- so a partitioned leader stays
+     * a leader, keeps its role, and will answer a read from state a
+     * newer leader has already moved past unless something makes it
+     * prove otherwise. A barrier is that proof.
+     *
+     * Three members, driven by hand, so each end can be reached
+     * deliberately: confirmed, lost, expired.
+     */
+    memfs *fs = memfs_new();
+    CHECK_FATAL(fs != NULL);
+    bj_io io;
+    CHECK_FATAL(memfs_open(fs, "raft.bj", &io) == BJ_OK);
+    elog *log = elog_create(&io);
+    CHECK_FATAL(log != NULL);
+    raft_node *n = rn_new(1, log);
+    CHECK_FATAL(n != NULL);
+
+    bj_builder *members = bj_builder_new();
+    bj_begin_array(members);
+    for (int i = 1; i <= 3; i++) {
+        bj_begin_object(members);
+        bj_put_key(members, (const uint8_t *)"id", 2);
+        bj_put_int(members, i);
+        bj_end_object(members);
+    }
+    bj_end_array(members);
+    size_t mlen; const uint8_t *mbuf = bj_builder_data(members, &mlen);
+    CHECK_OK(rn_set_members(n, mbuf, (uint32_t)mlen));
+    rn_set_timing(n, 150, 300, 50);
+    CHECK_I64(rn_quorum(n), 2);
+
+    /* A follower has nothing to take a barrier against: it cannot say
+     * what is committed, so there is no read index to serve at. */
+    uint64_t tok = 0, at = 0;
+    rn_start(n, 0, 0.0);
+    CHECK_RC(rn_read_barrier(n, &tok, &at), BJ_ERR_STATE);
+    CHECK_I64((long long)tok, 0);
+
+    /* Elect it: pre-vote, then the real round, both answered by one
+     * peer -- which is a quorum of three. */
+    for (int64_t t = 0; t <= 1000 && rn_out_count(n) == 0; t += 10) rn_tick(n, t, 0.5);
+    uint64_t pre = rn_out_corr(n, 0);
+    rn_out_clear(n);
+    bj_builder *grant = bj_builder_new();
+    vote_reply(grant, 0, 1);
+    size_t glen; const uint8_t *gbuf = bj_builder_data(grant, &glen);
+    CHECK_OK(rn_on_reply(n, pre, gbuf, (uint32_t)glen, 0.5));
+    CHECK_I64(rn_role(n), RAFT_CANDIDATE);
+    uint64_t real = rn_out_corr(n, 0);
+    rn_out_clear(n);
+    CHECK_OK(rn_on_reply(n, real, gbuf, (uint32_t)glen, 0.5));
+    CHECK_FATAL(rn_role(n) == RAFT_LEADER);
+
+    /* An AppendEntries answer from a follower that still follows us. */
+    bj_builder *ack = bj_builder_new();
+    bj_begin_object(ack);
+    bj_put_key(ack, (const uint8_t *)"term", 4);
+    bj_put_int(ack, (int64_t)elog_current_term(log));
+    bj_put_key(ack, (const uint8_t *)"success", 7);
+    bj_put_bool(ack, 1);
+    bj_put_key(ack, (const uint8_t *)"matchIndex", 10);
+    bj_put_int(ack, (int64_t)elog_last_index(log));
+    bj_end_object(ack);
+    size_t alen; const uint8_t *abuf = bj_builder_data(ack, &alen);
+
+    /* Becoming leader replicated its term-boundary no-op to both peers.
+     * Answer those, so neither has a request outstanding -- a peer that
+     * does is skipped by the next round, which is correct and would
+     * otherwise make the rest of this test measure the wrong thing. */
+    {
+        CHECK_FATAL(rn_out_count(n) >= 2);
+        uint64_t a1 = rn_out_corr(n, 0), a2 = rn_out_corr(n, 1);
+        rn_out_clear(n);
+        CHECK_OK(rn_on_reply(n, a1, abuf, (uint32_t)alen, 0.5));
+        CHECK_OK(rn_on_reply(n, a2, abuf, (uint32_t)alen, 0.5));
+        rn_out_clear(n);
+        rn_effects_clear(n);
+    }
+
+    /*
+     * ---- AN OLD ACK DOES NOT CONFIRM A NEW BARRIER, and this is the
+     * whole reason the node records when a request was SENT rather than
+     * when its answer arrived.
+     *
+     * A peer's ack proves it had not moved to a higher term at the
+     * moment it processed the request -- which is at or after that
+     * request went out, and says nothing about any instant before it. So
+     * a barrier taken AFTER the last round went out is not covered by
+     * that round's answers, however recently they landed. Confirming on
+     * "when did this peer last speak to us" would serve a read on the
+     * strength of evidence gathered before it was asked for.
+     */
+    {
+        /* A round goes out at 1000, and nobody answers it yet. */
+        rn_tick(n, 1000, 0.5);
+        CHECK_FATAL(rn_out_count(n) >= 2);
+        uint64_t h1 = rn_out_corr(n, 0);
+        rn_out_clear(n);
+
+        /* The barrier is taken at 1010, AFTER that round went out and
+         * before the next heartbeat is due (1050) -- so nothing goes out
+         * next except because a READ asked for it. */
+        rn_tick(n, 1010, 0.5);
+        CHECK_I64((long long)rn_out_count(n), 0);
+        CHECK_OK(rn_read_barrier(n, &tok, &at));
+        CHECK(tok != 0);
+        CHECK_I64(rn_read_state(n, tok), 0);
+        /* Both peers owe an answer already, so there is nothing useful
+         * to ask them a second time. */
+        CHECK_I64((long long)rn_out_count(n), 0);
+
+        /*
+         * And now the answer to the 1000 round lands, at 1020 -- AFTER
+         * the barrier was taken.
+         *
+         * THIS MUST NOT CONFIRM IT, and it is the single subtlest thing
+         * in the barrier. The peer proved it had not moved to a higher
+         * term at the moment it PROCESSED that request, which is at or
+         * after 1000 and says nothing whatever about 1010. Confirming on
+         * when the answer ARRIVED -- which is what check-quorum's
+         * ack_at records, and what a lease would use -- would serve a
+         * read on evidence gathered before it was asked for.
+         */
+        rn_tick(n, 1020, 0.5);
+        rn_out_clear(n);
+        CHECK_OK(rn_on_reply(n, h1, abuf, (uint32_t)alen, 0.5));
+        CHECK_I64(rn_read_state(n, tok), 0);
+        /* A lease would have said yes: that peer spoke to us 0ms ago. */
+        CHECK_I64(rn_has_quorum_contact(n, 1000), 1);
+
+        /* That peer is idle again, so the barrier asks IT -- rather than
+         * waiting for the heartbeat timer, which would put a heartbeat
+         * interval on every read in the cluster. */
+        CHECK_FATAL(rn_out_count(n) > 0);
+        uint64_t c1 = rn_out_corr(n, 0);
+        rn_out_clear(n);
+        CHECK_OK(rn_on_reply(n, c1, abuf, (uint32_t)alen, 0.5));
+        /* One peer plus ourselves is two of three, and this answer
+         * covers a request sent after the barrier. */
+        CHECK_I64(rn_read_state(n, tok), 1);
+        rn_read_release(n, tok);
+        CHECK_I64((long long)rn_reads_outstanding(n), 0);
+        /* Released is gone, and gone reads as LOST rather than as
+         * confirmed: a caller must never serve on a barrier nobody
+         * holds. */
+        CHECK_I64(rn_read_state(n, tok), -1);
+        rn_out_clear(n);
+        rn_effects_clear(n);
+    }
+
+    /* ---- a barrier nobody answers EXPIRES rather than hanging. This is
+     * the partitioned leader: still leader, still convinced, and unable
+     * to prove anything. */
+    {
+        /* Past the last ack, and nobody answers what goes out now. */
+        rn_tick(n, 1200, 0.5);
+        rn_out_clear(n);
+        CHECK_OK(rn_read_barrier(n, &tok, &at));
+        CHECK_I64(rn_read_state(n, tok), 0);
+        for (int64_t t = 1210; t <= 2400 && rn_read_state(n, tok) == 0; t += 10) {
+            rn_tick(n, t, 0.5);
+            rn_out_clear(n);
+        }
+        CHECK_I64(rn_read_state(n, tok), -1);
+        CHECK_I64(rn_role(n), RAFT_LEADER);   /* not deposed -- that is the point */
+        rn_read_release(n, tok);
+        rn_out_clear(n);
+        rn_effects_clear(n);
+    }
+
+    /* ---- the table is bounded, and says so rather than growing. */
+    {
+        uint64_t held[80];
+        uint32_t taken = 0;
+        while (taken < 80) {
+            uint64_t t2 = 0, a2 = 0;
+            int rc = rn_read_barrier(n, &t2, &a2);
+            if (rc == RAFT_ERR_CAPACITY) break;
+            CHECK_OK(rc);
+            held[taken++] = t2;
+        }
+        CHECK(taken > 0 && taken < 80);
+        CHECK_I64((long long)rn_reads_outstanding(n), (long long)taken);
+
+        /* ---- and step-down settles every one of them. Nobody is left
+         * holding a read: raft_node.h's "every registered wait
+         * terminates" covers these too. */
+        CHECK(rn_step_down(n, elog_current_term(log) + 1, 0.5) == 1);
+        for (uint32_t i = 0; i < taken; i++) CHECK_I64(rn_read_state(n, held[i]), -1);
+        for (uint32_t i = 0; i < taken; i++) rn_read_release(n, held[i]);
+        CHECK_I64((long long)rn_reads_outstanding(n), 0);
+    }
+
+    bj_builder_free(ack);
+    bj_builder_free(grant);
+    bj_builder_free(members);
+    rn_free(n);
+    elog_free(log);
+    memfs_free(fs);
+}
+
 TEST(three_nodes_elect_a_leader_and_commit_without_a_host_language) {
     /*
      * The end-to-end claim of the whole port, at the Raft layer: three
@@ -11192,6 +11399,7 @@ int main(void) {
     RUN(election_round_ignores_votes_from_a_world_that_ended);
     RUN(replication_picks_append_snapshot_or_park);
     RUN(snapshot_chunking_covers_every_byte_exactly_once);
+    RUN(a_read_barrier_needs_a_quorum_and_always_ends);
     RUN(three_nodes_elect_a_leader_and_commit_without_a_host_language);
     RUN(a_single_voter_group_commits_the_moment_it_elects_itself);
     RUN(a_stale_prevote_grant_cannot_elect_the_real_round);

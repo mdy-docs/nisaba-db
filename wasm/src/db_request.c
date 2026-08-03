@@ -73,40 +73,65 @@ typedef enum {
  * They did, briefly: renaming killCursor to closeCursor left a hand-
  * written 10 beside an eleven-character name, and an op whose length is
  * wrong is an op that simply never matches. */
-#define OP(name, code) { name, (uint32_t)(sizeof(name) - 1), code }
+/*
+ * The third column is what the op DOES -- db_session.h's dbs_req_kind --
+ * and it is here rather than anywhere else because an op cannot be added
+ * to this table without answering it. A replicated server routes on it
+ * before performing anything (a follower refuses, a leader owes a read a
+ * barrier), and a write miscounted as a read is a write a follower
+ * performs off the log.
+ *
+ * NONE is the three that touch no database state: `ping`, and the two
+ * that release a client's own local resources.
+ */
+#define OP(name, code, kind) { name, (uint32_t)(sizeof(name) - 1), code, kind }
 
-static const struct { const char *name; uint32_t len; dbs_op op; } OP_NAMES[] = {
-    OP("ping",        OP_PING),
-    OP("find",        OP_FIND),
-    OP("findOne",     OP_FIND_ONE),
-    OP("count",       OP_COUNT),
-    OP("distinct",    OP_DISTINCT),
-    OP("insert",      OP_INSERT),
-    OP("update",      OP_UPDATE),
-    OP("updateMany",  OP_UPDATE_MANY),
-    OP("replace",     OP_REPLACE),
-    OP("delete",      OP_DELETE),
-    OP("deleteMany",  OP_DELETE_MANY),
-    OP("getMore",     OP_GET_MORE),
-    OP("closeCursor", OP_CLOSE_CURSOR),
-    OP("compact",     OP_COMPACT),
-    OP("createCollection", OP_CREATE_COLLECTION),
-    OP("dropCollection",   OP_DROP_COLLECTION),
-    OP("createIndex",      OP_CREATE_INDEX),
-    OP("dropIndex",        OP_DROP_INDEX),
-    OP("listIndexes",      OP_LIST_INDEXES),
-    OP("listCollections",  OP_LIST_COLLECTIONS),
-    OP("insertMany",       OP_INSERT_MANY),
-    OP("bulkWrite",        OP_BULK_WRITE),
-    OP("aggregate",        OP_AGGREGATE),
-    OP("explain",          OP_EXPLAIN),
-    OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE),
-    OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE),
-    OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE),
-    OP("findByIndex",       OP_FIND_BY_INDEX),
-    OP("pruneExpired",      OP_PRUNE_EXPIRED),
-    OP("watch",             OP_WATCH),
-    OP("closeStream",       OP_CLOSE_STREAM),
+static const struct {
+    const char *name; uint32_t len; dbs_op op; uint8_t kind;
+} OP_NAMES[] = {
+    OP("ping",        OP_PING,        DBS_REQ_STATUS),
+    OP("find",        OP_FIND,        DBS_REQ_READ),
+    OP("findOne",     OP_FIND_ONE,    DBS_REQ_READ),
+    OP("count",       OP_COUNT,       DBS_REQ_READ),
+    OP("distinct",    OP_DISTINCT,    DBS_REQ_READ),
+    OP("insert",      OP_INSERT,      DBS_REQ_WRITE),
+    OP("update",      OP_UPDATE,      DBS_REQ_WRITE),
+    OP("updateMany",  OP_UPDATE_MANY, DBS_REQ_WRITE),
+    OP("replace",     OP_REPLACE,     DBS_REQ_WRITE),
+    OP("delete",      OP_DELETE,      DBS_REQ_WRITE),
+    OP("deleteMany",  OP_DELETE_MANY, DBS_REQ_WRITE),
+    /* A cursor batch is a READ like any other: the rule is applied
+     * uniformly rather than weakened for paging, so a page sees
+     * everything committed when it was asked for and not merely
+     * everything committed when the cursor was opened. */
+    OP("getMore",     OP_GET_MORE,    DBS_REQ_READ),
+    OP("closeCursor", OP_CLOSE_CURSOR, DBS_REQ_NONE),
+    /* Compaction rewrites this member's own files. It changes nothing a
+     * reader can observe and nothing another replica has to agree with,
+     * but it is not a read either -- and a member that cannot take a
+     * write has no business rewriting its files underneath the log. */
+    OP("compact",     OP_COMPACT,     DBS_REQ_WRITE),
+    OP("createCollection", OP_CREATE_COLLECTION, DBS_REQ_WRITE),
+    OP("dropCollection",   OP_DROP_COLLECTION,   DBS_REQ_WRITE),
+    OP("createIndex",      OP_CREATE_INDEX,      DBS_REQ_WRITE),
+    OP("dropIndex",        OP_DROP_INDEX,        DBS_REQ_WRITE),
+    OP("listIndexes",      OP_LIST_INDEXES,      DBS_REQ_READ),
+    OP("listCollections",  OP_LIST_COLLECTIONS,  DBS_REQ_READ),
+    OP("insertMany",       OP_INSERT_MANY,       DBS_REQ_WRITE),
+    OP("bulkWrite",        OP_BULK_WRITE,        DBS_REQ_WRITE),
+    OP("aggregate",        OP_AGGREGATE,         DBS_REQ_READ),
+    OP("explain",          OP_EXPLAIN,           DBS_REQ_READ),
+    OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE,  DBS_REQ_WRITE),
+    OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE, DBS_REQ_WRITE),
+    OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE,  DBS_REQ_WRITE),
+    OP("findByIndex",       OP_FIND_BY_INDEX,        DBS_REQ_READ),
+    /* It deletes what a TTL index says is over. */
+    OP("pruneExpired",      OP_PRUNE_EXPIRED,        DBS_REQ_WRITE),
+    /* Opening a stream is a read: what it goes on to deliver is this
+     * member's view of what changed, and a member that cannot show its
+     * data is current cannot show that either. */
+    OP("watch",             OP_WATCH,                DBS_REQ_READ),
+    OP("closeStream",       OP_CLOSE_STREAM,         DBS_REQ_NONE),
 };
 
 #undef OP
@@ -126,6 +151,19 @@ static int field_str(const uint8_t *o, size_t olen, const char *key,
     if (e || !*found) return e;
     cur c = { v, vlen, 0 };
     return take_string(&c, s, slen);
+}
+
+void dbs_request_kind(const uint8_t *req, size_t req_len, int *kind) {
+    *kind = DBS_REQ_NONE;
+    if (!req) return;
+    const uint8_t *ops; uint32_t ops_len; int found = 0;
+    if (field_str(req, req_len, "op", &ops, &ops_len, &found) != BJ_OK || !found) return;
+    for (size_t i = 0; i < sizeof(OP_NAMES) / sizeof(OP_NAMES[0]); i++) {
+        if (ops_len == OP_NAMES[i].len && memcmp(ops, OP_NAMES[i].name, ops_len) == 0) {
+            *kind = OP_NAMES[i].kind;
+            return;
+        }
+    }
 }
 
 static int field_int(const uint8_t *o, size_t olen, const char *key,

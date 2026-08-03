@@ -14,11 +14,29 @@ write down why" rather than guessing on the implementer's behalf.
 | # | Brief | What it unblocks |
 | --- | --- | --- |
 | 1 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
-| 2 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. Follower reads, and change streams that tail the log. Independent of the rest. |
+| 2 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. **Part one is decided and built** (linearizable leader-only reads); what remains is change streams that tail the log. |
 | 3 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
 
 1 is how a client reaches a cluster; 2 is a feature; 3 is the coverage
 all of it rests on.
+
+**Read semantics are settled**, which is half of brief 2. Every read is
+linearizable, the LEADER alone serves one, and it serves it behind a
+real ReadIndex barrier — a fresh heartbeat round to a quorum, not a
+lease, because nothing here assumes bounded clock skew and a lease would
+be the first thing that did. A follower refuses a read with the same
+`-63` it refuses a write with; a leader that cannot prove it still leads
+refuses with `-66` rather than answering from a log a newer leader may
+have moved past.
+
+That closed two holes that had shipped without ever being written down:
+reads were served by ANY member with no check at all, and
+`hasQuorumContact` — written for precisely this — was never called by
+the server. Read SCALING was never what follower reads would have
+bought: under a linearizable rule a follower read still costs the leader
+a round trip, so it distributes query work and nothing else. Scaling
+comes from an asynchronous replica tier outside consensus, deferred and
+explicitly non-linearizable.
 
 **They are load-bearing rather than speculative.** They were written
 assuming the C server would one day be the cluster member; that is
@@ -229,8 +247,23 @@ plan/execute rather than waiting for it to go away.
 
 ## Standing debts
 
-Both are paid. Neither was a design question — known, diagnosed, and now
-fixed.
+**`dropDatabase` is not replicated.** It is answered outright by
+whichever member takes it (`db_instance.c`'s `instance_op`), so on a
+leader it removes a directory the followers keep — a divergence the log
+never records and nothing detects. It is CLASSIFIED as a write, so a
+follower now refuses it and only the leader can do it, which halves the
+hole; the other half needs an instance-level log entry, because the
+existing envelope (`{ d, c }`) carries a command for a database rather
+than a command about one. Found while classifying ops for the read
+decision; it arrived with the instance and was never covered.
+
+**The log grows without bound.** A long-lived member's `__wal__.bj` is
+every write it has ever taken. Paying it means compaction, then a
+snapshot store in the process, then the log-naming rule that follows.
+A cluster that can be joined has one more reason to want it.
+
+The two below are paid. Neither was a design question — known,
+diagnosed, and now fixed.
 
 - **The compaction handle leak.** `compact()` never closed the OPFS
   handles it pre-opened, so the adopt step could not re-open its own

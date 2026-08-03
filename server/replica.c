@@ -49,17 +49,28 @@
 #define REPLICA_MAX_CONV 24
 
 /*
- * One client's write, somewhere between planned and answered.
+ * One client's request, somewhere between taken and answered.
  *
- * `last` is the index whose settlement finishes the batch in flight.
- * Entries commit, apply and settle in index order, so the last one
- * standing in for all of them is not an optimization: an earlier entry
- * of the same batch cannot survive a truncation the later one did not.
+ * TWO KINDS SHARE THIS TABLE, because they end the same way: an answer
+ * that was not ready when the request arrived, delivered later through
+ * replica_ready.
+ *
+ * A WRITE is waiting on the log. `last` is the index whose settlement
+ * finishes the batch in flight; entries commit, apply and settle in
+ * index order, so the last one standing in for all of them is not an
+ * optimization -- an earlier entry of the same batch cannot survive a
+ * truncation the later one did not.
+ *
+ * A READ (`barrier` non-zero) has already been PERFORMED and is waiting
+ * on the proof that it may be shown: a quorum confirming this node still
+ * leads. Executing before confirming is deliberate -- see
+ * replica_submit -- so what is parked here is the finished answer.
  */
 typedef struct {
     int      used;
     uint64_t client;
     uint64_t token;             /* dbs_step's */
+    uint64_t barrier;           /* rn_read_barrier's; 0 = this is a write */
     uint64_t   *indices;        /* what the batch in flight committed at */
     dbuf       *results;        /* and what applying each one produced */
     dbs_result *view;           /* the same, in the shape dbs_step takes */
@@ -171,7 +182,7 @@ static void pending_release(pending *p) {
 static pending *pending_for_index(replica *r, uint64_t index, dbuf **into) {
     for (int i = 0; i < REPLICA_MAX_PENDING; i++) {
         pending *p = &r->waiting[i];
-        if (!p->used || p->done) continue;
+        if (!p->used || p->done || p->barrier) continue;
         for (uint32_t k = 0; k < p->n; k++) {
             if (p->indices[k] != index) continue;
             p->at = k;
@@ -185,7 +196,8 @@ static pending *pending_for_index(replica *r, uint64_t index, dbuf **into) {
 
 static pending *pending_find(replica *r, uint64_t last) {
     for (int i = 0; i < REPLICA_MAX_PENDING; i++)
-        if (r->waiting[i].used && !r->waiting[i].done && r->waiting[i].last == last)
+        if (r->waiting[i].used && !r->waiting[i].done && !r->waiting[i].barrier &&
+            r->waiting[i].last == last)
             return &r->waiting[i];
     return NULL;
 }
@@ -942,6 +954,137 @@ static int refuse(const replica *r, int code, dbuf *out) {
     return e;
 }
 
+/*
+ * A read, behind the proof that it may be shown (raft_node.h's read
+ * barriers, section 6.4).
+ *
+ *   0  answered outright -- a group of one, which has nobody to hear
+ *      from, so the barrier is satisfied the moment it is taken
+ *   1  performed, and held until a quorum confirms
+ *  <0  the transport's problem
+ *
+ * THE ORDER IS TAKE, APPLY, PERFORM, HOLD, and each step is where it is
+ * for a reason.
+ *
+ * The barrier is taken FIRST, so `read_index` is the commit index as of
+ * the instant the read arrived and the confirmation covers a window
+ * beginning there. Confirming that a quorum still follows us over that
+ * window proves no later leader existed before it, so everything
+ * committed before the read asked is at or below `read_index`.
+ *
+ * The pump runs before the read is performed, so what it reads is at or
+ * above `read_index`. It is normally a no-op -- the transport's loop
+ * applies before it serves a client -- but resting on that ordering
+ * rather than stating it here would make this correct by accident.
+ *
+ * The read is performed BEFORE the confirmation arrives, which is the
+ * cheap half of the argument and is safe: the state served is at or
+ * above `read_index`, and serving something NEWER than the barrier
+ * requires is allowed. Only serving something older is not.
+ */
+static int submit_read(replica *r, pending *p, uint64_t client,
+                       const uint8_t *req, size_t len, dbuf *out) {
+    uint64_t barrier = 0, read_index = 0;
+    int e = rn_read_barrier(r->node, &barrier, &read_index);
+    if (e) {
+        /* Not the leader is BJ_ERR_STATE and is caught before this is
+         * called; what is left is a table full of reads this node has
+         * not finished proving. Refused explicitly, like every other
+         * bounded table here. */
+        e = refuse(r, DC_ERR_TOO_MANY_CLIENTS, out);
+        return e ? e : 0;
+    }
+
+    e = apply_committed(r);
+    if (e) { rn_read_release(r->node, barrier); return e; }
+    if (r->applied < read_index) {
+        /* Unreachable: everything at or below the commit index is in the
+         * log and the pump just ran. Said out loud rather than serving
+         * from state that is demonstrably too old. */
+        rn_read_release(r->node, barrier);
+        out->len = 0;
+        e = refuse(r, DC_ERR_NOT_CURRENT, out);
+        return e ? e : 0;
+    }
+
+    dbuf cmds = {0};
+    uint64_t token = 0;
+    e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
+    dbuf_free(&cmds);
+    if (e || token) {
+        /* A read plans nothing. A token here means the classifier and
+         * the session disagree about what this op does, which is the one
+         * thing that must never be true (db_session.h says why). */
+        if (token) dbi_abandon(r->inst, token);
+        rn_read_release(r->node, barrier);
+        return e ? e : BJ_ERR_STATE;
+    }
+
+    if (rn_read_state(r->node, barrier) > 0) {
+        rn_read_release(r->node, barrier);
+        return 0;                       /* nothing to prove; already proved */
+    }
+
+    p->used = 1;
+    p->client = client;
+    p->barrier = barrier;
+    p->done = 0;
+    e = dbuf_put(&p->answer, out->data, out->len);
+    if (e) { pending_release(p); rn_read_release(r->node, barrier); return e; }
+    out->len = 0;                       /* it goes out through replica_ready */
+    /* The heartbeats the barrier queued go NOW: a read that waited a
+     * tick for its own proof to start would add the tick interval to
+     * every read in the cluster. */
+    e = flush_out(r);
+    return e ? e : 1;
+}
+
+/*
+ * What this member is, and how far it has got.
+ *
+ * `ping` is the one thing a follower still answers once reads belong to
+ * the leader, so it is where a follower says so -- otherwise a member
+ * that is not the leader is a black box over the wire, and a cluster
+ * nobody can watch replicate is one nobody can operate. It reports and
+ * promises nothing: `applied` is this member's own floor at the moment
+ * it was asked, which is exactly the number that must not be used to
+ * serve a read.
+ *
+ * A server without --raft never reaches here and answers the plain
+ * { ok, pong } it always did.
+ */
+static int replica_status(const replica *r, dbuf *out) {
+    static const char *const ROLE[] = { "follower", "candidate", "leader" };
+    int role = rn_role(r->node);
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"ok", 2);
+    if (!e) e = bj_put_bool(b, 1);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"pong", 4);
+    if (!e) e = bj_put_bool(b, 1);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"role", 4);
+    if (!e) {
+        const char *name = (role >= 0 && role <= 2) ? ROLE[role] : "unknown";
+        e = bj_put_string(b, (const uint8_t *)name, (uint32_t)strlen(name));
+    }
+    if (!e) e = bj_put_key(b, (const uint8_t *)"leaderId", 8);
+    if (!e) e = bj_put_int(b, (int64_t)replica_leader_id(r));
+    if (!e) e = bj_put_key(b, (const uint8_t *)"applied", 7);
+    if (!e) e = bj_put_int(b, (int64_t)r->applied);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"commit", 6);
+    if (!e) e = bj_put_int(b, (int64_t)rn_commit_index(r->node));
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t n = 0;
+        const uint8_t *d = bj_builder_data(b, &n);
+        e = d ? dbuf_put(out, d, n) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
 int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
                    dbuf *out) {
     if (!r) return BJ_ERR_STATE;
@@ -951,22 +1094,37 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
         if (!r->waiting[i].used) { p = &r->waiting[i]; break; }
     if (!p) { int e = refuse(r, DC_ERR_TOO_MANY_CLIENTS, out); return e ? e : 0; }
 
+    /*
+     * What the request DOES, before any of it is done. Both branches
+     * below need to know, and asking first is what lets a follower
+     * refuse without touching anything: it used to plan the write, find
+     * out it could not take it, and abandon the plan -- which had
+     * already CREATED the database directory the request named. A member
+     * that cannot take a write has no business making a directory for
+     * one.
+     */
+    int kind = DBS_REQ_NONE;
+    dbi_request_kind(req, len, &kind);
+
+    if (kind == DBS_REQ_STATUS) { int e = replica_status(r, out); return e ? e : 0; }
+
+    if ((kind == DBS_REQ_READ || kind == DBS_REQ_WRITE) && !replica_is_leader(r)) {
+        /*
+         * Reads as well as writes. A follower is behind by at least a
+         * round trip and cannot tell by how much, so an answer from it
+         * is staleness presented as authority
+         * (docs/steps/read-semantics-and-change-streams.md).
+         */
+        int e = refuse(r, DC_ERR_NOT_LEADER, out);
+        return e ? e : 0;
+    }
+    if (kind == DBS_REQ_READ) return submit_read(r, p, client, req, len, out);
+
     dbuf cmds = {0};
     uint64_t token = 0;
     int e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
     if (e) { dbuf_free(&cmds); return e; }
-    if (!token) { dbuf_free(&cmds); return 0; }   /* a read, a ping, a refusal */
-
-    /* It plans, and only then do we find out it is a write -- which a
-     * follower cannot take. Nothing has been applied, so abandoning the
-     * plan leaves the database exactly as it was. */
-    if (!replica_is_leader(r)) {
-        dbi_abandon(r->inst, token);
-        dbuf_free(&cmds);
-        out->len = 0;
-        e = refuse(r, DC_ERR_NOT_LEADER, out);
-        return e ? e : 0;
-    }
+    if (!token) { dbuf_free(&cmds); return 0; }   /* a ping, or a refusal */
 
     p->used = 1;
     p->client = client;
@@ -1073,6 +1231,30 @@ int replica_tick(replica *r, uint64_t now) {
     }
 
     /*
+     * And the reads waiting to be shown. Every barrier reaches one of
+     * three ends -- confirmed, lost with the leadership, or expired
+     * because a quorum went quiet -- so a client holding a read is never
+     * holding it forever, which is the whole of what this table owes.
+     */
+    for (int i = 0; i < REPLICA_MAX_PENDING; i++) {
+        pending *p = &r->waiting[i];
+        if (!p->used || p->done || !p->barrier) continue;
+        int st = rn_read_state(r->node, p->barrier);
+        if (!st) continue;
+        if (st < 0) {
+            /* The answer was built; it just cannot be shown to be
+             * current, and showing it anyway is the one thing a read
+             * must not do. */
+            p->answer.len = 0;
+            e = refuse(r, DC_ERR_NOT_CURRENT, &p->answer);
+            if (e) return e;
+        }
+        rn_read_release(r->node, p->barrier);
+        p->barrier = 0;
+        p->done = 1;
+    }
+
+    /*
      * An effect this node had no room to report. There is no way to
      * recover what was not said and every kind here is actionable, so
      * carrying on would mean acting on a picture known to be incomplete
@@ -1102,7 +1284,10 @@ void replica_drop_client(replica *r, uint64_t client) {
     for (int i = 0; i < REPLICA_MAX_PENDING; i++) {
         pending *p = &r->waiting[i];
         if (!p->used || p->client != client) continue;
-        if (!p->done) dbi_abandon(r->inst, p->token);
+        /* A read holds a barrier and no plan; a write holds a plan and
+         * no barrier. Both have to be given back. */
+        if (p->barrier) rn_read_release(r->node, p->barrier);
+        else if (!p->done) dbi_abandon(r->inst, p->token);
         pending_release(p);
     }
 }

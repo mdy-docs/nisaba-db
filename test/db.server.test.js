@@ -687,16 +687,38 @@ for (const engine of ENGINES) {
       throw new Error(`no member took the write "${name}": ${last?.message}`);
     };
 
-    /* What this member holds. A member that has applied NOTHING yet has
-     * no `users` at all -- the collection is made by the first insert
-     * applying, so a follower polled before that answers -37 rather than
-     * an empty list, and that is "not caught up", not a failure. */
+    /*
+     * What the cluster holds, and how far each member has got.
+     *
+     * ONLY THE LEADER MAY BE READ. Reads are linearizable and the leader
+     * alone serves them
+     * (docs/steps/read-semantics-and-change-streams.md), so polling
+     * every member for its documents -- which is what this used to do --
+     * now gets -63 from every follower. What a follower will still
+     * answer is `ping`, and that is where it says what it is and how far
+     * its apply pump has got.
+     *
+     * So convergence is checked as: the LEADER's documents are what was
+     * expected, and every live member has applied at least as much of
+     * the log as the leader had when it was asked. That is a stronger
+     * claim than the old one, not a weaker substitute -- it is the log
+     * index rather than a re-derived read -- and the file-level checks
+     * elsewhere in this file are what tie a log prefix back to bytes on
+     * disk.
+     */
+    const statusOf = async (m) => {
+      const c = await connectServer(m.port);
+      try { return await c.ping(); } finally { await c.close(); }
+    };
+
     const namesOn = async (m) => {
       const db = (await connectServer(m.port)).db(DB);
       try {
         return (await db.collection('users').find({}, { sort: { name: 1 } }).toArray())
           .map((d) => d.name);
       } catch (err) {
+        /* A leader that has applied nothing has no `users` at all: the
+         * collection is made by the first insert applying. */
         if (err.code === -37) return [];
         throw err;
       } finally { await db.close(); }
@@ -735,16 +757,27 @@ for (const engine of ENGINES) {
     const agree = async (expected, withinMs = 20000) => {
       const started = Date.now();
       let seen = null;
+      let lag = null;
       while (Date.now() - started < withinMs) {
-        seen = [];
-        for (const m of nodes.filter((n) => n.alive)) seen.push(await namesOn(m));
-        if (seen.every((names) => JSON.stringify(names) === JSON.stringify(expected))) {
-          return Date.now() - started;
+        const live = nodes.filter((n) => n.alive);
+        /* Concurrently, so the leader's number and the followers' are
+         * from the same instant rather than one poll apart. */
+        const stats = await Promise.all(live.map(async (m) =>
+          [m, await statusOf(m).catch(() => null)]));
+        const lead = stats.find(([, st]) => st?.role === 'leader');
+        if (lead) {
+          const at = lead[1].applied;
+          seen = await namesOn(lead[0]).catch(() => null);
+          lag = stats.map(([m, st]) => `${m.id}:${st ? st.applied : '?'}`);
+          if (JSON.stringify(seen) === JSON.stringify(expected) &&
+              stats.every(([, st]) => st && st.applied >= at)) {
+            return Date.now() - started;
+          }
         }
         await new Promise((r) => setTimeout(r, 50));
       }
       throw new Error(`members never agreed on ${JSON.stringify(expected)}: ` +
-                      JSON.stringify(seen));
+                      `leader held ${JSON.stringify(seen)}, applied ${lag}`);
     };
 
     beforeAll(async () => {
@@ -794,6 +827,100 @@ for (const engine of ENGINES) {
       expect(took[0]).toBe(named.id);
       await agree(['alpha', 'beta', 'contested', 'redirected']);
     });
+
+    /*
+     * docs/steps/read-semantics-and-change-streams.md, part one: every
+     * read is linearizable and the leader alone serves one.
+     *
+     * A follower is behind by at least a round trip and cannot tell by
+     * how much, so an answer from it is staleness presented as
+     * authority. It refuses with the same code and the same address a
+     * write refusal carries, because a client acts on both the same way.
+     */
+    it('refuses a READ on a follower, exactly as it refuses a write', async () => {
+      await agree(['alpha', 'beta', 'contested', 'redirected']);
+      const live = nodes.filter((n) => n.alive);
+      const stats = await Promise.all(live.map(async (m) => [m, await statusOf(m)]));
+
+      const leaders = stats.filter(([, s]) => s.role === 'leader');
+      expect(leaders.length).toBe(1);
+      const followers = stats.filter(([, s]) => s.role !== 'leader');
+      expect(followers.length).toBe(2);
+
+      for (const [m, s] of followers) {
+        const c = await connectServer(m.port);
+        try {
+          await expect(c.db(DB).collection('users').countDocuments({}))
+            .rejects.toMatchObject({ code: -63, leaderId: leaders[0][1].leaderId });
+          /* The instance's own ops are classified too, and by the same
+           * table: listDatabases reads, dropDatabase writes. A follower
+           * refuses both -- which for dropDatabase matters more than it
+           * looks, because it is not replicated (docs/steps/README.md)
+           * and a follower performing one would silently diverge. */
+          await expect(c.listDatabases()).rejects.toMatchObject({ code: -63 });
+          await expect(c.dropDatabase(DB)).rejects.toMatchObject({ code: -63 });
+        } finally { await c.close(); }
+        /* And it still answers the one thing that touches nothing --
+         * which is how anybody watches it replicate at all now. */
+        expect(s).toMatchObject({ pong: true, role: 'follower' });
+        expect(s.applied).toBeGreaterThan(0);
+      }
+
+      // The leader does serve it, and serves the truth.
+      expect(await namesOn(leaders[0][0]))
+        .toEqual(['alpha', 'beta', 'contested', 'redirected']);
+    });
+
+    /*
+     * ...and the other half of linearizable: a LEADER that cannot prove
+     * it still leads refuses too.
+     *
+     * Raft does not depose a leader that has lost its quorum -- it
+     * simply stops being able to commit -- so without a barrier this
+     * member would go on answering reads from a log a newer leader may
+     * already have moved past. -66 rather than -63 because it is a
+     * different operator problem: not "ask somebody else", but "there
+     * may be nobody to ask".
+     */
+    it('refuses a read on a leader whose quorum has gone quiet', async () => {
+      const live = nodes.filter((n) => n.alive);
+      const stats = await Promise.all(live.map(async (m) => [m, await statusOf(m)]));
+      const leader = stats.find(([, s]) => s.role === 'leader')[0];
+      const others = live.filter((m) => m.id !== leader.id);
+      expect(others.length).toBe(2);
+
+      /* The quorum comes back whatever this test concludes. A failure
+       * here used to leave one member standing and every test after it
+       * waiting for a quorum that was never coming -- which reads as a
+       * hang rather than as the assertion that failed. */
+      try {
+        for (const m of others) await stop(m);
+
+        // Still the leader by its own reckoning -- that is the point.
+        expect((await statusOf(leader)).role).toBe('leader');
+
+        const db = (await connectServer(leader.port)).db(DB);
+        try {
+          await expect(db.collection('users').countDocuments({}))
+            .rejects.toMatchObject({ code: -66 });
+        } finally { await db.close(); }
+      } finally {
+        for (const m of others) if (!m.alive) await boot(m);
+      }
+
+      // And it clears the moment a quorum answers again: no restart, no
+      // election, just a member coming back. It takes a redial and a
+      // heartbeat, so the read is retried rather than assumed -- what is
+      // being checked is that it starts working, not how fast.
+      let back = null;
+      const until = Date.now() + 15000;
+      while (Date.now() < until && !back) {
+        back = await namesOn(leader).catch(() => null);
+        if (!back) await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(back).toEqual(['alpha', 'beta', 'contested', 'redirected']);
+      await agree(['alpha', 'beta', 'contested', 'redirected']);
+    }, 60000);
 
     it('survives the leader being killed, and takes writes again', async () => {
       const leader = await write('gamma');
@@ -1120,12 +1247,38 @@ for (const engine of ENGINES) {
       throw new Error(`no member took the write "${name}": ${last?.message}`);
     };
 
+    /*
+     * What the cluster holds, and how far each member has got.
+     *
+     * ONLY THE LEADER MAY BE READ. Reads are linearizable and the leader
+     * alone serves them
+     * (docs/steps/read-semantics-and-change-streams.md), so polling
+     * every member for its documents -- which is what this used to do --
+     * now gets -63 from every follower. What a follower will still
+     * answer is `ping`, and that is where it says what it is and how far
+     * its apply pump has got.
+     *
+     * So convergence is checked as: the LEADER's documents are what was
+     * expected, and every live member has applied at least as much of
+     * the log as the leader had when it was asked. That is a stronger
+     * claim than the old one, not a weaker substitute -- it is the log
+     * index rather than a re-derived read -- and the file-level checks
+     * elsewhere in this file are what tie a log prefix back to bytes on
+     * disk.
+     */
+    const statusOf = async (m) => {
+      const c = await connectServer(m.port);
+      try { return await c.ping(); } finally { await c.close(); }
+    };
+
     const namesOn = async (m) => {
       const db = (await connectServer(m.port)).db(DB);
       try {
         return (await db.collection('users').find({}, { sort: { name: 1 } }).toArray())
           .map((d) => d.name);
       } catch (err) {
+        /* A leader that has applied nothing has no `users` at all: the
+         * collection is made by the first insert applying. */
         if (err.code === -37) return [];
         throw err;
       } finally { await db.close(); }
@@ -1134,16 +1287,27 @@ for (const engine of ENGINES) {
     const agree = async (members, expected, withinMs = 20000) => {
       const started = Date.now();
       let seen = null;
+      let lag = null;
       while (Date.now() - started < withinMs) {
-        seen = [];
-        for (const m of members.filter((n) => n.alive)) seen.push(await namesOn(m));
-        if (seen.every((names) => JSON.stringify(names) === JSON.stringify(expected))) {
-          return Date.now() - started;
+        const live = members.filter((n) => n.alive);
+        /* Concurrently, so the leader's number and the followers' are
+         * from the same instant rather than one poll apart. */
+        const stats = await Promise.all(live.map(async (m) =>
+          [m, await statusOf(m).catch(() => null)]));
+        const lead = stats.find(([, st]) => st?.role === 'leader');
+        if (lead) {
+          const at = lead[1].applied;
+          seen = await namesOn(lead[0]).catch(() => null);
+          lag = stats.map(([m, st]) => `${m.id}:${st ? st.applied : '?'}`);
+          if (JSON.stringify(seen) === JSON.stringify(expected) &&
+              stats.every(([, st]) => st && st.applied >= at)) {
+            return Date.now() - started;
+          }
         }
         await new Promise((r) => setTimeout(r, 50));
       }
       throw new Error(`members never agreed on ${JSON.stringify(expected)}: ` +
-                      JSON.stringify(seen));
+                      `leader held ${JSON.stringify(seen)}, applied ${lag}`);
     };
 
     /*
@@ -1744,8 +1908,9 @@ for (const engine of ENGINES) {
       await expect(client.request({ op: 'listCollections' }))
         .rejects.toMatchObject({ code: -42 });
       // ping names none and needs none -- it is how a connection stays
-      // warm before it has opened anything.
-      expect(await client.ping()).toBe(true);
+      // warm before it has opened anything. It answers with what the
+      // member IS; unreplicated, that is just the pong.
+      expect(await client.ping()).toMatchObject({ pong: true });
     });
 
     it('refuses a database name that is not one', async () => {
@@ -2215,7 +2380,7 @@ for (const engine of ENGINES) {
         expect(await warm.db(DB).collection('users').countDocuments({})).toBe(3);
         // ping is the CLIENT's: it names no database, which is what
         // makes it usable by a connection that has not opened one.
-        expect(await warm.ping()).toBe(true);
+        expect(await warm.ping()).toMatchObject({ pong: true });
       } finally {
         await warm.close();
       }

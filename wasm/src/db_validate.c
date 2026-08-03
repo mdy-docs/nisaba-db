@@ -158,6 +158,10 @@ const char *dc_strerror(int code) {
         case DC_ERR_WRITE_LOST:
             return "Leadership moved before this write was applied, and no "
                    "replica holds it; it is safe to retry";
+        case DC_ERR_NOT_CURRENT:
+            return "This member leads but could not prove it still does, so it "
+                   "cannot show its data is current; a quorum has gone quiet -- "
+                   "retry, here or anywhere";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

@@ -1007,11 +1007,20 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
       dbs.delete(name);
       return (await conn.call({ op: 'dropDatabase', db: name })).dropped;
     },
-    /** The one op that names no database and touches nothing: it exists
-     * so a connection can stay warm without pretending to be a query. */
+    /**
+     * The one op that names no database and touches nothing: it exists
+     * so a connection can stay warm without pretending to be a query.
+     *
+     * On a REPLICATED server it is also the only thing a follower will
+     * answer — reads belong to the leader — so it is where a member says
+     * what it is: `{ pong, role, leaderId, applied, commit }`. Those
+     * numbers report and promise nothing. `applied` is that member's own
+     * floor at the moment it was asked, and it is precisely the number
+     * that may not be used to serve a read.
+     */
     async ping() {
-      await conn.call({ op: 'ping' });
-      return true;
+      const { ok, ...status } = await conn.call({ op: 'ping' });
+      return status;
     },
     /* The escape hatch: send an op the wire has, `db` and all, and read
      * the response object as it came. A new op is usable from JavaScript

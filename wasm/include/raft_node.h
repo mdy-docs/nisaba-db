@@ -534,6 +534,51 @@ int rn_installed(raft_node *n, uint64_t peer, uint64_t boundary);
 int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
                uint64_t *out_index);
 
+/* ---- read barriers (section 6.4, ReadIndex) ------------------------------
+ *
+ * A LEADER'S LOCAL STATE IS NOT AUTHORITATIVE BY ITSELF. Raft does not
+ * depose a leader that has lost contact with its quorum -- it simply
+ * stops being able to commit -- so a partitioned leader will answer a
+ * read from state a newer leader has already moved past. Serving that is
+ * presenting staleness as authority, which is the one thing a read must
+ * never do.
+ *
+ * A barrier is the proof. Take one, and a quorum of voters must be shown
+ * to still follow this leader SINCE the moment it was taken; the caller
+ * then serves state at or above `read_index` and the answer is
+ * linearizable. Concurrent barriers share the same round -- sixty-four
+ * reads at once cost one heartbeat round, not sixty-four -- because what
+ * confirms them is per-peer evidence, not a per-barrier message.
+ *
+ * A FRESH ROUND, NOT A LEASE. rn_has_quorum_contact would answer this
+ * more cheaply from timestamps, and that is a lease: it assumes bounded
+ * clock skew, which nothing else in this codebase does. This asks.
+ *
+ *     rn_read_barrier(n, &token, &read_index)
+ *     ... the host serves the read, and holds the answer ...
+ *     rn_read_state(n, token)   1 confirmed, 0 not yet, -1 lost
+ *     rn_read_release(n, token)
+ *
+ * EVERY BARRIER TERMINATES. Confirmed, lost at step-down or stop, or
+ * expired after an election timeout without a quorum answering -- there
+ * is no fourth outcome, and no client is left holding a read forever.
+ * Polled rather than reported through the effect queue: one entry per
+ * client connection would swamp a queue sized for peers and proposals.
+ *
+ * BJ_ERR_STATE if this node does not lead -- the host refuses with a
+ * routing error the caller can act on. RAFT_ERR_CAPACITY when more reads
+ * are outstanding than this build holds; also a refusal, for the reason
+ * every other bounded table here refuses.
+ *
+ * A single-voter group is confirmed the instant it is taken: there is
+ * nobody to hear from, so the read is answered without a round trip and
+ * without waiting.
+ */
+int      rn_read_barrier(raft_node *n, uint64_t *token, uint64_t *read_index);
+int      rn_read_state(const raft_node *n, uint64_t token);
+void     rn_read_release(raft_node *n, uint64_t token);
+uint32_t rn_reads_outstanding(const raft_node *n);
+
 /* ---- completions --------------------------------------------------------
  *
  * What a client is actually waiting for is not "committed" but "applied,

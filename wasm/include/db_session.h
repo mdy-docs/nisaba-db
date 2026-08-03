@@ -121,11 +121,13 @@ extern "C" {
 #define DC_ERR_NO_STREAM            (-60)
 #define DC_ERR_TOO_MANY_STREAMS     (-61)
 
-/* This member is not the leader of its group, so it cannot take a write.
- * The response carries `leaderId` when there is one, which is the whole
- * of what a client needs to try again in the right place: FORWARDING IS
- * NOT THIS SERVER'S JOB. A server that forwarded would be holding a
- * request whose outcome it cannot promise anything about, on a
+/* This member is not the leader of its group, so it can serve neither a
+ * write nor a READ -- a follower is always behind by at least a round
+ * trip and cannot tell how far, so answering would present staleness as
+ * authority. The response carries `leaderId` when there is one, which is
+ * the whole of what a client needs to try again in the right place:
+ * FORWARDING IS NOT THIS SERVER'S JOB. A server that forwarded would be
+ * holding a request whose outcome it cannot promise anything about, on a
  * connection it would have to keep alive to say so. */
 #define DC_ERR_NOT_LEADER           (-63)
 
@@ -135,9 +137,62 @@ extern "C" {
  * not happen and no replica holds it, so a retry is safe. */
 #define DC_ERR_WRITE_LOST           (-64)
 
+/*
+ * This member LEADS, and could not prove it still does in time to answer
+ * a read.
+ *
+ * Distinct from DC_ERR_NOT_LEADER on purpose, because they are different
+ * operator problems and a client acts on them differently. -63 means
+ * "ask somebody else, here is who". This means "there may be nobody to
+ * ask": a leader whose quorum has gone silent is still a leader -- Raft
+ * does not depose it -- and the honest answer to a read is that its data
+ * cannot be shown to be current, not a stale answer presented as one.
+ * Retrying against the same member is reasonable; it clears the moment a
+ * quorum answers again.
+ */
+#define DC_ERR_NOT_CURRENT          (-66)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)
+
+/* ---- what a request DOES, before it is performed -------------------------
+ *
+ * A replicated server has to know whether a request reads, writes or
+ * touches nothing BEFORE it runs it: a follower refuses the first two,
+ * and a leader owes a read a barrier proving its data is current
+ * (docs/steps/read-semantics-and-change-streams.md).
+ *
+ * The classification lives with the op table it classifies, one line per
+ * op, so an op cannot be added without one. Deriving it anywhere else
+ * would be a second opinion about what an op does -- and the failure
+ * would be silent in the worst direction: a write classified as a read
+ * is a write a follower performs off the log.
+ *
+ * NONE is the two calls that release a client's own local resources
+ * (closeCursor, closeStream). They touch no database state, so they are
+ * answered by whichever member holds them.
+ *
+ * STATUS is `ping`, and it is its own kind for one reason: it is the
+ * only thing a FOLLOWER still answers once reads are the leader's alone,
+ * so it is where a follower says what it is and how far it has got. A
+ * keepalive that needed a quorum would be a connection that died with
+ * the cluster, and a cluster whose members cannot be asked anything is
+ * one nobody can watch replicate.
+ *
+ * Anything this cannot classify -- a malformed request, an unknown op --
+ * is NONE, because the answer is a refusal and a refusal needs no
+ * quorum. It is never an error: the caller performs the request anyway
+ * and gets the real diagnosis from the code that owns it.
+ */
+typedef enum {
+    DBS_REQ_NONE   = 0,
+    DBS_REQ_READ   = 1,
+    DBS_REQ_WRITE  = 2,
+    DBS_REQ_STATUS = 3
+} dbs_req_kind;
+
+void dbs_request_kind(const uint8_t *req, size_t req_len, int *kind);
 
 typedef struct dbs dbs;
 

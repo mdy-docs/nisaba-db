@@ -50,7 +50,10 @@ const db2 = await connect(new OPFSStorageProvider(dir));
 ```
 
 `connect(provider, options?)` returns an already-open `Db`. `options.order`
-sets the underlying B+ tree order (default 32) — rarely needs changing.
+sets the underlying B+ tree order for files this connection CREATES
+(default 32) — rarely needs changing, and never needs repeating: a tree
+records its own order and reads it back, so an existing database opens
+correctly whatever you pass.
 `options.autoCompact` (`{ minBytes?, factor? }`) schedules a deferred
 compaction sweep after every open — see
 [Compaction](#compaction-compact).

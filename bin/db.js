@@ -299,10 +299,10 @@ async function main() {
   let db, closeAll;
   if (remote) {
     if (opts.orderExplicit) {
-      // The order the files were made with is the server's to know; a
-      // client asking for a different one would be asking it to read the
-      // same bytes a second way.
-      console.error('Error: --order is the server\'s, chosen when it opened the directory');
+      // --order is the order NEW files are created with, and creating
+      // them is the server's job. It is not needed to READ anything: a
+      // tree records its own order and reads it back.
+      console.error('Error: --order is the server\'s, and only for files it creates');
       process.exit(1);
     }
     let client;

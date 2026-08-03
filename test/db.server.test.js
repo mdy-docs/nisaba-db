@@ -502,6 +502,60 @@ const REQUIRED = process.env.NISABA_SERVER_TESTS === 'required';
  * nothing wrong -- so it says what it found and what to do instead.
  */
 /*
+ * --order is a CREATION parameter, not something a reader has to be told.
+ *
+ * The tree records its own order in its metadata and bpt_open reads it
+ * back (meta_apply), so `s->order` in db_session.c reaches bpt_create
+ * and rtree_create and nothing else. docs/db-server.md used to say the
+ * opposite -- "open a tree with the wrong one and its pages read as
+ * nonsense" -- which would have had operators carrying a number around
+ * forever to avoid a corruption that cannot happen.
+ *
+ * So: make the files with one order, read them with another, and with a
+ * different implementation that was never told either.
+ */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: --order is for files it CREATES ($name)', (engine) => {
+    it('reads back files made with a different order, and so does the JS engine',
+       async () => {
+      const port = nextPort();
+      // 8, which is nothing like the default 32: if the reader had to be
+      // told, this would not survive the restart.
+      const first = await startServer(engine, port, ['--order', '8'], -1);
+      {
+        const db = (await connectServer(port)).db(DB);
+        await db.collection('users').insertMany(
+          Array.from({ length: 50 }, (_, i) => ({ n: i, name: `u${i}` })));
+        expect(await db.collection('users').countDocuments({})).toBe(50);
+        await db.close();
+      }
+      first.proc.kill();
+      await new Promise((r) => first.proc.once('exit', r));
+
+      // Again, on the same files, with NO --order at all.
+      const again = await startServer(engine, port, [], -1, first.dir);
+      try {
+        const db = (await connectServer(port)).db(DB);
+        expect(await db.collection('users').countDocuments({})).toBe(50);
+        expect((await db.collection('users').find({ n: 7 }).toArray())[0].name)
+          .toBe('u7');
+        await db.close();
+      } finally {
+        again.proc.kill();
+        await new Promise((r) => again.proc.once('exit', r));
+      }
+
+      // And a third implementation, told nothing about it either.
+      const provider = new NodeFSStorageProvider(path.join(first.dir, DB));
+      const jsDb = await connect(provider);
+      const users = await jsDb.collection('users');
+      expect(await users.countDocuments({})).toBe(50);
+      await jsDb.close();
+      await provider.close();
+    }, 60000);
+  });
+
+/*
  * --dir names the data directory, so a server does not have to be put
  * INSIDE it. Everything below the root has always been fd-relative --
  * bjns_posix and server/root.c openat() from one descriptor and never
@@ -2438,7 +2492,8 @@ for (const engine of ENGINES) {
       // Nothing is left to refuse: every CLI command works over the
       // socket now, database-wide compact included. What the server
       // still owns is the things that are not commands at all.
-      // --order is the server's, decided when it opened the directory.
+      // --order is the order NEW files are created with, and creating
+      // them is the server's job -- not a number a reader has to know.
       const ordered = cli('count', 'users', '--order', '64');
       expect(ordered.status).toBe(1);
       expect(ordered.stderr).toMatch(/--order is the server's/);

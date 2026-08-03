@@ -161,9 +161,10 @@ naming a database creates it, and an `insert` into a collection that does
 not exist creates that, so a database can be built from nothing over the
 wire. One process per ROOT is the one-writer rule, widened from the
 directory the advisory lock enforces locally.
-For the same reason `--order` is refused with `--server`: the order the
-files were written with is the server's to know, and it takes its own
-`--order` if they were not made with the default 32.
+For the same reason `--order` is refused with `--server`: it is the order
+NEW files are created with, and creating them is the server's job, not a
+client's. (It is not needed to READ anything — a tree records its own
+order and reads it back — so a client never has a reason to pass one.)
 
 The wire carries thirty-one operations, and the CLI commands that ride
 on them:

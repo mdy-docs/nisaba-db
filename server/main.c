@@ -860,10 +860,16 @@ int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
     int max_clients = MAX_CLIENTS;
     int idle_seconds = DEFAULT_IDLE_TIMEOUT;
-    /* The order the files were WRITTEN with, which is not a preference:
-     * open a tree with the wrong one and its pages read as nonsense. The
-     * default is what every host in this repo creates with, so the flag
-     * exists for a database made with `db ... --order N`. */
+    /*
+     * The B+ tree order for files this process CREATES -- a fresh
+     * database in an empty directory, and any collection or index made
+     * later in its life.
+     *
+     * NOT something a reader has to be told. A tree records its own
+     * order in its metadata and bpt_open reads it back, so this reaches
+     * bpt_create and rtree_create (db_session.c) and nothing else, and
+     * an existing database opens correctly whatever is passed here.
+     */
     int order = DC_DEFAULT_ORDER;
     /* 0 = not a replica: every write is applied where it lands, which is
      * what this server has always done and what it still does by

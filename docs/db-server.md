@@ -64,7 +64,7 @@ data and reporting nothing wrong.
 | `--dir PATH` | the directory the instance lives in (default `.`). Must exist; under WASI, must be inside a preopen |
 | `--port N` | TCP listener on loopback (default 8097). Needs sockets: wasip2 or native |
 | `--stdio` | frames on stdin/stdout. Every target, including wasip1 |
-| `--order N` | B+ tree order the files were **written** with (default 32) |
+| `--order N` | B+ tree order for files this process **creates** (default 32, min 3) |
 | `--max-clients N` | connections held at once (default and ceiling 64) |
 | `--idle-timeout N` | seconds of silence before a connection's slot is taken back (default 60; 0 disables) |
 | `--raft ID` | this process is a cluster member with that node id |
@@ -73,9 +73,18 @@ data and reporting nothing wrong.
 | `--join HOST:PORT` | ask a RUNNING cluster to admit this node, knowing only a seed address; repeat for more seeds. Use **instead of** `--peer` |
 | `--leave ID` | ask that cluster to remove member `ID`, then exit without serving; needs `--join` to say who to ask |
 
-`--order` is not a preference. Open a tree with the wrong one and its
-pages read as nonsense, so it has to match whatever created the files —
-`bin/db.js --order N`, or a host passing `order` to `connect()`.
+**`--order` is a creation parameter, not something a reader has to be
+told.** A tree records its own order in its metadata and reads it back
+when opened, so files made with one order open correctly under any
+other — including by a different implementation that was never told
+either. What the flag sets is the order of files this process goes on to
+CREATE: a new database in an empty directory, and any collection or
+index made later in that process's life. An existing database's files
+keep whatever they were made with.
+
+So it is worth passing when a directory is first served, and it is safe
+to forget afterwards. `bin/db.js --order N` and a host passing `order` to
+`connect()` mean the same thing.
 
 ## A cluster
 

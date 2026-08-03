@@ -78,6 +78,12 @@ Three directories, three processes, no JavaScript in any of them. They
 elect a leader, put every write through a log before applying it, and
 survive one of them dying — two of three is still a quorum.
 
+**`./examples/cluster.sh` does all of this and prints what it is doing**
+— builds, starts three members, finds the leader, inserts and reads,
+shows a follower refusing, kills the leader, joins a fourth member with
+`--join` and removes it again, then cleans up. Every line in it is a
+command you could type.
+
 **One log for the whole instance**, not one per database: one leader,
 one election, one member set, one failover story for the executable. A
 log entry carries the database its command is for, and that is the whole

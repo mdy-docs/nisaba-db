@@ -153,8 +153,8 @@ const char *dc_strerror(int code) {
         case DC_ERR_TOO_MANY_STREAMS:
             return "Too many change streams open at once on this server";
         case DC_ERR_NOT_LEADER:
-            return "This member is not the leader of its group and cannot "
-                   "take a write; retry against the leader";
+            return "This member is not the leader of its group, so it can serve "
+                   "neither a read nor a write; retry against the leader";
         case DC_ERR_WRITE_LOST:
             return "Leadership moved before this write was applied, and no "
                    "replica holds it; it is safe to retry";

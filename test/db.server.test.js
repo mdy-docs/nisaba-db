@@ -426,7 +426,15 @@ const ENGINES = [
   {
     name: 'native',
     ready: () => have(NATIVE),
-    argv: (dir, port, extra) => [path.resolve(NATIVE), ['--port', String(port), ...extra], { cwd: dir }]
+    argv: (dir, port, extra) => [path.resolve(NATIVE), ['--port', String(port), ...extra], { cwd: dir }],
+    /* The same server, told which directory to use instead of being put
+     * in it. The cwd is deliberately somewhere else: that is the whole
+     * of what --dir has to prove. */
+    argvDir: (dir, port, extra) => [
+      path.resolve(NATIVE),
+      ['--dir', dir, '--port', String(port), ...extra],
+      { cwd: os.tmpdir() }
+    ]
   },
   {
     name: 'wasm32-wasip2 under wasmtime',
@@ -434,6 +442,14 @@ const ENGINES = [
     argv: (dir, port, extra) => [wasmtime, [
       'run', '-S', 'inherit-network', '--dir', `${dir}::.`,
       path.resolve(WASIP2), '--port', String(port), ...extra
+    ], {}],
+    /* TWO --dir flags, and the .wasm path is the boundary: wasmtime's
+     * maps a host directory into the guest, the server's names a
+     * directory inside what the host granted. */
+    argvDir: (dir, port, extra) => [wasmtime, [
+      'run', '-S', 'inherit-network', '--dir', `${path.dirname(dir)}::/root`,
+      path.resolve(WASIP2),
+      '--dir', `/root/${path.basename(dir)}`, '--port', String(port), ...extra
     ], {}]
   }
 ];
@@ -485,6 +501,104 @@ const REQUIRED = process.env.NISABA_SERVER_TESTS === 'required';
  * databases in it, standing on top of somebody's data and reporting
  * nothing wrong -- so it says what it found and what to do instead.
  */
+/*
+ * --dir names the data directory, so a server does not have to be put
+ * INSIDE it. Everything below the root has always been fd-relative --
+ * bjns_posix and server/root.c openat() from one descriptor and never
+ * name a path again -- so which directory it is costs exactly one open,
+ * and every other suite here still exercises the default by running the
+ * server with `.` as its cwd (or preopen).
+ */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: --dir names the data directory ($name)', (engine) => {
+    it('serves a directory the process is not standing in', async () => {
+      const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-dir-'));
+      const data = path.join(parent, 'instance');
+      fs.mkdirSync(data);
+      const port = nextPort();
+
+      const [cmd, args, opts] = engine.argvDir(data, port, []);
+      const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('did not start')), 30000);
+        proc.stderr.on('data', (d) => {
+          if (String(d).includes('serving')) { clearTimeout(t); resolve(); }
+        });
+      });
+
+      try {
+        const db = (await connectServer(port)).db('shop');
+        await db.collection('items').insertOne({ sku: 'A1' });
+        expect((await db.collection('items').find({}).toArray()).map((d) => d.sku))
+          .toEqual(['A1']);
+        await db.close();
+      } finally {
+        proc.kill();
+        await new Promise((r) => proc.once('exit', r));
+      }
+
+      // In THAT directory, and readable by the JS implementation --
+      // which is the claim, not merely that the server answered.
+      expect(fs.readdirSync(data)).toContain('shop');
+      const provider = new NodeFSStorageProvider(path.join(data, 'shop'));
+      const jsDb = await connect(provider);
+      const items = await jsDb.collection('items');
+      expect((await items.find({}).toArray()).map((d) => d.sku)).toEqual(['A1']);
+      await jsDb.close();
+      await provider.close();
+    }, 60000);
+
+    /*
+     * Start it and expect it to GIVE UP. If the refusal ever stops
+     * working the server starts instead and never exits, so this waits
+     * with a deadline and kills it -- a test that leaked a running
+     * server would hold a port and a temp directory for the rest of the
+     * run, and report a timeout rather than the thing that broke.
+     */
+    const refusedBy = async (dir) => {
+      const [cmd, args, opts] = engine.argvDir(dir, nextPort(), []);
+      const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+      let err = '';
+      proc.stderr.on('data', (d) => { err += String(d); });
+      try {
+        const code = await Promise.race([
+          new Promise((r) => proc.once('exit', r)),
+          new Promise((r) => setTimeout(() => r('still running'), 10000))
+        ]);
+        return { code, err };
+      } finally {
+        proc.kill();
+      }
+    };
+
+    it('refuses a directory that is not there, rather than making one', async () => {
+      /*
+       * A mistyped --dir that quietly created an empty instance would be
+       * indistinguishable from having lost the data, so it is refused
+       * and the message says exactly that.
+       */
+      const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-dir-'));
+      const { code, err } = await refusedBy(path.join(parent, 'nope'));
+      expect(code).not.toBe(0);
+      expect(code).not.toBe('still running');
+      expect(err).toMatch(/cannot open the data directory/);
+      expect(err).toMatch(/not created for you/);
+      expect(fs.existsSync(path.join(parent, 'nope'))).toBe(false);
+    }, 30000);
+
+    it('refuses a path that is a file', async () => {
+      const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-dir-'));
+      const file = path.join(parent, 'afile');
+      fs.writeFileSync(file, 'not a directory');
+      const { code, err } = await refusedBy(file);
+      expect(code).not.toBe(0);
+      expect(code).not.toBe('still running');
+      expect(err).toMatch(/cannot open the data directory/);
+      // Untouched: a refusal leaves things exactly as they were.
+      expect(fs.readFileSync(file, 'utf8')).toBe('not a directory');
+    }, 30000);
+  });
+
 describe.each(ENGINES.filter((e) => e.ready()))(
   'nisaba-server: a root that is a database ($name)', (engine) => {
     it('refuses to serve it, and says how to move it', async () => {

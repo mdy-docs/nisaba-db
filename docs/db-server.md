@@ -18,17 +18,30 @@ depend on sockets (preview1 has none).
 ./wasm/build-server.sh --wasip1     # wasm32-wasip1, --stdio only
 ```
 
-The ROOT directory is the working directory (native) or the preopen
-mapped to `.` (WASI). One process per root, for its whole lifetime:
+The ROOT directory is `--dir`, defaulting to `.` — which is also what a
+WASI preopen is mapped to, so nothing that worked before needs the flag.
+One process per root, for its whole lifetime:
 
 ```sh
-wasmtime run -S inherit-network --dir ~/.nisaba::. \
-  wasm/lib/nisaba-server-wasip2.wasm --port 8097
+nisaba-server --dir ~/.nisaba --port 8097          # natively
+nisaba-server --dir /tmp/brand-new                 # an empty directory is an empty instance
+nisaba-server --dir ~/.nisaba --stdio              # frames on stdin/stdout
 
-cd ~/.nisaba && nisaba-server --port 8097          # or natively
-cd /tmp/brand-new && nisaba-server --port 8097     # an empty directory is an empty instance
-nisaba-server --stdio                              # frames on stdin/stdout
+wasmtime run -S inherit-network --dir ~/.nisaba::/data \
+  wasm/lib/nisaba-server-wasip2.wasm --dir /data --port 8097
 ```
+
+**The two `--dir` flags in that last line are different flags**, and the
+`.wasm` path is the boundary: the first is wasmtime's, mapping a host
+directory into the guest, and the second is the server's, naming a
+directory *inside* what the host granted. Under WASI it must stay inside
+one — that is the sandbox rather than this flag, and a path outside every
+preopen is reported as "no such file", because to the guest that is
+exactly what it is.
+
+**The directory is not created for you.** A mistyped `--dir` would
+otherwise start a server on a brand-new empty instance, which from the
+outside is indistinguishable from having lost the data.
 
 ```
 ~/.nisaba/                 the root -- one process owns it
@@ -48,6 +61,7 @@ data and reporting nothing wrong.
 
 | Flag | |
 | --- | --- |
+| `--dir PATH` | the directory the instance lives in (default `.`). Must exist; under WASI, must be inside a preopen |
 | `--port N` | TCP listener on loopback (default 8097). Needs sockets: wasip2 or native |
 | `--stdio` | frames on stdin/stdout. Every target, including wasip1 |
 | `--order N` | B+ tree order the files were **written** with (default 32) |
@@ -66,12 +80,12 @@ pages read as nonsense, so it has to match whatever created the files —
 ## A cluster
 
 ```sh
-cd node1 && nisaba-server --port 8097 --raft 1 --raft-port 9001 \
-                          --peer 2@127.0.0.1:9002 --peer 3@127.0.0.1:9003
-cd node2 && nisaba-server --port 8098 --raft 2 --raft-port 9002 \
-                          --peer 1@127.0.0.1:9001 --peer 3@127.0.0.1:9003
-cd node3 && nisaba-server --port 8099 --raft 3 --raft-port 9003 \
-                          --peer 1@127.0.0.1:9001 --peer 2@127.0.0.1:9002
+nisaba-server --dir node1 --port 8097 --raft 1 --raft-port 9001 \
+              --peer 2@127.0.0.1:9002 --peer 3@127.0.0.1:9003
+nisaba-server --dir node2 --port 8098 --raft 2 --raft-port 9002 \
+              --peer 1@127.0.0.1:9001 --peer 3@127.0.0.1:9003
+nisaba-server --dir node3 --port 8099 --raft 3 --raft-port 9003 \
+              --peer 1@127.0.0.1:9001 --peer 2@127.0.0.1:9002
 ```
 
 Three directories, three processes, no JavaScript in any of them. They
@@ -106,8 +120,8 @@ list at all.
 ## Growing and shrinking one
 
 ```sh
-cd node4 && nisaba-server --port 8100 --raft 4 --raft-port 9004 \
-                          --join 127.0.0.1:9001 --join 127.0.0.1:9002
+nisaba-server --dir node4 --port 8100 --raft 4 --raft-port 9004 \
+              --join 127.0.0.1:9001 --join 127.0.0.1:9002
 ```
 
 One address, no ids, no member list. It asks; if that seed is not the

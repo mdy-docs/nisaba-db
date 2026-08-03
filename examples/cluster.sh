@@ -124,13 +124,15 @@ step "Starting three members"
 # become one database because the log makes them so.
 start_member() {
   local id=$1 port=$2 raft_port=$3; shift 3
-  # --dir is the whole of what makes this member's data ITS data. One
-  # process owns one directory for its lifetime, which is the entire
+  # The DIRECTORY is what makes this member's data its own, and the
+  # server takes it from where it is standing -- there is no --dir flag,
+  # because under WASI the host grants the directory and calls it ".".
+  # One process owns one directory for its lifetime, which is the whole
   # answer to concurrent writers.
   mkdir -p "$DIR/node$id"
-  "$SERVER" --dir "$DIR/node$id" \
+  ( cd "$DIR/node$id" && exec "$OLDPWD/$SERVER" \
       --port "$port" --raft "$id" --raft-port "$raft_port" "$@" \
-      > "$DIR/node$id.log" 2>&1 &
+  ) > "$DIR/node$id.log" 2>&1 &
   RUNNING="$RUNNING $port:$!"
   echo "  node $id: clients on $port, peers on $raft_port, data in $DIR/node$id"
 }
@@ -255,9 +257,9 @@ step "Adding a fourth member, which knows one ADDRESS"
 #
 # The seed address is a member's PEER port, not its client port.
 mkdir -p "$DIR/node4"
-"$SERVER" --dir "$DIR/node4" \
+( cd "$DIR/node4" && exec "$OLDPWD/$SERVER" \
     --port 8100 --raft 4 --raft-port 9004 --join 127.0.0.1:9002 \
-    > "$DIR/node4.log" 2>&1 &
+) > "$DIR/node4.log" 2>&1 &
 RUNNING="$RUNNING 8100:$!"
 NODES="$NODES 4:8100:9004"
 wait_for_member 4

@@ -34,11 +34,17 @@
  *   (default)   a TCP listener. Needs sockets, which means wasm32-wasip2
  *               or native; see wasm/build-server.sh.
  *
- * ONE PROCESS PER DATA DIRECTORY. --dir names it (default ".", which is
- * what a WASI preopen is mapped to) and the process owns it for its
- * lifetime. That is the whole answer to concurrent writers:
- * wasi-filesystem has no locking to arbitrate them with, so there is
- * never more than one.
+ * ONE PROCESS PER DATA DIRECTORY, and the directory is "." -- the
+ * preopen, under WASI, and the working directory natively. The process
+ * owns it for its lifetime. That is the whole answer to concurrent
+ * writers: wasi-filesystem has no locking to arbitrate them with, so
+ * there is never more than one.
+ *
+ * THE HOST CHOOSES IT, NOT THIS PROCESS. `wasmtime run --dir DIR::.`
+ * grants exactly one directory and names it "."; a --dir flag HERE
+ * would be a second place the same fact is decided, on the same command
+ * line as the host's own (they were even spelled the same). So there
+ * isn't one: point the host at the directory, or cd into it.
  *
  * MANY CONNECTIONS, ONE AT A TIME THROUGH THE ENGINE. poll() over the
  * listener and every accepted socket; whichever is ready is served, and
@@ -780,12 +786,11 @@ static int serve_forever(dbi *inst, replica *rep, peers *px, int srv,
 
 static void usage(const char *me) {
     fprintf(stderr,
-            "usage: %s [--dir PATH] [--stdio] [--port N] [--order N]\n"
-            "           [--max-clients N] [--idle-timeout SECONDS]\n"
-            "           [--raft NODE_ID] [--raft-port N] [--peer ID@HOST:PORT ...]\n"
+            "usage: %s [--stdio] [--port N] [--order N] [--max-clients N]\n"
+            "           [--idle-timeout SECONDS] [--raft NODE_ID]\n"
+            "           [--raft-port N] [--peer ID@HOST:PORT ...]\n"
             "           [--join HOST:PORT ...] [--leave NODE_ID]\n"
-            "  serves the instance in --dir, defaulting to \".\" -- which is what a\n"
-            "  WASI preopen is mapped to, and where it must stay under WASI\n"
+            "  serves the instance in the preopened directory \".\"\n"
             "  --raft replicates every write through a log before applying it\n"
             "  --raft-port is where the other members reach this one\n"
             "  --peer names a member and where to reach IT; repeat per member\n"
@@ -847,16 +852,6 @@ static int parse_seed(const char *spec, seed_addr *out) {
 
 int main(int argc, char **argv) {
     int use_stdio = 0;
-    /*
-     * The directory the instance lives in. "." is the default and is
-     * what a WASI preopen is mapped to (`wasmtime run --dir DIR::.`), so
-     * nothing that worked before needs the flag.
-     *
-     * Under WASI the path must still be inside a preopen -- that is the
-     * sandbox rather than this flag, and a path outside one is refused
-     * by the host with a capability error, not by anything here.
-     */
-    const char *root_dir = ".";
     int port = DEFAULT_PORT;
     int max_clients = MAX_CLIENTS;
     int idle_seconds = DEFAULT_IDLE_TIMEOUT;
@@ -890,7 +885,6 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdio") == 0) use_stdio = 1;
-        else if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) root_dir = argv[++i];
         else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--order") == 0 && i + 1 < argc) {
             order = atoi(argv[++i]);
@@ -1005,44 +999,14 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /*
-     * The ROOT. Everything below this line is fd-relative -- bjns_posix
-     * and server/root.c openat() from this descriptor and never name a
-     * path again -- so which directory it is costs exactly one open.
-     *
-     * O_DIRECTORY so that a FILE handed to --dir is refused here, where
-     * the path is still in hand to say so, rather than at the first
-     * openat with nothing to name.
-     *
-     * IT IS NOT CREATED. A mistyped --dir would otherwise start a server
-     * on a brand-new empty instance, which from the outside is
-     * indistinguishable from having lost the data.
-     */
-    int dirfd = open(root_dir, O_RDONLY | O_DIRECTORY);
-    if (dirfd < 0) {
-        fprintf(stderr, "cannot open the data directory \"%s\": %s\n",
-                root_dir, strerror(errno));
-        if (errno == ENOENT) {
-            fprintf(stderr, "  it is not created for you: a mistyped --dir would"
-                            " start an empty instance\n");
-#ifdef __wasi__
-            /* A path outside every preopen is reported as ENOENT and is
-             * indistinguishable from a missing one, so both are named:
-             * the sandbox is the host's and this cannot tell them
-             * apart. */
-            fprintf(stderr, "  and under WASI a path outside every preopen looks"
-                            " exactly like a missing one --\n"
-                            "  check the host's own --dir mapping too\n");
-#endif
-        }
-        return 1;
-    }
+    int dirfd = open(".", O_RDONLY);
+    if (dirfd < 0) { perror("open ."); return 1; }
 
     /*
-     * That directory is the INSTANCE's root: the databases are
-     * directories under it, and nothing of the database format lives in
-     * it directly. The log does, when this is a replica -- one log for
-     * the whole instance, beside the databases it replicates.
+     * The preopen is the INSTANCE's root: the databases are directories
+     * under it, and nothing of the database format lives in it directly.
+     * The log does, when this is a replica -- one log for the whole
+     * instance, beside the databases it replicates.
      */
     bj_ns ns;
     if (bjns_posix_open(dirfd, &ns) != BJ_OK) {

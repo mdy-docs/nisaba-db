@@ -1,9 +1,14 @@
 /**
- * Assemble the publishable package from the repository.
+ * Assemble the publishable nisaba-db package from the repository.
  *
- * Nothing in this directory is a source of truth: every shipped file is
- * copied from the repo root at pack time (prepack runs this), so the
- * package can never drift from what the repository builds and tests.
+ * Lives BESIDE the package, not in it: the package directory holds only
+ * what ships (plus its package.json and README), and this script is the
+ * monorepo's, reachable from the package's build/prepack scripts as
+ * ../nisaba-db.build.mjs.
+ *
+ * Nothing in the package directory is a source of truth: every shipped
+ * file is copied from the repo root at pack time (prepack runs this), so
+ * the package can never drift from what the repository builds and tests.
  * The copied tree mirrors the repo's layout exactly, because the source
  * files import each other by relative path ('../wasm/nisaba-wasm.js',
  * '../third_party/binjson/js/binjson.js') and preserving the shape is
@@ -27,8 +32,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const repo = path.resolve(here, '..', '..');
+const here = path.dirname(fileURLToPath(import.meta.url));   // packages/
+const repo = path.resolve(here, '..');
+const pkg = path.join(here, 'nisaba-db');
 
 const CLOSURE = [
   // The core, and the module it re-exports from.
@@ -62,7 +68,7 @@ if (!fs.existsSync(path.join(repo, 'wasm', 'lib', 'nisaba.wasm'))) {
 
 for (const rel of CLOSURE) {
   const from = path.join(repo, rel);
-  const to = path.join(here, rel);
+  const to = path.join(pkg, rel);
   if (!fs.existsSync(from)) {
     console.error(`missing from the repository: ${rel}`);
     process.exit(1);
@@ -71,4 +77,4 @@ for (const rel of CLOSURE) {
   fs.copyFileSync(from, to);
 }
 
-console.log(`assembled ${CLOSURE.length} files into ${here}`);
+console.log(`assembled ${CLOSURE.length} files into ${pkg}`);

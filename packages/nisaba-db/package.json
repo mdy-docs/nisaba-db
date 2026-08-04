@@ -18,9 +18,9 @@
     "third_party"
   ],
   "scripts": {
-    "build": "node build.mjs",
-    "prepack": "node build.mjs",
-    "test": "node smoke.mjs"
+    "build": "node ../nisaba-db.build.mjs",
+    "prepack": "node ../nisaba-db.build.mjs",
+    "test": "node ../nisaba-db.smoke.mjs"
   },
   "keywords": [
     "database",

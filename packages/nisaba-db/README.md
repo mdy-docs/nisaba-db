@@ -69,8 +69,10 @@ repository package.
 ## Building this package
 
 Every shipped file is copied from the repository at pack time
-(`prepack` runs `build.mjs`), so the package cannot drift from what the
-repository builds and tests. From a repo checkout:
+(`prepack` runs `../nisaba-db.build.mjs` — the assembly script lives
+beside this directory, not in it, so the package holds only what
+ships), and the package cannot drift from what the repository builds
+and tests. From a repo checkout:
 
 ```sh
 cd packages/nisaba-db

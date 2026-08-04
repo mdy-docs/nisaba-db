@@ -793,6 +793,18 @@ static int propose_batch(replica *r, pending *p, const dbuf *cmds) {
     uint32_t count = 0;
     int e = array_begin(&c, &count);
     if (e) return e;
+    /*
+     * Refused WHOLE, before anything is appended. rn_propose refuses the
+     * entry that hits the await cap -- not the entries before it, which
+     * are already in the log and commit anyway. Discovering that mid-way
+     * left 256 of a client's 300 documents landing behind a dropped
+     * connection, which violates all-or-nothing in the worst direction:
+     * silently. So the capacity question is asked once, up front, for
+     * the batch as a whole, counting what other in-flight requests
+     * already hold.
+     */
+    if (count > rn_max_await() - rn_awaiting(r->node))
+        return DC_ERR_BATCH_TOO_LARGE;
     if (count > p->cap) {
         uint64_t *ix = (uint64_t *)realloc(p->indices, count * sizeof *ix);
         if (!ix) return BJ_ERR_OOM;
@@ -1174,6 +1186,13 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
     if (e) {
         dbi_abandon(r->inst, token);
         pending_release(p);
+        /* A batch the node cannot track is a REFUSAL, not a transport
+         * failure: nothing was appended, the previous state stands
+         * exactly as it was, and the connection survives to be told so. */
+        if (e == DC_ERR_BATCH_TOO_LARGE) {
+            int re = refuse(r, e, out);
+            return re ? re : 0;
+        }
         return e;
     }
     out->len = 0;   /* the answer comes later, through replica_ready */
@@ -1204,6 +1223,19 @@ static int advance(replica *r, pending *p) {
     p->token = next;
     e = propose_batch(r, p, &cmds);
     dbuf_free(&cmds);
+    if (e == DC_ERR_BATCH_TOO_LARGE) {
+        /* Mid-request -- a bulkWrite whose next OPERATION plans more
+         * entries than the node can track. The operations already
+         * applied stay applied, exactly as they do for any mid-list
+         * failure; what this one cannot do is report them, because a
+         * refusal has no result to carry them in. The refusal names the
+         * rule, and the caller re-reads to learn where the list got to. */
+        dbi_abandon(r->inst, p->token);
+        p->answer.len = 0;
+        e = refuse(r, DC_ERR_BATCH_TOO_LARGE, &p->answer);
+        p->done = 1;
+        return e;
+    }
     if (e) dbi_abandon(r->inst, p->token);
     return e;
 }

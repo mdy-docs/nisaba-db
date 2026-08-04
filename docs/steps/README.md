@@ -310,19 +310,25 @@ resumable change stream has another: the `-68` refusal for a
 compacted-away resume token is enforced but unreachable until something
 actually compacts, so that rule ships untested end-to-end.
 
-**A single proposal is capped at 256 entries, and the failure is rude.**
-`RN_MAX_AWAIT` bounds the node's await table, so an `insertMany` (or
-bulkWrite) that plans more than 256 commands on a REPLICATED server
-fails by closing the connection rather than by a refusal naming the
-bound. Found writing the change-stream paging tests; an unreplicated
-server takes the same list without complaint. The honest fix is a
-refusal with its own code before any of the batch is proposed — or
-chunked proposing, which is a design decision about atomicity (a
-refused whole is all-or-nothing; chunks are not) and should be made
-deliberately, not implied by a table size.
 
-The two below are paid. Neither was a design question — known,
-diagnosed, and now fixed.
+The ones below are paid — known, diagnosed, and now fixed.
+
+- **The 256-entry proposal cliff.** `RN_MAX_AWAIT` bounds the node's
+  await table, and a batch that hit it mid-way used to fail the worst
+  way there is: `rn_propose` refused the entry at the cap but not the
+  256 already appended, so a 300-doc `insertMany` on a replicated
+  server closed the connection AND silently landed 256 of the
+  documents — all-or-nothing violated, in silence. Found writing the
+  change-stream paging tests. Now the capacity question is asked once,
+  up front, for the batch as a whole (`propose_batch`, counting what
+  other in-flight requests hold), and a batch the node cannot track is
+  refused WHOLE with its own code (`-70`, nothing appended, the
+  connection survives). Chunked proposing was considered and declined
+  deliberately: entries appended across chunks can partially survive a
+  leader change, and `-64`'s whole meaning is "no replica holds it".
+  If a workload ever needs bigger batches than 256, that is the design
+  conversation to reopen — with partial-result reporting on the table,
+  not implied by a table size.
 
 - **The compaction handle leak.** `compact()` never closed the OPFS
   handles it pre-opened, so the adopt step could not re-open its own

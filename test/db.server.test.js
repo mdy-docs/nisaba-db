@@ -1832,6 +1832,31 @@ for (const engine of ENGINES) {
         .toBe(true);
     });
 
+    /*
+     * The await-table bound (RN_MAX_AWAIT, 256), met honestly. It used
+     * to be met the worst way there is: rn_propose refused the entry
+     * that hit the cap but not the 256 already appended, so a 300-doc
+     * insertMany closed the connection AND silently landed 256 of the
+     * documents. Now the capacity question is asked once, up front, for
+     * the batch as a whole -- refused whole, nothing appended, and the
+     * refusal is a RESPONSE the connection survives.
+     */
+    it('refuses a batch larger than the node can track -- whole, and out loud', async () => {
+      const coll = client.db('bounds').collection('big');
+      const docs = Array.from({ length: 300 }, (_, i) => ({ n: i }));
+      await expect(coll.insertMany(docs)).rejects.toMatchObject({ code: -70 });
+
+      // Nothing landed: all or nothing means the refusal left the
+      // previous state exactly as it was.
+      expect(await coll.countDocuments({})).toBe(0);
+
+      // The connection SURVIVED the refusal -- same client, and a batch
+      // within the bound goes through whole.
+      const ok = await coll.insertMany(docs.slice(0, 200));
+      expect(ok.insertedCount).toBe(200);
+      expect(await coll.countDocuments({})).toBe(200);
+    });
+
     it('resumes across a restart at the floor of EVERY database, not one', async () => {
       const before = {
         analytics: await client.db('analytics').collection('events').countDocuments({}),

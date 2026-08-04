@@ -2440,6 +2440,7 @@ int rn_await(raft_node *n, uint64_t index, uint64_t term) {
 }
 
 uint32_t rn_awaiting(const raft_node *n) { return n ? n->nawait : 0; }
+uint32_t rn_max_await(void) { return RN_MAX_AWAIT; }
 
 /*
  * Answer everything at or below `floor`, and keep the rest.

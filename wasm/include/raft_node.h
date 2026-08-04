@@ -608,6 +608,13 @@ int rn_await(raft_node *n, uint64_t index, uint64_t term);
  * own intake, and for tests. */
 uint32_t rn_awaiting(const raft_node *n);
 
+/* And the most it can owe at once (RN_MAX_AWAIT). With rn_awaiting this
+ * is how a host refuses a batch WHOLE before proposing any of it: a
+ * batch that hits the cap mid-way leaves its appended prefix committing
+ * anyway -- rn_propose refuses the entry, not the entries before it --
+ * which is an all-or-nothing violation no error code can undo. */
+uint32_t rn_max_await(void);
+
 /*
  * Seed the commit index at startup from the log's persisted (advisory)
  * marker and the state machine's applied floor. Never lowers it. The

@@ -175,6 +175,11 @@ const char *dc_strerror(int code) {
             return "watch: the resume index is ahead of this member's log; a "
                    "token can only come from a delivered event, so this one is "
                    "not this log's";
+        case DC_ERR_BATCH_TOO_LARGE:
+            return "This request plans more log entries than the node can "
+                   "track in flight; nothing was applied. Split the list into "
+                   "smaller requests, or retry when in-flight writes have "
+                   "settled";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

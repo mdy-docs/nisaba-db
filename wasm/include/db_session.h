@@ -173,6 +173,18 @@ extern "C" {
  * is not this log's, and the honest answer is that, not a silent wait. */
 #define DC_ERR_RESUME_AHEAD         (-69)
 
+/* One request planned more log entries than the node can track in
+ * flight (rn_max_await, counting what other requests already hold).
+ * Refused WHOLE, before any entry is appended, because the alternative
+ * was found the hard way: a batch that hits the cap mid-way leaves its
+ * appended prefix committing anyway while the client is told nothing --
+ * 256 of 300 documents landing behind a dropped connection. Chunked
+ * proposing was considered and declined: entries appended across chunks
+ * can partially survive a leader change, and DC_ERR_WRITE_LOST's whole
+ * meaning is "no replica holds it". Split the list, or retry when
+ * in-flight writes have settled. */
+#define DC_ERR_BATCH_TOO_LARGE      (-70)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)

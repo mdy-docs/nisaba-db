@@ -909,8 +909,9 @@ for (const engine of ENGINES) {
           /* The instance's own ops are classified too, and by the same
            * table: listDatabases reads, dropDatabase writes. A follower
            * refuses both -- which for dropDatabase matters more than it
-           * looks, because it is not replicated (docs/steps/README.md)
-           * and a follower performing one would silently diverge. */
+           * looks, because it is not replicated (the standing debt in
+           * docs/replicaton-roadmap.md) and a follower performing one
+           * would silently diverge. */
           await expect(c.listDatabases()).rejects.toMatchObject({ code: -63 });
           await expect(c.dropDatabase(DB)).rejects.toMatchObject({ code: -63 });
         } finally { await c.close(); }

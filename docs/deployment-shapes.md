@@ -124,10 +124,10 @@ That is why a JS driver exists at all. It is NOT, it turns out, why the
 whole driver is in JS — see the audit below, which was written after
 this paragraph and corrects it.
 
-This is recorded as a settled decision in
-[`steps/README.md`](steps/README.md): the browser stays a host, and
-plan/execute is permanent. Every other host — Node, native, WASI — pays
-a discipline it does not need so that this one can exist at all.
+This is a settled decision: the browser stays a host, and plan/execute
+is permanent. Every other host — Node, native, WASI — pays a discipline
+it does not need so that this one can exist at all. The audit below is
+the record of what that actually forces.
 
 ### The audit: what is actually forced
 
@@ -375,13 +375,13 @@ and is promoted to a voter once its match index proves it current.
 `--leave ID` removes one. Argv became a BOOTSTRAP and the log became the
 member set, so a restart needs neither flag.
 
-What is still missing on the C side — briefs in [`steps/`](steps/):
-
-The log growing without bound, which is the real reason to want
-compaction and a snapshot store in the process. A joiner does not need
-them — nothing compacts, so an empty joiner is caught up by plain
-AppendEntries — but a long-lived member's `__wal__.bj` is every write it
-has ever taken. `steps/README.md` records it.
+Nothing is missing on the C side any more. The last gap — the log
+growing without bound — is paid: past `--snapshot-entries` applied
+entries a member snapshots itself into a snapstore generation and
+compacts the log through the boundary, and a joiner behind the
+compacted base is caught up by a snapshot install the node serves from
+that store (`docs/replicaton-roadmap.md` records the whole story, and
+the crash states of the adoption window are tested by forging).
 
 **The server holds an INSTANCE**, which retired the brief for it: one
 root directory, a subdirectory per database, and one connection that
@@ -442,8 +442,9 @@ future work obvious and some other work pointless.
 peer transport and an apply pump; the C request grammar becomes the only
 server-side driver; Node is required for neither shape.
 
-What this commits us to — the briefs in [`steps/`](steps/) were written
-on this assumption and are now confirmed rather than speculative:
+What this commits us to — the docs/steps briefs (all since built and
+retired, directory included) were written on this assumption and were
+confirmed rather than speculative:
 
 1. ~~`steps/install-snapshot-in-c.md`~~ — **done**, and retired: the last
    Raft message kind a host had to answer is the node's.

@@ -1,6 +1,6 @@
 {
-  "name": "nisaba-db",
-  "version": "1.0.0",
+  "name": "@mdy-docs/nisaba-db",
+  "version": "0.1.0",
   "description": "A WASM/C, MongoDB-driver-shaped embedded document database for Node and the browser: CRUD, query operators, $regex, secondary/geo/text indexes, change streams. One wasm binary serves both platforms; only the storage provider differs.",
   "type": "module",
   "main": "src/db.js",

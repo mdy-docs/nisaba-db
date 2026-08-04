@@ -14,8 +14,8 @@ differs per platform is which storage provider you hand to `connect`.
 ## Node
 
 ```js
-import { ready } from 'nisaba-db/wasm';
-import { connect, NodeFSStorageProvider } from 'nisaba-db/node';
+import { ready } from '@mdy-docs/nisaba-db/wasm';
+import { connect, NodeFSStorageProvider } from '@mdy-docs/nisaba-db/node';
 
 await ready();                       // loads the wasm engine, once per process
 const db = await connect(new NodeFSStorageProvider('./data'));
@@ -32,8 +32,8 @@ open the same database, and its `flush()` is a real `fsync`.
 ## Browser
 
 ```js
-import { ready } from 'nisaba-db/wasm';
-import { connect, OPFSStorageProvider, MemoryStorageProvider } from 'nisaba-db';
+import { ready } from '@mdy-docs/nisaba-db/wasm';
+import { connect, OPFSStorageProvider, MemoryStorageProvider } from '@mdy-docs/nisaba-db';
 
 await ready();
 const db = await connect(new OPFSStorageProvider());   // origin-private file system
@@ -48,8 +48,8 @@ when the owning tab closes:
 
 ```js
 // inside each tab's worker
-import { connectShared } from 'nisaba-db/coordinator';
-import { OPFSStorageProvider } from 'nisaba-db';
+import { connectShared } from '@mdy-docs/nisaba-db/coordinator';
+import { OPFSStorageProvider } from '@mdy-docs/nisaba-db';
 
 const db = await connectShared('my-app', new OPFSStorageProvider());
 // same Db shape as connect(): collections, queries, watch(), ...

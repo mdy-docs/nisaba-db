@@ -8,6 +8,7 @@ import path from 'node:path';
 // provider and ready() are loaded below only when there is one to open.
 import { ObjectId, Pointer } from '../third_party/binjson/js/binjson.js';
 import { connectServer } from '../src/db-server-client.js';
+import { fromExtendedJson, toExtendedJson } from '../src/extended-json.js';
 
 // Data root: $NISABA_DIR, else ~/.nisaba -- one subdirectory per database
 // name (NodeFSStorageProvider.subProvider). Earlier versions of this tool
@@ -158,46 +159,18 @@ function printDocs(docs, noun = 'document') {
   }
 }
 
-/** JSON.parse with MongoDB Extended JSON's {$oid} / {$date} literals. */
+/** JSON.parse with MongoDB Extended JSON's {$oid} / {$date} / {$binary}
+ * literals. The convention itself lives in src/extended-json.js, shared
+ * with the HTTP front end so the two surfaces cannot disagree about what
+ * a literal means; what is this file's is only the CLI's answer to a bad
+ * argument, which is a sentence and an exit. */
 function parseJson(label, str) {
   try {
-    return JSON.parse(str, (key, value) => {
-      if (value && typeof value === 'object' && !Array.isArray(value)) {
-        const keys = Object.keys(value);
-        if (keys.length === 1 && keys[0] === '$oid' && typeof value.$oid === 'string') {
-          return new ObjectId(value.$oid);
-        }
-        if (keys.length === 1 && keys[0] === '$date' && typeof value.$date === 'string') {
-          return new Date(value.$date);
-        }
-        if (keys.length === 1 && keys[0] === '$binary' && value.$binary && typeof value.$binary.base64 === 'string') {
-          return new Uint8Array(Buffer.from(value.$binary.base64, 'base64'));
-        }
-      }
-      return value;
-    });
+    return fromExtendedJson(JSON.parse(str));
   } catch (err) {
     console.error(`Error: ${label} is not valid JSON: ${err.message}`);
     process.exit(1);
   }
-}
-
-/** The inverse of parseJson's reviver: ObjectId/Date/Uint8Array to
- * MongoDB Extended JSON, recursively, for `dump` output -- so a dump
- * restores byte-identically through parseJson. */
-function toExtendedJson(value) {
-  if (value instanceof ObjectId || (value && typeof value.toHexString === 'function')) {
-    return { $oid: value.toHexString() };
-  }
-  if (value instanceof Date) return { $date: value.toISOString() };
-  if (value instanceof Uint8Array) return { $binary: { base64: Buffer.from(value).toString('base64'), subType: '00' } };
-  if (Array.isArray(value)) return value.map(toExtendedJson);
-  if (value !== null && typeof value === 'object') {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = toExtendedJson(v);
-    return out;
-  }
-  return value;
 }
 
 function readStdin() {

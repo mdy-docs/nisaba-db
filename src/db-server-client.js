@@ -251,6 +251,12 @@ class Connection {
     const streams = [...this._streams.values()];
     this._streams.clear();
     for (const st of streams) st._fail(this._dead);
+    /* And so is a holder of many connections (the HTTP front end keeps a
+     * table of them): a session whose socket the server reaped is an
+     * entry nobody will ever hit again, and the close is the only moment
+     * anybody can learn that without sending traffic -- which would
+     * reset the very idle timer that reaps it. */
+    if (this.onDead) this.onDead(this._dead);
   }
 
   /** @internal register a stream so its frames can find it */
@@ -800,14 +806,22 @@ function collection(conn, name) {
         /* Best effort: a connection already gone has released it. */
         try { await conn.call({ op: 'closeStream', stream: id }); } catch { /* closed either way */ }
       });
-      const pending = call({ op: 'watch' }).then((res) => {
+      const subscribed = call({ op: 'watch' }).then((res) => {
         id = res.stream;
         if (closed) {          // closed before the id arrived: give the slot back
           conn.call({ op: 'closeStream', stream: id }).catch(() => {});
           return;
         }
         conn._watching(id, stream);
-      }).catch((err) => stream._fail(err));
+      });
+      const pending = subscribed.catch((err) => stream._fail(err));
+      /* The subscribe's own outcome, for a holder that has to know the
+       * stream EXISTS before promising it to somebody else -- the HTTP
+       * front end answers 503 or 200 with it. Iterating never needed
+       * this: a refused subscribe surfaces from next() too, and still
+       * does. The rejection is handled (pending above), so a caller that
+       * ignores `ready` leaks no unhandled rejection. */
+      stream.ready = subscribed;
       return stream;
     },
 
@@ -958,7 +972,7 @@ function database(conn, name) {
  * @returns {Promise<object>} db(name), listDatabases(), dropDatabase(),
  *   ping(), close()
  */
-export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_MS } = {}) {
+export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_MS, onClose = null } = {}) {
   const { host, port } = parseAddress(address);
   const socket = await new Promise((resolve, reject) => {
     const s = net.connect({ host, port });
@@ -973,6 +987,11 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
   });
 
   const conn = new Connection(socket, `${host}:${port}`);
+  /* `onClose` fires once, however the connection dies -- the server
+   * reaping an idle slot, the process going away, or close() below. It
+   * reports; it must not be used to resurrect, because by the time it
+   * runs every pending call and stream has already been failed. */
+  if (onClose) conn.onDead = onClose;
 
   /* Keep the slot. A failed ping is not raised here -- there is nobody to
    * raise it to -- but it kills the connection the same way any other

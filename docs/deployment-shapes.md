@@ -463,14 +463,17 @@ to production clustering and become the embedded-Node story.
 
 Not in C, and not the parent project's problem. A thin HTTP front end in
 this repo, over `src/db-server-client.js` — which already speaks all 31
-operations with no engine in the process. Briefed in
-[`steps/http-front-end.md`](steps/http-front-end.md).
+operations with no engine in the process. **Built**:
+`src/db-http-front.js`, run as `db-http`, documented in
+[`http-front.md`](http-front.md) — RPC-shaped grammar, Extended JSON,
+sessions for cursors, change streams as SSE, and writes and reads
+following the leader across a cluster.
 
 ```
    browser / REST client
           │  HTTP
           ▼
-   ┌─ node http front ─────────────┐   new, this repo
+   ┌─ node http front ─────────────┐   bin/http-front.js
    │  src/db-server-client.js      │   no WASM, no ready()
    └──────────┬────────────────────┘
               │  binjson frames over TCP

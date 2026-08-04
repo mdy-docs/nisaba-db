@@ -13,12 +13,31 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [http-front-end.md](http-front-end.md) | Decision B: clients reach a cluster over HTTP, through a Node process that routes writes to the leader. |
-| 2 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. **Part one is decided and built** (linearizable leader-only reads); what remains is change streams that tail the log. |
-| 3 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
+| 1 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. **Part one is decided and built** (linearizable leader-only reads); what remains is change streams that tail the log. |
+| 2 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
 
-1 is how a client reaches a cluster; 2 is a feature; 3 is the coverage
-all of it rests on.
+1 is a feature; 2 is the coverage everything here rests on.
+
+**The cluster has an HTTP front end**, which is why that brief is gone
+([`../http-front.md`](../http-front.md) is the surviving document).
+`db-http --listen 8080 --server host:port [--server …]` is a Node
+process over `src/db-server-client.js` — no engine, no WASM — that
+`curl` every wire op through: an RPC-shaped grammar
+(`POST /db/<db>/<coll>/<op>`, chosen over a REST-shaped second grammar
+because it maps one-to-one onto the wire and cannot drift), Extended
+JSON bodies with the `{$oid}`/`{$date}`/`{$binary}` convention now owned
+once in `src/extended-json.js` and shared with `bin/db.js`, sessions for
+cursors reaped by the SERVER's `--idle-timeout` rather than a second
+policy, change streams as SSE with the `id:` field deliberately left for
+the log index part two of the streams brief will put there, and writes
+AND reads following the leader — the refusal is the trigger to re-ask
+the members who leads (`ping`), not a dial string, because the `leader`
+record names the peer wire rather than the client port. Only refusals
+are retried; a transport failure mid-write is 502, unknown-not-failed.
+The brief's one stale premise died with it: it predated the read
+decision, so its "serve reads from whichever member and say so" interim
+is gone — a follower refuses a read the way it refuses a write, and the
+front end treats both alike.
 
 **Read semantics are settled**, which is half of brief 2. Every read is
 linearizable, the LEADER alone serves one, and it serves it behind a
@@ -174,12 +193,13 @@ the C path under partitions and crashes. What is left on the host side
 is what will never move — opening a file, which is asynchronous in a
 browser, and the close/reopen an adoption runs between.
 
-**HTTP is not one of these briefs, deliberately.** It goes in a Node
-process in front of the server, over `src/db-server-client.js`, rather
-than in `server/main.c` — the same document records that decision and
-what it costs. The subset written for the C server is on the branch
-`wip/http-transport`; nothing on `main` depends on it, and the brief for
-the Node front end has not been written yet.
+**HTTP is a Node process in front, and it is built** (above). The
+decision it implements — in front of the server, over
+`src/db-server-client.js`, rather than in `server/main.c` — is recorded
+with its costs in [`../deployment-shapes.md`](../deployment-shapes.md).
+The subset written for the C server stays on the branch
+`wip/http-transport` as a record of what that path costs; nothing on
+`main` depends on it.
 
 **The database server is built**, which is why there is no brief for it:
 one process per database directory, binjson over sockets, as a

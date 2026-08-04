@@ -10,6 +10,8 @@
     "./remote": { "types": "./types/remote.d.ts", "default": "./src/db-remote.js" },
     "./node": { "types": "./types/node.d.ts", "default": "./src/db-node.js" },
     "./server-client": { "types": "./types/server-client.d.ts", "default": "./src/db-server-client.js" },
+    "./http-front": { "types": "./types/http-front.d.ts", "default": "./src/db-http-front.js" },
+    "./extended-json": { "default": "./src/extended-json.js" },
     "./wasm": { "types": "./types/wasm.d.ts", "default": "./wasm/nisaba-wasm.js" },
     "./coordinator": { "types": "./types/coordinator.d.ts", "default": "./src/db-coordinator.js" },
     "./wal": { "types": "./types/wal.d.ts", "default": "./src/db-wal.js" },
@@ -30,7 +32,8 @@
     "third_party/binjson-structures/wasm"
   ],
   "bin": {
-    "db": "bin/db.js"
+    "db": "bin/db.js",
+    "db-http": "bin/http-front.js"
   },
   "scripts": {
     "test": "vitest run",

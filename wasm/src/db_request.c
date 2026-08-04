@@ -27,6 +27,7 @@
 #include "bjcursor.h"
 #include "binjson.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -380,8 +381,9 @@ static void accumulate(const uint8_t *res, size_t res_len,
 }
 
 /*
- * One change event, from the command that caused it and the result of
- * applying it.
+ * One change event, from the command that caused it -- the ONE
+ * derivation, whether the command was just applied (live emit) or is
+ * being replayed out of the log for a resumed watch (dbs_log_event).
  *
  * This is where a change stream comes from, and it costs almost nothing
  * because a LOGGED COMMAND already names the one document it touched:
@@ -390,61 +392,51 @@ static void accumulate(const uint8_t *res, size_t res_len,
  * this library makes (wasm/nisaba-wasm.js's _applyCommand), including
  * the one read it cannot avoid -- an update names its CHANGES, not its
  * outcome, so the document has to be read back to say what it now is.
- * That read is a bpt_search by _id, and it happens only while somebody
- * is watching.
+ * Live, that read happens right after the apply; replayed, it happens
+ * later, so what it finds is the document as it NOW stands (or nothing,
+ * if it has gone) -- updateLookup semantics, stated in db_session.h.
  *
  * An upsert reaches here as a plain insert, because that is what the
  * planner wrote down; a watcher sees `insert`, which is what happened.
+ *
+ * `index` is the log index the command committed at, carried inside the
+ * event as the resume token; 0 (no log) puts none. `c` may be NULL when
+ * the collection cannot be opened (replaying an insert into a collection
+ * since dropped): the read-back is skipped, nothing else needs it.
+ * `*have` is 0 for a command that makes no event -- DDL, which is not a
+ * document change.
  */
-static int emit_change(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
-                       const uint8_t *cmd, uint32_t cmd_len,
-                       const uint8_t *result, size_t result_len) {
+static int build_event(dc_collection *c, const char *coll, uint32_t coll_len,
+                       uint64_t index, const uint8_t *cmd, uint32_t cmd_len,
+                       dbuf *out, int *have) {
+    *have = 0;
     int op = 0;
     const uint8_t *cname; uint32_t cname_len;
     int e = dc_wal_parse(cmd, cmd_len, &op, &cname, &cname_len);
     if (e) return e;
 
-    /* Nothing happened, nothing to say: a delete that removed no
-     * document, an update whose target had already gone. */
-    static const struct { const char *key; } NIL = { NULL };
-    (void)NIL;
-    int64_t n = 0;
-    {
-        static const char *COUNTS[] = { "deletedCount", "matchedCount" };
-        for (size_t i = 0; i < sizeof(COUNTS) / sizeof(COUNTS[0]); i++) {
-            const uint8_t *v; size_t vlen; int f = 0;
-            if (obj_get_field(result, result_len, (const uint8_t *)COUNTS[i],
-                              (uint32_t)strlen(COUNTS[i]), &v, &vlen, &f) || !f) continue;
-            cur rc = { v, vlen, 0 };
-            double d = 0;
-            if (!read_number(&rc, &d)) n += (int64_t)d;
-        }
-        /* An insert reports neither count; it reports an id. */
-        if (op != DC_WAL_INSERT && n == 0) return BJ_OK;
-    }
+    static const char *const TYPE[] = { "insert", "update", "replace", "delete" };
+    const char *type = (op >= 0 && op <= DC_WAL_DELETE) ? TYPE[op] : NULL;
+    if (!type) return BJ_OK;   /* DDL: not a document change */
 
     const uint8_t *doc = NULL; size_t doc_len = 0; int has_doc = 0;
     if ((e = field_raw(cmd, cmd_len, "doc", &doc, &doc_len, &has_doc))) return e;
 
     uint8_t id[12];
-    int has_id = 0;
     if (op == DC_WAL_INSERT) {
         if (!has_doc) return BJ_ERR_STATE;
         e = dc_document_id(doc, doc_len, id);
         if (e) return e;
-        has_id = 1;
     } else {
         const uint8_t *v; size_t vlen; int f = 0;
         if ((e = field_raw(cmd, cmd_len, "id", &v, &vlen, &f))) return e;
         if (!f || vlen != 13 || v[0] != BJ_TYPE_OID) return BJ_ERR_STATE;
         memcpy(id, v + 1, 12);
-        has_id = 1;
     }
-    (void)has_id;
 
     /* An update's post-image, read back by the id the command names. */
     dbuf after = {0};
-    if (op == DC_WAL_UPDATE) {
+    if (op == DC_WAL_UPDATE && c) {
         dbuf idf = {0};
         if ((e = id_filter(id, &idf))) { dbuf_free(&idf); return e; }
         uint8_t *d = NULL; size_t dlen = 0; int got = 0;
@@ -454,10 +446,6 @@ static int emit_change(dbs *s, dc_collection *c, const char *coll, uint32_t coll
         free(d);
         if (e) { dbuf_free(&after); return e; }
     }
-
-    static const char *const TYPE[] = { "insert", "update", "replace", "delete" };
-    const char *type = (op >= 0 && op <= DC_WAL_DELETE) ? TYPE[op] : NULL;
-    if (!type) { dbuf_free(&after); return BJ_OK; }   /* DDL: not a document change */
 
     bj_builder *b = bj_builder_new();
     if (!b) { dbuf_free(&after); return BJ_ERR_OOM; }
@@ -475,6 +463,11 @@ static int emit_change(dbs *s, dc_collection *c, const char *coll, uint32_t coll
     bj_begin_object(b);
     PUT_KEY(b, "_id"); bj_put_oid(b, id);
     bj_end_object(b);
+    if (index) {
+        /* The resume token: name this in a later watch's `from` and the
+         * stream continues right after this event. Only a log mints one. */
+        PUT_KEY(b, "index"); bj_put_int(b, (int64_t)index);
+    }
     if (op == DC_WAL_INSERT || op == DC_WAL_REPLACE) {
         PUT_KEY(b, "fullDocument"); bj_put_raw(b, doc, (uint32_t)doc_len);
     } else if (op == DC_WAL_UPDATE && after.len) {
@@ -483,11 +476,65 @@ static int emit_change(dbs *s, dc_collection *c, const char *coll, uint32_t coll
     bj_end_object(b);
     size_t len = 0;
     const uint8_t *data = bj_builder_data(b, &len);
-    if (data) dbs_emit(s, coll, coll_len, data, len);
-    e = data ? BJ_OK : BJ_ERR_STATE;
+    e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
+    if (!e) *have = 1;
     bj_builder_free(b);
     dbuf_free(&after);
     return e;
+}
+
+/* The live half: suppress what provably did nothing (the apply result is
+ * in hand, which replay never has), build, broadcast. */
+static int emit_change(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
+                       uint64_t index, const uint8_t *cmd, uint32_t cmd_len,
+                       const uint8_t *result, size_t result_len) {
+    int op = 0;
+    const uint8_t *cname; uint32_t cname_len;
+    int e = dc_wal_parse(cmd, cmd_len, &op, &cname, &cname_len);
+    if (e) return e;
+
+    /* Nothing happened, nothing to say: a delete that removed no
+     * document, an update whose target had already gone. */
+    int64_t n = 0;
+    {
+        static const char *COUNTS[] = { "deletedCount", "matchedCount" };
+        for (size_t i = 0; i < sizeof(COUNTS) / sizeof(COUNTS[0]); i++) {
+            const uint8_t *v; size_t vlen; int f = 0;
+            if (obj_get_field(result, result_len, (const uint8_t *)COUNTS[i],
+                              (uint32_t)strlen(COUNTS[i]), &v, &vlen, &f) || !f) continue;
+            cur rc = { v, vlen, 0 };
+            double d = 0;
+            if (!read_number(&rc, &d)) n += (int64_t)d;
+        }
+        /* An insert reports neither count; it reports an id. */
+        if (op != DC_WAL_INSERT && n == 0) return BJ_OK;
+    }
+
+    dbuf event = {0};
+    int have = 0;
+    e = build_event(c, coll, coll_len, index, cmd, cmd_len, &event, &have);
+    if (!e && have) dbs_emit(s, coll, coll_len, index, event.data, event.len);
+    dbuf_free(&event);
+    return e;
+}
+
+int dbs_log_event(dbs *s, const char *coll, size_t coll_len, uint64_t index,
+                  const uint8_t *cmd, uint32_t cmd_len, dbuf *out, int *have) {
+    if (!s || !coll || !cmd || !out || !have) return BJ_ERR_STATE;
+    *have = 0;
+    int op = 0;
+    const uint8_t *cname; uint32_t cname_len;
+    int e = dc_wal_parse(cmd, cmd_len, &op, &cname, &cname_len);
+    if (e) return e;
+    /* Another collection's entry: the log is per database, the stream is
+     * per collection, and the filter is here so every reader shares it. */
+    if (cname_len != coll_len || memcmp(cname, coll, coll_len) != 0) return BJ_OK;
+    /* Best effort, for the update read-back only: a collection since
+     * dropped still replays its inserts and deletes faithfully. */
+    dc_collection *c = NULL;
+    (void)dbs_collection(s, coll, coll_len, &c);
+    return build_event(c, (const char *)coll, (uint32_t)coll_len, index,
+                       cmd, cmd_len, out, have);
 }
 
 /* What one write did, in the terms every result is built from. A list of
@@ -557,14 +604,18 @@ static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
  * Unreplicated there is no pump and no log, and dc_wal_apply is told so
  * with index 0.
  */
+/* `*index_out`: the log index the command committed at -- what a change
+ * event carries as its resume token -- or 0 when this collection is not
+ * log-driven and there is no such fact. */
 static int apply_cmd(dbs *s, dc_collection *c, const uint8_t *cmd, uint32_t clen,
-                     dbuf *one) {
+                     dbuf *one, uint64_t *index_out) {
     if (dbs_repl_active(s)) {
         int rc = 0;
         int e = dbs_repl_applied(s, one, &rc);
-        (void)dbs_repl_next_index(s);   /* the lists stay in step */
+        *index_out = dbs_repl_next_index(s);   /* the lists stay in step */
         return e ? e : rc;
     }
+    *index_out = 0;
     return dc_wal_apply(c, 0, cmd, clen, one);
 }
 
@@ -617,7 +668,8 @@ static int run_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
         /* index 0: this collection is not log-driven here, so the applied
          * index is not staged. A replicated server passes the log index
          * it committed at, and dc_wal_apply stages it with the mutation. */
-        e = apply_cmd(s, c, cmd, clen, &one);
+        uint64_t at = 0;
+        e = apply_cmd(s, c, cmd, clen, &one, &at);
         if (e) goto done;
         accumulate(one.data, one.len, &wr->matched, &wr->modified, &wr->deleted);
         const uint8_t *v; size_t vlen; int found = 0;
@@ -629,7 +681,7 @@ static int run_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
          * be told: a stream is an observer, never a participant, so it
          * cannot fail the write it is watching. */
         if (watching) {
-            int ee = emit_change(s, c, coll, coll_len, cmd, clen, one.data, one.len);
+            int ee = emit_change(s, c, coll, coll_len, at, cmd, clen, one.data, one.len);
             if (ee) { e = ee; goto done; }
         }
     }
@@ -806,9 +858,10 @@ static int do_insert_many(dbs *s, dc_collection *c, const char *coll, uint32_t c
         const uint8_t *cmd = dc_wal_plan_cmd(p, i, &clen);
         if (!cmd) { e = BJ_ERR_STATE; break; }
         one.len = 0;
-        int rc = apply_cmd(s, c, cmd, clen, &one);
+        uint64_t at = 0;
+        int rc = apply_cmd(s, c, cmd, clen, &one, &at);
         if (!rc && watching) {
-            int ee = emit_change(s, c, coll, coll_len, cmd, clen, one.data, one.len);
+            int ee = emit_change(s, c, coll, coll_len, at, cmd, clen, one.data, one.len);
             if (ee) { e = ee; break; }
         }
         attempted++;
@@ -1438,16 +1491,80 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
      * perfectly good thing to watch -- the first insert makes it, and
      * that insert is an event the watcher wants. Opening it here would
      * refuse exactly the case a change stream is most useful for.
+     *
+     * `from` resumes: replay every logged entry after that index into
+     * the new stream before any live event reaches it, so a consumer
+     * that reconnects with the last index it saw misses nothing and
+     * repeats nothing. The subscribe, the replay and the reply happen in
+     * one synchronous stretch and the pump applies entries in another,
+     * so no event can fall between the replay's ceiling and the first
+     * live one. A replay longer than the stream's queue overflows it,
+     * which with a token to resume from is a page boundary, not a loss.
+     *
+     * The reply's `index` is the replay ceiling -- where "live" begins.
+     * It is what a consumer that has not yet seen any event resumes
+     * from, and it is only present when a log minted it.
      */
     if (op == OP_WATCH) {
+        int64_t from = -1;
+        {
+            const uint8_t *v; size_t vlen; int f = 0;
+            if ((e = field_raw(req, req_len, "from", &v, &vlen, &f)))
+                return respond_error(out, DC_ERR_REQ_MALFORMED);
+            if (f) {
+                cur fc = { v, vlen, 0 };
+                double d = 0;
+                if (read_number(&fc, &d) || d < 0)
+                    return respond_error(out, DC_ERR_REQ_MALFORMED);
+                from = (int64_t)d;
+            }
+        }
+
+        const int logged = dbs_has_log(s);
+        uint64_t floor = logged ? dbs_log_floor(s) : 0;
+        if (from >= 0) {
+            if (!logged) return respond_error(out, DC_ERR_RESUME_NO_LOG);
+            if ((uint64_t)from < dbs_log_base(s))
+                return respond_error(out, DC_ERR_RESUME_COMPACTED);
+            if ((uint64_t)from > floor)
+                return respond_error(out, DC_ERR_RESUME_AHEAD);
+        }
+
         uint64_t id = 0;
         e = dbs_watch(s, client, (const char *)coll, coll_len, &id);
         if (e) return respond_error(out, e);
+
+        if (from >= 0) {
+            dbuf cmd = {0}, event = {0};
+            for (uint64_t i = (uint64_t)from + 1; i <= floor; i++) {
+                cmd.len = 0;
+                e = dbs_log_entry(s, i, &cmd);
+                if (e) break;
+                if (!cmd.len) continue;        /* another database's, or no command */
+                event.len = 0;
+                int have = 0;
+                e = dbs_log_event(s, (const char *)coll, coll_len, i,
+                                  cmd.data, (uint32_t)cmd.len, &event, &have);
+                if (e) break;
+                if (!have) continue;           /* another collection's, or DDL */
+                int fed = 0;
+                e = dbs_stream_feed(s, client, id, i, event.data, event.len, &fed);
+                if (e || !fed) break;          /* overflow pages the rest out */
+            }
+            dbuf_free(&cmd);
+            dbuf_free(&event);
+            if (e) {
+                dbs_close_stream(s, client, id);
+                return respond_error(out, e);
+            }
+        }
+
         bj_builder *wb = bj_builder_new();
         if (!wb) return BJ_ERR_OOM;
         bj_begin_object(wb);
         PUT_KEY(wb, "ok");     bj_put_bool(wb, 1);
         PUT_KEY(wb, "stream"); bj_put_int(wb, (int64_t)id);
+        if (logged) { PUT_KEY(wb, "index"); bj_put_int(wb, (int64_t)floor); }
         bj_end_object(wb);
         int we = finish(wb, out);
         bj_builder_free(wb);

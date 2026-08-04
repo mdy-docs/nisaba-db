@@ -162,6 +162,19 @@ const char *dc_strerror(int code) {
             return "This member leads but could not prove it still does, so it "
                    "cannot show its data is current; a quorum has gone quiet -- "
                    "retry, here or anywhere";
+        case DC_ERR_RESUME_NO_LOG:
+            return "watch: resume needs an entry log and this server keeps none "
+                   "(an unreplicated server applies writes directly); watch "
+                   "without `from` and re-read current state";
+        case DC_ERR_RESUME_COMPACTED:
+            return "watch: the resume index is below the log's base -- the "
+                   "entries after it were compacted away, so the events they "
+                   "would have made cannot be served; watch afresh and re-read "
+                   "current state";
+        case DC_ERR_RESUME_AHEAD:
+            return "watch: the resume index is ahead of this member's log; a "
+                   "token can only come from a delivered event, so this one is "
+                   "not this log's";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

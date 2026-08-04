@@ -696,6 +696,13 @@ static int serve_forever(dbi *inst, replica *rep, peers *px, int srv,
          */
         for (int i = n - 1; i >= 0; i--) {
             int any = 0;
+            /* Not while an answer is deferred. Events would jump the
+             * held answer -- and for a watch that answer is the one
+             * carrying the stream id, so the client would be handed
+             * events for a stream it has not been told exists and drop
+             * them. The queue is the session's, bounded and counted;
+             * everything flows the moment the answer does. */
+            if (cs[i].owed) continue;
             for (;;) {
                 /* Stop filling a connection that is not draining. This
                  * is what makes the SESSION's per-stream bound the real

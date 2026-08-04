@@ -203,9 +203,9 @@ be used to serve a read.
 
 Reads that scale by adding members are a different thing: an
 asynchronous replica tier outside consensus, explicitly not
-linearizable, deferred to its own brief
-([`steps/read-semantics-and-change-streams.md`](steps/read-semantics-and-change-streams.md)
-records the decision and what was rejected).
+linearizable, deferred until a workload wants it
+([`replicaton-roadmap.md`](replicaton-roadmap.md)'s step 6 decision
+records why and what was rejected).
 
 **Without `--raft` nothing changes**, including the file layout: a
 directory served by a single process today can be joined to a cluster
@@ -353,7 +353,7 @@ none of those (`listCollections` and `ping`).
 | `{op:'aggregate', coll, stages:[...]}` | `{ok:true, docs:[...]}` |
 | `{op:'findByIndex', coll, index, values:[...]}` | `{ok:true, docs:[...]}` |
 | `{op:'pruneExpired', coll, now}` | `{ok:true, deletedCount}` |
-| `{op:'watch', coll}` | `{ok:true, stream}` |
+| `{op:'watch', coll, from?}` | `{ok:true, stream, index?}` |
 | `{op:'closeStream', stream}` | `{ok:true, closed:true}` |
 | `{op:'explain', coll, filter}` | `{ok:true, plan:{source, index}}` |
 | `{op:'insert', coll, doc, id}` | `{ok:true, result}` |
@@ -518,8 +518,27 @@ in-process watcher gets, `ns` and all:
 
 ```js
 { ns: { coll: 'notes' }, operationType: 'insert' | 'update' | 'replace' | 'delete',
-  documentKey: { _id }, fullDocument: {...} }   // absent on a delete
+  documentKey: { _id }, index: 12,              // only on a replicated server
+  fullDocument: {...} }                         // absent on a delete
 ```
+
+**On a replicated server the stream is RESUMABLE, and the log index is
+the token.** Every event carries `index` — the log index its command
+committed at — and `{op:'watch', coll, from: N}` replays every entry
+after `N` into the new stream before any live event: everything after
+the token, exactly once, in order. The reply's own `index` is the replay
+ceiling — where "live" begins — so a consumer holds a resume point
+before its first event too. Three refusals, each its own code, because
+the remedies differ: `-67` this server keeps no log (unreplicated —
+resume is a property of the log, not the stream machinery), `-68` the
+index was compacted away (watch afresh and re-read; a gap is never
+bridged in silence), `-69` the index is ahead of this member's log.
+
+What replay cannot reproduce is stated rather than discovered: the log
+records commands, not outcomes, so a replayed update or delete appears
+even if it matched nothing by apply time, and a replayed update's
+`fullDocument` is the document as it *now* stands (or absent if gone) —
+the same "current image" contract MongoDB's `updateLookup` makes.
 
 **The events cost the engine nothing new.** A logged command already
 names the one document it touched — the planner expanded `updateMany`
@@ -537,15 +556,26 @@ come from:
 
 - The **session** holds at most `DBS_STREAM_EVENTS` (256) events or
   `DBS_STREAM_BYTES` (1 MB) per stream. Past that the stream *overflows*:
-  it stops collecting, sends `{stream, overflow: true}` once, and closes.
-  A flag rather than a count, deliberately — once a stream overflows,
-  nothing more is built for it, so any number would mean "however many
-  happened before the transport next looked".
+  it stops collecting, sends `{stream, overflow: true, index: N}` once —
+  after delivering everything it had queued — and closes. `index` is the
+  last log index actually delivered, present only when a log minted one;
+  with it the overflow is a **page boundary** rather than a loss: resume
+  with `from: N` and nothing is missed, which is also how a replay
+  longer than one queue pages itself out. Without a log the old remedy
+  stands: re-watch and re-read current state. A flag rather than a
+  count, deliberately — once a stream overflows, nothing more is built
+  for it, so any count would mean "however many happened before the
+  transport next looked".
 - The **transport** stops handing a connection events once it is holding
   `OUT_HIGH_WATER` (64 KB) of unsent bytes. Without that the backlog
   would simply move into a buffer nothing counts, and a consumer that
   stopped reading would cost the server memory instead of costing itself
   its stream.
+- And the transport never sends an event past a **deferred answer**: on
+  a replicated server a watch's reply is held for the read barrier, and
+  that reply is the one carrying the stream id — an event delivered
+  ahead of it would name a stream the client has not been told exists.
+  Events queue in the session until the answer flows, then follow it.
 
 **`--stdio` delivers events too, but only behind an answer.** That
 transport is one client by construction and has no poll loop — the only

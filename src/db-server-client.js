@@ -116,16 +116,28 @@ export class ServerError extends Error {
 }
 
 /**
- * A change stream fell too far behind and the server closed it. There
- * are no resume tokens (a documented non-goal), so the remedy is the
- * in-process one: watch again and re-read current state.
+ * A change stream fell behind and the server closed it -- after
+ * delivering everything it had queued, so nothing already handed over is
+ * in doubt.
+ *
+ * On a REPLICATED server this is a page boundary, not a loss:
+ * `resumeFrom` is the log index of the last event delivered, and
+ * `watch({ from: err.resumeFrom })` continues right after it, missing
+ * nothing -- which is also how reading a long history pages itself out.
+ * Without a log (an unreplicated server), `resumeFrom` is null and the
+ * remedy is the old one: watch again and re-read current state.
  */
 export class ChangeStreamOverflowError extends Error {
-  constructor() {
-    super('change stream overflow: the server stopped holding events for this ' +
-          'stream and closed it -- consume faster, or watch() again and re-read ' +
-          'current state');
+  constructor(resumeFrom = null) {
+    super(resumeFrom !== null
+      ? 'change stream overflow: the server stopped holding events for this ' +
+        `stream and closed it -- resume with watch({ from: ${resumeFrom} }) to ` +
+        'continue where it left off'
+      : 'change stream overflow: the server stopped holding events for this ' +
+        'stream and closed it -- consume faster, or watch() again and re-read ' +
+        'current state');
     this.name = 'ChangeStreamOverflowError';
+    this.resumeFrom = resumeFrom;
   }
 }
 
@@ -147,6 +159,11 @@ class RemoteChangeStream {
     this._closed = false;
     this._error = null;
     this._close = close;
+    /* The resume token: the log index of the last event this stream has
+     * handed over -- initially the subscribe's replay ceiling, so it is
+     * meaningful before the first event too. null on a server without a
+     * log, where resuming is not a thing this stream can offer. */
+    this.resumeFrom = null;
   }
 
   on(event, cb) {
@@ -160,6 +177,7 @@ class RemoteChangeStream {
   /** @internal a frame arrived for this stream */
   _emit(change) {
     if (this._closed) return;
+    if (typeof change?.index === 'number') this.resumeFrom = change.index;
     for (const cb of this._listeners) cb(change);
     if (this._waiting.length) { this._waiting.shift().resolve({ value: change, done: false }); return; }
     this._queue.push(change);
@@ -233,6 +251,15 @@ class Connection {
     this._dead = null;      // the Error every later call fails with
     this._closing = false;  // our own close(), so EOF is not a surprise
     this._streams = new Map();   // stream id -> RemoteChangeStream
+    /* Frames for a stream id nobody has claimed YET. A resumed watch's
+     * replayed events can share a TCP segment with the subscribe answer
+     * itself, and this loop processes the whole segment synchronously --
+     * before the microtask that registers the stream has had a turn. So
+     * an unclaimed frame is held rather than dropped, and _watching
+     * flushes it the moment the id is claimed. Bounded by the server's
+     * own per-stream queue: it never sends more than one queue's worth
+     * ahead of the answer. */
+    this._unclaimed = new Map(); // stream id -> [frame, ...]
 
     socket.on('data', (chunk) => this._onData(chunk));
     socket.on('error', (err) => this._die(err));
@@ -250,6 +277,7 @@ class Connection {
      * and there will be no more of them. */
     const streams = [...this._streams.values()];
     this._streams.clear();
+    this._unclaimed.clear();
     for (const st of streams) st._fail(this._dead);
     /* And so is a holder of many connections (the HTTP front end keeps a
      * table of them): a session whose socket the server reaped is an
@@ -259,9 +287,36 @@ class Connection {
     if (this.onDead) this.onDead(this._dead);
   }
 
-  /** @internal register a stream so its frames can find it */
-  _watching(id, stream) { this._streams.set(id, stream); }
-  _unwatching(id) { this._streams.delete(id); }
+  /** @internal register a stream so its frames can find it -- and hand
+   * over whatever arrived for this id before anybody claimed it */
+  _watching(id, stream) {
+    this._streams.set(id, stream);
+    const held = this._unclaimed.get(id);
+    if (!held) return;
+    this._unclaimed.delete(id);
+    for (const frame of held) this._route(frame);
+  }
+  _unwatching(id) { this._streams.delete(id); this._unclaimed.delete(id); }
+
+  /** @internal deliver one event/overflow frame to its stream */
+  _route(routed) {
+    const st = this._streams.get(routed.stream);
+    if (!st) {
+      const held = this._unclaimed.get(routed.stream) || [];
+      held.push(routed);
+      this._unclaimed.set(routed.stream, held);
+      return;
+    }
+    if (routed.overflow !== undefined) {
+      this._streams.delete(routed.stream);
+      /* The overflow frame names the last index delivered when a log
+       * minted one -- the resume point. */
+      st._fail(new ChangeStreamOverflowError(
+        typeof routed.index === 'number' ? routed.index : null));
+    } else {
+      st._emit(routed.event);
+    }
+  }
 
   _onData(chunk) {
     this._buf = this._buf.length ? Buffer.concat([this._buf, chunk]) : chunk;
@@ -285,15 +340,7 @@ class Connection {
       try { routed = decode(frame); } catch { /* handled below */ }
       if (routed && typeof routed === 'object' && routed.ok === undefined &&
           typeof routed.stream === 'number') {
-        const st = this._streams.get(routed.stream);
-        if (st) {
-          if (routed.overflow !== undefined) {
-            this._streams.delete(routed.stream);
-            st._fail(new ChangeStreamOverflowError());
-          } else {
-            st._emit(routed.event);
-          }
-        }
+        this._route(routed);
         continue;   // never an answer to anything
       }
 
@@ -780,17 +827,26 @@ function collection(conn, name) {
     /*
      * A live feed of this collection's changes, over the same socket.
      *
+     * On a replicated server every event carries `index` -- the log
+     * index its command committed at -- and `watch({ from })` RESUMES: the
+     * server replays everything after that index into the stream before
+     * any live event, so a consumer that reconnects with the last index
+     * it saw (`stream.resumeFrom` keeps it) misses nothing and repeats
+     * nothing. A `from` compacted out of the log, ahead of it, or asked
+     * of a server with no log is refused with its own code, never
+     * bridged in silence.
+     *
      * The stream costs one of the server's bounded slots and one queue
      * on it, so close() it when done -- losing the connection does it
      * for you, and so does falling far enough behind that the server
-     * gives up (ChangeStreamOverflowError, which has no resume token to
-     * offer: watch again and re-read).
+     * gives up (ChangeStreamOverflowError, whose resumeFrom says where
+     * to pick back up when the server's log makes that possible).
      *
      * The collection need not exist yet. Watching one before its first
      * insert is the case a change stream is most useful for, and the
      * insert that creates it is an event like any other.
      */
-    watch() {
+    watch({ from } = {}) {
       let id = null;
       let closed = false;
       /* Synchronous, like the in-process watch(): a caller writes
@@ -806,9 +862,22 @@ function collection(conn, name) {
         /* Best effort: a connection already gone has released it. */
         try { await conn.call({ op: 'closeStream', stream: id }); } catch { /* closed either way */ }
       });
-      const subscribed = call({ op: 'watch' }).then((res) => {
+      /* A resumed stream's token starts where the caller said, and only
+       * delivered events advance it: if the consumer dies mid-replay it
+       * resumes from what it actually processed, never past it. */
+      const resuming = from !== undefined && from !== null;
+      if (resuming) stream.resumeFrom = from;
+      const subscribed = call({
+        op: 'watch', ...(resuming ? { from } : {})
+      }).then((res) => {
         id = res.stream;
+        /* A live-only watch starts at the replay ceiling -- "you are
+         * here" -- present only when a log minted it. */
+        if (typeof res.index === 'number' && stream.resumeFrom === null) {
+          stream.resumeFrom = res.index;
+        }
         if (closed) {          // closed before the id arrived: give the slot back
+          conn._unwatching(id);   // and anything held for it unclaimed
           conn.call({ op: 'closeStream', stream: id }).catch(() => {});
           return;
         }

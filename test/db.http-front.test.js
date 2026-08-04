@@ -86,7 +86,7 @@ async function post(front, pathname, body = undefined) {
  * rather than EventSource, because what is being tested is the frames on
  * the wire, not a browser's reconnect policy.
  */
-function sse(front, pathname) {
+function sse(front, pathname, headers = {}) {
   const { port } = front.address();
   const events = [];
   const waiting = [];
@@ -96,7 +96,7 @@ function sse(front, pathname) {
     if (w) w(ev); else events.push(ev);
   };
   const ready = new Promise((resolve, reject) => {
-    req = http.get(`http://127.0.0.1:${port}${pathname}`, (res) => {
+    req = http.get(`http://127.0.0.1:${port}${pathname}`, { headers }, (res) => {
       resolve(res.statusCode);
       let buf = '';
       res.on('data', (chunk) => {
@@ -456,4 +456,115 @@ describe.skipIf(!(REQUIRED || have(NATIVE)))('http front end: a three-member clu
     expect(change.data.fullDocument.note).toBe('replicated');
     stream.close();
   }, 60000);
+
+  /*
+   * Resume where the watch ANSWER is itself deferred: on a real cluster
+   * a read is held behind the ReadIndex barrier, so the subscribe reply
+   * and the replayed events cross the socket in one burst once the
+   * quorum confirms -- the ordering (answer first, then events; events
+   * held for an unclaimed stream id) is exactly what this exercises,
+   * and what a group of one cannot.
+   */
+  it('resumes a stream on a cluster, events replayed behind a barrier-held answer', async () => {
+    await post(front, `/db/${DB}/history/insert`, { doc: { n: 1 } });
+    await post(front, `/db/${DB}/history/insert`, { doc: { n: 2 } });
+
+    const stream = sse(front, `/db/${DB}/history/watch?from=0`);
+    expect(await stream.ready).toBe(200);
+    expect((await stream.next()).event).toBe('watching');
+    const a = await stream.next(20000);
+    const b = await stream.next(20000);
+    expect([a, b].map((e) => e.data.fullDocument.n)).toEqual([1, 2]);
+    expect(Number(a.id)).toBe(a.data.index);
+    stream.close();
+  }, 60000);
+});
+
+/**
+ * Resumable SSE (roadmap step 6 over HTTP; docs/http-front.md is the
+ * contract): the log index rides as each event's SSE `id:`, so
+ * SSE's own reconnect machinery -- Last-Event-ID -- is the resume
+ * protocol, and a server-side overflow with a token is a page boundary
+ * the front end crosses without the consumer ever seeing it.
+ *
+ * A group of one (`--raft 1`): the log without the election mechanics.
+ * The cluster suite above already proves the leader-following half.
+ */
+describe.skipIf(!(REQUIRED || have(NATIVE)))('http front end: resumable SSE (--raft 1, native)', () => {
+  const DB = 'ssedb';
+  const port = nextPort();
+  let proc, front;
+
+  beforeAll(async () => {
+    ({ proc } = await startServer(ENGINES[0], port, ['--raft', '1']));
+    front = new DbHttpFront(`127.0.0.1:${port}`, { listenPort: 0 });
+    await front.start();
+    return async () => {
+      await front.stop();
+      proc.kill();
+      await new Promise((r) => proc.once('exit', r));
+    };
+  }, 60000);
+
+  it('replays history from ?from=0, each event carrying its log index as the SSE id', async () => {
+    for (const n of [1, 2, 3]) {
+      expect((await post(front, `/db/${DB}/hist/insert`, { doc: { n } })).status).toBe(200);
+    }
+    const stream = sse(front, `/db/${DB}/hist/watch?from=0`);
+    expect(await stream.ready).toBe(200);
+    expect((await stream.next()).event).toBe('watching');
+
+    const seen = [];
+    for (let i = 0; i < 3; i++) seen.push(await stream.next());
+    expect(seen.map((e) => e.data.fullDocument.n)).toEqual([1, 2, 3]);
+    // The SSE id IS the event's log index -- what Last-Event-ID sends back.
+    for (const e of seen) expect(Number(e.id)).toBe(e.data.index);
+    expect(seen[0].data.index).toBeLessThan(seen[2].data.index);
+    stream.close();
+  });
+
+  it('resumes from Last-Event-ID: only what came after it, exactly as a reconnect would', async () => {
+    const all = sse(front, `/db/${DB}/hist/watch?from=0`);
+    await all.ready;
+    await all.next();                       // watching
+    const first = await all.next();         // n: 1
+    all.close();
+
+    // The header wins over the URL, because a reconnecting consumer
+    // knows better than its original URL where it actually got to.
+    const rest = sse(front, `/db/${DB}/hist/watch?from=0`, { 'last-event-id': first.id });
+    expect(await rest.ready).toBe(200);
+    await rest.next();                      // watching
+    expect((await rest.next()).data.fullDocument.n).toBe(2);
+    expect((await rest.next()).data.fullDocument.n).toBe(3);
+    rest.close();
+  });
+
+  it('pages a 300-event history through the bounded queue without the consumer noticing', async () => {
+    for (const half of [0, 150]) {
+      const docs = Array.from({ length: 150 }, (_, i) => ({ n: half + i }));
+      expect((await post(front, `/db/${DB}/paged/insertMany`, { docs })).status).toBe(200);
+    }
+    // The server's stream queue holds 256 events; the replay overflows
+    // at the boundary and the front end resumes from the overflow's
+    // token -- the SSE consumer just sees 300 changes, in order.
+    const stream = sse(front, `/db/${DB}/paged/watch?from=0`);
+    expect(await stream.ready).toBe(200);
+    expect((await stream.next()).event).toBe('watching');
+    const seen = [];
+    while (seen.length < 300) {
+      const ev = await stream.next(20000);
+      expect(ev.event).toBe('change');
+      seen.push(ev.data.fullDocument.n);
+    }
+    expect(seen).toEqual(Array.from({ length: 300 }, (_, i) => i));
+    stream.close();
+  });
+
+  it('refuses a token from the future with the wire\'s own code', async () => {
+    const { port: p } = front.address();
+    const res = await fetch(`http://127.0.0.1:${p}/db/${DB}/hist/watch?from=999999`);
+    expect(res.status).toBe(400);
+    expect((await res.json()).code).toBe(-69);
+  });
 });

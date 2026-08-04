@@ -59,16 +59,18 @@
  *
  * A CHANGE STREAM IS A SERVER PUSH, so GET /db/<db>/<coll>/watch is
  * Server-Sent Events (the idiom src/raft-monitor.js established here):
- * `event: watching` once subscribed, `event: change` per change,
- * `event: overflow` then the end if the server gave up holding events
- * (ChangeStreamOverflowError — no resume token exists today), `event:
- * end` with a reason for every other way it stops. Nothing ends in
- * silence. The SSE `id:` field is deliberately unused: when change
- * streams tail the log (docs/steps/read-semantics-and-change-streams.md
- * part two), the log index becomes the event id and Last-Event-ID
- * becomes the resume request, on this same endpoint. An SSE connection
- * IS its own session — it holds a dedicated socket, kept alive, released
- * when the HTTP request closes.
+ * `event: watching` once subscribed, `event: change` per change, `event:
+ * end` with a reason for every way it stops. Nothing ends in silence.
+ * On a replicated server the stream is RESUMABLE, by SSE's own
+ * machinery: each event's log index rides as its `id:`, `?from=` or a
+ * Last-Event-ID header replays everything after that index before
+ * anything live, and an EventSource that reconnects therefore continues
+ * exactly where it got to. A server-side overflow with a token to
+ * resume from is a page boundary this side crosses silently; one
+ * without a token (a server with no log) is `event: overflow` then the
+ * end, the old contract. An SSE connection IS its own session — it
+ * holds a dedicated socket, kept alive, released when the HTTP request
+ * closes.
  *
  * WHICH MEMBER TAKES A REQUEST: the leader, for reads and writes alike
  * (reads are linearizable and leader-only; a follower refuses both with
@@ -219,7 +221,13 @@ function fill(req) {
 /* ---- errors as responses -------------------------------------------- */
 
 function statusOf(err) {
-  if (err instanceof ServerError) return RETRYABLE.has(err.code) ? 503 : 400;
+  if (err instanceof ServerError) {
+    /* A resume token compacted out of the log is GONE, not malformed:
+     * the caller's remedy is a fresh watch, and 410 is HTTP's word for
+     * exactly that. */
+    if (err.code === -68) return 410;
+    return RETRYABLE.has(err.code) ? 503 : 400;
+  }
   return 502;
 }
 
@@ -418,9 +426,24 @@ export class DbHttpFront {
       return this._notFound(res);
     }
 
-    /* The change stream. */
+    /* The change stream. `from` resumes: the query parameter for a
+     * first request, the Last-Event-ID header on an SSE reconnect --
+     * and the header wins, because a reconnecting consumer knows better
+     * than its original URL where it actually got to. */
     if (req.method === 'GET' && parts.length === 4 && parts[0] === 'db' && parts[3] === 'watch') {
-      return this._watch(parts[1], parts[2], res, req);
+      const header = req.headers['last-event-id'];
+      const raw = header !== undefined ? header : url.searchParams.get('from');
+      let from = null;
+      if (raw !== null && raw !== undefined && raw !== '') {
+        from = Number(raw);
+        if (!Number.isInteger(from) || from < 0) {
+          return this._json(res, 400, {
+            ok: false,
+            error: `not a resume index: '${raw}' (want the \`index\` of a delivered event)`
+          });
+        }
+      }
+      return this._watch(parts[1], parts[2], from, res, req);
     }
 
     if (req.method !== 'POST') return this._notFound(res);
@@ -512,16 +535,29 @@ export class DbHttpFront {
    * right status, not an empty stream -- and released when either side
    * goes: the HTTP request closing closes the stream and the socket; the
    * socket dying ends the response, with a reason, always.
+   *
+   * Every event that has a log index carries it as its SSE `id:`, which
+   * is what makes the stream RESUMABLE by the protocol's own machinery:
+   * an EventSource that reconnects sends Last-Event-ID, and the watch
+   * picks up right after it -- exactly once, in order, across the
+   * reconnect. An overflow with a token is handled here and never
+   * reaches the consumer: the server closed the stream at a page
+   * boundary, so this side re-watches from the last index it wrote and
+   * the response simply continues -- which is also how a long history
+   * pages through the server's bounded queue. Only an overflow with no
+   * token (a server with no log) still ends the stream, because there
+   * is nothing to resume from and pretending otherwise would be a gap.
    */
-  async _watch(db, coll, res, req) {
+  async _watch(db, coll, from, res, req) {
     const deadline = Date.now() + this.retryMs;
     let client = null;
     let stream = null;
     for (;;) {
       try {
         const member = this._leader;
-        client = await connectServer(member, { keepAliveMs: undefined });
-        stream = client.db(db).collection(coll).watch();
+        client = await connectServer(member);
+        stream = client.db(db).collection(coll)
+          .watch(from !== null ? { from } : {});
         await stream.ready;
         break;
       } catch (err) {
@@ -538,7 +574,13 @@ export class DbHttpFront {
     }
 
     res.writeHead(200, SSE_HEADERS);
-    res.write(`event: watching\ndata: ${JSON.stringify({ db, coll, member: client.address })}\n\n`);
+    /* The subscribe position rides as the first frame's id: a consumer
+     * that reconnects before any change resumes from here rather than
+     * from nothing. */
+    const hello = { db, coll, member: client.address };
+    if (stream.resumeFrom !== null) hello.index = stream.resumeFrom;
+    res.write((stream.resumeFrom !== null ? `id: ${stream.resumeFrom}\n` : '') +
+              `event: watching\ndata: ${JSON.stringify(hello)}\n\n`);
     this._sse.add(res);
 
     const finish = (event, data) => {
@@ -554,19 +596,32 @@ export class DbHttpFront {
     });
 
     try {
-      for await (const change of stream) {
-        res.write(`event: change\ndata: ${JSON.stringify(toExtendedJson(change))}\n\n`);
-      }
-      finish('end', { reason: 'closed' });
-    } catch (err) {
-      if (err instanceof ChangeStreamOverflowError) {
-        /* The server stopped holding events for a consumer that fell
-         * behind, and there is no resume token to offer (yet: part two
-         * of the change-streams brief puts the log index here). Saying
-         * so loudly is the contract. */
-        finish('overflow', { reason: err.message });
-      } else {
-        finish('end', { reason: err.message });
+      for (;;) {
+        try {
+          for await (const change of stream) {
+            const id = typeof change.index === 'number' ? `id: ${change.index}\n` : '';
+            res.write(`${id}event: change\ndata: ${JSON.stringify(toExtendedJson(change))}\n\n`);
+          }
+          finish('end', { reason: 'closed' });
+          break;
+        } catch (err) {
+          if (err instanceof ChangeStreamOverflowError && err.resumeFrom !== null &&
+              !res.writableEnded) {
+            /* A page boundary, not a loss: continue from where the
+             * server stopped, on the same connection. */
+            stream = client.db(db).collection(coll).watch({ from: err.resumeFrom });
+            try { await stream.ready; continue; } catch (again) {
+              finish('end', { reason: again.message });
+              break;
+            }
+          }
+          if (err instanceof ChangeStreamOverflowError) {
+            finish('overflow', { reason: err.message });
+          } else {
+            finish('end', { reason: err.message });
+          }
+          break;
+        }
       }
     } finally {
       this._sse.delete(res);

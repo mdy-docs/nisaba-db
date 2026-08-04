@@ -152,6 +152,27 @@ extern "C" {
  */
 #define DC_ERR_NOT_CURRENT          (-66)
 
+/* The three ways a resumed watch can be refused. A resume token is a log
+ * index, so resuming needs a log; each of these says precisely which
+ * expectation failed, because the remedies differ. */
+
+/* watch named a `from` index and this server keeps no entry log to
+ * replay -- an unreplicated server applies writes directly. Resume is a
+ * property of the log, not of the stream machinery. */
+#define DC_ERR_RESUME_NO_LOG        (-67)
+
+/* The `from` index is below the log's base: the entries between them
+ * were compacted away, so the events they would have made cannot be
+ * served -- and MUST not be skipped, because a gap delivered in silence
+ * is worse than a refusal. Watch afresh and re-read current state. */
+#define DC_ERR_RESUME_COMPACTED     (-68)
+
+/* The `from` index is ahead of what this member has applied. A token can
+ * only have come from a delivered event, and a delivered event's entry
+ * is applied on the leader that served it -- so a token from the future
+ * is not this log's, and the honest answer is that, not a silent wait. */
+#define DC_ERR_RESUME_AHEAD         (-69)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)
@@ -161,7 +182,7 @@ extern "C" {
  * A replicated server has to know whether a request reads, writes or
  * touches nothing BEFORE it runs it: a follower refuses the first two,
  * and a leader owes a read a barrier proving its data is current
- * (docs/steps/read-semantics-and-change-streams.md).
+ * (docs/replicaton-roadmap.md, the step 6 decision).
  *
  * The classification lives with the op table it classifies, one line per
  * op, so an op cannot be added without one. Deriving it anywhere else
@@ -424,18 +445,86 @@ void dbs_drop_client(dbs *s, uint64_t client);
  * and returns, so a write is never slowed by a consumer, and the
  * transport hands out what has accumulated whenever it next looks.
  *
- * BOUNDED, AND IT SAYS WHEN. A consumer that stops reading fills its
- * queue; at DBS_STREAM_EVENTS events or DBS_STREAM_BYTES bytes the stream
- * OVERFLOWS -- it stops collecting, says so once, and closes. That is the in-process contract too (wasm/nisaba-wasm.js's
- * ChangeStream): there are no resume tokens, so an overflowed consumer
- * re-watches and re-reads current state, and a stream that grew without
- * limit or dropped events in silence would be worse than either.
+ * THE LOG INDEX IS THE RESUME TOKEN. On a server whose writes go through
+ * an entry log, every event carries the `index` its command committed
+ * at, and a watch may name `from`: the last index its consumer has
+ * already seen. The session then REPLAYS -- it reads the log through the
+ * seam below (dbs_set_log), re-derives each entry's event (dbs_log_event),
+ * and feeds them to the new stream before any live event -- so a
+ * consumer that reconnects gets everything after its token, exactly
+ * once, in order. What replay cannot reproduce is suppressed no-ops and
+ * an update's image AS OF the entry: the log records commands rather
+ * than outcomes, so a replayed update or delete appears even if it
+ * matched nothing by the time it applied, and a replayed update's
+ * fullDocument is the document as it NOW stands, or absent if it is
+ * gone -- the same "current image" contract MongoDB's updateLookup
+ * makes, stated here so nobody discovers it as a surprise.
+ *
+ * BOUNDED, AND IT SAYS WHEN -- AND WHERE. A consumer that stops reading
+ * fills its queue; at DBS_STREAM_EVENTS events or DBS_STREAM_BYTES bytes
+ * the stream OVERFLOWS -- it stops collecting, says so once with the
+ * last index it delivered, and closes. With a log behind it that is a
+ * PAGE BOUNDARY rather than a loss: the consumer re-watches from the
+ * index the overflow named and misses nothing, which is also how a
+ * replay longer than one queue pages itself out. Without a log (the
+ * in-process host, an unreplicated server) the old contract stands: no
+ * token to offer, so an overflowed consumer re-watches and re-reads
+ * current state.
  */
+
+/*
+ * The log, as the session is allowed to see it: three questions,
+ * answered by whoever owns the log (server/replica.c), registered per
+ * database by the instance. The session never holds the log -- same
+ * split as everywhere else in this library: C decides what to read, the
+ * host delivers the bytes.
+ */
+typedef struct {
+    void *ctx;
+    /* Entries at or below this index are gone (compacted into a
+     * snapshot); a resume from below it is refused, never bridged. */
+    uint64_t (*base)(void *ctx);
+    /* The highest index this member has APPLIED -- the replay ceiling.
+     * Not the commit marker, which can trail what was applied. */
+    uint64_t (*floor)(void *ctx);
+    /* The command entry `index` carries for database `db`, appended to
+     * `cmd`. Leaves `cmd` empty when the entry is another database's or
+     * carries no command (a config change, a no-op). */
+    int (*entry)(void *ctx, const char *db, size_t db_len, uint64_t index,
+                 dbuf *cmd);
+} dbs_log;
+
+/* Register the log reader, and the database name entries are filtered
+ * by. `log` NULL unregisters. The name is copied. */
+int dbs_set_log(dbs *s, const dbs_log *log, const char *db_name, size_t db_len);
+
+/* The registered log, from the request handler's side of the wall: is
+ * there one, its bounds, and one entry's command for this database.
+ * dbs_log_entry leaves `cmd` empty for an entry that is not this
+ * database's or carries no command. */
+int      dbs_has_log(const dbs *s);
+uint64_t dbs_log_base(dbs *s);
+uint64_t dbs_log_floor(dbs *s);
+int      dbs_log_entry(dbs *s, uint64_t index, dbuf *cmd);
 
 /* Start watching `coll`. The id is the client's handle to it, unique for
  * the session's lifetime and never reused. */
 int dbs_watch(dbs *s, uint64_t client, const char *coll, size_t coll_len,
               uint64_t *id_out);
+
+/* Derive the event entry `index`'s command would emit, into `out` --
+ * the replay half of the derivation dbs_emit's callers make live, with
+ * the differences the section comment states. `*have` is 0 for a
+ * command that emits nothing (DDL, another collection's). */
+int dbs_log_event(dbs *s, const char *coll, size_t coll_len, uint64_t index,
+                  const uint8_t *cmd, uint32_t cmd_len, dbuf *out, int *have);
+
+/* Append one already-encoded event to ONE stream -- replay's delivery,
+ * where dbs_emit's is live broadcast. Returns through *fed: 1 queued,
+ * 0 the stream overflowed (stop replaying; the overflow frame will name
+ * the last delivered index and the consumer resumes from there). */
+int dbs_stream_feed(dbs *s, uint64_t client, uint64_t id, uint64_t index,
+                    const uint8_t *event, size_t len, int *fed);
 
 /* Stop. DC_ERR_NO_STREAM if that id is not this client's -- the same
  * conflation of "no such" and "not yours" cursors make, for the same
@@ -448,8 +537,11 @@ int dbs_watched(const dbs *s, const char *coll, size_t coll_len);
 
 /* Append one already-encoded event OBJECT to every stream watching
  * `coll`. Never fails a write: a stream that cannot take it overflows,
- * which is that stream's problem and not the writer's. */
-void dbs_emit(dbs *s, const char *coll, size_t coll_len,
+ * which is that stream's problem and not the writer's. `index` is the
+ * log index the event's command committed at, 0 when there is no log --
+ * it rides beside the queue so the overflow frame can name the last
+ * index actually delivered. */
+void dbs_emit(dbs *s, const char *coll, size_t coll_len, uint64_t index,
               const uint8_t *event, size_t len);
 
 /*
@@ -458,8 +550,11 @@ void dbs_emit(dbs *s, const char *coll, size_t coll_len,
  * what it is carrying -- the frame is built here, in the shape
  * db_request.c answers in, so the wire has one owner.
  *
- *   { stream: <id>, event: {...} }        one change
- *   { stream: <id>, overflow: true }      events were lost; it is gone
+ *   { stream: <id>, event: {...} }              one change
+ *   { stream: <id>, overflow: true, index: N }  events after N were lost;
+ *                                               it is gone. `index` only
+ *                                               when a log gave it one:
+ *                                               it is the resume point.
  */
 int dbs_stream_take(dbs *s, uint64_t client, dbuf *out, int *have);
 

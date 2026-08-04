@@ -35,6 +35,9 @@ struct dbi {
     dbi_slot  db[DBI_MAX_DATABASES];
     /* One counter for every cursor and every stream in the process. */
     uint64_t  next_id;
+    /* The entry log's reader (dbi_set_log), handed to every database
+     * this instance opens so a watch can resume. Zeroed = no log. */
+    dbs_log   log;
 };
 
 /* ---- opening ------------------------------------------------------------ */
@@ -123,7 +126,28 @@ int dbi_database(dbi *i, const char *name, size_t len, int create, dbs **out) {
     d->name_len = (uint32_t)len;
     d->s = s;
     dbs_set_id_source(s, &i->next_id);
+    /* The instance's log reader reaches every database it opens, present
+     * and future, under that database's own name -- registration happens
+     * here so a database opened lazily (an apply creating one, a client
+     * naming a new one) is never the one that cannot resume a watch. */
+    if (i->log.entry) {
+        e = dbs_set_log(s, &i->log, name, len);
+        if (e) { slot_close(i, d); return e; }
+    }
     *out = s;
+    return BJ_OK;
+}
+
+int dbi_set_log(dbi *i, const dbs_log *log) {
+    if (!i) return BJ_ERR_STATE;
+    if (log) i->log = *log;
+    else     memset(&i->log, 0, sizeof i->log);
+    for (int k = 0; k < DBI_MAX_DATABASES; k++) {
+        dbi_slot *d = &i->db[k];
+        if (!d->used) continue;
+        int e = dbs_set_log(d->s, log, d->name, d->name_len);
+        if (e) return e;
+    }
     return BJ_OK;
 }
 
@@ -429,6 +453,27 @@ int dbi_apply(dbi *i, uint64_t index, const uint8_t *payload, uint32_t len,
     e = dbi_database(i, (const char *)name, nlen, 1, &s);
     if (e) return e;
     return dbs_apply(s, index, cmd, (uint32_t)cmd_len, result);
+}
+
+int dbi_entry_cmd(const uint8_t *payload, uint32_t len,
+                  const char *db, size_t db_len,
+                  const uint8_t **cmd, size_t *cmd_len) {
+    if (!payload || !cmd || !cmd_len) return BJ_ERR_STATE;
+    *cmd = NULL;
+    *cmd_len = 0;
+    /* Not an envelope at all -- a payload from before databases had
+     * names, or a probe. Nothing to serve, nothing to stop on: the
+     * caller is replaying a log, and an entry that is not a command is
+     * an entry with no events in it. */
+    const uint8_t *name; uint32_t nlen; int found = 0;
+    if (req_str(payload, len, "d", &name, &nlen, &found) || !found) return BJ_OK;
+    if (nlen != db_len || memcmp(name, db, db_len) != 0) return BJ_OK;
+    const uint8_t *c; size_t clen;
+    if (obj_get_field(payload, len, (const uint8_t *)"c", 1, &c, &clen, &found) || !found)
+        return BJ_OK;
+    *cmd = c;
+    *cmd_len = clen;
+    return BJ_OK;
 }
 
 uint64_t dbi_applied_floor(dbi *i) {

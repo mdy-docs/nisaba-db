@@ -150,31 +150,41 @@ lives there and nowhere else. If leadership moves, its next read is
 refused (503, leader named) rather than redirected to a member that has
 never heard of the cursor; the remedy is a new session.
 
-## Change streams: Server-Sent Events
+## Change streams: Server-Sent Events, resumable by the protocol's own machinery
 
 ```sh
 curl -N localhost:8080/db/shop/orders/watch
+# id: 12
 # event: watching
-# data: {"db":"shop","coll":"orders","member":"127.0.0.1:9001"}
+# data: {"db":"shop","coll":"orders","member":"127.0.0.1:9001","index":12}
 #
+# id: 13
 # event: change
-# data: {"operationType":"insert","ns":{...},"fullDocument":{...}}
+# data: {"operationType":"insert","ns":{...},"index":13,"fullDocument":{...}}
 ```
+
+On a replicated server every event's **log index rides as its SSE
+`id:`** — the resume token. `?from=N` (or a `Last-Event-ID` header,
+which wins, because a reconnecting consumer knows better than its
+original URL where it got to) replays everything after `N` before
+anything live: exactly once, in order, across the reconnect. A browser
+`EventSource` gets this for free — it reconnects with `Last-Event-ID`
+by itself. A token that was compacted out of the log is **410 Gone**
+(the wire's `-68`): watch afresh and re-read, because a gap is never
+bridged in silence.
 
 Each stream holds its own dedicated socket — an SSE connection is its
 own session — subscribed before the 200 is committed, so a refused watch
 is a JSON refusal under the right status, not an empty stream. Closing
 the HTTP request closes the stream and the socket.
 
-Nothing ends in silence: `event: overflow` then the end if the server
-stopped holding events for a consumer that fell behind (there is no
-resume token today), `event: end` with a reason for every other way it
-stops, and `: keep-alive` comments defeat idle reapers in between.
-
-The SSE `id:` field is deliberately unused. When change streams tail the
-log ([`steps/read-semantics-and-change-streams.md`](steps/read-semantics-and-change-streams.md)
-part two), the log index becomes the event id and `Last-Event-ID`
-becomes the resume request, on this same endpoint.
+Nothing ends in silence: a server-side overflow with a token to resume
+from is a page boundary the front end crosses without the consumer ever
+seeing it (the server's stream queue is bounded; a long replay pages
+through it); an overflow with no token — a server with no log — is
+`event: overflow` then the end. `event: end` carries a reason for every
+other way it stops, and `: keep-alive` comments defeat idle reapers in
+between.
 
 ## A cluster: who takes the request
 

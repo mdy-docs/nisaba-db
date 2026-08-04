@@ -63,21 +63,26 @@ typedef struct {
 /* A change stream and who it belongs to. `queue` holds already-encoded
  * event objects back to back -- the transport splices them into frames
  * without decoding one, the same way every other result crosses this
- * layer.
+ * layer. `idx` rides beside it, one log index per queued event (0 when
+ * no log gave it one), so taking an event can record how far the
+ * consumer has got without decoding what it took.
  *
  * `overflowed` is a flag and not a count, deliberately: once a stream
  * overflows nothing more is BUILT for it (dbs_watched stops naming it),
  * so any count would be "however many happened before the transport
  * next looked" -- a number that means something different depending on
- * timing. The consumer's remedy does not vary with it either: there are
- * no resume tokens, so it re-watches and re-reads. */
+ * timing. The consumer's remedy is in `last_index`: the overflow frame
+ * names it, and with a log behind the stream the consumer resumes from
+ * there and misses nothing. Without one it re-watches and re-reads. */
 typedef struct {
     uint64_t id;
     uint64_t client;
     char    *coll;                          /* owned copy */
     size_t   coll_len;
     dbuf     queue;
+    uint64_t idx[DBS_STREAM_EVENTS];
     uint32_t count;
+    uint64_t last_index;                    /* highest index DELIVERED */
     int      overflowed;
 } dbs_stream;
 
@@ -157,6 +162,14 @@ struct dbs {
     uint64_t   *id_source;
     dbs_stream  streams[DBS_MAX_STREAMS];
     uint64_t    next_stream_id;
+
+    /* The log this database's writes go through, if it goes through one
+     * (dbs_set_log) -- what makes a watch resumable. `db_name` is this
+     * database's own name, kept so replay can ask the reader to filter
+     * an instance-wide log down to its entries. */
+    dbs_log     log;
+    char       *db_name;                    /* owned copy; NULL = no log */
+    size_t      db_name_len;
 
     /*
      * Writes planned but not yet replicated (db_session.h's fork). A
@@ -1424,6 +1437,30 @@ void dbs_drop_client(dbs *s, uint64_t client) {
  * its opposite in one: a cursor is pulled, and this is pushed.
  */
 
+int dbs_set_log(dbs *s, const dbs_log *log, const char *db_name, size_t db_len) {
+    if (!s) return BJ_ERR_STATE;
+    free(s->db_name);
+    s->db_name = NULL;
+    s->db_name_len = 0;
+    memset(&s->log, 0, sizeof s->log);
+    if (!log) return BJ_OK;
+    s->db_name = (char *)malloc(db_len ? db_len : 1);
+    if (!s->db_name) return BJ_ERR_OOM;
+    memcpy(s->db_name, db_name, db_len);
+    s->db_name_len = db_len;
+    s->log = *log;
+    return BJ_OK;
+}
+
+int dbs_has_log(const dbs *s)  { return s && s->log.entry != NULL; }
+uint64_t dbs_log_base(dbs *s)  { return dbs_has_log(s) ? s->log.base(s->log.ctx)  : 0; }
+uint64_t dbs_log_floor(dbs *s) { return dbs_has_log(s) ? s->log.floor(s->log.ctx) : 0; }
+
+int dbs_log_entry(dbs *s, uint64_t index, dbuf *cmd) {
+    if (!dbs_has_log(s) || !cmd) return BJ_ERR_STATE;
+    return s->log.entry(s->log.ctx, s->db_name, s->db_name_len, index, cmd);
+}
+
 int dbs_watch(dbs *s, uint64_t client, const char *coll, size_t coll_len,
               uint64_t *id_out) {
     if (!s || !coll || !id_out) return BJ_ERR_STATE;
@@ -1437,6 +1474,7 @@ int dbs_watch(dbs *s, uint64_t client, const char *coll, size_t coll_len,
         st->id       = s->id_source ? ++*s->id_source : ++s->next_stream_id;
         st->client   = client;
         st->count      = 0;
+        st->last_index = 0;
         st->overflowed = 0;
         *id_out = st->id;
         return BJ_OK;
@@ -1519,24 +1557,44 @@ int dbs_watched(const dbs *s, const char *coll, size_t coll_len) {
     return 0;
 }
 
-void dbs_emit(dbs *s, const char *coll, size_t coll_len,
+/* The one enqueue, shared by broadcast and replay: full-or-would-be
+ * overflows the stream, and the event is not queued and never will be --
+ * from there the stream owes its consumer one sentence saying so (with
+ * the last index it DID deliver), and nothing else. */
+static int stream_enqueue(dbs_stream *st, uint64_t index,
+                          const uint8_t *event, size_t len) {
+    if (st->count >= DBS_STREAM_EVENTS ||
+        st->queue.len + len > DBS_STREAM_BYTES ||
+        dbuf_put(&st->queue, event, len) != BJ_OK) {
+        st->overflowed = 1;
+        return 0;
+    }
+    st->idx[st->count++] = index;
+    return 1;
+}
+
+void dbs_emit(dbs *s, const char *coll, size_t coll_len, uint64_t index,
               const uint8_t *event, size_t len) {
     if (!s || !coll || !event || !len) return;
     for (int i = 0; i < DBS_MAX_STREAMS; i++) {
         dbs_stream *st = &s->streams[i];
         if (!st->id || st->overflowed) continue;
         if (st->coll_len != coll_len || memcmp(st->coll, coll, coll_len) != 0) continue;
-        /* Full, or would be. The event is not queued and never will be:
-         * from here the stream owes its consumer one sentence saying so,
-         * and nothing else. */
-        if (st->count >= DBS_STREAM_EVENTS ||
-            st->queue.len + len > DBS_STREAM_BYTES ||
-            dbuf_put(&st->queue, event, len) != BJ_OK) {
-            st->overflowed = 1;
-            continue;
-        }
-        st->count++;
+        stream_enqueue(st, index, event, len);
     }
+}
+
+int dbs_stream_feed(dbs *s, uint64_t client, uint64_t id, uint64_t index,
+                    const uint8_t *event, size_t len, int *fed) {
+    if (!s || !event || !len || !fed) return BJ_ERR_STATE;
+    *fed = 0;
+    for (int i = 0; i < DBS_MAX_STREAMS; i++) {
+        dbs_stream *st = &s->streams[i];
+        if (st->id != id || st->client != client) continue;
+        if (!st->overflowed) *fed = stream_enqueue(st, index, event, len);
+        return BJ_OK;
+    }
+    return DC_ERR_NO_STREAM;
 }
 
 int dbs_stream_take(dbs *s, uint64_t client, dbuf *out, int *have) {
@@ -1568,9 +1626,14 @@ int dbs_stream_take(dbs *s, uint64_t client, dbuf *out, int *have) {
             bj_builder_free(b);
             if (e) return e;
             /* Consumed: shift the rest down. A queue that is normally
-             * empty or short does not earn a ring buffer. */
+             * empty or short does not earn a ring buffer. The index
+             * array shifts with it, and the departing one is now the
+             * highest this consumer has been GIVEN -- the fact the
+             * overflow frame reports. */
             memmove(st->queue.data, st->queue.data + c.pos, st->queue.len - c.pos);
             st->queue.len -= c.pos;
+            if (st->idx[0]) st->last_index = st->idx[0];
+            memmove(st->idx, st->idx + 1, (st->count - 1) * sizeof st->idx[0]);
             st->count--;
             *have = 1;
             return BJ_OK;
@@ -1578,6 +1641,7 @@ int dbs_stream_take(dbs *s, uint64_t client, dbuf *out, int *have) {
 
         if (st->overflowed) {
             uint64_t id = st->id;
+            uint64_t last = st->last_index;
             stream_release(st);          /* said once, then gone */
             bj_builder *b = bj_builder_new();
             if (!b) return BJ_ERR_OOM;
@@ -1586,6 +1650,14 @@ int dbs_stream_take(dbs *s, uint64_t client, dbuf *out, int *have) {
             bj_put_int(b, (int64_t)id);
             bj_put_key(b, (const uint8_t *)"overflow", 8);
             bj_put_bool(b, 1);
+            if (last) {
+                /* The resume point, when a log minted one: everything
+                 * through `last` was delivered, so `from: last` misses
+                 * nothing. Absent when there is no log, because a number
+                 * nobody can act on is noise dressed as help. */
+                bj_put_key(b, (const uint8_t *)"index", 5);
+                bj_put_int(b, (int64_t)last);
+            }
             bj_end_object(b);
             size_t len = 0;
             const uint8_t *data = bj_builder_data(b, &len);
@@ -1757,6 +1829,7 @@ void dbs_close(dbs *s) {
     }
     if (s->catalog) bpt_free(s->catalog);
     s->ns->close(s->ns->ctx, &s->catalog_io);
+    free(s->db_name);
     free(s);
 }
 

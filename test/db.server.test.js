@@ -746,7 +746,7 @@ for (const engine of ENGINES) {
      *
      * ONLY THE LEADER MAY BE READ. Reads are linearizable and the leader
      * alone serves them
-     * (docs/steps/read-semantics-and-change-streams.md), so polling
+     * (docs/replicaton-roadmap.md, the step 6 decision), so polling
      * every member for its documents -- which is what this used to do --
      * now gets -63 from every follower. What a follower will still
      * answer is `ping`, and that is where it says what it is and how far
@@ -883,7 +883,7 @@ for (const engine of ENGINES) {
     });
 
     /*
-     * docs/steps/read-semantics-and-change-streams.md, part one: every
+     * The step 6 read decision (docs/replicaton-roadmap.md): every
      * read is linearizable and the leader alone serves one.
      *
      * A follower is behind by at least a round trip and cannot tell by
@@ -1306,7 +1306,7 @@ for (const engine of ENGINES) {
      *
      * ONLY THE LEADER MAY BE READ. Reads are linearizable and the leader
      * alone serves them
-     * (docs/steps/read-semantics-and-change-streams.md), so polling
+     * (docs/replicaton-roadmap.md, the step 6 decision), so polling
      * every member for its documents -- which is what this used to do --
      * now gets -63 from every follower. What a follower will still
      * answer is `ping`, and that is where it says what it is and how far
@@ -3248,3 +3248,171 @@ for (const engine of ENGINES) {
     });
   });
 }
+
+/**
+ * Resumable change streams (roadmap step 6, documented in
+ * docs/db-server.md): the log index IS the resume token.
+ *
+ * A group of ONE, deliberately: `--raft 1` gives the server a real entry
+ * log -- which is what makes a watch resumable -- while election and
+ * barrier mechanics stay out of the way (a group of one leads instantly
+ * and a read is answered outright). The cluster half of the story is the
+ * front end's suite, where a deferred watch answer and the replay have
+ * to keep their order across a socket.
+ *
+ * Absolute log indexes are never asserted: the log also carries the
+ * entries Raft itself writes (a bootstrap CONFIG, a term-opening no-op),
+ * so a test that assumed "first insert is entry 1" would be asserting an
+ * implementation detail. Tokens come from events, which is where a
+ * consumer gets them.
+ */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: resumable change streams, --raft 1 ($name)', (engine) => {
+  const port = nextPort();
+  let proc, client, db;
+
+  beforeAll(async () => {
+    ({ proc } = await startServer(engine, port, ['--raft', '1'], -1));
+    client = await connectServer(port);
+    db = client.db('streams');
+    return async () => {
+      await client.close();
+      proc.kill();
+      await new Promise((r) => proc.once('exit', r));
+    };
+  }, 60000);
+
+  it('events carry the log index, and the watch reply says where live begins', async () => {
+    const coll = db.collection('marked');
+    const w = coll.watch();
+    await w.ready;
+    // The subscribe position: "you are here", before any event.
+    expect(typeof w.resumeFrom).toBe('number');
+    const before = w.resumeFrom;
+
+    await coll.insertOne({ n: 1 });
+    const { value: ev } = await w.next();
+    expect(ev.operationType).toBe('insert');
+    expect(typeof ev.index).toBe('number');
+    expect(ev.index).toBeGreaterThan(before);
+    // The stream keeps the token so a consumer does not have to.
+    expect(w.resumeFrom).toBe(ev.index);
+    await w.close();
+  });
+
+  it('resumes from a token: everything after it, exactly once, in order, then live', async () => {
+    const coll = db.collection('resume');
+    await coll.insertOne({ n: 1 });
+    await coll.insertOne({ n: 2 });
+    await coll.insertOne({ n: 3 });
+
+    // From the log's start: the full history replays, in log order.
+    const all = coll.watch({ from: 0 });
+    const events = [];
+    for (let i = 0; i < 3; i++) events.push((await all.next()).value);
+    expect(events.map((e) => e.fullDocument.n)).toEqual([1, 2, 3]);
+    await all.close();
+
+    // From the first event's token: only what came after it.
+    const later = coll.watch({ from: events[0].index });
+    expect((await later.next()).value.fullDocument.n).toBe(2);
+    expect((await later.next()).value.fullDocument.n).toBe(3);
+
+    // And the stream is LIVE after the replay: a new write follows the
+    // replayed ones on the same stream, in order.
+    await coll.insertOne({ n: 4 });
+    expect((await later.next()).value.fullDocument.n).toBe(4);
+    await later.close();
+  });
+
+  it('replays an update with the document as it NOW stands (the stated contract)', async () => {
+    const coll = db.collection('images');
+    const { insertedId } = await coll.insertOne({ n: 1 });
+    await coll.updateOne({ _id: insertedId }, { $set: { n: 2 } });
+    await coll.updateOne({ _id: insertedId }, { $set: { n: 3 } });
+
+    const w = coll.watch({ from: 0 });
+    const first = (await w.next()).value;
+    expect(first.operationType).toBe('insert');
+    expect(first.fullDocument.n).toBe(1);      // the log carries the insert whole
+    const up = (await w.next()).value;
+    expect(up.operationType).toBe('update');
+    // updateLookup semantics: the replayed update's image is current,
+    // not as-of -- db_session.h says so, and this asserts it stays said.
+    expect(up.fullDocument.n).toBe(3);
+    await w.close();
+  });
+
+  it('refuses a token from the future: it is not this log\'s', async () => {
+    const w = db.collection('resume').watch({ from: 999999 });
+    await expect(w.ready).rejects.toMatchObject({ code: -69 });
+  });
+
+  it('pages a long history through the bounded queue: overflow carries the resume point', async () => {
+    const coll = db.collection('paged');
+    const docs = Array.from({ length: 300 }, (_, i) => ({ n: i }));
+    /* Two batches, not one: a single proposal is bounded by the node's
+     * await table (RN_MAX_AWAIT, 256), which is a fact about proposing,
+     * not about replaying -- the log ends up with 300 entries either
+     * way, which is what this test needs: more than one stream queue
+     * (DBS_STREAM_EVENTS, 256) can hold. */
+    await coll.insertMany(docs.slice(0, 150));
+    await coll.insertMany(docs.slice(150));
+
+    // The stream's queue holds 256 events (DBS_STREAM_EVENTS), so a
+    // 300-event replay overflows -- which with a token is a PAGE
+    // BOUNDARY: everything queued is delivered first, the overflow
+    // names the last delivered index, and resuming from it misses
+    // nothing.
+    const got = [];
+    let resumeAt = null;
+    const first = coll.watch({ from: 0 });
+    try {
+      for await (const c of first) got.push(c);
+    } catch (err) {
+      expect(err).toBeInstanceOf(ChangeStreamOverflowError);
+      resumeAt = err.resumeFrom;
+    }
+    expect(got.length).toBe(256);
+    expect(resumeAt).toBe(got[got.length - 1].index);
+
+    const rest = coll.watch({ from: resumeAt });
+    while (got.length < docs.length) got.push((await rest.next()).value);
+    await rest.close();
+    expect(got.map((c) => c.fullDocument.n)).toEqual(docs.map((d) => d.n));
+  });
+});
+
+/* The refusal an unreplicated server owes a resume: there is no log, and
+ * saying so is the contract -- a watch without `from` still works there,
+ * and its events carry no index because no log minted one. */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: resume without a log is refused ($name)', (engine) => {
+  const port = nextPort();
+  let proc, client, db;
+
+  beforeAll(async () => {
+    ({ proc } = await startServer(engine, port, [], -1));
+    client = await connectServer(port);
+    db = client.db('nolog');
+    return async () => {
+      await client.close();
+      proc.kill();
+      await new Promise((r) => proc.once('exit', r));
+    };
+  }, 60000);
+
+  it('watch({from}) is -67; a plain watch still works, unindexed', async () => {
+    const refused = db.collection('things').watch({ from: 0 });
+    await expect(refused.ready).rejects.toMatchObject({ code: -67 });
+
+    const live = db.collection('things').watch();
+    await live.ready;
+    expect(live.resumeFrom).toBeNull();   // no log, no token
+    await db.collection('things').insertOne({ n: 1 });
+    const { value: ev } = await live.next();
+    expect(ev.operationType).toBe('insert');
+    expect(ev.index).toBeUndefined();
+    await live.close();
+  });
+});

@@ -13,10 +13,34 @@ write down why" rather than guessing on the implementer's behalf.
 
 | # | Brief | What it unblocks |
 | --- | --- | --- |
-| 1 | [read-semantics-and-change-streams.md](read-semantics-and-change-streams.md) | Roadmap step 6. **Part one is decided and built** (linearizable leader-only reads); what remains is change streams that tail the log. |
-| 2 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
+| 1 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
 
-1 is a feature; 2 is the coverage everything here rests on.
+One brief left, and it is the coverage everything else here rests on.
+
+**Change streams tail the log**, which is why that brief is gone —
+roadmap step 6 is done, both halves. The log index is the resume token:
+on a replicated server every event carries `index`, `watch {from}`
+replays everything after that index into the stream before any live
+event — exactly once, in order — and the rules live in C with the rest
+of the log's rules, three refusals with three codes: `-67` no log here
+(an unreplicated server), `-68` compacted away (a gap is refused, never
+bridged in silence — enforced now, reachable once compaction exists),
+`-69` ahead of this member's log. `ChangeStreamOverflowError` is
+REFRAMED rather than retired, exactly as the brief allowed: the server
+still stops holding events for a consumer that fell behind, but the
+overflow now names the last index delivered, so with a log behind it it
+is a page boundary (`resumeFrom`, and re-watch from there) instead of a
+loss — which is also how a replay longer than one bounded queue pages
+itself out. What replay deliberately does not reproduce is stated in
+`db_session.h`: the log records commands, not outcomes, so a replayed
+update's image is the document as it NOW stands (updateLookup
+semantics). Over HTTP the same machinery is SSE's own: the index rides
+as each event's `id:`, `Last-Event-ID` resumes, and a compacted token is
+410 Gone ([`../db-server.md`](../db-server.md) has the wire,
+[`../http-front.md`](../http-front.md) the SSE surface). What is NOT
+built: a follower serving a stream — it has the same log, but watch is
+a read and reads are the leader's; revisiting that is part of the async
+replica tier question, not a loose end here.
 
 **The cluster has an HTTP front end**, which is why that brief is gone
 ([`../http-front.md`](../http-front.md) is the surviving document).
@@ -28,18 +52,19 @@ because it maps one-to-one onto the wire and cannot drift), Extended
 JSON bodies with the `{$oid}`/`{$date}`/`{$binary}` convention now owned
 once in `src/extended-json.js` and shared with `bin/db.js`, sessions for
 cursors reaped by the SERVER's `--idle-timeout` rather than a second
-policy, change streams as SSE with the `id:` field deliberately left for
-the log index part two of the streams brief will put there, and writes
-AND reads following the leader — the refusal is the trigger to re-ask
-the members who leads (`ping`), not a dial string, because the `leader`
-record names the peer wire rather than the client port. Only refusals
-are retried; a transport failure mid-write is 502, unknown-not-failed.
-The brief's one stale premise died with it: it predated the read
-decision, so its "serve reads from whichever member and say so" interim
-is gone — a follower refuses a read the way it refuses a write, and the
-front end treats both alike.
+policy, change streams as SSE, and writes AND reads following the
+leader — the refusal is the trigger to re-ask the members who leads
+(`ping`), not a dial string, because the `leader` record names the peer
+wire rather than the client port. Only refusals are retried; a
+transport failure mid-write is 502, unknown-not-failed. The brief's one
+stale premise died with it: it predated the read decision, so its
+"serve reads from whichever member and say so" interim is gone — a
+follower refuses a read the way it refuses a write, and the front end
+treats both alike.
 
-**Read semantics are settled**, which is half of brief 2. Every read is
+**Read semantics are settled**, the other half of the retired streams
+brief, and recorded in [`../replicaton-roadmap.md`](../replicaton-roadmap.md)'s
+step 6 decision. Every read is
 linearizable, the LEADER alone serves one, and it serves it behind a
 real ReadIndex barrier — a fresh heartbeat round to a quorum, not a
 lease, because nothing here assumes bounded clock skew and a lease would
@@ -280,7 +305,21 @@ decision; it arrived with the instance and was never covered.
 **The log grows without bound.** A long-lived member's `__wal__.bj` is
 every write it has ever taken. Paying it means compaction, then a
 snapshot store in the process, then the log-naming rule that follows.
-A cluster that can be joined has one more reason to want it.
+A cluster that can be joined has one more reason to want it — and now a
+resumable change stream has another: the `-68` refusal for a
+compacted-away resume token is enforced but unreachable until something
+actually compacts, so that rule ships untested end-to-end.
+
+**A single proposal is capped at 256 entries, and the failure is rude.**
+`RN_MAX_AWAIT` bounds the node's await table, so an `insertMany` (or
+bulkWrite) that plans more than 256 commands on a REPLICATED server
+fails by closing the connection rather than by a refusal naming the
+bound. Found writing the change-stream paging tests; an unreplicated
+server takes the same list without complaint. The honest fix is a
+refusal with its own code before any of the batch is proposed — or
+chunked proposing, which is a design decision about atomicity (a
+refused whole is all-or-nothing; chunks are not) and should be made
+deliberately, not implied by a table size.
 
 The two below are paid. Neither was a design question — known,
 diagnosed, and now fixed.

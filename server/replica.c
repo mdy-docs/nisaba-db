@@ -494,6 +494,34 @@ static int put_member(bj_builder *b, uint64_t id, const char *host, int port) {
     return e;
 }
 
+/*
+ * The log, read the way a resumed change stream needs it (db_session.h's
+ * dbs_log): the base below which entries are gone, the applied floor
+ * replay may run to, and one entry's command for one database. The
+ * replica owns the log and the instance hands these to every database it
+ * opens -- the session decides what to replay, this side only delivers
+ * the bytes, which is the same split as everywhere else.
+ */
+static uint64_t log_base(void *ctx)  { return elog_base_index(((replica *)ctx)->log); }
+static uint64_t log_floor(void *ctx) { return ((replica *)ctx)->applied; }
+
+static int log_entry(void *ctx, const char *db, size_t db_len, uint64_t index,
+                     dbuf *cmd) {
+    replica *r = (replica *)ctx;
+    uint64_t term = 0;
+    int type = 0;
+    const uint8_t *p = NULL;
+    size_t plen = 0;
+    int e = elog_get(r->log, index, &term, &type, &p, &plen);
+    if (e) return e;
+    if (type != EL_NORMAL) return BJ_OK;   /* config, no-op: no command */
+    const uint8_t *c = NULL; size_t clen = 0;
+    e = dbi_entry_cmd(p, (uint32_t)plen, db, db_len, &c, &clen);
+    if (e || !c) return e;
+    /* Copied out: the log owns `p` and it dies on the next log call. */
+    return dbuf_put(cmd, c, clen);
+}
+
 int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
                  const uint8_t *members, uint32_t members_len,
                  uint64_t now, replica **out) {
@@ -624,12 +652,23 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
         if (e) { replica_close(r); return e; }
     }
 
+    /* From here every database this instance opens can replay the log,
+     * which is what makes a watch on any of them resumable. */
+    {
+        dbs_log reader = { r, log_base, log_floor, log_entry };
+        e = dbi_set_log(inst, &reader);
+        if (e) { replica_close(r); return e; }
+    }
+
     *out = r;
     return BJ_OK;
 }
 
 void replica_close(replica *r) {
     if (!r) return;
+    /* The instance outlives this call in some teardowns, and a reader
+     * whose ctx has been freed must not be reachable from it. */
+    if (r->inst) dbi_set_log(r->inst, NULL);
     for (int i = 0; i < REPLICA_MAX_PENDING; i++)
         if (r->waiting[i].used) pending_release(&r->waiting[i]);
     if (r->node) rn_free(r->node);
@@ -1113,7 +1152,7 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
          * Reads as well as writes. A follower is behind by at least a
          * round trip and cannot tell by how much, so an answer from it
          * is staleness presented as authority
-         * (docs/steps/read-semantics-and-change-streams.md).
+         * (docs/replicaton-roadmap.md, the step 6 decision).
          */
         int e = refuse(r, DC_ERR_NOT_LEADER, out);
         return e ? e : 0;

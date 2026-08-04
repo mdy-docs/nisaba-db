@@ -193,6 +193,21 @@ uint32_t dbi_inflight(const dbi *i);
 int dbi_apply(dbi *i, uint64_t index, const uint8_t *payload, uint32_t len,
               dbuf *result);
 
+/* Unwrap one entry's envelope WITHOUT applying it: the command it
+ * carries for database `db`, or NULL when the entry is another
+ * database's, is not an envelope, or carries no command. The envelope's
+ * shape has one owner and this is its reader -- a resumed change stream
+ * replays the log through it (db_session.h's dbs_log). The pointers
+ * alias `payload`. */
+int dbi_entry_cmd(const uint8_t *payload, uint32_t len,
+                  const char *db, size_t db_len,
+                  const uint8_t **cmd, size_t *cmd_len);
+
+/* Register the entry log's reader with this instance: it reaches every
+ * database already open and every one opened later, which is what makes
+ * a watch on any of them resumable. NULL unregisters. */
+int dbi_set_log(dbi *i, const dbs_log *log);
+
 /*
  * The replay floor: the highest index THIS INSTANCE has applied, across
  * every database in the root -- not merely the ones that happen to be

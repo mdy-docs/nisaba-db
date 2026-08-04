@@ -125,6 +125,8 @@
 #include "db_names.h"
 #include "db_validate.h"   /* dc_strerror: a refusal says why, even here */
 #include "bjio_posix.h"
+#include "bjcursor.h"      /* walking dbi_list's answer in adopt_install */
+#include "instns.h"        /* the root's namespace, one nesting level deep */
 #include "binjson.h"
 #include "dbuf.h"
 
@@ -528,8 +530,77 @@ static int listen_on(int port) {
  * client whose last answer has not gone out, so a pipelining client
  * cannot make the server hold an unbounded number of answers for it.
  */
-static int serve_forever(dbi *inst, replica *rep, peers *px, int srv,
-                         int max_clients, int idle_seconds) {
+/*
+ * A committed install waiting to be adopted (replica.h's orchestration
+ * contract). The instance must be CLOSED across the swap -- its open
+ * collections are positioned in the very files being replaced -- and
+ * reopened on the other side; its lifetime is this file's, which is why
+ * the orchestration is too. Every current database file is a victim:
+ * the generation's own live map says what comes back.
+ */
+static int adopt_install(dbi **inst, replica *rep, dbi_root *rootops, int order,
+                         root_state *rst) {
+    dbuf dbs = {0}, victims = {0}, names = {0};
+    int e = dbi_list(*inst, &dbs);
+    if (!e) {
+        cur c = { dbs.data, dbs.len, 0 };
+        uint32_t ndb = 0;
+        if (array_begin(&c, &ndb) == BJ_OK) {
+            for (uint32_t i = 0; !e && i < ndb; i++) {
+                const uint8_t *dn; uint32_t dlen;
+                if (take_string(&c, &dn, &dlen)) break;
+                names.len = 0;
+                if (root_list_files(rst, (const char *)dn, dlen, &names)) continue;
+                for (size_t at = 0; !e && at < names.len; ) {
+                    size_t end = at;
+                    while (end < names.len && names.data[end] != '\0') end++;
+                    if (end > at) {
+                        e = dbuf_put(&victims, dn, dlen);
+                        if (!e) e = dbuf_put(&victims, (const uint8_t *)"/", 1);
+                        if (!e) e = dbuf_put(&victims, names.data + at, end - at);
+                        if (!e) e = dbuf_put(&victims, (const uint8_t *)"", 1);
+                    }
+                    at = end + 1;
+                }
+            }
+        }
+    }
+
+    dbi_close(*inst);
+    *inst = NULL;
+    if (!e) e = replica_adopt(rep, (const char *)victims.data, victims.len);
+    if (!e) e = dbi_open(rootops, order, inst);
+    if (!e) replica_set_instance(rep, *inst);
+
+    /* A directory the snapshot restored nothing into is a database the
+     * cluster does not have: remove it, or it lingers as a name with no
+     * catalog behind it. */
+    if (!e) {
+        cur c = { dbs.data, dbs.len, 0 };
+        uint32_t ndb = 0;
+        if (array_begin(&c, &ndb) == BJ_OK) {
+            for (uint32_t i = 0; i < ndb; i++) {
+                const uint8_t *dn; uint32_t dlen;
+                if (take_string(&c, &dn, &dlen)) break;
+                names.len = 0;
+                if (root_list_files(rst, (const char *)dn, dlen, &names) == BJ_OK &&
+                    names.len == 0) {
+                    int removed = 0;
+                    rootops->remove(rootops->ctx, (const char *)dn, dlen, &removed);
+                }
+            }
+        }
+    }
+    dbuf_free(&dbs);
+    dbuf_free(&victims);
+    dbuf_free(&names);
+    return e;
+}
+
+static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
+                         int max_clients, int idle_seconds,
+                         dbi_root *rootops, int order, root_state *rst) {
+    dbi *inst = *inst_p;
     const uint64_t idle_ms = (uint64_t)(idle_seconds > 0 ? idle_seconds : 0) * 1000u;
     conn *cs = (conn *)calloc((size_t)max_clients, sizeof *cs);
     /* Clients, the listener, and whatever the peer transport asks to
@@ -643,6 +714,23 @@ static int serve_forever(dbi *inst, replica *rep, peers *px, int srv,
                  * stops without saying which has told nobody anything. */
                 fprintf(stderr, "replica: halted (%d: %s)\n", te, dc_strerror(te));
                 break;
+            }
+            /*
+             * An install that has committed and is waiting on the live
+             * files. Between this line and its return every open cursor
+             * and stream dies with the instance -- the state they were
+             * positioned in is the one being replaced, and a member that
+             * receives installs is a follower nobody could open one on
+             * anyway.
+             */
+            if (replica_adopt_pending(rep)) {
+                int ae = adopt_install(&inst, rep, rootops, order, rst);
+                *inst_p = inst;
+                if (ae != 0) {
+                    fprintf(stderr, "replica: snapshot adoption failed (%d: %s)\n",
+                            ae, dc_strerror(ae));
+                    break;
+                }
             }
         }
 
@@ -797,8 +885,11 @@ static void usage(const char *me) {
             "           [--idle-timeout SECONDS] [--raft NODE_ID]\n"
             "           [--raft-port N] [--peer ID@HOST:PORT ...]\n"
             "           [--join HOST:PORT ...] [--leave NODE_ID]\n"
+            "           [--snapshot-entries N]\n"
             "  serves the instance in the preopened directory \".\"\n"
             "  --raft replicates every write through a log before applying it\n"
+            "  --snapshot-entries: applied entries between local snapshots, which\n"
+            "         bound the log (default 8192; 0 never compacts)\n"
             "  --raft-port is where the other members reach this one\n"
             "  --peer names a member and where to reach IT; repeat per member\n"
             "  --join asks a RUNNING cluster to admit this node, knowing only a\n"
@@ -873,6 +964,17 @@ int main(int argc, char **argv) {
      * an existing database opens correctly whatever is passed here.
      */
     int order = DC_DEFAULT_ORDER;
+    /*
+     * Applied entries between snapshots, replica.h's compaction trigger.
+     * Non-zero BY DEFAULT, because "the log grows without bound" was a
+     * standing debt, not a behavior anybody chose -- a member that never
+     * compacts is now something an operator asks for (0), not something
+     * that happens to everyone who did not know to ask. The figure is a
+     * policy knob, not a correctness one: smaller means more frequent
+     * pauses and a shorter change-stream resume horizon, larger means a
+     * longer log to replay at startup.
+     */
+    long snapshot_entries = 8192;
     /* 0 = not a replica: every write is applied where it lands, which is
      * what this server has always done and what it still does by
      * default. A node id turns the log on. */
@@ -905,6 +1007,13 @@ int main(int argc, char **argv) {
             max_clients = atoi(argv[++i]);
             if (max_clients < 1 || max_clients > MAX_CLIENTS) {
                 fprintf(stderr, "--max-clients must be between 1 and %d\n", MAX_CLIENTS);
+                return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--snapshot-entries") == 0 && i + 1 < argc) {
+            snapshot_entries = atol(argv[++i]);
+            if (snapshot_entries < 0) {
+                fprintf(stderr, "--snapshot-entries cannot be negative (0 disables)\n");
                 return 2;
             }
         }
@@ -1015,8 +1124,12 @@ int main(int argc, char **argv) {
      * The log does, when this is a replica -- one log for the whole
      * instance, beside the databases it replicates.
      */
+    /* The INSTANCE's namespace, not a database's: flat names are the
+     * root's own files (the log, the snapshot store), `db/file` reaches
+     * one level down -- which is what lets one namespace carry a whole
+     * instance through a snapshot (instns.h). */
     bj_ns ns;
-    if (bjns_posix_open(dirfd, &ns) != BJ_OK) {
+    if (instns_open(dirfd, &ns) != BJ_OK) {
         fprintf(stderr, "cannot open the directory\n");
         return 1;
     }
@@ -1028,7 +1141,7 @@ int main(int argc, char **argv) {
                 "database.\n"
                 "  Move its files into a subdirectory named for the database and "
                 "serve the parent.\n");
-        bjns_posix_free(&ns);
+        instns_free(&ns);
         return 1;
     }
 
@@ -1043,7 +1156,7 @@ int main(int argc, char **argv) {
     if (e != BJ_OK) {
         fprintf(stderr, "cannot open the instance: %s\n", dc_strerror(e));
         root_free(rst);
-        bjns_posix_free(&ns);
+        instns_free(&ns);
         return 1;
     }
 
@@ -1060,7 +1173,7 @@ int main(int argc, char **argv) {
             peers_free(px);
             dbi_close(inst);
             root_free(rst);
-            bjns_posix_free(&ns);
+            instns_free(&ns);
             return 1;
         }
         for (int i = 0; i < n_peers; i++) {
@@ -1075,7 +1188,7 @@ int main(int argc, char **argv) {
                 peers_free(px);
                 dbi_close(inst);
                 root_free(rst);
-                bjns_posix_free(&ns);
+                instns_free(&ns);
                 return 1;
             }
         }
@@ -1105,7 +1218,7 @@ int main(int argc, char **argv) {
             peers_free(px);
             dbi_close(inst);
             root_free(rst);
-            bjns_posix_free(&ns);
+            instns_free(&ns);
             return 1;
         }
         fprintf(stderr, "nisaba: node %d admitted, as a learner until it catches up\n",
@@ -1116,13 +1229,14 @@ int main(int argc, char **argv) {
     replica *rep = NULL;
     if (node_id > 0) {
         e = replica_open(&ns, inst, (uint64_t)node_id, px,
-                         members.data, (uint32_t)members.len, now_ms(), &rep);
+                         members.data, (uint32_t)members.len, now_ms(),
+                         rst, (uint64_t)snapshot_entries, &rep);
         if (e != BJ_OK) {
             fprintf(stderr, "cannot open the log: %s\n", dc_strerror(e));
             peers_free(px);
             dbi_close(inst);
             root_free(rst);
-            bjns_posix_free(&ns);
+            instns_free(&ns);
             return 1;
         }
         /* What the LOG says, which is not necessarily what argv said: a
@@ -1150,7 +1264,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "nisaba: serving 127.0.0.1:%d (max %d clients, idle timeout %ds)\n",
                 port, max_clients, idle_seconds);
         fflush(stderr);
-        rc = serve_forever(inst, rep, px, srv, max_clients, idle_seconds) == 0 ? 0 : 1;
+        rc = serve_forever(&inst, rep, px, srv, max_clients, idle_seconds,
+                           &rootops, order, rst) == 0 ? 0 : 1;
         close(srv);
 #else
         (void)port;   /* accepted and refused, rather than not accepted */
@@ -1174,7 +1289,7 @@ done:
     peers_free(px);
     dbi_close(inst);
     root_free(rst);
-    bjns_posix_free(&ns);
+    instns_free(&ns);
     close(dirfd);
     return rc;
 }

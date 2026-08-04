@@ -36,4 +36,16 @@ root_state *root_new(int rootfd);
 void        root_free(root_state *st);
 void        root_fill(root_state *st, dbi_root *out);
 
+/*
+ * The regular FILES of one directory, NUL-separated into `out`: the
+ * root's own with db_len 0 (the log, the snapshot store's generations),
+ * a database's with its name. Directories are never included -- the
+ * split between "a database" (a directory) and "an instance file" is
+ * this repository's, and a listing that blurred it would be how a
+ * snapshot ate a database or a database swallowed the store. A missing
+ * directory lists as empty rather than failing: the caller is usually
+ * sweeping, and a directory already gone is a sweep already done.
+ */
+int root_list_files(root_state *st, const char *db, uint32_t db_len, dbuf *out);
+
 #endif /* NISABA_SERVER_ROOT_H */

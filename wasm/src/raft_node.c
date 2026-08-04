@@ -1627,6 +1627,24 @@ static int is_live(void *vctx, const char *role, uint32_t role_len,
     return 0;
 }
 
+void rn_swap_log(raft_node *n, elog *fresh, const bj_io *io, elog **old) {
+    if (!n || !fresh || !old) return;
+    /* A swap replaces a log this node already owned -- a prior install's
+     * -- and that one is ours to close rather than the caller's to be
+     * handed back twice. The caller only ever gets the log it lent us. */
+    if (n->owns_log) {
+        elog_free(n->log);
+        if (n->own_io.close) n->own_io.close(n->own_io.ctx);
+        *old = NULL;
+    } else {
+        *old = n->log;
+    }
+    n->log = fresh;
+    if (io) n->own_io = *io;
+    else    memset(&n->own_io, 0, sizeof n->own_io);
+    n->owns_log = 1;
+}
+
 int rn_adopt(raft_node *n, const char *victims, size_t victims_len, elog **old) {
     if (!n || !old) return BJ_ERR_STATE;
     *old = NULL;
@@ -1702,19 +1720,7 @@ int rn_adopt(raft_node *n, const char *victims, size_t victims_len, elog **old) 
         return e;
     }
 
-    /* A second adoption replaces a log this node already owned, and
-     * that one is ours to close rather than the caller's to be handed
-     * back twice. The caller only ever gets the log it lent us. */
-    if (n->owns_log) {
-        elog_free(n->log);
-        if (n->own_io.close) n->own_io.close(n->own_io.ctx);
-        *old = NULL;
-    } else {
-        *old = n->log;
-    }
-    n->log = fresh;
-    n->own_io = io;
-    n->owns_log = 1;
+    rn_swap_log(n, fresh, &io, old);
 
     /* Where this node now stands. The member set rode the install
      * because a bootstrapped log has no CONFIG history to derive it

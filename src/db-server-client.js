@@ -1101,7 +1101,8 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
      *
      * On a REPLICATED server it is also the only thing a follower will
      * answer — reads belong to the leader — so it is where a member says
-     * what it is: `{ pong, role, leaderId, applied, commit }`. Those
+     * what it is: `{ pong, role, leaderId, applied, commit, base,
+     * last }`. Those
      * numbers report and promise nothing. `applied` is that member's own
      * floor at the moment it was asked, and it is precisely the number
      * that may not be used to serve a read.

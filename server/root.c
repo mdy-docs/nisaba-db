@@ -135,6 +135,38 @@ static int root_list(void *ctx, dbuf *out) {
     return e;
 }
 
+int root_list_files(root_state *st, const char *db, uint32_t db_len, dbuf *out) {
+    if (!st || !out) return BJ_ERR_STATE;
+    char sub[DBI_NAME_MAX + 1];
+    const char *where = ".";
+    if (db_len) {
+        if (db_len >= sizeof sub) return BJ_ERR_RANGE;
+        memcpy(sub, db, db_len);
+        sub[db_len] = '\0';
+        where = sub;
+    }
+    int scan = openat(st->fd, where, O_RDONLY | O_DIRECTORY);
+    if (scan < 0) return errno == ENOENT ? BJ_OK : BJ_ERR_STATE;
+    DIR *d = fdopendir(scan);   /* consumes `scan` */
+    if (!d) { close(scan); return BJ_ERR_STATE; }
+
+    int e = BJ_OK;
+    for (struct dirent *ent; !e && (ent = readdir(d)) != NULL; ) {
+        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        struct stat sb;
+        if (db_len) {
+            if (fstatat(dirfd(d), ent->d_name, &sb, 0) != 0) continue;
+        } else {
+            if (fstatat(st->fd, ent->d_name, &sb, 0) != 0) continue;
+        }
+        if (!S_ISREG(sb.st_mode)) continue;   /* FILES only, either way */
+        e = dbuf_put(out, (const uint8_t *)ent->d_name, strlen(ent->d_name));
+        if (!e) e = dbuf_put(out, (const uint8_t *)"", 1);
+    }
+    closedir(d);
+    return e;
+}
+
 /* Everything in `fd`, then `fd`'s own entry in its parent. Bounded
  * depth, because a database directory is files and a stray directory in
  * one is somebody else's mistake rather than a structure to walk. */

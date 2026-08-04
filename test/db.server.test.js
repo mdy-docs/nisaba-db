@@ -3441,3 +3441,193 @@ describe.each(ENGINES.filter((e) => e.ready()))(
     await live.close();
   });
 });
+
+/**
+ * Log compaction (--snapshot-entries): the standing debt "the log grows
+ * without bound", paid. Past N applied entries since the log's base the
+ * member snapshots LOCALLY -- every database's files into a snapstore
+ * generation, the manifest committed at the applied boundary, the log
+ * compacted into the store's paired file -- and everything downstream of
+ * that one act arms itself: the base moves (visible in ping), a restart
+ * opens the store's log instead of __wal__.bj, a change-stream resume
+ * from below the base is refused with -68 (a rule that was previously
+ * enforced but unreachable), and a blank joiner is caught up by a
+ * snapshot install because AppendEntries from entry 1 no longer exists.
+ */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: log compaction, --raft 1 --snapshot-entries 8 ($name)', (engine) => {
+  const port = nextPort();
+  let proc, dir, client, db;
+
+  const ping = async () => {
+    const { ...status } = await client.ping();
+    return status;
+  };
+  const baseMoves = async (withinMs = 15000) => {
+    const until = Date.now() + withinMs;
+    for (;;) {
+      const s = await ping();
+      if (s.base > 0) return s;
+      if (Date.now() > until) throw new Error(`log base never moved: ${JSON.stringify(s)}`);
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  };
+
+  beforeAll(async () => {
+    ({ proc, dir } = await startServer(engine, port, ['--raft', '1', '--snapshot-entries', '8'], -1));
+    client = await connectServer(port);
+    db = client.db('appdb');
+    return async () => {
+      await client.close().catch(() => {});
+      proc.kill();
+      await new Promise((r) => proc.once('exit', r));
+    };
+  }, 60000);
+
+  it('compacts past the threshold: the base moves and the data does not', async () => {
+    const coll = db.collection('things');
+    for (let i = 0; i < 20; i++) await coll.insertOne({ n: i });
+    const s = await baseMoves();
+    expect(s.base).toBeGreaterThan(0);
+    expect(s.last).toBeGreaterThanOrEqual(s.base);
+    // The data is untouched by the log moving out from under it.
+    expect(await coll.countDocuments({})).toBe(20);
+
+    // On disk: the store's generation and its paired log, and no legacy
+    // __wal__.bj -- the naming rule's premise, checked at the file level.
+    const files = fs.readdirSync(dir);
+    expect(files.some((f) => /^__snap__-\d+\.manifest\.bj$/.test(f))).toBe(true);
+    expect(files.some((f) => /^__snap__-log-\d+\.bj$/.test(f))).toBe(true);
+    expect(files).not.toContain('__wal__.bj');
+  }, 60000);
+
+  it('a restart opens the store\'s log: same data, same base, still writable', async () => {
+    const before = await ping();
+    await client.close();
+    proc.kill();
+    await new Promise((r) => proc.once('exit', r));
+
+    ({ proc } = await startServer(engine, port + 1,
+      ['--raft', '1', '--snapshot-entries', '8'], 0, dir));
+    client = await connectServer(port + 1);
+    db = client.db('appdb');
+
+    const after = await ping();
+    expect(after.base).toBe(before.base);
+    expect(await db.collection('things').countDocuments({})).toBe(20);
+    await db.collection('things').insertOne({ n: 999 });
+    expect(await db.collection('things').countDocuments({})).toBe(21);
+  }, 60000);
+
+  it('a resume below the base is -68 at last; at the base it replays the suffix', async () => {
+    const s = await ping();
+    expect(s.base).toBeGreaterThan(1);
+
+    // Below the base: the entries are gone and the refusal says so --
+    // the rule shipped with resumable streams, reachable only now that
+    // something actually compacts.
+    const gone = db.collection('things').watch({ from: s.base - 1 });
+    await expect(gone.ready).rejects.toMatchObject({ code: -68 });
+
+    // At the base: everything the log still holds, then live.
+    const ok = db.collection('things').watch({ from: s.base });
+    await ok.ready;
+    await db.collection('things').insertOne({ n: 1000 });
+    const seen = [];
+    for (;;) {
+      const { value } = await ok.next();
+      seen.push(value.fullDocument.n);
+      if (value.fullDocument.n === 1000) break;
+    }
+    expect(seen.length).toBeGreaterThan(1);   // replayed suffix, then the live insert
+    await ok.close();
+  }, 60000);
+});
+
+/*
+ * The install path, driven by compaction: a blank member joins a leader
+ * whose log no longer starts at 1, so AppendEntries cannot catch it up
+ * and the node serves it a snapshot install from the store -- staged,
+ * verified, adopted at the boundary (files AND rebased log), then the
+ * suffix by ordinary AppendEntries. Native only: the machinery is the
+ * same C on both engines and the single-server compaction suite above
+ * runs on both.
+ */
+describe.skipIf(!have(NATIVE))('nisaba-server: a compacted leader installs a snapshot into a joiner', () => {
+  const base = nextPort();
+  let one, two, c1;
+
+  const startMember = async (args) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-install-'));
+    const proc = spawn(path.resolve(NATIVE), ['--port', String(args.port),
+      '--raft', String(args.id), '--raft-port', String(args.raftPort),
+      '--snapshot-entries', '8', ...(args.join ? ['--join', args.join] : [])],
+      { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    let log = '';
+    proc.stderr.on('data', (d) => { log += d; });
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(`member ${args.id} did not start`)), 30000);
+      proc.stderr.on('data', () => { if (log.includes('serving')) { clearTimeout(t); resolve(); } });
+    });
+    return { proc, dir, tail: () => log };
+  };
+
+  beforeAll(async () => {
+    one = await startMember({ id: 1, port: base, raftPort: base + 10 });
+    c1 = await connectServer(base);
+    return async () => {
+      await c1.close().catch(() => {});
+      one.proc.kill();
+      two?.proc.kill();
+    };
+  }, 60000);
+
+  it('catches a blank joiner up by install, and it follows live after', async () => {
+    const coll = c1.db('appdb').collection('things');
+    for (let i = 0; i < 20; i++) await coll.insertOne({ n: i });
+
+    // The leader has compacted: entry 1 is not in its log any more.
+    let lead = null;
+    const until = Date.now() + 15000;
+    while (Date.now() < until) {
+      lead = await c1.ping();
+      if (lead.base > 0) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(lead.base).toBeGreaterThan(0);
+
+    two = await startMember({ id: 2, port: base + 1, raftPort: base + 11,
+                              join: `127.0.0.1:${base + 10}` });
+
+    // The joiner reaches the leader's applied floor -- which it cannot
+    // do by AppendEntries alone, because the entries below the base are
+    // gone. The adoption line on its stderr is the proof of HOW.
+    let member = null;
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      try {
+        const c2 = await connectServer(base + 1, { keepAliveMs: 0 });
+        const s = await c2.ping();
+        await c2.close();
+        if (s.applied >= lead.applied) { member = s; break; }
+      } catch { /* still staging */ }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    expect(member).not.toBeNull();
+    expect(two.tail()).toMatch(/snapshot install adopted at index/);
+    expect(member.base).toBe(lead.base);
+
+    // And it is a live follower now: the next write reaches it.
+    await coll.insertOne({ n: 100 });
+    const catchesUp = Date.now() + 10000;
+    let after = null;
+    while (Date.now() < catchesUp) {
+      const c2 = await connectServer(base + 1, { keepAliveMs: 0 });
+      after = await c2.ping();
+      await c2.close();
+      if (after.applied > member.applied) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(after.applied).toBeGreaterThan(member.applied);
+  }, 90000);
+});

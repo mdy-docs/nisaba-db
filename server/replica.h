@@ -53,13 +53,23 @@
  * are read back off the node (rn_adopted, which is where they live)
  * rather than kept a second time.
  *
- * WHAT IS NOT HERE
+ * SNAPSHOTS AND THE LOG'S BOUND
  *
- * Snapshots. Nothing compacts the log here, so no peer can fall below
- * its base and RN_EFFECT_NEEDS_SNAPSHOT cannot fire -- it is reported
- * and refused rather than served. The rule for which log to open
- * (snapstore.h's naming, and "the store's log if a generation has been
- * adopted") arrives with the compaction that needs it.
+ * The log no longer grows without bound: past `snapshot_entries` applied
+ * entries since its base, this member snapshots LOCALLY -- every
+ * database's files stream into an immutable snapstore.h generation, the
+ * manifest commits at the applied boundary, and the log is compacted
+ * into the store's paired log file, based at that boundary and carrying
+ * the suffix and hard state forward. Each member does this for itself,
+ * as Raft members do; nothing about it is replicated.
+ *
+ * That one act is what arms everything downstream: the node serves
+ * installs to peers below the new base (it always could, given a store
+ * with a generation in it -- rn_set_snapstore), a resumed change stream
+ * from below the base is refused with -68 instead of being a code path
+ * nothing could reach, and WHICH LOG TO OPEN at startup becomes a rule
+ * rather than a constant: the store's newest log that opens, else the
+ * legacy __wal__.bj (the naming src/db-wal.js wrote down first).
  */
 #ifndef NISABA_SERVER_REPLICA_H
 #define NISABA_SERVER_REPLICA_H
@@ -72,6 +82,7 @@
 #include "db_session.h"
 #include "db_instance.h"
 #include "peers.h"
+#include "root.h"
 
 typedef struct replica replica;
 
@@ -105,8 +116,35 @@ typedef struct replica replica;
  */
 int  replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
                   const uint8_t *members, uint32_t members_len,
-                  uint64_t now, replica **out);
+                  uint64_t now, root_state *rt, uint64_t snapshot_entries,
+                  replica **out);
 void replica_close(replica *r);
+
+/*
+ * A committed install is waiting to be put onto the live files, and the
+ * transport is the one that has to orchestrate it -- the instance must
+ * be CLOSED across the adoption (the restored files are the ones its
+ * open collections are positioned in) and reopened after, and the
+ * instance's lifetime is the transport's, not this file's.
+ *
+ *     if (replica_adopt_pending(rep)) {
+ *         victims = every database file, as "db/file", NUL-separated
+ *         dbi_close(inst)
+ *         replica_adopt(rep, victims, len)
+ *         inst = dbi_open(...)
+ *         replica_set_instance(rep, inst)
+ *     }
+ *
+ * replica_adopt runs the node's adoption (files restored, log rebased to
+ * the boundary), then the bookkeeping that follows it here: the legacy
+ * log and superseded generations are swept, and the applied floor moves
+ * to the boundary. replica_set_instance re-registers the log reader on
+ * the fresh instance, so a resumed change stream works across an
+ * adoption exactly as it does across a restart.
+ */
+int  replica_adopt_pending(const replica *r);
+int  replica_adopt(replica *r, const char *victims, size_t victims_len);
+void replica_set_instance(replica *r, dbi *inst);
 
 /* Whether this node can take a write right now. */
 int      replica_is_leader(const replica *r);

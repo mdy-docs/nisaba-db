@@ -117,6 +117,19 @@ void       rn_free(raft_node *n);
  */
 void rn_set_log(raft_node *n, elog *log);
 
+/*
+ * The OWNERSHIP-carrying form, for local compaction (rn_set_log is the
+ * bare pointer swap and leaves ownership where it was). The node takes
+ * `fresh` and the io behind it as its own -- both die with rn_free, as
+ * an adopted install's do -- and hands the previous log back through
+ * `*old` ONLY if the host had lent it; a log the node already owned (a
+ * prior install's) is freed here and `*old` is NULL, exactly rn_adopt's
+ * rule. A host compacting locally therefore never has to know whose the
+ * outgoing log was: free `*old` and close its io if non-NULL, and
+ * nothing otherwise.
+ */
+void rn_swap_log(raft_node *n, elog *fresh, const bj_io *io, elog **old);
+
 /* ---- serving a snapshot -------------------------------------------------
  *
  * A peer whose next index the log no longer holds cannot be caught up by

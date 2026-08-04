@@ -24,7 +24,7 @@ replays everything after that index into the stream before any live
 event — exactly once, in order — and the rules live in C with the rest
 of the log's rules, three refusals with three codes: `-67` no log here
 (an unreplicated server), `-68` compacted away (a gap is refused, never
-bridged in silence — enforced now, reachable once compaction exists),
+bridged in silence — and reachable, now that compaction exists),
 `-69` ahead of this member's log. `ChangeStreamOverflowError` is
 REFRAMED rather than retired, exactly as the brief allowed: the server
 still stops holding events for a consumer that fell behind, but the
@@ -117,11 +117,12 @@ follows the adopted set rather than being a second copy of it. A member
 whose address the transport lacks is a member nothing can replicate to,
 and the failure is silent: it looks exactly like a slow follower.
 
-Snapshots are still not needed for this and that is worth repeating:
-nothing compacts the log, so the leader's base stays at zero and an
-empty joiner is caught up from index 1. What makes them mandatory is the
-log growing without bound — a standing debt, and a cluster that can be
-joined has one more reason to want it paid.
+Snapshots were not needed for joining when it was built — nothing
+compacted the log then, so an empty joiner was caught up from index 1.
+Now something does (below), and a joiner behind a compacted base is
+caught up by a snapshot install instead, served by the node from the
+leader's own store; `test/db.server.test.js` proves the whole chain
+against a blank member.
 
 **The server holds an INSTANCE**, which is why that brief is gone. One
 process, one root directory, a subdirectory per database, and one
@@ -184,21 +185,20 @@ the same cluster as C members, which `test/db.server.test.js` proves
 with two C members and one `RaftNode` that the quorum cannot do without.
 Without the flag nothing changes, file layout included.
 
-Two things the brief listed are deliberately NOT built, and both are
-waiting on the same thing rather than on a decision:
+Two things the brief listed were deliberately deferred, and both are
+now built:
 
-- **Snapshots in the server.** The node serves and adopts an install by
-  itself given a `bj_ns` and an `sst`, and it has the first. It does not
-  have the second because nothing in the process compacts the log — so
-  no generation exists to install, no peer can fall below the log's base,
-  and `RN_EFFECT_NEEDS_SNAPSHOT` cannot fire. It is reported and refused
-  rather than ignored if it ever does. The log-naming rule the brief
-  asks for ("the store's paired log if a generation has been adopted,
-  otherwise the WAL", written down only in `src/db-wal.js`) belongs with
-  the compaction that needs it.
+- ~~**Snapshots in the server.**~~ Built, with compaction (below): the
+  server holds an `sst` over the root, `--snapshot-entries` makes the
+  generations, the node serves installs from them, and the log-naming
+  rule the brief asked for ("the store's paired log if a generation has
+  been adopted, otherwise the WAL") lives in `server/replica.c`'s
+  `open_best_log`, beside the compaction that needs it — exactly where
+  this note said it belonged.
 - ~~**Joining.**~~ Built, above. The reason given here when the brief was
   retired was wrong and is worth leaving on the record: a joiner does
-  NOT need the snapshot half.
+  NOT need the snapshot half — until the leader compacts, after which it
+  needs nothing else, and gets it without asking.
 
 **Completions in C is done.** A proposal's fate — applied, and still
 yours — is `rn_await` / `rn_applied` / `RN_EFFECT_SETTLED`, decided in
@@ -302,16 +302,29 @@ existing envelope (`{ d, c }`) carries a command for a database rather
 than a command about one. Found while classifying ops for the read
 decision; it arrived with the instance and was never covered.
 
-**The log grows without bound.** A long-lived member's `__wal__.bj` is
-every write it has ever taken. Paying it means compaction, then a
-snapshot store in the process, then the log-naming rule that follows.
-A cluster that can be joined has one more reason to want it — and now a
-resumable change stream has another: the `-68` refusal for a
-compacted-away resume token is enforced but unreachable until something
-actually compacts, so that rule ships untested end-to-end.
+
 
 
 The ones below are paid — known, diagnosed, and now fixed.
+
+- **The log grew without bound.** Paid in full: past `--snapshot-entries`
+  applied entries (default 8192; 0 disables) a member snapshots LOCALLY —
+  every database's files stream into a snapstore generation through the
+  instance namespace (`server/instns.c`, one validated level of nesting,
+  because an instance's files live one level down and the node opens
+  everything through a single `bj_ns`), the manifest commits at the
+  applied boundary, and the log compacts into the store's paired file
+  with the suffix and hard state carried forward (`rn_swap_log` hands
+  the node ownership the same way an install's adoption does). Startup
+  follows the naming rule — the store's newest log that opens, else
+  `__wal__.bj` — restores a committed-but-unadopted generation after a
+  crash, and sweeps what was superseded. The `-68` refusal for a
+  compacted-away resume token, shipped enforced-but-unreachable with
+  resumable streams, is now reachable and tested. And joining grew its
+  missing half for free: a blank member behind a compacted base is
+  caught up by a snapshot install the node serves from the store,
+  adopted by the transport closing and reopening the instance around
+  `rn_adopt` (`server/main.c`'s `adopt_install`).
 
 - **The 256-entry proposal cliff.** `RN_MAX_AWAIT` bounds the node's
   await table, and a batch that hit it mid-way used to fail the worst

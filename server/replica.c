@@ -5,6 +5,8 @@
 #include "raft_msg.h"      /* the member-record grammar; this file reads it */
 #include "db_validate.h"   /* dc_strerror, and the two routing codes */
 #include "entrylog.h"
+#include "snapstore.h"     /* generations and the log-naming rule */
+#include "bjfile.h"        /* bjfile_crc32, the store's checksum */
 #include "binjson.h"
 #include "bjcursor.h"
 
@@ -16,6 +18,17 @@
  * src/db-wal.js opens, so a database written by one host is a database
  * the other can serve. */
 #define REPLICA_WAL "__wal__.bj"
+
+/* The snapshot store's file prefix: "__snap__-<gen>-<role>.bj" and kin,
+ * beside the log and the database directories in the root. Double
+ * underscores for the same reason the log has them -- root_list refuses
+ * to present these to a client as databases (they are files, and it
+ * lists directories), and a person listing the directory should see at
+ * a glance which files are the instance's own. */
+#define REPLICA_SNAP_PREFIX "__snap__"
+
+/* Copy buffer for streaming a file into or out of a generation. */
+#define REPLICA_COPY_BYTES (64u * 1024u)
 
 /*
  * Writes waiting on the log at once. One per connection is the shape the
@@ -104,9 +117,13 @@ struct replica {
     bj_ns     *ns;              /* borrowed */
     dbi       *inst;            /* borrowed */
     peers     *px;              /* borrowed; NULL is a group of one */
-    bj_io      log_io;
-    elog      *log;
+    root_state *rt;             /* borrowed; the directory listings */
+    bj_io      log_io;          /* meaningful only while host_owns_log */
+    elog      *log;             /* mirror of rn_log once the node owns it */
+    int        host_owns_log;   /* 0 after an adopt or a local compaction */
     raft_node *node;
+    sst       *store;           /* owned; the snapshot store's policy */
+    uint64_t   snap_every;      /* applied entries between snapshots; 0 = never */
     uint64_t   applied;
     uint64_t   rnd;             /* the election-timeout draw's state */
     uint64_t   self_id;
@@ -115,6 +132,7 @@ struct replica {
     int        said_no_snapshot;
     int        said_no_conversation;
     int        said_no_address;
+    int        said_snap_failed;
     conversation conv[REPLICA_MAX_CONV];
     pending    waiting[REPLICA_MAX_PENDING];
 };
@@ -522,9 +540,577 @@ static int log_entry(void *ctx, const char *db, size_t db_len, uint64_t index,
     return dbuf_put(cmd, c, clen);
 }
 
+/* ---- snapshots: local compaction, and the log-naming rule ---------------
+ *
+ * See replica.h's header. Everything below is the HOST half of the
+ * snapshot story: the node already serves an install from a committed
+ * generation and adopts one it receives (raft_node.h); what nothing did
+ * until here was MAKE a generation, which is the act that bounds the
+ * log and arms all of it.
+ */
+
+/* Copy `src` to `dst` through the namespace, checksumming and counting
+ * as it goes -- the same chunked walk rn_adopt's restore makes. */
+static int copy_file(bj_ns *ns, const char *src, uint32_t src_len,
+                     const char *dst, uint32_t dst_len,
+                     uint64_t *size_out, uint32_t *crc_out) {
+    bj_io in, dout;
+    int e = ns->open(ns->ctx, src, src_len, 0, &in);
+    if (e) return e;
+    e = ns->open(ns->ctx, dst, dst_len, BJ_NS_CREATE | BJ_NS_TRUNC, &dout);
+    if (e) { if (in.close) in.close(in.ctx); return e; }
+    uint8_t *buf = (uint8_t *)malloc(REPLICA_COPY_BYTES);
+    if (!buf) e = BJ_ERR_OOM;
+    uint64_t total = in.size(in.ctx), at = 0;
+    uint32_t crc = 0;
+    while (!e && at < total) {
+        uint32_t want = (uint32_t)((total - at > REPLICA_COPY_BYTES)
+                                       ? REPLICA_COPY_BYTES : (total - at));
+        int64_t got = in.read(in.ctx, at, buf, want);
+        if (got <= 0) { e = got < 0 ? (int)got : BJ_ERR_EOF; break; }
+        crc = bjfile_crc32(crc, buf, (size_t)got);
+        e = dout.write(dout.ctx, at, buf, (uint32_t)got);
+        at += (uint64_t)got;
+    }
+    free(buf);
+    /* Durable before anything depends on it: a generation file still in
+     * a buffer is a snapshot the next crash does not have. */
+    if (!e && dout.sync) e = dout.sync(dout.ctx);
+    if (dout.close) dout.close(dout.ctx);
+    if (in.close) in.close(in.ctx);
+    if (!e) { *size_out = total; *crc_out = crc; }
+    return e;
+}
+
+/* Remove every NUL-separated name in `plan`, best-effort: a name that
+ * fails to unlink is swept at the next open, and nothing adopted can be
+ * lost by failing to delete what superseded it. */
+static void remove_all(bj_ns *ns, const uint8_t *plan, size_t len) {
+    for (size_t at = 0; at < len; ) {
+        size_t end = at;
+        while (end < len && plan[end] != '\0') end++;
+        if (end > at) ns->remove(ns->ctx, (const char *)plan + at, (uint32_t)(end - at));
+        at = end + 1;
+    }
+}
+
+/*
+ * Compact the log through `boundary` into the store's paired log for
+ * `gen`: a fresh log based at the boundary, carrying the suffix and the
+ * hard state forward, made durable, then handed to the node -- which
+ * takes ownership, exactly as it does for an install's rebased log.
+ */
+static int compact_log_into(replica *r, uint64_t gen, uint64_t boundary,
+                            uint64_t bterm) {
+    dbuf name = {0};
+    int e = sst_log_name(r->store, gen, &name);
+    if (e) { dbuf_free(&name); return e; }
+    bj_io io;
+    e = r->ns->open(r->ns->ctx, (const char *)name.data, (uint32_t)name.len,
+                    BJ_NS_CREATE | BJ_NS_TRUNC, &io);
+    dbuf_free(&name);
+    if (e) return e;
+    elog *fresh = elog_create_at(&io, boundary, bterm);
+    if (!fresh) { if (io.close) io.close(io.ctx); return BJ_ERR_OOM; }
+
+    uint64_t hard_term = elog_current_term(r->log);
+    if (hard_term > 0) e = elog_set_hard_state(fresh, hard_term, elog_voted_for(r->log));
+
+    /* The suffix: everything the boundary does not cover. Entries commit
+     * and apply in index order, so what a pending write is waiting on is
+     * either at or below the boundary (settled, by definition of
+     * applied) or carried forward here, indexes unchanged. */
+    uint64_t last = elog_last_index(r->log);
+    for (uint64_t i = boundary + 1; !e && i <= last; i++) {
+        uint64_t term = 0;
+        int type = 0;
+        const uint8_t *p = NULL;
+        size_t plen = 0;
+        e = elog_get(r->log, i, &term, &type, &p, &plen);
+        if (!e) {
+            uint64_t at = 0;
+            e = elog_append(fresh, term, type, p, (uint32_t)plen, &at);
+        }
+    }
+    if (!e) {
+        uint64_t commit = elog_commit_index(r->log);
+        if (commit > last) commit = last;
+        if (commit > boundary) e = elog_set_commit_index(fresh, commit);
+    }
+    if (!e) e = elog_sync(fresh);
+    if (e) {
+        elog_free(fresh);
+        if (io.close) io.close(io.ctx);
+        return e;
+    }
+
+    elog *old = NULL;
+    rn_swap_log(r->node, fresh, &io, &old);
+    if (old) {
+        /* The node handed back the log we lent it; the fresh one is its
+         * own now, io and all. */
+        elog_free(old);
+        if (r->log_io.close) r->log_io.close(r->log_io.ctx);
+        memset(&r->log_io, 0, sizeof r->log_io);
+    }
+    r->log = fresh;
+    r->host_owns_log = 0;
+    return BJ_OK;
+}
+
+/*
+ * One local snapshot: every database's files stream into a generation,
+ * the manifest commits at the applied boundary, the log is compacted
+ * through it, and everything superseded is swept. A failure part-way
+ * leaves partial generation files with no manifest -- a generation that
+ * never existed, swept at the next open -- and the log untouched.
+ *
+ * Runs synchronously between turns of the transport's loop, so nothing
+ * applies or is served mid-copy; the files it reads are exactly the
+ * state at `applied`. The pause is the cost, and it is the same bargain
+ * WalDb.snapshot() struck under its write chain.
+ */
+static int snapshot_take(replica *r) {
+    uint64_t boundary = r->applied;
+    uint64_t bterm = 0;
+    int e = elog_term_at(r->log, boundary, &bterm);
+    if (e) return e;
+    uint64_t gen = sst_next_gen(r->store);
+
+    dbuf dbs = {0};
+    e = dbi_list(r->inst, &dbs);
+    if (e) { dbuf_free(&dbs); return e; }
+
+    bj_builder *files = bj_builder_new();
+    bj_builder *live = bj_builder_new();
+    if (!files || !live) {
+        bj_builder_free(files); bj_builder_free(live);
+        dbuf_free(&dbs);
+        return BJ_ERR_OOM;
+    }
+    e = bj_begin_array(files);
+    if (!e) e = bj_begin_array(live);
+
+    dbuf names = {0}, gen_name = {0}, live_name = {0};
+    uint32_t nrole = 0;
+    cur c = { dbs.data, dbs.len, 0 };
+    uint32_t ndb = 0;
+    if (!e) e = array_begin(&c, &ndb);
+    for (uint32_t i = 0; !e && i < ndb; i++) {
+        const uint8_t *dn; uint32_t dlen;
+        e = take_string(&c, &dn, &dlen);
+        if (e) break;
+        names.len = 0;
+        e = root_list_files(r->rt, (const char *)dn, dlen, &names);
+        for (size_t at = 0; !e && at < names.len; ) {
+            size_t end = at;
+            while (end < names.len && names.data[end] != '\0') end++;
+            if (end == at) { at = end + 1; continue; }
+            /* The node's transfer works over a fixed array of files
+             * (RN_MAX_SNAP_FILES); a generation it could never serve is
+             * refused here, whole, rather than committed and stuck. */
+            if (nrole >= RN_MAX_SNAP_FILES) { e = RAFT_ERR_CAPACITY; break; }
+            char role[16];
+            int rlen = snprintf(role, sizeof role, "f%u", nrole);
+
+            gen_name.len = 0;
+            e = sst_data_name(r->store, gen, role, (uint32_t)rlen, &gen_name);
+            if (e) break;
+            live_name.len = 0;
+            e = dbuf_put(&live_name, dn, dlen);
+            if (!e) e = dbuf_put(&live_name, (const uint8_t *)"/", 1);
+            if (!e) e = dbuf_put(&live_name, names.data + at, end - at);
+            if (e) break;
+
+            uint64_t size = 0;
+            uint32_t crc = 0;
+            e = copy_file(r->ns, (const char *)live_name.data, (uint32_t)live_name.len,
+                          (const char *)gen_name.data, (uint32_t)gen_name.len,
+                          &size, &crc);
+            if (e) break;
+
+            if (!e) e = bj_begin_object(files);
+            if (!e) e = bj_put_key(files, (const uint8_t *)"role", 4);
+            if (!e) e = bj_put_string(files, (const uint8_t *)role, (uint32_t)rlen);
+            if (!e) e = bj_put_key(files, (const uint8_t *)"name", 4);
+            if (!e) e = bj_put_string(files, gen_name.data, (uint32_t)gen_name.len);
+            if (!e) e = bj_put_key(files, (const uint8_t *)"size", 4);
+            if (!e) e = bj_put_int(files, (int64_t)size);
+            if (!e) e = bj_put_key(files, (const uint8_t *)"crc", 3);
+            if (!e) e = bj_put_int(files, (int64_t)crc);
+            if (!e) e = bj_end_object(files);
+
+            if (!e) e = bj_begin_object(live);
+            if (!e) e = bj_put_key(live, (const uint8_t *)"role", 4);
+            if (!e) e = bj_put_string(live, (const uint8_t *)role, (uint32_t)rlen);
+            if (!e) e = bj_put_key(live, (const uint8_t *)"name", 4);
+            if (!e) e = bj_put_string(live, live_name.data, (uint32_t)live_name.len);
+            if (!e) e = bj_end_object(live);
+
+            nrole++;
+            at = end + 1;
+        }
+    }
+    dbuf_free(&names);
+    dbuf_free(&gen_name);
+    dbuf_free(&live_name);
+    dbuf_free(&dbs);
+    if (!e) e = bj_end_array(files);
+    if (!e) e = bj_end_array(live);
+
+    /* config: { live: [...] } -- the map from roles back to the names
+     * the database opens, which is what an adoption (here or on a peer
+     * that was sent this generation) restores by. */
+    dbuf manifest = {0};
+    if (!e) {
+        size_t flen = 0, llen = 0;
+        const uint8_t *fd = bj_builder_data(files, &flen);
+        const uint8_t *ld = bj_builder_data(live, &llen);
+        bj_builder *cfg = bj_builder_new();
+        if (!fd || !ld || !cfg) e = BJ_ERR_OOM;
+        if (!e) e = bj_begin_object(cfg);
+        if (!e) e = bj_put_key(cfg, (const uint8_t *)"live", 4);
+        if (!e) e = bj_put_raw(cfg, ld, (uint32_t)llen);
+        if (!e) e = bj_end_object(cfg);
+        if (!e) {
+            size_t clen = 0;
+            const uint8_t *cd = bj_builder_data(cfg, &clen);
+            if (!cd) e = BJ_ERR_STATE;
+            else e = sst_manifest_encode(boundary, bterm, cd, (uint32_t)clen,
+                                         fd, (uint32_t)flen, &manifest);
+        }
+        bj_builder_free(cfg);
+    }
+    bj_builder_free(files);
+    bj_builder_free(live);
+    if (e) { dbuf_free(&manifest); return e; }
+
+    /* Writing the manifest IS the commit. */
+    dbuf mname = {0};
+    e = sst_manifest_name(r->store, gen, &mname);
+    if (!e) {
+        bj_io io;
+        e = r->ns->open(r->ns->ctx, (const char *)mname.data, (uint32_t)mname.len,
+                        BJ_NS_CREATE | BJ_NS_TRUNC, &io);
+        if (!e) {
+            e = io.write(io.ctx, 0, manifest.data, (uint32_t)manifest.len);
+            if (!e && io.sync) e = io.sync(io.ctx);
+            if (io.close) io.close(io.ctx);
+        }
+    }
+    dbuf_free(&mname);
+
+    dbuf sweep = {0};
+    if (!e) e = sst_adopt_committed(r->store, gen, manifest.data,
+                                    (uint32_t)manifest.len, &sweep);
+    dbuf_free(&manifest);
+
+    /* The log, through the boundary. After this line the old entries are
+     * the store's business, and a resume from below the boundary is
+     * -68 -- which until this file existed was a rule nothing could
+     * reach. */
+    if (!e) e = compact_log_into(r, gen, boundary, bterm);
+
+    if (!e) {
+        /* Superseded: the previous generation's files, every older store
+         * log, and the legacy log the store's now replaces. */
+        remove_all(r->ns, sweep.data, sweep.len);
+        r->ns->remove(r->ns->ctx, REPLICA_WAL, (uint32_t)strlen(REPLICA_WAL));
+        dbuf listing = {0}, keep = {0}, prune = {0};
+        if (root_list_files(r->rt, NULL, 0, &listing) == BJ_OK &&
+            sst_log_name(r->store, gen, &keep) == BJ_OK &&
+            sst_prune_logs_plan(r->store, listing.data, (uint32_t)listing.len,
+                                (const char *)keep.data, (uint32_t)keep.len,
+                                &prune) == BJ_OK) {
+            remove_all(r->ns, prune.data, prune.len);
+        }
+        dbuf_free(&listing); dbuf_free(&keep); dbuf_free(&prune);
+        fprintf(stderr, "nisaba: snapshot %llu at index %llu (%u files); log compacted\n",
+                (unsigned long long)gen, (unsigned long long)boundary, nrole);
+        fflush(stderr);
+    }
+    dbuf_free(&sweep);
+    return e;
+}
+
+/* Scan the root for the store's generations and adopt the newest valid
+ * one -- the plan/open/execute trampoline snapstore.h describes, walked
+ * here with synchronous opens. A store with nothing to adopt is the
+ * normal state of a member that has never compacted. */
+static int store_scan_adopt(replica *r) {
+    dbuf listing = {0};
+    int e = root_list_files(r->rt, NULL, 0, &listing);
+    if (!e) e = sst_scan(r->store, listing.data, (uint32_t)listing.len);
+    if (e) { dbuf_free(&listing); return e; }
+
+    uint32_t nc = sst_candidate_count(r->store);
+    for (uint32_t i = 0; i < nc; i++) {
+        uint32_t mlen = 0;
+        const char *mname = sst_candidate_manifest(r->store, i, &mlen);
+        if (!mname) continue;
+        bj_io io;
+        if (r->ns->open(r->ns->ctx, mname, mlen, 0, &io)) continue;
+        uint64_t sz = io.size(io.ctx);
+        uint8_t *bytes = (sz > 0 && sz < (16u << 20)) ? (uint8_t *)malloc((size_t)sz) : NULL;
+        int ok = bytes && io.read(io.ctx, 0, bytes, (uint32_t)sz) == (int64_t)sz;
+        if (io.close) io.close(io.ctx);
+        int te = ok ? sst_try_manifest(r->store, i, bytes, (uint32_t)sz) : SST_ERR_MANIFEST;
+        free(bytes);
+        if (te != BJ_OK) continue;
+
+        uint32_t np = sst_pending_count(r->store);
+        if (np > RN_MAX_SNAP_FILES) continue;
+        double sizes[RN_MAX_SNAP_FILES];
+        for (uint32_t k = 0; k < np; k++) {
+            uint32_t nlen = 0;
+            const char *pn = sst_pending_name(r->store, k, &nlen);
+            bj_io fio;
+            sizes[k] = -1;
+            if (pn && r->ns->open(r->ns->ctx, pn, nlen, 0, &fio) == BJ_OK) {
+                sizes[k] = (double)fio.size(fio.ctx);
+                if (fio.close) fio.close(fio.ctx);
+            }
+        }
+        if (sst_confirm(r->store, sizes, np) == BJ_OK) break;
+    }
+    dbuf_free(&listing);
+    return BJ_OK;
+}
+
+/* The log-naming rule: the store's newest log that OPENS -- a crash
+ * mid-compaction leaves a torn newest file, and its predecessor is only
+ * ever deleted once a successor is durable -- and the legacy __wal__.bj
+ * when the store offers none. */
+static int open_best_log(replica *r) {
+    dbuf listing = {0}, cands = {0};
+    int e = root_list_files(r->rt, NULL, 0, &listing);
+    if (!e) e = sst_log_candidates(r->store, listing.data, (uint32_t)listing.len, &cands);
+    dbuf_free(&listing);
+    if (e) { dbuf_free(&cands); return e; }
+
+    for (size_t at = 0; at < cands.len && !r->log; ) {
+        size_t end = at;
+        while (end < cands.len && cands.data[end] != '\0') end++;
+        if (end > at) {
+            bj_io io;
+            if (r->ns->open(r->ns->ctx, (const char *)cands.data + at,
+                            (uint32_t)(end - at), 0, &io) == BJ_OK) {
+                elog *lg = io.size(io.ctx) > 0 ? elog_open(&io) : NULL;
+                if (lg) {
+                    r->log = lg;
+                    r->log_io = io;
+                    r->host_owns_log = 1;
+                } else if (io.close) {
+                    io.close(io.ctx);
+                }
+            }
+        }
+        at = end + 1;
+    }
+    dbuf_free(&cands);
+    if (r->log) return BJ_OK;
+
+    /* An empty file is a new log; anything else is one to recover. Both
+     * are entrylog.h's call, not this file's guess about its format. */
+    e = r->ns->open(r->ns->ctx, REPLICA_WAL, (uint32_t)strlen(REPLICA_WAL),
+                    BJ_NS_CREATE, &r->log_io);
+    if (e) return e;
+    r->log = (r->log_io.size(r->log_io.ctx) > 0) ? elog_open(&r->log_io)
+                                                 : elog_create(&r->log_io);
+    if (!r->log) {
+        if (r->log_io.close) r->log_io.close(r->log_io.ctx);
+        return BJ_ERR_STATE;
+    }
+    r->host_owns_log = 1;
+    return BJ_OK;
+}
+
+/* Copy each of the adopted generation's files onto the live name its
+ * config.live maps it to. The node has its own copy of this walk
+ * (raft_node.c's live_each); this one exists because a restore at
+ * STARTUP runs before there is a node to ask. */
+static int restore_live_files(replica *r, const dbuf *latest) {
+    uint64_t gen = sst_latest_gen(r->store);
+    const uint8_t *config; size_t clen; int f = 0;
+    int e = obj_get_field(latest->data, latest->len, (const uint8_t *)"config", 6,
+                          &config, &clen, &f);
+    if (e || !f) return SST_ERR_MANIFEST;
+    const uint8_t *live; size_t llen;
+    e = obj_get_field(config, clen, (const uint8_t *)"live", 4, &live, &llen, &f);
+    if (e || !f) return SST_ERR_MANIFEST;
+    cur c = { live, llen, 0 };
+    uint32_t count = 0;
+    if (array_begin(&c, &count)) return SST_ERR_MANIFEST;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t start = c.pos;
+        if (skip_value(&c)) return SST_ERR_MANIFEST;
+        const uint8_t *nv; size_t nlen; int nf = 0;
+        if (obj_get_field(c.d + start, c.pos - start, (const uint8_t *)"name", 4,
+                          &nv, &nlen, &nf) || !nf) return SST_ERR_MANIFEST;
+        cur nc = { nv, nlen, 0 };
+        const uint8_t *s; uint32_t slen;
+        if (take_string(&nc, &s, &slen)) return SST_ERR_MANIFEST;
+        /* The generation file for this entry is named by ROLE; read it
+         * back the same way. */
+        const uint8_t *rv; size_t rlen2; int rf = 0;
+        if (obj_get_field(c.d + start, c.pos - start, (const uint8_t *)"role", 4,
+                          &rv, &rlen2, &rf) || !rf) return SST_ERR_MANIFEST;
+        cur rc = { rv, rlen2, 0 };
+        const uint8_t *rs; uint32_t rslen;
+        if (take_string(&rc, &rs, &rslen)) return SST_ERR_MANIFEST;
+        dbuf gname = {0};
+        e = sst_data_name(r->store, gen, (const char *)rs, rslen, &gname);
+        if (!e) {
+            uint64_t sz; uint32_t crc;
+            e = copy_file(r->ns, (const char *)gname.data, (uint32_t)gname.len,
+                          (const char *)s, slen, &sz, &crc);
+        }
+        dbuf_free(&gname);
+        if (e) return e;
+    }
+    return BJ_OK;
+}
+
+/*
+ * A committed generation whose boundary is past the log's base is an
+ * adoption that never finished: an install (or a local compaction)
+ * crashed between its manifest committing and its log moving. Restoring
+ * is safe in both cases -- the generation is the state at its boundary,
+ * and any live progress past it is replayed from the log's suffix by
+ * the ordinary recovery the apply pump runs (replay from the applied
+ * floor is exact; db_wal.h's contract). A log whose entries end BELOW
+ * the boundary describes a state the snapshot has superseded whole, so
+ * it is replaced by a fresh one based there, exactly as an adoption
+ * would have.
+ */
+static int restore_if_stale(replica *r) {
+    if (!sst_has_latest(r->store)) return BJ_OK;
+    dbuf latest = {0};
+    int has = 0;
+    int e = sst_latest(r->store, &latest, &has);
+    if (e || !has) { dbuf_free(&latest); return e; }
+
+    uint64_t boundary = 0, bterm = 0;
+    {
+        const uint8_t *v; size_t vlen; int f = 0;
+        if (!obj_get_field(latest.data, latest.len,
+                           (const uint8_t *)"lastIncludedIndex", 17, &v, &vlen, &f) && f) {
+            cur vc = { v, vlen, 0 };
+            (void)read_u64(&vc, &boundary);
+        }
+        if (!obj_get_field(latest.data, latest.len,
+                           (const uint8_t *)"lastIncludedTerm", 16, &v, &vlen, &f) && f) {
+            cur vc = { v, vlen, 0 };
+            (void)read_u64(&vc, &bterm);
+        }
+    }
+    if (!boundary || boundary <= elog_base_index(r->log)) {
+        dbuf_free(&latest);
+        return BJ_OK;
+    }
+
+    fprintf(stderr, "nisaba: restoring snapshot at index %llu (an adoption did not"
+                    " finish before the last crash)\n",
+            (unsigned long long)boundary);
+    fflush(stderr);
+
+    /* Stale files that the generation does not restore -- a journal left
+     * behind would rewind a restored file on the next recovery. Every
+     * current database file goes; the copies below bring back the ones
+     * the snapshot holds. */
+    dbuf dbs = {0};
+    e = dbi_list(r->inst, &dbs);
+    if (!e) {
+        cur c = { dbs.data, dbs.len, 0 };
+        uint32_t ndb = 0;
+        if (!array_begin(&c, &ndb)) {
+            dbuf names = {0}, victim = {0};
+            for (uint32_t i = 0; !e && i < ndb; i++) {
+                const uint8_t *dn; uint32_t dlen;
+                if (take_string(&c, &dn, &dlen)) break;
+                names.len = 0;
+                if (root_list_files(r->rt, (const char *)dn, dlen, &names)) continue;
+                for (size_t at = 0; at < names.len; ) {
+                    size_t end = at;
+                    while (end < names.len && names.data[end] != '\0') end++;
+                    if (end > at) {
+                        victim.len = 0;
+                        if (!dbuf_put(&victim, dn, dlen) &&
+                            !dbuf_put(&victim, (const uint8_t *)"/", 1) &&
+                            !dbuf_put(&victim, names.data + at, end - at)) {
+                            r->ns->remove(r->ns->ctx, (const char *)victim.data,
+                                          (uint32_t)victim.len);
+                        }
+                    }
+                    at = end + 1;
+                }
+            }
+            dbuf_free(&names);
+            dbuf_free(&victim);
+        }
+    }
+    dbuf_free(&dbs);
+
+    if (!e) e = restore_live_files(r, &latest);
+    dbuf_free(&latest);
+    if (e) return e;
+
+    if (elog_last_index(r->log) < boundary) {
+        /* The log ends below the boundary: nothing in it survives the
+         * snapshot. A fresh one, based there, carrying the hard state. */
+        uint64_t gen = sst_latest_gen(r->store);
+        dbuf name = {0};
+        e = sst_log_name(r->store, gen, &name);
+        bj_io io;
+        if (!e) e = r->ns->open(r->ns->ctx, (const char *)name.data,
+                                (uint32_t)name.len, BJ_NS_CREATE | BJ_NS_TRUNC, &io);
+        dbuf_free(&name);
+        if (e) return e;
+        elog *fresh = elog_create_at(&io, boundary, bterm);
+        if (!fresh) { if (io.close) io.close(io.ctx); return BJ_ERR_OOM; }
+        uint64_t hard_term = elog_current_term(r->log);
+        if (hard_term > 0) e = elog_set_hard_state(fresh, hard_term, elog_voted_for(r->log));
+        if (!e) e = elog_sync(fresh);
+        if (e) {
+            elog_free(fresh);
+            if (io.close) io.close(io.ctx);
+            return e;
+        }
+        elog_free(r->log);
+        if (r->log_io.close) r->log_io.close(r->log_io.ctx);
+        r->log = fresh;
+        r->log_io = io;
+        r->host_owns_log = 1;
+    }
+    return BJ_OK;
+}
+
+/* Crashed attempts and superseded generations, swept at open the way
+ * the store's contract promises. Best-effort throughout. */
+static void startup_sweep(replica *r) {
+    dbuf plan = {0};
+    if (sst_sweep_plan(r->store, &plan) == BJ_OK)
+        remove_all(r->ns, plan.data, plan.len);
+    dbuf_free(&plan);
+    if (!sst_has_latest(r->store)) return;
+    /* A store log is in use only when a generation was adopted; every
+     * other store log -- and the legacy file, if the chosen log is the
+     * store's -- is history. The prune keeps whichever log is open. */
+    dbuf listing = {0}, keep = {0}, prune = {0};
+    if (root_list_files(r->rt, NULL, 0, &listing) == BJ_OK &&
+        sst_log_name(r->store, sst_latest_gen(r->store), &keep) == BJ_OK &&
+        sst_prune_logs_plan(r->store, listing.data, (uint32_t)listing.len,
+                            (const char *)keep.data, (uint32_t)keep.len,
+                            &prune) == BJ_OK) {
+        remove_all(r->ns, prune.data, prune.len);
+    }
+    dbuf_free(&listing); dbuf_free(&keep); dbuf_free(&prune);
+}
+
 int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
                  const uint8_t *members, uint32_t members_len,
-                 uint64_t now, replica **out) {
+                 uint64_t now, root_state *rt, uint64_t snapshot_entries,
+                 replica **out) {
     if (!ns || !inst || !out || !self_id) return BJ_ERR_STATE;
     if (px && peers_count(px) > rn_max_peers()) return RAFT_ERR_CAPACITY;
     *out = NULL;
@@ -533,34 +1119,43 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
     r->ns = ns;
     r->inst = inst;
     r->px = px;
+    r->rt = rt;
+    r->snap_every = snapshot_entries;
     r->self_id = self_id;
     /* Non-zero, or xorshift stays at zero forever and every member draws
      * the same nothing -- which is the bug this exists to avoid. */
     r->rnd = (self_id * 0x9E3779B97F4A7C15ULL) ^ (now + 0x100000001B3ULL);
     if (!r->rnd) r->rnd = 0x9E3779B97F4A7C15ULL;
 
-    int e = ns->open(ns->ctx, REPLICA_WAL, (uint32_t)strlen(REPLICA_WAL),
-                     BJ_NS_CREATE, &r->log_io);
-    if (e) { free(r); return e; }
+    r->store = sst_new(REPLICA_SNAP_PREFIX, (uint32_t)strlen(REPLICA_SNAP_PREFIX));
+    if (!r->store) { free(r); return BJ_ERR_OOM; }
 
-    /* An empty file is a new log; anything else is one to recover. Both
-     * are entrylog.h's call, not this file's guess about its format. */
-    r->log = (r->log_io.size(r->log_io.ctx) > 0) ? elog_open(&r->log_io)
-                                                 : elog_create(&r->log_io);
-    if (!r->log) {
+    /* The store first, then the log, then the reconciliation between
+     * them -- the order IS the naming rule replica.h states. All of it
+     * before the node exists, and before any database opens: a restore
+     * replaces the very files a database handle would be positioned in. */
+    int e = store_scan_adopt(r);
+    if (!e) e = open_best_log(r);
+    if (!e) e = restore_if_stale(r);
+    if (e) {
+        if (r->log) elog_free(r->log);
         if (r->log_io.close) r->log_io.close(r->log_io.ctx);
+        sst_free(r->store);
         free(r);
-        return BJ_ERR_STATE;
+        return e;
     }
+    startup_sweep(r);
 
     r->node = rn_new(self_id, r->log);
     if (!r->node) {
         elog_free(r->log);
         if (r->log_io.close) r->log_io.close(r->log_io.ctx);
+        sst_free(r->store);
         free(r);
         return BJ_ERR_OOM;
     }
     rn_set_ns(r->node, ns);
+    rn_set_snapstore(r->node, r->store);
 
     /*
      * The group to BOOTSTRAP with: the set a join came back with when
@@ -671,16 +1266,80 @@ void replica_close(replica *r) {
     if (r->inst) dbi_set_log(r->inst, NULL);
     for (int i = 0; i < REPLICA_MAX_PENDING; i++)
         if (r->waiting[i].used) pending_release(&r->waiting[i]);
+    /* The node first: a log it rebased for itself (an install, a local
+     * compaction) is its own and rn_free closes it. The one WE opened is
+     * ours -- elog_free does not close the handle behind the io; the one
+     * that opened it closes it, which is this. */
     if (r->node) rn_free(r->node);
-    if (r->log) elog_free(r->log);
-    /* elog_free does not close the handle behind the io; the one that
-     * opened it closes it, which is this. */
-    if (r->log_io.close) r->log_io.close(r->log_io.ctx);
+    if (r->host_owns_log) {
+        if (r->log) elog_free(r->log);
+        if (r->log_io.close) r->log_io.close(r->log_io.ctx);
+    }
+    sst_free(r->store);
     free(r);
 }
 
 int      replica_is_leader(const replica *r) { return r && rn_role(r->node) == RAFT_LEADER; }
 uint64_t replica_leader_id(const replica *r) { return r ? rn_leader_id(r->node) : 0; }
+
+int replica_adopt_pending(const replica *r) {
+    return r && r->node && rn_adopt_pending(r->node);
+}
+
+int replica_adopt(replica *r, const char *victims, size_t victims_len) {
+    if (!r) return BJ_ERR_STATE;
+    uint64_t boundary = rn_adopt_boundary(r->node);
+    elog *old = NULL;
+    int e = rn_adopt(r->node, victims, victims_len, &old);
+    if (e) return e;
+    if (old) {
+        /* The log we lent came back; the node owns its rebased one. */
+        elog_free(old);
+        if (r->log_io.close) r->log_io.close(r->log_io.ctx);
+        memset(&r->log_io, 0, sizeof r->log_io);
+    }
+    r->host_owns_log = 0;
+    r->log = rn_log(r->node);
+    r->applied = boundary;
+
+    /* Whatever was waiting is waiting on an instance that no longer
+     * exists. By the time a member is adopting an install it has been a
+     * follower for a while -- reads and writes are refused, so this is
+     * empty in every ordinary run -- but "ordinarily empty" is not a
+     * contract, and a dangling token would be. */
+    for (int i = 0; i < REPLICA_MAX_PENDING; i++)
+        if (r->waiting[i].used) pending_release(&r->waiting[i]);
+
+    /* The housekeeping local compaction does after its own swap: the
+     * legacy log is superseded by the store's, older store logs by the
+     * adopted generation's, and older generations by this one. */
+    r->ns->remove(r->ns->ctx, REPLICA_WAL, (uint32_t)strlen(REPLICA_WAL));
+    dbuf listing = {0}, keep = {0}, prune = {0}, sweep = {0};
+    if (root_list_files(r->rt, NULL, 0, &listing) == BJ_OK &&
+        sst_log_name(r->store, sst_latest_gen(r->store), &keep) == BJ_OK &&
+        sst_prune_logs_plan(r->store, listing.data, (uint32_t)listing.len,
+                            (const char *)keep.data, (uint32_t)keep.len,
+                            &prune) == BJ_OK) {
+        remove_all(r->ns, prune.data, prune.len);
+    }
+    if (sst_sweep_plan(r->store, &sweep) == BJ_OK)
+        remove_all(r->ns, sweep.data, sweep.len);
+    dbuf_free(&listing); dbuf_free(&keep); dbuf_free(&prune); dbuf_free(&sweep);
+
+    fprintf(stderr, "nisaba: snapshot install adopted at index %llu\n",
+            (unsigned long long)boundary);
+    fflush(stderr);
+    return BJ_OK;
+}
+
+void replica_set_instance(replica *r, dbi *inst) {
+    if (!r) return;
+    r->inst = inst;
+    if (inst) {
+        dbs_log reader = { r, log_base, log_floor, log_entry };
+        dbi_set_log(inst, &reader);
+    }
+}
 
 uint32_t replica_peer_count(const replica *r) {
     if (!r) return 0;
@@ -1125,6 +1784,13 @@ static int replica_status(const replica *r, dbuf *out) {
     if (!e) e = bj_put_int(b, (int64_t)r->applied);
     if (!e) e = bj_put_key(b, (const uint8_t *)"commit", 6);
     if (!e) e = bj_put_int(b, (int64_t)rn_commit_index(r->node));
+    /* The log's bounds -- how an operator (and a test) sees compaction
+     * happen: `base` moves when a snapshot commits, and `last - base` is
+     * what the next one will cover. */
+    if (!e) e = bj_put_key(b, (const uint8_t *)"base", 4);
+    if (!e) e = bj_put_int(b, (int64_t)elog_base_index(r->log));
+    if (!e) e = bj_put_key(b, (const uint8_t *)"last", 4);
+    if (!e) e = bj_put_int(b, (int64_t)elog_last_index(r->log));
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -1252,6 +1918,29 @@ static int lost(replica *r, pending *p) {
 
 int replica_tick(replica *r, uint64_t now) {
     if (!r) return BJ_ERR_STATE;
+
+    /*
+     * The compaction trigger: enough APPLIED entries since the log's
+     * base, and no adoption in flight (an install about to move the
+     * whole state machine makes a snapshot of the old one a wasted
+     * generation). Host-driven, matching every other policy in this
+     * repository -- the engine runs no timers, so WHEN to compact
+     * belongs to the side that has a clock, which is this one. A
+     * failure says so once rather than every tick, and keeps trying:
+     * a full disk that empties should not need a restart to notice.
+     */
+    if (r->snap_every && !rn_adopt_pending(r->node) && !rn_installing(r->node) &&
+        r->applied > elog_base_index(r->log) &&
+        r->applied - elog_base_index(r->log) >= r->snap_every) {
+        int se = snapshot_take(r);
+        if (se && !r->said_snap_failed) {
+            r->said_snap_failed = 1;
+            fprintf(stderr, "replica: snapshot failed: %s\n", dc_strerror(se));
+            fflush(stderr);
+        }
+        if (!se) r->said_snap_failed = 0;
+    }
+
     int e = rn_tick(r->node, (int64_t)now, rnd01(r));
     if (e) return e;
     e = flush_out(r);            /* heartbeats, and any election it started */

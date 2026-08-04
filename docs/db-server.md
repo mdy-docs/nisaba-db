@@ -42,7 +42,10 @@ host's own. Point the host at the directory, or `cd` into it.
 │   └── coll-events.bj
 ├── billing/
 │   └── ...
-└── __wal__.bj             the log, with --raft: ONE for the instance
+├── __wal__.bj             the log, with --raft ... until the first snapshot
+├── __snap__-3-f0.bj       ...after which: the newest generation's files,
+├── __snap__-3.manifest.bj    its manifest (the commit point),
+└── __snap__-log-3.bj         and the compacted log, based at its boundary
 ```
 
 **A directory that is itself a database is refused**, with the sentence
@@ -62,6 +65,7 @@ data and reporting nothing wrong.
 | `--raft-port N` | where the other members reach this one (loopback) |
 | `--peer ID@HOST:PORT` | another member and where to reach IT; repeat once per member |
 | `--join HOST:PORT` | ask a RUNNING cluster to admit this node, knowing only a seed address; repeat for more seeds. Use **instead of** `--peer` |
+| `--snapshot-entries N` | applied entries between local snapshots, which bound the log (default 8192; 0 never compacts) |
 | `--leave ID` | ask that cluster to remove member `ID`, then exit without serving; needs `--join` to say who to ask |
 
 **`--order` is a creation parameter, not something a reader has to be
@@ -195,7 +199,8 @@ server without `--raft`, and a `--raft` group of one, pay nothing —
 there is nobody to hear from.
 
 **`ping` is what a follower still answers**, and on a replica it says
-what the member is: `{ pong, role, leaderId, applied, commit }`. It is
+what the member is: `{ pong, role, leaderId, applied, commit, base,
+last }`. It is
 how you watch a cluster replicate now that followers do not serve data.
 Those numbers report and promise nothing — `applied` is that member's
 own floor when it was asked, which is precisely the number that may not
@@ -834,18 +839,22 @@ Stated here rather than discovered later.
   waiting is always looked at before one further down. Nothing starves
   while requests are small; a stream of large ones from slot 0 would make
   slot 5 wait.
-- **No compaction scheduler.** The engine runs no timers, so *when* to
-  sweep stays with whoever is driving (`docs/compaction.md`) — which is
-  what `minBytes`/`factor` are for: they make calling it on a timer
-  cheap, because a sweep that finds nothing worth doing costs one
-  `size()` per collection.
+- **No compaction scheduler for COLLECTIONS.** The engine runs no
+  timers, so *when* to sweep stays with whoever is driving
+  (`docs/compaction.md`) — which is what `minBytes`/`factor` are for:
+  they make calling it on a timer cheap, because a sweep that finds
+  nothing worth doing costs one `size()` per collection. (The LOG is
+  different: `--snapshot-entries` is a transport-side policy and the
+  transport has a clock, so log compaction does happen by itself.)
 - **A sweep opens every collection**, and the session holds at most
   `DBS_MAX_COLLECTIONS` (32) open at once. A database with more than
   that refuses the sweep (`-38`) rather than half-doing it.
-- **No change-stream pipelines, no `updateDescription`, no resume
-  tokens.** The same three non-goals the in-process `watch()` has
-  (README). A stream watches one collection, whole events, and an
-  overflowed consumer re-watches rather than resuming.
+- **No change-stream pipelines, no `updateDescription`.** Two of the
+  three non-goals the in-process `watch()` has (README); the third —
+  resume tokens — stopped being one on a REPLICATED server, where the
+  log index is the token and an overflow is a page boundary (above). A
+  stream still watches one collection, whole events; without a log, an
+  overflowed consumer still re-watches rather than resuming.
 - **No `sort` on the find-one-and-\* family**, as above.
 - **No TLS, no auth, no tenants.** Loopback only. Those belong to the
   gateway in front, not to the database

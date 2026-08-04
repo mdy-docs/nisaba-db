@@ -11,11 +11,47 @@ write down why" rather than guessing on the implementer's behalf.
 
 ## The remaining work, in dependency order
 
-| # | Brief | What it unblocks |
-| --- | --- | --- |
-| 1 | [crash-point-testing.md](crash-point-testing.md) | Roadmap step 7. Confidence in everything already built. |
+Nothing. Every brief this directory was created for is built and
+retired; the roadmap's remaining open items live under "Standing debts"
+below.
 
-One brief left, and it is the coverage everything else here rests on.
+**Crash-point testing is done**, which is why the last brief is gone —
+roadmap step 7, the one item that was coverage rather than a feature.
+The process is killed at every boundary of the write path and the
+invariants hold as assertions, not prose. `test/db.wal-crash.test.js`
+sweeps a crash across EVERY mutating call of a fixed workload (a
+provider that dies at mutation N and stays dead — the durable bytes
+freeze at that instant, and reopening a copy of them is the reboot),
+which covers append-before-sync, sync-before-apply, the mid-apply
+stage/commit pair, mid-batch, and the commit marker's ride-along sync
+without the test having to know where each falls in the byte stream;
+a nested sweep crashes recovery itself. The exactly-once oracle is a
+counter against the log — an `$inc` applied twice or skipped moves the
+document off the count of `$inc` commands in the recovered log, where a
+`set` would hide the double-apply. `test/raft-crash.test.js` runs the
+replicated boundaries in the deterministic simulator over flush-shadow
+disks (durable = each file's bytes at its last successful flush; the
+Nth flush can be armed to throw mid-fsync): the follower that dies
+between accepting entries and acking, the leader that dies between
+commit and apply, seeded chaos crash-stop rounds under load, and the
+snapshot install interrupted mid-staging, after its manifest commits,
+and mid-adopt — for which the harness's boot rule had to become
+`openWalStorage`'s actual rule (the newest log that OPENS) rather than
+a paraphrase, because the crash states are exactly where the paraphrase
+diverged. The C server's mid-adopt window — the only place in the
+system that replaces live files wholesale — is covered by FORGED
+directory states in `test/db.server.test.js`: assembled from the real
+files of two real runs into exactly what a crash at each boundary
+leaves (staged-no-manifest, manifest-committed-before-adopt, files
+half-replaced, files-moved-log-not, torn store log), then booted and
+asserted against `replica.c`'s recovery rules, plus a `kill -9` under
+load proving every acknowledged insert survives exactly once. Forging
+found a real bug on the first run: `restore_if_stale` carried the OLD
+log's hard state into the fresh boundary-based log, and a boundary term
+above it made the entrylog refuse — the precise crash state the restore
+exists for was also the state the server could not boot from. Fixed
+(the manifest's term is newer knowledge: raise, drop the vote),
+falsified both ways.
 
 **Change streams tail the log**, which is why that brief is gone —
 roadmap step 6 is done, both halves. The log index is the resume token:

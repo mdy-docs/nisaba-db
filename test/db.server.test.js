@@ -3631,3 +3631,223 @@ describe.skipIf(!have(NATIVE))('nisaba-server: a compacted leader installs a sna
     expect(after.applied).toBeGreaterThan(member.applied);
   }, 90000);
 });
+
+/*
+ * Crash-points in the mid-adopt window (docs/steps crash-point brief,
+ * boundary 8): the adopt step is the only place in the system that
+ * replaces live files wholesale, and a crash inside it leaves a
+ * directory no single act describes -- a committed manifest over old
+ * files, half-replaced files, a torn store log. Each state below is
+ * FORGED: assembled from the real files of two real runs of this server
+ * (one before any compaction, one after), into exactly the bytes a crash
+ * at that boundary leaves behind, then a server is started over it and
+ * the recovery rules (replica.c: open_best_log, restore_if_stale,
+ * startup_sweep) are asserted one by one. Forging over kill-timing, per
+ * the brief: each state is deterministic and names its boundary; a
+ * kill aimed at the same instant is a race the suite would sometimes
+ * lose. Native only, like the install suite above -- the recovery is the
+ * same C on both engines.
+ */
+describe.skipIf(!have(NATIVE))('nisaba-server: crash-points in the mid-adopt window (forged states)', () => {
+  const basePort = nextPort();
+  let portOff = 0;
+  let OLD, NEW, gen, boundary;
+
+  const boot = (dir, snapshotEntries) => {
+    const port = basePort + (portOff++);
+    const proc = spawn(path.resolve(NATIVE), ['--port', String(port), '--raft', '1',
+      '--snapshot-entries', String(snapshotEntries)],
+      { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+    let log = '';
+    proc.stderr.on('data', (d) => { log += d; });
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(`server did not start: ${log}`)), 30000);
+      proc.stderr.on('data', () => {
+        if (log.includes('serving')) { clearTimeout(t); resolve({ proc, port, tail: () => log }); }
+      });
+    });
+  };
+  const halt = async (proc, signal = 'SIGTERM') => {
+    proc.kill(signal);
+    await new Promise((r) => proc.once('exit', r));
+  };
+
+  /** A fresh directory holding exactly the named pieces of OLD and NEW. */
+  const forge = ({ db, wal, snapData, manifest, storeLog }) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-forged-'));
+    fs.cpSync(path.join(db, 'appdb'), path.join(dir, 'appdb'), { recursive: true });
+    if (wal) fs.cpSync(path.join(OLD, '__wal__.bj'), path.join(dir, '__wal__.bj'));
+    if (snapData) {
+      for (const f of fs.readdirSync(NEW)) {
+        if (new RegExp(`^__snap__-${gen}-f\\d+\\.bj$`).test(f)) {
+          fs.cpSync(path.join(NEW, f), path.join(dir, f));
+        }
+      }
+    }
+    if (manifest) {
+      fs.cpSync(path.join(NEW, `__snap__-${gen}.manifest.bj`),
+                path.join(dir, `__snap__-${gen}.manifest.bj`));
+    }
+    if (storeLog) {
+      fs.cpSync(path.join(NEW, `__snap__-log-${gen}.bj`),
+                path.join(dir, `__snap__-log-${gen}.bj`));
+    }
+    return dir;
+  };
+
+  /** Boot a forged state, wait until it serves reads, and report what
+   * recovery did: the ping, the doc count, and whether the restore line
+   * was said. */
+  const recovered = async (dir) => {
+    const { proc, port, tail } = await boot(dir, 0);
+    const client = await connectServer(port);
+    const coll = client.db('appdb').collection('things');
+    const count = await coll.countDocuments({});
+    const status = await client.ping();
+    // Still a database, not a husk: the next write lands.
+    await coll.insertOne({ n: 9999 });
+    const countAfterWrite = await coll.countDocuments({});
+    await client.close();
+    await halt(proc);
+    return { count, countAfterWrite, status, restored: /restoring snapshot at index/.test(tail()) };
+  };
+
+  beforeAll(async () => {
+    // OLD: a member that never compacted -- 10 docs behind __wal__.bj.
+    OLD = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-forge-old-'));
+    let { proc, port } = await boot(OLD, 0);
+    let client = await connectServer(port);
+    let coll = client.db('appdb').collection('things');
+    for (let i = 0; i < 10; i++) await coll.insertOne({ n: i });
+    await client.close();
+    await halt(proc);
+
+    // NEW: the same history continued under --snapshot-entries 1, which
+    // compacts at every tick -- so once quiet, the boundary IS the
+    // applied floor and the generation holds exactly the 25 documents.
+    NEW = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-forge-new-'));
+    fs.cpSync(OLD, NEW, { recursive: true });
+    ({ proc, port } = await boot(NEW, 1));
+    client = await connectServer(port);
+    coll = client.db('appdb').collection('things');
+    for (let i = 10; i < 25; i++) await coll.insertOne({ n: i });
+    let status = null;
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      status = await client.ping();
+      if (status.base > 0 && status.base === status.applied) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(status.base).toBe(status.applied);
+    boundary = status.base;
+    await client.close();
+    await halt(proc);
+
+    const manifests = fs.readdirSync(NEW).filter((f) => /^__snap__-\d+\.manifest\.bj$/.test(f));
+    expect(manifests.length).toBe(1); // superseded generations were swept
+    gen = manifests[0].match(/^__snap__-(\d+)\./)[1];
+    expect(fs.existsSync(path.join(NEW, '__wal__.bj'))).toBe(false);
+  }, 120000);
+
+  it('control: the completed adoption restarts without a restore', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-forged-'));
+    fs.cpSync(NEW, dir, { recursive: true });
+    const r = await recovered(dir);
+    expect(r.restored).toBe(false);      // nothing was mid-flight
+    expect(r.count).toBe(25);
+    expect(r.status.base).toBe(boundary);
+  }, 60000);
+
+  it('crash mid-staging (no manifest): the half-staged generation is no state at all, and is swept', async () => {
+    const dir = forge({ db: OLD, wal: true, snapData: true, manifest: false, storeLog: false });
+    const r = await recovered(dir);
+    expect(r.restored).toBe(false);      // a manifest-less generation never existed
+    expect(r.count).toBe(10);            // the old state governs, whole
+    expect(r.countAfterWrite).toBe(11);
+    // The orphaned staging files were swept at open, as the store promises.
+    expect(fs.readdirSync(dir).filter((f) => f.startsWith(`__snap__-${gen}-`))).toEqual([]);
+  }, 60000);
+
+  it('crash after the manifest commits, before any file moves: the restore completes the adoption', async () => {
+    const dir = forge({ db: OLD, wal: true, snapData: true, manifest: true, storeLog: false });
+    const r = await recovered(dir);
+    expect(r.restored).toBe(true);       // the committed boundary outranks the old log's base
+    expect(r.count).toBe(25);            // the generation's state, not the old files'
+    expect(r.countAfterWrite).toBe(26);
+    expect(r.status.base).toBe(boundary); // and the log was re-based there
+  }, 60000);
+
+  it('crash with the live files half-replaced: the restore is whole-or-nothing over the wreckage', async () => {
+    const dir = forge({ db: OLD, wal: true, snapData: true, manifest: true, storeLog: false });
+    // One live file died mid-copy: truncated to a torn stub.
+    fs.truncateSync(path.join(dir, 'appdb', 'coll-things.bj'), 10);
+    const r = await recovered(dir);
+    expect(r.restored).toBe(true);
+    expect(r.count).toBe(25);
+    expect(r.status.base).toBe(boundary);
+  }, 60000);
+
+  it('crash after the files moved, before the log did: the restore re-runs over the new files', async () => {
+    const dir = forge({ db: NEW, wal: true, snapData: true, manifest: true, storeLog: false });
+    const r = await recovered(dir);
+    expect(r.restored).toBe(true);       // the OLD log still governs the naming, so the restore fires
+    expect(r.count).toBe(25);            // idempotent: restoring over already-restored files
+    expect(r.status.base).toBe(boundary);
+  }, 60000);
+
+  it('crash mid-compaction (torn store log): recovery lands on the boundary either way', async () => {
+    // Torn so badly it cannot open: the log-naming rule falls through to
+    // the still-present __wal__.bj, and the restore recovers the boundary.
+    let dir = forge({ db: NEW, wal: true, snapData: true, manifest: true, storeLog: true });
+    fs.truncateSync(path.join(dir, `__snap__-log-${gen}.bj`), 8);
+    let r = await recovered(dir);
+    expect(r.restored).toBe(true);
+    expect(r.count).toBe(25);
+    expect(r.status.base).toBe(boundary);
+
+    // Torn mid-file: entrylog's own recovery rolls the tail back to the
+    // last good commit, so the store's log OPENS, already based at the
+    // boundary -- a valid recovery that needs no restore. Either path
+    // must land on the same state; which one runs is the tear's shape.
+    dir = forge({ db: NEW, wal: true, snapData: true, manifest: true, storeLog: true });
+    const torn = path.join(dir, `__snap__-log-${gen}.bj`);
+    fs.truncateSync(torn, Math.floor(fs.statSync(torn).size / 2));
+    r = await recovered(dir);
+    expect(r.count).toBe(25);
+    expect(r.status.base).toBe(boundary);
+  }, 60000);
+
+  it('kill -9 under load: every acknowledged write survives the restart, exactly once', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-kill9-'));
+    const { proc, port } = await boot(dir, 5);
+    const client = await connectServer(port);
+    const coll = client.db('appdb').collection('things');
+    const acked = [];
+    let dead = false;
+    proc.once('exit', () => { dead = true; });
+    try {
+      for (let i = 0; i < 500 && !dead; i++) {
+        await coll.insertOne({ n: i });
+        acked.push(i); // the reply came back: sync-before-ack says this is durable
+        if (i === 30) proc.kill('SIGKILL'); // no goodbye; writes still in flight
+      }
+    } catch { /* the crash severed the connection mid-call */ }
+    await client.close().catch(() => {});
+    expect(acked.length).toBeGreaterThanOrEqual(31);
+
+    const { proc: proc2, port: port2 } = await boot(dir, 5);
+    const client2 = await connectServer(port2);
+    const coll2 = client2.db('appdb').collection('things');
+    const docs = await coll2.find({}).toArray();
+    const byN = new Map();
+    for (const d of docs) byN.set(d.n, (byN.get(d.n) || 0) + 1);
+    for (const n of acked) {
+      expect(byN.get(n), `acknowledged insert ${n} lost`).toBe(1); // present, and only once
+    }
+    // Still a working member: the next write lands.
+    await coll2.insertOne({ n: 100000 });
+    expect(await coll2.countDocuments({ n: 100000 })).toBe(1);
+    await client2.close();
+    await halt(proc2);
+  }, 90000);
+});

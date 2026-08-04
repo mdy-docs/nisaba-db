@@ -198,6 +198,9 @@ export class KvMachine {
     const c = decode(entry.payload);
     if (c.op === 'set') this.map.set(c.k, c.v);
     else if (c.op === 'del') this.map.delete(c.k);
+    // 'inc' exists for the crash tests: a set is idempotent by accident,
+    // so a double-apply is invisible through it. A counter is not.
+    else if (c.op === 'inc') this.map.set(c.k, (this.map.get(c.k) || 0) + 1);
     this.applied = entry.index;
     await this._persist();
   }
@@ -216,6 +219,7 @@ export class KvMachine {
 
 export const kvSet = (k, v) => encode({ op: 'set', k, v });
 export const kvDel = (k) => encode({ op: 'del', k });
+export const kvInc = (k) => encode({ op: 'inc', k });
 
 /**
  * Quiesced leader-side snapshot: freeze the state machine at the node's
@@ -283,11 +287,39 @@ export async function bootNode(id, ids, sim, net, disk, nodeOptions = {}) {
   const store = new SnapshotStore(directoryOf(disk), { prefix: SNAP_PREFIX });
   await store.open();
 
-  const logName = store.latest ? store.logName : WAL_FILE;
-  const log = new EntryLog(await disk.openFile(logName, { create: true }), store.latest
-    ? { baseIndex: store.latest.lastIncludedIndex, baseTerm: store.latest.lastIncludedTerm }
-    : {});
-  await log.open();
+  // The log-choice rule, and it is openWalStorage's rule EXACTLY (not a
+  // paraphrase): the newest candidate that OPENS — generation-paired
+  // logs newest first, the legacy WAL last — and only failing all of
+  // those, a fresh log based at the committed boundary (or a fresh WAL
+  // when there is no generation). The paraphrase this used to be
+  // ("store.latest ? store's log : WAL") picked an EMPTY based log in
+  // precisely the crash states the difference exists for: a member that
+  // committed an install's manifest and died before adopting it still
+  // HAS its old log, and must boot as the state that old log describes
+  // so the leader can install again.
+  let log = null;
+  const candidates = [...await store.logCandidates(), WAL_FILE];
+  for (const name of candidates) {
+    try {
+      const l = new EntryLog(await disk.openFile(name, { create: false }));
+      await l.open();
+      log = l;
+      break;
+    } catch { /* missing or torn: try the predecessor */ }
+  }
+  if (!log) {
+    if (store.latest) {
+      const { handle } = await store.createLogFile();
+      handle.truncate(0); // the name may be a torn leftover
+      log = new EntryLog(handle, {
+        baseIndex: store.latest.lastIncludedIndex,
+        baseTerm: store.latest.lastIncludedTerm
+      });
+    } else {
+      log = new EntryLog(await disk.openFile(WAL_FILE, { create: true }));
+    }
+    await log.open();
+  }
 
   const machine = new KvMachine(disk);
   await machine.reload();

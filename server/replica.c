@@ -1068,8 +1068,17 @@ static int restore_if_stale(replica *r) {
         if (e) return e;
         elog *fresh = elog_create_at(&io, boundary, bterm);
         if (!fresh) { if (io.close) io.close(io.ctx); return BJ_ERR_OOM; }
+        /* The old log's hard state can sit BELOW the boundary's term --
+         * this member crashed before it ever appended an entry of the
+         * term that produced the snapshot -- and a log based at term T
+         * refuses a hard state under T. The manifest is newer knowledge:
+         * raise the term to it, and drop the vote, which belonged to the
+         * old term (raising can never double a vote; keeping the old
+         * term could refuse the log its own base). */
         uint64_t hard_term = elog_current_term(r->log);
-        if (hard_term > 0) e = elog_set_hard_state(fresh, hard_term, elog_voted_for(r->log));
+        uint64_t voted = elog_voted_for(r->log);
+        if (hard_term < bterm) { hard_term = bterm; voted = 0; }
+        if (hard_term > 0) e = elog_set_hard_state(fresh, hard_term, voted);
         if (!e) e = elog_sync(fresh);
         if (e) {
             elog_free(fresh);

@@ -274,6 +274,19 @@ interleaved with another database's at all.
 | `{op:'listDatabases'}` | `{ok:true, databases:[...]}` — the subdirectories of the root |
 | `{op:'dropDatabase', db}` | `{ok:true, dropped}` — the directory and everything in it; `false` if there was none |
 
+**`dropDatabase` is replicated.** On a `--raft` member it travels the
+log as an instance-level entry (`{d, i:'drop'}` — an act *about* a
+database, where the ordinary envelope `{d, c}` carries a command *for*
+one), so every member removes its own directory at apply, a member that
+was down learns the drop from the log it is caught up with, and the
+reply is the leader's apply result. A request that was in flight on the
+database when the drop committed is answered `code: -71` — its session
+was closed by the apply, whatever it wrote is gone with the database
+either way, and the refusal is deliberately not retried automatically:
+retrying a write would recreate the database the drop just removed.
+Change streams that were live on it end with their session; there is no
+invalidate event.
+
 **Named is made.** A request naming a database that is not there creates
 it, the same way an insert makes a collection: there is nothing to be
 gained from a separate act of creation whose only effect is a directory.

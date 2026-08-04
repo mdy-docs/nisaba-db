@@ -441,9 +441,16 @@ const ENGINES = [
 /* Distinct ports, allocated as suites are declared: two servers are alive
  * at once whenever vitest's teardown of one overlaps the setup of the
  * next, and a bound port is the one resource these tests cannot make a
- * fresh copy of. 18000 belongs to the protocol suite above. */
+ * fresh copy of. 18000 belongs to the protocol suite above. Slots are
+ * 500 wide -- no suite offsets anywhere near that -- because at 1000 the
+ * 49th slot walked off the end of the port space, and the failure was a
+ * parse error in whichever suite happened to be declared last. */
 let portSlot = 1;
-const nextPort = () => 18000 + (portSlot++) * 1000 + (process.pid % 1000);
+const nextPort = () => {
+  const port = 18000 + (portSlot++) * 500 + (process.pid % 500);
+  if (port > 65000) throw new Error(`port slots exhausted (${port})`);
+  return port;
+};
 
 async function startServer(engine, port, extra = [], docs = 0, reuse = null) {
   // docs < 0: an EMPTY directory -- no catalog, no collection, nothing.
@@ -908,10 +915,9 @@ for (const engine of ENGINES) {
             .rejects.toMatchObject({ code: -63, leaderId: leaders[0][1].leaderId });
           /* The instance's own ops are classified too, and by the same
            * table: listDatabases reads, dropDatabase writes. A follower
-           * refuses both -- which for dropDatabase matters more than it
-           * looks, because it is not replicated (the standing debt in
-           * docs/replicaton-roadmap.md) and a follower performing one
-           * would silently diverge. */
+           * refuses both; the drop then travels the LOG from the leader
+           * (the replicated-drop suite below), which is how the follower
+           * performs it without diverging. */
           await expect(c.listDatabases()).rejects.toMatchObject({ code: -63 });
           await expect(c.dropDatabase(DB)).rejects.toMatchObject({ code: -63 });
         } finally { await c.close(); }
@@ -3850,5 +3856,200 @@ describe.skipIf(!have(NATIVE))('nisaba-server: crash-points in the mid-adopt win
     expect(await coll2.countDocuments({ n: 100000 })).toBe(1);
     await client2.close();
     await halt(proc2);
+  }, 90000);
+});
+
+/*
+ * dropDatabase, replicated (the standing debt in docs/replicaton-roadmap.md,
+ * paid). The drop travels the log as an instance-level entry
+ * ({d, i:'drop'} -- an act ABOUT a database, where {d, c} carries a
+ * command FOR one), so every member removes its own directory at apply,
+ * a restarted member converges by replay, and the reply is the leader's
+ * apply result. The sharp edge is a request in flight on the database a
+ * committed drop closes: its session is gone before its settlement, and
+ * the answer is the -71 refusal rather than a stepped result -- or a
+ * dead server, which is what an unguarded token would have produced.
+ */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: dropDatabase is replicated ($name)', (engine) => {
+  const base = nextPort();
+  const members = [1, 2].map((id) => ({
+    id, port: base + id - 1, raftPort: base + 10 + id - 1,
+    dir: fs.mkdtempSync(path.join(os.tmpdir(), `nisaba-drop${id}-`))
+  }));
+  const raftArgs = (m) => ['--raft', String(m.id), '--raft-port', String(m.raftPort),
+    ...members.filter((r) => r.id !== m.id)
+      .flatMap((r) => ['--peer', `${r.id}@127.0.0.1:${r.raftPort}`])];
+
+  const boot = (m) => {
+    const [cmd, args, opts] = engine.argv(m.dir, m.port, raftArgs(m));
+    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+    let log = '';
+    proc.stderr.on('data', (d) => { log += d; });
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error(`member ${m.id} did not start: ${log}`)), 30000);
+      proc.stderr.on('data', () => {
+        if (log.includes('serving')) { clearTimeout(t); m.proc = proc; resolve(); }
+      });
+    });
+  };
+  const halt = async (m) => {
+    if (!m.proc) return;
+    m.proc.kill();
+    await new Promise((r) => m.proc.once('exit', r));
+    m.proc = null;
+  };
+  const leaderClient = async () => {
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      for (const m of members) {
+        if (!m.proc) continue;
+        try {
+          const c = await connectServer(m.port, { keepAliveMs: 0 });
+          if ((await c.ping()).role === 'leader') return { c, m };
+          await c.close();
+        } catch { /* booting */ }
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error('no leader');
+  };
+  const untilTrue = async (pred, ms = 15000) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (await pred()) return;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error('condition never held');
+  };
+
+  let lead, follower, client;
+
+  beforeAll(async () => {
+    await Promise.all(members.map(boot));
+    ({ c: client, m: lead } = await leaderClient());
+    follower = members.find((m) => m.id !== lead.id);
+    return async () => {
+      await client.close().catch(() => {});
+      for (const m of members) await halt(m);
+    };
+  }, 60000);
+
+  it('a drop on the leader removes the directory on every member', async () => {
+    for (let i = 0; i < 3; i++) {
+      await client.db('victim').collection('x').insertOne({ i });
+    }
+    await untilTrue(() => fs.existsSync(path.join(follower.dir, 'victim')));
+
+    expect(await client.dropDatabase('victim')).toBe(true);
+    expect(await client.listDatabases()).not.toContain('victim');
+    // The follower applied the same entry against its own root -- the
+    // divergence this act used to leave is the thing being tested.
+    await untilTrue(() => !fs.existsSync(path.join(follower.dir, 'victim')));
+    expect(fs.existsSync(path.join(lead.dir, 'victim'))).toBe(false);
+
+    // Absent: the entry still commits, and says nothing was there.
+    expect(await client.dropDatabase('victim')).toBe(false);
+  }, 60000);
+
+  it('a member restarted across the drop converges by replay, not by luck', async () => {
+    await client.db('phoenix').collection('x').insertOne({ n: 1 });
+    await untilTrue(() => fs.existsSync(path.join(follower.dir, 'phoenix')));
+    // The follower is DOWN when the drop is proposed: it learns it from
+    // the log it is caught up with after its restart, there is no other
+    // channel. (Not awaited before the reboot -- in a group of two the
+    // drop cannot commit until the follower is back to ack it.)
+    await halt(follower);
+    const drop = client.dropDatabase('phoenix');
+    await new Promise((r) => setTimeout(r, 300));
+    await boot(follower);
+    expect(await drop).toBe(true);
+    await untilTrue(() => !fs.existsSync(path.join(follower.dir, 'phoenix')));
+
+    // And the name is reusable: using it recreates it everywhere.
+    await client.db('phoenix').collection('x').insertOne({ back: true });
+    await untilTrue(() => fs.existsSync(path.join(follower.dir, 'phoenix')));
+  }, 60000);
+
+  it('a write in flight when its database is dropped is refused (-71), and the member survives', async () => {
+    await client.db('racing').collection('y').insertOne({ seed: true });
+    // Stop the follower: nothing can commit, so both requests below park
+    // in the log in order -- the write's entry first, the drop's second.
+    // The restart commits both: the write applies, then the drop closes
+    // the session that would have built its reply.
+    await halt(follower);
+    const second = await connectServer(lead.port, { keepAliveMs: 0 });
+    const write = client.db('racing').collection('y').insertOne({ racing: true })
+      .then((r) => ({ ok: r }), (e) => ({ code: e.code }));
+    await new Promise((r) => setTimeout(r, 500));   // its entry is appended first
+    const drop = second.dropDatabase('racing')
+      .then((r) => ({ ok: r }), (e) => ({ code: e.code }));
+    await new Promise((r) => setTimeout(r, 500));
+    await boot(follower);
+
+    expect(await write).toEqual({ code: -71 });
+    expect(await drop).toEqual({ ok: true });
+    // Not a wound: the same connections keep serving.
+    expect(await client.listDatabases()).not.toContain('racing');
+    await second.close();
+  }, 60000);
+});
+
+/*
+ * The drop can remove the database that held the applied floor -- the
+ * floor is a MAX over databases -- and after compaction the survivors'
+ * floor can sit BELOW the log's base. A restart must read the base as
+ * the floor it is (the snapshot IS the state at the base) rather than
+ * trying to replay entries that no longer exist. Native only: one
+ * member, and the machinery is the same C on both engines.
+ */
+describe.skipIf(!have(NATIVE))('nisaba-server: a drop, then compaction, then a restart', () => {
+  it('the restarted member boots at the base with the drop in force', async () => {
+    const port = nextPort();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-dropfloor-'));
+    const boot = (p) => {
+      const proc = spawn(path.resolve(NATIVE), ['--port', String(p), '--raft', '1',
+        '--snapshot-entries', '1'], { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
+      let log = '';
+      proc.stderr.on('data', (d) => { log += d; });
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error(`did not start: ${log}`)), 30000);
+        proc.on('exit', (code) => { clearTimeout(t); reject(new Error(`exit ${code}: ${log}`)); });
+        proc.stderr.on('data', () => {
+          if (log.includes('serving')) { clearTimeout(t); resolve(proc); }
+        });
+      });
+    };
+
+    let proc = await boot(port);
+    let client = await connectServer(port);
+    await client.db('keep').collection('a').insertOne({ n: 1 });
+    // The victim holds the max applied index when it is dropped...
+    for (let i = 0; i < 5; i++) await client.db('victim').collection('b').insertOne({ i });
+    expect(await client.dropDatabase('victim')).toBe(true);
+    // ...and compaction then moves the base past the drop, so the
+    // surviving files' floor ('keep', long idle) is below the base.
+    const deadline = Date.now() + 15000;
+    let s = null;
+    while (Date.now() < deadline) {
+      s = await client.ping();
+      if (s.base > 0 && s.base === s.applied) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    expect(s.base).toBe(s.applied);
+    await client.close();
+    proc.kill();
+    await new Promise((r) => proc.once('exit', r));
+
+    // The boot that used to be a trap: floor(keep) < base, entries gone.
+    proc = await boot(port + 1);
+    client = await connectServer(port + 1);
+    expect(await client.listDatabases()).toEqual(['keep']);
+    expect(await client.db('keep').collection('a').countDocuments({})).toBe(1);
+    await client.db('keep').collection('a').insertOne({ n: 2 });   // still writable
+    expect(await client.db('keep').collection('a').countDocuments({})).toBe(2);
+    await client.close();
+    proc.kill();
+    await new Promise((r) => proc.once('exit', r));
   }, 90000);
 });

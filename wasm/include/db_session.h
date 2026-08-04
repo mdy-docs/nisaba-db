@@ -185,6 +185,16 @@ extern "C" {
  * in-flight writes have settled. */
 #define DC_ERR_BATCH_TOO_LARGE      (-70)
 
+/* The database this request was planned against was dropped while the
+ * request was in flight -- a committed dropDatabase closed it between
+ * the request's propose and its settlement. The request's own entries
+ * sit BELOW the drop in the log, so anything they applied is gone with
+ * the database either way; what cannot be produced is a result, because
+ * the session that would have built it no longer exists. Not retried
+ * automatically: retrying a write would recreate the database the drop
+ * just removed, and only the caller knows whether it means to. */
+#define DC_ERR_DB_DROPPED           (-71)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)

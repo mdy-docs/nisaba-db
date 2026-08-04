@@ -158,11 +158,11 @@ int dbi_handle(dbi *i, uint64_t client, const uint8_t *req, size_t req_len,
  * dbs_request_kind with the instance's own three ops in front of it.
  *
  * `dropDatabase` is a WRITE and is classified as one, which is what
- * makes a follower refuse it. It is NOT yet replicated -- it is answered
- * outright by whichever member takes it, so on a leader it removes a
- * directory the followers keep. That is a real gap and it is written
- * down rather than hidden by the classification: see
- * docs/steps/README.md.
+ * makes a follower refuse it -- and on the replicated path it IS
+ * replicated: dbi_propose turns it into an instance-level log entry
+ * that every member applies against its own root (see below). It was
+ * once answered outright, which removed a directory only the leader
+ * stopped having; that divergence is closed.
  */
 void dbi_request_kind(const uint8_t *req, size_t req_len, int *kind);
 
@@ -178,6 +178,21 @@ void dbi_request_kind(const uint8_t *req, size_t req_len, int *kind);
  * db_wal.h's grammar stay exactly what it is, and what lets a command
  * built by a host whose log is per-database (src/db-wal.js) still be the
  * same bytes.
+ *
+ * One entry carries no command at all, because its act is about a
+ * database rather than for one:
+ *
+ *     { d: "<database>", i: "drop" }        -- dropDatabase, replicated
+ *
+ * Applying it closes the database's session (whatever that session has
+ * in flight -- see DC_ERR_DB_DROPPED) and removes its directory; the
+ * apply result ({ok, dropped}) is the reply. A replay reader
+ * (dbi_entry_cmd) sees "no command" and skips it, so a resumed change
+ * stream never has to know the form exists. Streams that were LIVE on
+ * the dropped database end silently with their session; there is no
+ * invalidate event, deliberately -- the log records commands, not
+ * outcomes, and a drop's outcome is that there is nothing left to say
+ * events about.
  */
 int dbi_propose(dbi *i, uint64_t client, const uint8_t *req, size_t req_len,
                 uint64_t *token, dbuf *cmds, dbuf *out);

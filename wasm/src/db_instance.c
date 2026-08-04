@@ -14,12 +14,26 @@
  * as well as its request, which is what lets dbs_step find the one that
  * planned it without a second table to keep in step.
  *
- * A session with work in flight is never closed, so a slot cannot mean
- * one database at propose and another at step.
+ * A session with work in flight used to be provably never closed, so a
+ * slot could not mean one database at propose and another at step. A
+ * replicated dropDatabase broke the proof: the drop is a committed log
+ * entry, and applying it MUST close the session whatever is in flight
+ * there -- every replica applies the same prefix, and one that deferred
+ * the close would diverge from the ones that did not. So the token now
+ * carries the slot's GENERATION, bumped at every close, and a step
+ * whose generation is stale is answered DC_ERR_DB_DROPPED rather than
+ * stepped into whichever database occupies the slot now.
  */
-#define TOKEN_SLOT(t)      ((uint32_t)((t) >> 48) - 1u)
-#define TOKEN_INNER(t)     ((t) & 0xffffffffffffULL)
-#define TOKEN_MAKE(slot,i) ((((uint64_t)(slot) + 1u) << 48) | (i))
+#define TOKEN_SLOT(t)          ((uint32_t)((t) >> 48) - 1u)
+#define TOKEN_GEN(t)           ((uint32_t)((t) >> 40) & 0xffu)
+#define TOKEN_INNER(t)         ((t) & 0xffffffffffULL)
+#define TOKEN_MAKE(slot,gen,i) ((((uint64_t)(slot) + 1u) << 48) | \
+                                (((uint64_t)(gen) & 0xffu) << 40) | (i))
+
+/* The token of an INSTANCE act -- a request whose one log entry is about
+ * a database rather than for one. No slot, no session, no state: the
+ * apply's result is the whole answer, so the token needs no identity. */
+#define TOKEN_INSTANCE     (~0ULL)
 
 typedef struct {
     int      used;
@@ -33,6 +47,9 @@ struct dbi {
     dbi_root  root;
     int       order;
     dbi_slot  db[DBI_MAX_DATABASES];
+    /* Each slot's generation, OUTSIDE the slot: slot_close wipes the
+     * slot, and the generation's whole job is to survive that. */
+    uint32_t  gen[DBI_MAX_DATABASES];
     /* One counter for every cursor and every stream in the process. */
     uint64_t  next_id;
     /* The entry log's reader (dbi_set_log), handed to every database
@@ -59,6 +76,7 @@ static void slot_close(dbi *i, dbi_slot *d) {
     /* The session first: it holds trees over files in this namespace. */
     dbs_close(d->s);
     i->root.close_ns(i->root.ctx, &d->ns);
+    i->gen[d - i->db]++;   /* every token minted against this occupancy is dead */
     memset(d, 0, sizeof *d);
 }
 
@@ -367,17 +385,73 @@ static int wrap_commands(const char *db, uint32_t db_len, const dbuf *in, dbuf *
     return e;
 }
 
-/* The slot a token belongs to, or NULL for one nobody issued. */
+/* The slot a token belongs to, or NULL for one nobody issued -- and
+ * NULL too when the occupancy that minted it has since been closed (a
+ * committed dropDatabase): the generation is the proof. */
 static dbi_slot *slot_of_token(dbi *i, uint64_t token) {
     uint32_t slot = TOKEN_SLOT(token);
     if (slot >= DBI_MAX_DATABASES) return NULL;
+    if ((i->gen[slot] & 0xffu) != TOKEN_GEN(token)) return NULL;
     return i->db[slot].used ? &i->db[slot] : NULL;
+}
+
+/* The one-entry plan of an instance act: [ { d: <name>, i: <act> } ].
+ * The `c`-less envelope is the marker -- dbi_entry_cmd already reads
+ * such an entry as "no command", so a change-stream replay skips it
+ * without knowing it exists. */
+static int plan_instance(const uint8_t *name, uint32_t nlen, const char *act,
+                         dbuf *cmds) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+    if (!e) e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"d", 1);
+    if (!e) e = bj_put_string(b, name, nlen);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"i", 1);
+    if (!e) e = bj_put_string(b, (const uint8_t *)act, (uint32_t)strlen(act));
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_end_array(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t n = 0;
+        const uint8_t *d = bj_builder_data(b, &n);
+        cmds->len = 0;
+        e = d ? dbuf_put(cmds, d, n) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
 }
 
 int dbi_propose(dbi *i, uint64_t client, const uint8_t *req, size_t req_len,
                 uint64_t *token, dbuf *cmds, dbuf *out) {
     if (!i || !req || !token || !cmds || !out) return BJ_ERR_STATE;
     *token = 0;
+
+    /*
+     * dropDatabase, ON THE REPLICATED PATH, is a log entry like any
+     * other write -- answered outright it removed a directory only the
+     * leader stopped having, which was the divergence recorded for as
+     * long as the instance existed. The entry carries the act rather
+     * than its outcome; every member applies it against its own root,
+     * and the leader's apply result is the reply. Validated here the
+     * way any proposal is: a name the entry could never apply is
+     * refused before anything is appended.
+     */
+    if (op_is(req, req_len, "dropDatabase")) {
+        const uint8_t *name; uint32_t nlen; int found = 0;
+        int e = req_str(req, req_len, "db", &name, &nlen, &found);
+        if (e || !found) {
+            e = dbs_refusal(e ? DC_ERR_REQ_MALFORMED : DC_ERR_REQ_MISSING_FIELD, out);
+            return e < 0 ? e : BJ_OK;
+        }
+        e = dc_check_db_name((const char *)name, nlen);
+        if (!e && nlen >= DBI_NAME_MAX) e = DC_ERR_INVALID_DB_NAME;
+        if (e) { e = dbs_refusal(e, out); return e < 0 ? e : BJ_OK; }
+        e = plan_instance(name, nlen, "drop", cmds);
+        if (e) return e;
+        *token = TOKEN_INSTANCE;
+        return BJ_OK;
+    }
 
     int r = instance_op(i, req, req_len, out);
     if (r) return r < 0 ? r : BJ_OK;   /* answered outright; nothing to log */
@@ -396,7 +470,7 @@ int dbi_propose(dbi *i, uint64_t client, const uint8_t *req, size_t req_len,
     if (e || !inner) return e;
     e = wrap_commands(d->name, d->name_len, cmds, cmds);
     if (e) { dbs_abandon(s, inner); return e; }
-    *token = TOKEN_MAKE((uint32_t)(d - i->db), inner);
+    *token = TOKEN_MAKE((uint32_t)(d - i->db), i->gen[d - i->db], inner);
     return BJ_OK;
 }
 
@@ -405,20 +479,41 @@ int dbi_step(dbi *i, uint64_t token, const uint64_t *indices,
              uint64_t *next, dbuf *cmds, dbuf *out) {
     if (!i || !next || !cmds || !out) return BJ_ERR_STATE;
     *next = 0;
+
+    /* An instance act settles in one trip: its apply result -- built by
+     * dbi_apply on every replica, read here on the one with the client
+     * -- IS the reply, refusal included (a deterministic rc is an answer
+     * every replica computed identically). */
+    if (token == TOKEN_INSTANCE) {
+        if (!results || n != 1) return BJ_ERR_STATE;
+        if (results[0].rc) {
+            int e = dbs_refusal(results[0].rc, out);
+            return e < 0 ? e : BJ_OK;
+        }
+        return dbuf_put(out, results[0].data, results[0].len);
+    }
+
     dbi_slot *d = slot_of_token(i, token);
-    if (!d) return BJ_ERR_STATE;
+    if (!d) {
+        /* The occupancy that planned this request is gone -- a committed
+         * dropDatabase closed it while the request was in flight. The
+         * client is refused, not the server errored: the log applied
+         * everything in order and the state is exactly what it says. */
+        int e = dbs_refusal(DC_ERR_DB_DROPPED, out);
+        return e < 0 ? e : BJ_OK;
+    }
 
     uint64_t inner = 0;
     int e = dbs_step(d->s, TOKEN_INNER(token), indices, results, n, &inner, cmds, out);
     if (e || !inner) return e;
     e = wrap_commands(d->name, d->name_len, cmds, cmds);
     if (e) { dbs_abandon(d->s, inner); return e; }
-    *next = TOKEN_MAKE((uint32_t)(d - i->db), inner);
+    *next = TOKEN_MAKE((uint32_t)(d - i->db), i->gen[d - i->db], inner);
     return BJ_OK;
 }
 
 void dbi_abandon(dbi *i, uint64_t token) {
-    if (!i) return;
+    if (!i || token == TOKEN_INSTANCE) return;
     dbi_slot *d = slot_of_token(i, token);
     if (d) dbs_abandon(d->s, TOKEN_INNER(token));
 }
@@ -443,7 +538,23 @@ int dbi_apply(dbi *i, uint64_t index, const uint8_t *payload, uint32_t len,
 
     const uint8_t *cmd; size_t cmd_len;
     e = obj_get_field(payload, len, (const uint8_t *)"c", 1, &cmd, &cmd_len, &found);
-    if (e || !found) return DC_ERR_WAL_MISSING_FIELD;
+    if (e) return DC_ERR_WAL_MISSING_FIELD;
+    if (!found) {
+        /* No command: an INSTANCE act, about the database rather than
+         * for it. An act this build cannot name is refused rather than
+         * skipped -- a replica that ignores what it does not understand
+         * has diverged from one that does not. */
+        const uint8_t *act; uint32_t alen; int af = 0;
+        if (req_str(payload, len, "i", &act, &alen, &af) || !af)
+            return DC_ERR_WAL_MISSING_FIELD;
+        if (alen == 4 && memcmp(act, "drop", 4) == 0) {
+            int dropped = 0;
+            e = dbi_drop(i, (const char *)name, nlen, &dropped);
+            if (e) return e;
+            return respond_flag(result, "dropped", dropped);
+        }
+        return DC_ERR_WAL_MISSING_FIELD;
+    }
 
     /* Created if this is the entry that makes it, the way a collection is
      * made by the insert that first names it: a replica applying a

@@ -141,13 +141,24 @@ Now the replication roadmap. Having read the new primitives' contracts, here's t
 
 ## Standing debt
 
-**`dropDatabase` is not replicated.** It is answered outright by
-whichever member takes it (`db_instance.c`'s `instance_op`), so on a
-leader it removes a directory the followers keep — a divergence the log
-never records and nothing detects. It is CLASSIFIED as a write, so a
-follower refuses it and only the leader can perform it, which halves
-the hole; the other half needs an instance-level log entry, because the
-existing envelope (`{ d, c }`) carries a command for a database rather
-than a command about one. Found while classifying ops for the read
-decision; it arrived with the instance and was never covered.
-`test/db.server.test.js` pins the follower refusal.
+None. The last one is paid:
+
+**`dropDatabase` is replicated now.** It used to be answered outright by
+whichever member took it, so on a leader it removed a directory the
+followers kept — a divergence the log never recorded. The other half of
+the fix was exactly what the debt named: an instance-level log entry
+(`{d, i:'drop'}`), because the existing envelope (`{d, c}`) carries a
+command *for* a database rather than a command *about* one. Every member
+applies the drop against its own root; a member that was down converges
+by replay; the leader's apply result is the reply. Two consequences had
+to be paid with it. A committed drop is the one thing that closes a
+session with work in flight, so tokens now carry their slot's
+generation and a request stranded by the drop is refused `-71`
+(DC_ERR_DB_DROPPED) rather than stepped into whichever database occupies
+the slot next — or crashing the server, which is what the unguarded
+token did. And the applied floor is a MAX over databases, so dropping
+the one that held it can leave the survivors' floor below a compacted
+log's base at restart; `replica_open` now reads the base as the floor it
+is (the snapshot IS the state at the base). All of it tested on both
+engines, plus a native unit test for the slot-reuse case client timing
+cannot reach.

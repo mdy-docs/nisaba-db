@@ -2441,6 +2441,156 @@ TEST(one_log_addresses_every_database_and_the_floor_spans_all_of_them) {
     inst_close(&back);
 }
 
+TEST(a_replicated_drop_travels_the_log_and_a_dangling_token_is_refused) {
+    /*
+     * dropDatabase on the replicated path is a LOG ENTRY -- {d, i:'drop'},
+     * an act about a database where {d, c} carries a command for one --
+     * applied by every member against its own root. And the entry is the
+     * one thing that can close a session with work in flight: a request
+     * planned against the dropped database settles AFTER the drop
+     * applied, and its token now names a slot whose occupancy is gone.
+     * The token carries the slot's generation for exactly this moment:
+     * the step is answered DC_ERR_DB_DROPPED -- even when a NEW database
+     * has taken the slot, which is the case a bare used-check cannot
+     * tell apart, and stepping into the squatter's session would be a
+     * request answered by a database it never named.
+     */
+    inst_fixture fx;
+    CHECK_FATAL(inst_open(&fx, "nisaba-inst-drop") == 0);
+    const uint64_t CLIENT = 9;
+    uint64_t index = 800;
+
+    /* A write on `alpha`, planned but NOT yet settled. */
+    uint8_t oid[12];
+    memset(oid, 0, sizeof oid);
+    oid[0] = 0xAD; oid[11] = 1;
+    doc *d = doc_new();
+    doc_oid(d, "_id", oid);
+    doc_str(d, "who", "alpha");
+    uint32_t dlen; const uint8_t *body = doc_done(d, &dlen);
+    const uint8_t *req; uint32_t req_len;
+    bj_builder *rb = request_with_id("insert", "people", "doc", body, dlen, oid,
+                                     &req, &req_len);
+    bj_builder *wb = bj_builder_new();
+    CHECK_FATAL(wb != NULL);
+    CHECK_OK(bj_begin_object(wb));
+    CHECK_OK(bj_put_key(wb, (const uint8_t *)"db", 2));
+    CHECK_OK(bj_put_string(wb, (const uint8_t *)"alpha", 5));
+    {
+        cur c = { req, req_len, 0 };
+        uint32_t n = 0;
+        CHECK_OK(object_begin(&c, &n));
+        for (uint32_t k = 0; k < n; k++) {
+            const uint8_t *kn; uint32_t klen;
+            CHECK_OK(take_key(&c, &kn, &klen));
+            size_t start = c.pos;
+            CHECK_OK(skip_value(&c));
+            CHECK_OK(bj_put_key(wb, kn, klen));
+            CHECK_OK(bj_put_raw(wb, c.d + start, (uint32_t)(c.pos - start)));
+        }
+    }
+    CHECK_OK(bj_end_object(wb));
+    size_t wlen = 0;
+    const uint8_t *wreq = bj_builder_data(wb, &wlen);
+    CHECK_FATAL(wreq != NULL);
+
+    dbuf res = {0}, wcmds = {0};
+    uint64_t wtoken = 0;
+    CHECK_OK(dbi_propose(fx.i, CLIENT, wreq, wlen, &wtoken, &wcmds, &res));
+    CHECK(wtoken != 0);
+
+    /* The write's entry applies (it sits below the drop in the log)... */
+    uint64_t wix[1];
+    dbuf wout = {0};
+    dbs_result wr;
+    {
+        cur c = { wcmds.data, wcmds.len, 0 };
+        uint32_t got = 0;
+        CHECK_OK(array_begin(&c, &got));
+        size_t start = c.pos;
+        CHECK_OK(skip_value(&c));
+        wix[0] = index++;
+        wr.rc = dbi_apply(fx.i, wix[0], c.d + start, (uint32_t)(c.pos - start), &wout);
+        CHECK_I64(wr.rc, 0);
+        wr.data = wout.data;
+        wr.len = (uint32_t)wout.len;
+    }
+
+    /* ...then the drop is proposed: one instance-level entry, no session. */
+    bj_builder *db_ = bj_builder_new();
+    CHECK_FATAL(db_ != NULL);
+    CHECK_OK(bj_begin_object(db_));
+    CHECK_OK(bj_put_key(db_, (const uint8_t *)"op", 2));
+    CHECK_OK(bj_put_string(db_, (const uint8_t *)"dropDatabase", 12));
+    CHECK_OK(bj_put_key(db_, (const uint8_t *)"db", 2));
+    CHECK_OK(bj_put_string(db_, (const uint8_t *)"alpha", 5));
+    CHECK_OK(bj_end_object(db_));
+    size_t drlen = 0;
+    const uint8_t *drreq = bj_builder_data(db_, &drlen);
+    CHECK_FATAL(drreq != NULL);
+
+    dbuf dres = {0}, dcmds = {0};
+    uint64_t dtoken = 0;
+    CHECK_OK(dbi_propose(fx.i, CLIENT, drreq, drlen, &dtoken, &dcmds, &dres));
+    CHECK(dtoken != 0);
+    CHECK_I64((long long)array_len(dcmds.data, dcmds.len), 1);
+
+    /* The drop entry applies: session closed, directory gone. */
+    uint64_t dix[1];
+    dbuf dout = {0};
+    dbs_result dr;
+    {
+        cur c = { dcmds.data, dcmds.len, 0 };
+        uint32_t got = 0;
+        CHECK_OK(array_begin(&c, &got));
+        size_t start = c.pos;
+        CHECK_OK(skip_value(&c));
+        dix[0] = index++;
+        dr.rc = dbi_apply(fx.i, dix[0], c.d + start, (uint32_t)(c.pos - start), &dout);
+        CHECK_I64(dr.rc, 0);
+        dr.data = dout.data;
+        dr.len = (uint32_t)dout.len;
+    }
+    {
+        dbuf names = {0};
+        uint32_t n = 0;
+        CHECK_OK(dbi_list(fx.i, &names));
+        CHECK_I64(names_have(&names, "alpha", &n), 0);
+        dbuf_free(&names);
+    }
+
+    /* A squatter takes the freed slot -- the reuse a bare used-check
+     * would mistake for the original occupancy. */
+    dbs *squatter = NULL;
+    CHECK_OK(dbi_database(fx.i, "squatter", 8, 1, &squatter));
+
+    /* The write's settlement arrives: refused as DB_DROPPED, never
+     * stepped into the squatter's session. */
+    uint64_t more = 0;
+    dbuf again = {0};
+    res.len = 0;
+    CHECK_OK(dbi_step(fx.i, wtoken, wix, &wr, 1, &more, &again, &res));
+    CHECK_I64((long long)more, 0);
+    CHECK_I64(response_ok(&res), 0);
+    {
+        int f = 0;
+        CHECK_I64(response_num(&res, "code", &f), DC_ERR_DB_DROPPED);
+    }
+
+    /* The drop's own settlement: its apply result is its reply. */
+    dres.len = 0;
+    CHECK_OK(dbi_step(fx.i, dtoken, dix, &dr, 1, &more, &again, &dres));
+    CHECK_I64((long long)more, 0);
+    CHECK_I64(response_ok(&dres), 1);
+    CHECK_I64(response_flag(&dres, "dropped"), 1);
+
+    dbuf_free(&again); dbuf_free(&dout); dbuf_free(&dcmds); dbuf_free(&dres);
+    dbuf_free(&wout); dbuf_free(&wcmds); dbuf_free(&res);
+    bj_builder_free(db_); bj_builder_free(wb); bj_builder_free(rb);
+    doc_free(d);
+    inst_close(&fx);
+}
+
 TEST(a_reopened_session_knows_where_its_apply_got_to) {
     /*
      * The replay floor, read by a session that has just opened and has
@@ -11470,6 +11620,7 @@ int main(void) {
     RUN(a_replicated_write_answers_exactly_what_an_unreplicated_one_does);
     RUN(an_instance_keeps_its_databases_apart_and_addresses_them_by_name);
     RUN(one_log_addresses_every_database_and_the_floor_spans_all_of_them);
+    RUN(a_replicated_drop_travels_the_log_and_a_dangling_token_is_refused);
     RUN(a_reopened_session_knows_where_its_apply_got_to);
     RUN(a_bulk_writes_later_operation_sees_its_earlier_ones);
     RUN(a_database_can_be_built_from_an_empty_directory);

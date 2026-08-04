@@ -1223,6 +1223,19 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
      * apply a non-event.
      */
     r->applied = dbi_applied_floor(inst);
+    /*
+     * The floor is a MAX over databases, and a replicated dropDatabase
+     * can remove the database that held it -- after which the surviving
+     * ones report something older. Below the log's base that is not a
+     * replay plan, it is a trap: the entries between are compacted away,
+     * and the snapshot the base came from IS the state at the base
+     * (the drop applied before the boundary was taken, or the install
+     * adopted it whole). Above the base the regression is legal and the
+     * replay is the answer: re-applying recreates the dropped database
+     * entry by entry and the drop entry removes it again.
+     */
+    if (r->applied < elog_base_index(r->log))
+        r->applied = elog_base_index(r->log);
     rn_seed_commit(r->node, r->applied > elog_commit_index(r->log)
                                 ? r->applied : elog_commit_index(r->log));
 

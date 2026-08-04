@@ -180,6 +180,10 @@ const char *dc_strerror(int code) {
                    "track in flight; nothing was applied. Split the list into "
                    "smaller requests, or retry when in-flight writes have "
                    "settled";
+        case DC_ERR_DB_DROPPED:
+            return "The database this request was using was dropped while the "
+                   "request was in flight; whatever the request applied is "
+                   "gone with it, and no result can be produced";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

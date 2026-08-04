@@ -1,0 +1,51 @@
+{
+  "name": "nisaba-db",
+  "version": "1.0.0",
+  "description": "A WASM/C, MongoDB-driver-shaped embedded document database for Node and the browser: CRUD, query operators, $regex, secondary/geo/text indexes, change streams. One wasm binary serves both platforms; only the storage provider differs.",
+  "type": "module",
+  "main": "src/db.js",
+  "types": "types/nisaba.d.ts",
+  "exports": {
+    ".": { "types": "./types/nisaba.d.ts", "default": "./src/db.js" },
+    "./node": { "types": "./types/node.d.ts", "default": "./src/db-node.js" },
+    "./coordinator": { "types": "./types/coordinator.d.ts", "default": "./src/db-coordinator.js" },
+    "./wasm": { "types": "./types/wasm.d.ts", "default": "./wasm/nisaba-wasm.js" }
+  },
+  "files": [
+    "src",
+    "wasm",
+    "types",
+    "third_party"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "node build.mjs",
+    "test": "node smoke.mjs"
+  },
+  "keywords": [
+    "database",
+    "document-database",
+    "embedded-database",
+    "mongodb",
+    "wasm",
+    "opfs",
+    "binjson"
+  ],
+  "author": "Daniel Walton",
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdy-docs/nisaba-db.git",
+    "directory": "packages/nisaba-db"
+  },
+  "homepage": "https://github.com/mdy-docs/nisaba-db#readme",
+  "bugs": {
+    "url": "https://github.com/mdy-docs/nisaba-db/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

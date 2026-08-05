@@ -1138,6 +1138,24 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
       const { data, eof, size } = await conn.call({ op: 'readSnapshotFile', gen, role, offset });
       return { data, eof, size };
     },
+    /** The generation's MANIFEST FILE, whole and raw -- the binjson
+     * record plus the CRC-32 trailer whose validity IS the commit
+     * (snapstore.h). A restore puts these exact bytes back; a
+     * re-encoding is exactly not that. */
+    async readSnapshotManifest(gen) {
+      const parts = [];
+      let offset = 0;
+      for (;;) {
+        const { data, eof } = await conn.call({ op: 'readSnapshotFile', gen, manifest: true, offset });
+        parts.push(data);
+        offset += data.length;
+        if (eof) break;
+      }
+      const whole = new Uint8Array(offset);
+      let at = 0;
+      for (const p of parts) { whole.set(p, at); at += p.length; }
+      return whole;
+    },
     /* The escape hatch: send an op the wire has, `db` and all, and read
      * the response object as it came. A new op is usable from JavaScript
      * the day it lands in C, before it has a method. */

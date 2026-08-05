@@ -487,13 +487,31 @@ two tracks can proceed in parallel after it.
    re-ship, manifest-first pruning, the mixed-prefix refusal, and
    watch shipping gen 3 on the member's own `--snapshot-entries`
    cadence with nobody calling `snapshot`.
-6. **Restore half.** Test: wipe the root, `db-backup restore`, start
-   the server on the restored directory, assert
-   `snapshot install adopted at index N` on stderr, every document
-   readable, and a second member joining blank converges. The
-   mid-restore crash states (torn download, files-without-manifest)
-   must land in the forged-state suite in `test/db.server.test.js` —
-   they are exactly the directory shapes it already proves recoverable.
+6. ✅ **Restore half — built.** `restoreFromS3` (`db-backup restore
+   --into <empty-dir>`) refuses a non-empty directory, downloads the
+   chosen (or newest committed) generation with every file verified
+   against the manifest, and writes the manifest LAST — **byte-identical
+   to the member's own manifest file, CRC trailer and all**, which
+   required two artifact corrections to step 5: the wire gained
+   `{op:'readSnapshotFile', gen, manifest:true}` (the manifest file
+   itself, raw — a re-encoding is exactly not the bytes whose validity
+   is the commit), and the agent's own facts (member, boundary,
+   shipped-at) moved out of the manifest's bytes into S3 object
+   metadata. Tested end to end: a restored root boots, logs
+   `restoring snapshot at index N`, serves both databases, and takes
+   fresh writes; an interrupted restore (files, no manifest) is the
+   crashed-attempt shape — the server boots empty and sweeps it, and
+   nothing half-restored is ever adopted.
+
+   **Found along the way, and fixed:** a pre-existing pipelining bug in
+   `server/replica.c` — the deferred-answer paths treated the
+   connection's output buffer as per-request scratch and zeroed it, so
+   whenever an answered request (a ping) shared a `read()` with a
+   deferred one (a replicated write), the earlier answer was destroyed
+   and every later answer on that connection paired one request early.
+   The agent's poll-while-writing traffic hit it reliably; the HTTP
+   front's pooled connections could too. Deferral now takes back only
+   the bytes it appended itself.
 7. **Watch mode + retention.** Test: cadence on `base` movement, `--keep`
    pruning manifest-first. The cross-host S3 round-trip lands here:
    backed up from a C member, restored into a Node-hosted member, and

@@ -23,8 +23,12 @@
  *
  * A listing without manifest.bj never existed; pruning deletes the
  * manifest FIRST, so a half-pruned generation reads as absent, never as
- * intact. The manifest stored is the server's, plus the facts only this
- * side knows: which member it came from, and when it was shipped.
+ * intact. manifest.bj is the member's manifest FILE, byte-identical --
+ * the binjson record plus the CRC-32 trailer whose validity IS the
+ * commit (snapstore.h) -- because restore puts those bytes straight
+ * back and the server's own adoption validates them. The facts only
+ * this side knows -- which member, which boundary, when -- ride as S3
+ * object metadata, ABOUT the object and never in its bytes.
  *
  * INTEGRITY IS CHECKED IN TRANSIT, against the manifest the server
  * answered: every file's bytes are CRC-32'd as the chunks stream and
@@ -38,7 +42,19 @@
  * refuses further reads with -73; the agent restarts from
  * latestSnapshot — a retry, not a pin (docs/s3-backup.md says why).
  */
-import { ServerError, encode, decode } from './db-server-client.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { ServerError, decode } from './db-server-client.js';
+
+/**
+ * The canonical snapshot prefix: the C server's REPLICA_SNAP_PREFIX and
+ * the JS WAL host's SNAP_PREFIX, verbatim ("One snapshot, two hosts",
+ * docs/s3-backup.md). Spelled here rather than imported because
+ * importing db-wal.js loads the WASM engine, and this process's whole
+ * claim is that it has none; the tripwire test pins all three
+ * spellings together.
+ */
+export const SNAP_PREFIX = '__snap__';
 
 /* bjfile_crc32's twin: zlib CRC-32, chainable from 0. */
 const CRC_TABLE = (() => {
@@ -60,6 +76,34 @@ const sleep = (ms, signal) => new Promise((resolve) => {
   const t = setTimeout(resolve, ms);
   signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
 });
+
+/**
+ * A manifest file is binjson followed by a CRC-32 (little-endian) of
+ * exactly those bytes (snapstore.h); a torn one cannot validate. Checked
+ * on ship and again on restore -- transport integrity at both ends of
+ * the wire whose middle is S3. Returns the decoded record.
+ */
+export function verifyManifestBytes(bytes) {
+  if (bytes.length < 5) throw new Error('manifest file too short to hold a record and its CRC');
+  const body = bytes.subarray(0, bytes.length - 4);
+  const want = bytes[bytes.length - 4] | (bytes[bytes.length - 3] << 8) |
+               (bytes[bytes.length - 2] << 16) | (bytes[bytes.length - 1] << 24);
+  if (crc32(body) !== (want >>> 0)) {
+    throw new Error('manifest file failed its CRC -- torn in transit');
+  }
+  return decode(body);
+}
+
+/** The generation numbers under `instance`, newest first, committed or
+ * not -- callers that need committed ones probe for the manifest. */
+async function generationsIn(s3, instance) {
+  const { prefixes } = await s3.list(`${instance}/`, { delimiter: '/' });
+  return prefixes
+    .map((p) => /\/gen-(\d+)\/$/.exec(p))
+    .filter(Boolean)
+    .map((m) => Number(m[1]))
+    .sort((a, b) => b - a);
+}
 
 export class BackupAgent {
   /**
@@ -85,25 +129,16 @@ export class BackupAgent {
 
   _key(gen, name) { return `${this.instance}/gen-${gen}/${name}`; }
 
-  /** The generation numbers present under this instance prefix,
-   * committed (manifest present) or not, newest first. */
-  async _generations() {
-    const { prefixes } = await this.s3.list(`${this.instance}/`, { delimiter: '/' });
-    return prefixes
-      .map((p) => /\/gen-(\d+)\/$/.exec(p))
-      .filter(Boolean)
-      .map((m) => Number(m[1]))
-      .sort((a, b) => b - a);
-  }
+  _generations() { return generationsIn(this.s3, this.instance); }
 
   /** The prefix belongs to ONE member. Checked once per run, against
-   * the newest committed manifest already there. */
+   * the newest committed manifest's metadata. */
   async _guardMember() {
     if (this._memberChecked) return;
     for (const gen of await this._generations()) {
-      let body = null;
-      try { body = await this.s3.getObject(this._key(gen, 'manifest.bj')); } catch { continue; }
-      const theirs = decode(body).member;
+      const head = await this.s3.headObject(this._key(gen, 'manifest.bj'));
+      if (!head) continue;
+      const theirs = head.metadata.member;
       if (theirs && theirs !== this.member) {
         throw new Error(
           `s3 prefix '${this.instance}' holds generations from member ${theirs}; ` +
@@ -164,11 +199,13 @@ export class BackupAgent {
     }
 
     this._log('shipping', { gen, boundary, files: manifest.files.length });
+    let manifestBytes;
     try {
       for (const f of manifest.files) {
         const body = await this._fetchFile(gen, f);
         await this.s3.putObject(this._key(gen, `${f.role}.bj`), body);
       }
+      manifestBytes = Buffer.from(await this.client.readSnapshotManifest(gen));
     } catch (err) {
       if (err instanceof ServerError && err.code === -73) {
         this._log('superseded', { gen });
@@ -176,12 +213,15 @@ export class BackupAgent {
       }
       throw err;
     }
-    await this.s3.putObject(this._key(gen, 'manifest.bj'), Buffer.from(encode({
-      ...manifest,
-      member: this.member,
-      instance: this.instance,
-      shippedAt: new Date()
-    })));
+    verifyManifestBytes(manifestBytes);
+    await this.s3.putObject(this._key(gen, 'manifest.bj'), manifestBytes, {
+      metadata: {
+        member: this.member,
+        gen: String(gen),
+        boundary: String(boundary),
+        shippedat: new Date().toISOString()
+      }
+    });
     this._lastShipped = boundary;
     this._log('shipped', { gen, boundary });
     return { shipped: true, gen, boundary };
@@ -244,4 +284,64 @@ export class BackupAgent {
       await sleep(pollMs, signal);
     }
   }
+}
+
+/**
+ * The restore half (docs/s3-backup.md step 6): put a shipped generation
+ * into an EMPTY directory, in the snapstore's own on-disk shape --
+ * `__snap__-<gen>-<role>.bj` files and the manifest, byte-identical,
+ * written LAST. What the operator does next is start a server on it:
+ * the startup adoption (restore_if_stale) restores every live name from
+ * the manifest's config.live and bases a fresh log at the boundary. The
+ * restored process is a NEW cluster of one; docs/s3-backup.md says why
+ * restoring beside a live cluster is refused by design, not by code.
+ *
+ * Every file is verified against the manifest (size and CRC) before the
+ * manifest is written, so an interrupted restore leaves data files with
+ * no manifest -- exactly the crashed-snapshot-attempt shape the store's
+ * own startup sweep already handles ("never existed").
+ */
+export async function restoreFromS3({ s3, instance, into, gen = null, log = () => {} }) {
+  fs.mkdirSync(into, { recursive: true });
+  if (fs.readdirSync(into).length > 0) {
+    throw new Error(`refusing to restore into ${into}: it is not empty, and restore never merges`);
+  }
+
+  let chosen = gen;
+  if (chosen === null) {
+    for (const g of await generationsIn(s3, instance)) {
+      if (await s3.headObject(`${instance}/gen-${g}/manifest.bj`)) { chosen = g; break; }
+    }
+    if (chosen === null) throw new Error(`no committed generation under '${instance}'`);
+  }
+
+  const manifestBytes = await s3.getObject(`${instance}/gen-${chosen}/manifest.bj`);
+  const manifest = verifyManifestBytes(manifestBytes);
+  log('restoring', { gen: chosen, lastIncludedIndex: manifest.lastIncludedIndex, files: manifest.files.length });
+
+  for (const f of manifest.files) {
+    // The name is written into a directory: a manifest that names a
+    // path is not a manifest, whatever else it is.
+    if (f.name.includes('/') || f.name.includes('\\') || f.name.includes('..')) {
+      throw new Error(`manifest names a path, not a file: '${f.name}'`);
+    }
+    const body = await s3.getObject(`${instance}/gen-${chosen}/${f.role}.bj`);
+    if (body.length !== f.size) {
+      throw new Error(`${f.role}: S3 holds ${body.length} bytes, the manifest says ${f.size}`);
+    }
+    if (crc32(body) !== f.crc) {
+      throw new Error(`${f.role}: CRC mismatch against the manifest -- the stored copy is damaged`);
+    }
+    fs.writeFileSync(path.join(into, f.name), body);
+  }
+
+  // The commit point, byte-identical, last.
+  fs.writeFileSync(path.join(into, `${SNAP_PREFIX}-${chosen}.manifest.bj`), manifestBytes);
+  log('restored', { gen: chosen, into });
+  return {
+    gen: chosen,
+    lastIncludedIndex: manifest.lastIncludedIndex,
+    lastIncludedTerm: manifest.lastIncludedTerm,
+    files: manifest.files.length
+  };
 }

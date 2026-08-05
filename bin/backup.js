@@ -15,16 +15,22 @@
  */
 import { connectServer } from '../src/db-server-client.js';
 import { S3Client } from '../src/s3.js';
-import { BackupAgent } from '../src/db-backup.js';
+import { BackupAgent, restoreFromS3 } from '../src/db-backup.js';
 
 function usage() {
-  console.error(`Usage: db-backup <once|watch> --target host:port --s3-bucket name --instance name [options]
+  console.error(`Usage: db-backup <once|watch|restore> --s3-bucket name --instance name [options]
 
 Commands:
   once    Take a snapshot on the member (idempotent when nothing changed),
-          ship it, apply retention, exit.
+          ship it, apply retention, exit. Needs --target.
   watch   Stay up: ship every generation the member commits (--every adds
-          a wall-clock cadence), apply retention, until stopped.
+          a wall-clock cadence), apply retention, until stopped. Needs
+          --target.
+  restore Download a generation into an EMPTY directory (--into), in the
+          snapstore's own on-disk shape, manifest last. Then start a
+          server on it: the startup adoption does the rest. The restored
+          process is a NEW cluster of one -- never restore beside a live
+          cluster.
 
 Options:
   --target host:port     The ONE member this agent backs up. A follower is
@@ -41,6 +47,9 @@ Options:
   --every dur            watch: also TAKE a snapshot this often -- cadence
                          decoupled from write volume.
   --no-snapshot          once: ship what is committed without taking one.
+  --into dir             restore: the empty directory to restore into.
+  --gen n                restore: a specific generation (default: newest
+                         committed).
 
 Durations: 30s, 5m, 1h (a bare number is seconds). Credentials ride
 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY. docs/s3-backup.md has the story.`);
@@ -55,7 +64,7 @@ function duration(s) {
 
 const argv = process.argv.slice(2);
 const command = argv.shift();
-if (command !== 'once' && command !== 'watch') usage();
+if (command !== 'once' && command !== 'watch' && command !== 'restore') usage();
 
 const opts = {
   region: 'us-east-1', prefix: null, keep: null,
@@ -74,19 +83,42 @@ for (let i = 0; i < argv.length; i++) {
   else if (arg === '--poll') opts.pollMs = duration(next());
   else if (arg === '--every') opts.everyMs = duration(next());
   else if (arg === '--no-snapshot') opts.takeSnapshot = false;
+  else if (arg === '--into') opts.into = next();
+  else if (arg === '--gen') opts.gen = Number(next());
   else usage();
 }
-if (!opts.target || !opts.bucket || !opts.instance) usage();
+if (!opts.bucket || !opts.instance) usage();
+if (command === 'restore' ? !opts.into : !opts.target) usage();
 
 const s3 = new S3Client({
   bucket: opts.bucket, endpoint: opts.endpoint, region: opts.region
 });
+const instance = opts.prefix ? `${opts.prefix}/${opts.instance}` : opts.instance;
+
+if (command === 'restore') {
+  const r = await restoreFromS3({
+    s3, instance, into: opts.into, gen: opts.gen ?? null,
+    log: (kind, detail) => console.error(`db-backup: ${kind} ${JSON.stringify(detail)}`)
+  });
+  console.error(`db-backup: restored gen ${r.gen} (boundary ${r.lastIncludedIndex}, ${r.files} files) into ${opts.into}
+
+Next, from that directory, start a server on it:
+
+    nisaba-server --port <port> --raft 1 --raft-port <raft-port>
+
+The startup adoption restores every database from the generation and
+bases a fresh log at index ${r.lastIncludedIndex}. The restored process
+is a NEW cluster of one; grow it with --join from blank members. Never
+start it beside the cluster the backup came from.`);
+  process.exit(0);
+}
+
 await s3.createBucket();
 
 const client = await connectServer(opts.target);
 const agent = new BackupAgent({
   client, s3,
-  instance: opts.prefix ? `${opts.prefix}/${opts.instance}` : opts.instance,
+  instance,
   member: opts.target,
   log: (kind, detail) => console.error(`db-backup: ${kind} ${JSON.stringify(detail)}`)
 });

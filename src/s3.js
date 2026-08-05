@@ -94,7 +94,7 @@ export class S3Client {
 
   /* ---- one signed request ------------------------------------------- */
 
-  async _request(method, key, { query = {}, body = null, contentType = null } = {}) {
+  async _request(method, key, { query = {}, body = null, contentType = null, metadata = null } = {}) {
     const path = `/${rfc3986(this.bucket)}${key ? `/${encodeKey(key)}` : ''}`;
     const qs = Object.keys(query).sort()
       .map((k) => `${rfc3986(k)}=${rfc3986(String(query[k]))}`)
@@ -110,6 +110,11 @@ export class S3Client {
       'x-amz-date': now
     };
     if (contentType) headers['content-type'] = contentType;
+    if (metadata) {
+      for (const [k, v] of Object.entries(metadata)) {
+        headers[`x-amz-meta-${k.toLowerCase()}`] = String(v);
+      }
+    }
 
     const signedNames = Object.keys(headers).sort();
     const canonical = [
@@ -172,8 +177,11 @@ export class S3Client {
     this._throw(res);
   }
 
-  async putObject(key, body, { contentType = 'application/octet-stream' } = {}) {
-    const res = await this._request('PUT', key, { body, contentType });
+  /** `metadata` rides as x-amz-meta-* headers (signed like any header)
+   * and comes back from headObject -- facts ABOUT an object that must
+   * not change its bytes, e.g. which member a manifest came from. */
+  async putObject(key, body, { contentType = 'application/octet-stream', metadata = null } = {}) {
+    const res = await this._request('PUT', key, { body, contentType, metadata });
     if (res.status !== 200) this._throw(res);
     return { etag: res.headers.etag ?? null };
   }
@@ -184,13 +192,17 @@ export class S3Client {
     return res.body;
   }
 
-  /** { size, etag }, or null when there is no such object -- absence is
-   * an answer here, not an exception, because callers probe. */
+  /** { size, etag, metadata }, or null when there is no such object --
+   * absence is an answer here, not an exception, because callers probe. */
   async headObject(key) {
     const res = await this._request('HEAD', key);
     if (res.status === 404) return null;
     if (res.status !== 200) throw new S3Error(res.status, '', `HEAD ${key} (HTTP ${res.status})`);
-    return { size: Number(res.headers['content-length']), etag: res.headers.etag ?? null };
+    const metadata = {};
+    for (const [h, v] of Object.entries(res.headers)) {
+      if (h.startsWith('x-amz-meta-')) metadata[h.slice('x-amz-meta-'.length)] = v;
+    }
+    return { size: Number(res.headers['content-length']), etag: res.headers.etag ?? null, metadata };
   }
 
   /** Deleting the already-gone is what the caller asked for (204 both ways). */

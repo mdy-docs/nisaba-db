@@ -1716,6 +1716,15 @@ static int refuse(const replica *r, int code, dbuf *out) {
  */
 static int submit_read(replica *r, pending *p, uint64_t client,
                        const uint8_t *req, size_t len, dbuf *out) {
+    /*
+     * `out` is the CONNECTION's output buffer, not this request's: with
+     * pipelined requests it can already hold answers built this batch
+     * and not yet flushed (server/main.c's conn_serve loop). Everything
+     * below may only APPEND to it, and a deferral may only take back
+     * what it appended itself -- zeroing it wholesale was how a ping's
+     * answer vanished and every later answer paired one request early.
+     */
+    size_t mark = out->len;
     uint64_t barrier = 0, read_index = 0;
     int e = rn_read_barrier(r->node, &barrier, &read_index);
     if (e) {
@@ -1734,7 +1743,6 @@ static int submit_read(replica *r, pending *p, uint64_t client,
          * log and the pump just ran. Said out loud rather than serving
          * from state that is demonstrably too old. */
         rn_read_release(r->node, barrier);
-        out->len = 0;
         e = refuse(r, DC_ERR_NOT_CURRENT, out);
         return e ? e : 0;
     }
@@ -1761,9 +1769,12 @@ static int submit_read(replica *r, pending *p, uint64_t client,
     p->client = client;
     p->barrier = barrier;
     p->done = 0;
-    e = dbuf_put(&p->answer, out->data, out->len);
+    /* Only THIS request's answer defers -- the bytes past the mark.
+     * Anything before it belongs to earlier pipelined requests and goes
+     * out on the ordinary flush, in order. */
+    e = dbuf_put(&p->answer, out->data + mark, out->len - mark);
     if (e) { pending_release(p); rn_read_release(r->node, barrier); return e; }
-    out->len = 0;                       /* it goes out through replica_ready */
+    out->len = mark;                    /* it goes out through replica_ready */
     /* The heartbeats the barrier queued go NOW: a read that waited a
      * tick for its own proof to start would add the tick interval to
      * every read in the cluster. */
@@ -1917,7 +1928,10 @@ static int snapshot_take_now(replica *r, dbuf *out) {
  * of one committed generation file, read straight off the store's
  * immutable copy. `gen` must be the committed generation -- naming it
  * is what makes a prune mid-transfer a clean refusal instead of a file
- * that changes identity between chunks. */
+ * that changes identity between chunks. {gen, manifest:true, offset?}
+ * reads the MANIFEST file itself, raw -- CRC trailer and all -- because
+ * a restore must put back the exact bytes whose validity is the commit
+ * (snapstore.h), and a re-encoding is exactly not that. */
 static int snapshot_read_file(replica *r, const uint8_t *req, size_t len, dbuf *out) {
     if (!sst_has_latest(r->store))
         return refuse(r, DC_ERR_SNAPSHOT_GONE, out);
@@ -1930,21 +1944,38 @@ static int snapshot_read_file(replica *r, const uint8_t *req, size_t len, dbuf *
     e = req_field_u64(req, len, "offset", &offset, &found);
     if (e) return refuse(r, e, out);
 
-    const uint8_t *rv; size_t rvlen;
-    found = 0;
-    if (obj_get_field(req, len, (const uint8_t *)"role", 4, &rv, &rvlen, &found))
-        return refuse(r, DC_ERR_REQ_MALFORMED, out);
-    if (!found) return refuse(r, DC_ERR_REQ_MISSING_FIELD, out);
-    cur rc = { rv, rvlen, 0 };
-    const uint8_t *role; uint32_t role_len;
-    if (take_string(&rc, &role, &role_len))
-        return refuse(r, DC_ERR_REQ_MALFORMED, out);
+    int manifest = 0;
+    {
+        const uint8_t *mv; size_t mvlen;
+        found = 0;
+        if (obj_get_field(req, len, (const uint8_t *)"manifest", 8, &mv, &mvlen, &found))
+            return refuse(r, DC_ERR_REQ_MALFORMED, out);
+        if (found) {
+            cur mc = { mv, mvlen, 0 };
+            if (read_bool(&mc, &manifest))
+                return refuse(r, DC_ERR_REQ_MALFORMED, out);
+        }
+    }
+
+    const uint8_t *role = NULL; uint32_t role_len = 0;
+    if (!manifest) {
+        const uint8_t *rv; size_t rvlen;
+        found = 0;
+        if (obj_get_field(req, len, (const uint8_t *)"role", 4, &rv, &rvlen, &found))
+            return refuse(r, DC_ERR_REQ_MALFORMED, out);
+        if (!found) return refuse(r, DC_ERR_REQ_MISSING_FIELD, out);
+        cur rc = { rv, rvlen, 0 };
+        if (take_string(&rc, &role, &role_len))
+            return refuse(r, DC_ERR_REQ_MALFORMED, out);
+    }
 
     if (gen != sst_latest_gen(r->store))
         return refuse(r, DC_ERR_SNAPSHOT_GONE, out);
 
     dbuf name = {0};
-    e = sst_data_name(r->store, gen, (const char *)role, role_len, &name);
+    e = manifest
+        ? sst_manifest_name(r->store, gen, &name)
+        : sst_data_name(r->store, gen, (const char *)role, role_len, &name);
     if (e) { dbuf_free(&name); return refuse(r, DC_ERR_REQ_MALFORMED, out); }
 
     bj_io io;
@@ -2063,7 +2094,13 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
         }
         return e;
     }
-    out->len = 0;   /* the answer comes later, through replica_ready */
+    /* Nothing of this request's is in `out` (dbi_propose writes there
+     * only when it answers outright, and then token is 0) -- and what IS
+     * there belongs to earlier pipelined requests, so it is left alone:
+     * the zeroing that used to be here ate a ping's answer whenever one
+     * shared a read() with a write, and every later answer on the
+     * connection paired one request early. The write's own answer comes
+     * later, through replica_ready. */
     /* The AppendEntries the proposal queued goes NOW, not on the next
      * tick: a write that waits a tick for its own replication to start
      * has added the tick interval to every write in the cluster. */

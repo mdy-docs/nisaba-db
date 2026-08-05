@@ -213,6 +213,9 @@ export interface RemoteDb {
    * `offset` until `eof`. -73 once the generation is superseded. */
   readSnapshotFile(gen: number, role: string, offset?: number):
     Promise<{ data: Uint8Array; eof: boolean; size: number }>;
+  /** The generation's manifest FILE, whole and raw: the binjson record
+   * plus the CRC-32 trailer whose validity is the commit. */
+  readSnapshotManifest(gen: number): Promise<Uint8Array>;
   close(): Promise<void>;
 }
 

@@ -147,12 +147,15 @@ jobs:
           name: nisaba-server-wasip2
       # The SAME wasmtime version the repo pins for every other host,
       # read from build-common.sh rather than written down again here.
+      # Zip handling is the SYSTEM tar (bsdtar, which reads and writes
+      # zip) by absolute path: the tar Git Bash puts on PATH is GNU
+      # tar, which does neither.
       - name: Fetch the pinned wasmtime for Windows
         run: |
           V="$(grep '^WASMTIME_VERSION=' build/build-common.sh | cut -d'"' -f2)"
           echo "wasmtime $V"
           curl -fLo wasmtime.zip "https://github.com/bytecodealliance/wasmtime/releases/download/v$V/wasmtime-v$V-x86_64-windows.zip"
-          tar -xf wasmtime.zip
+          "$WINDIR/System32/tar.exe" -xf wasmtime.zip
           mv "wasmtime-v$V-x86_64-windows" wasmtime-dist
       - name: Assemble the bundle
         run: |
@@ -163,7 +166,7 @@ jobs:
       - name: Smoke it on Windows
         run: node build/smoke-server.mjs --wasmtime nisaba-server-windows-x86_64/wasmtime.exe nisaba-server-windows-x86_64/nisaba-server-wasip2.wasm
       - name: Package
-        run: tar -acf nisaba-server-windows-x86_64.zip nisaba-server-windows-x86_64
+        run: '"$WINDIR/System32/tar.exe" -acf nisaba-server-windows-x86_64.zip nisaba-server-windows-x86_64'
       - uses: actions/upload-artifact@v4
         with:
           name: nisaba-server-windows-x86_64

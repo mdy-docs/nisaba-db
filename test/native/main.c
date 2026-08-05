@@ -16,6 +16,14 @@
  * This is not a replacement for test/db.test.js, which remains the
  * specification of the public API. It is the layer below it.
  */
+/* openat/mkdirat/O_DIRECTORY: glibc gates them behind a feature-test
+ * macro where macOS exposes them unconditionally -- the omission
+ * builds on a Mac and breaks on every Linux runner (server/main.c and
+ * root.c carry the same guard). Before any include, or it does
+ * nothing. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "db.h"
 #include "bplustree.h"
 #include "binjson.h"

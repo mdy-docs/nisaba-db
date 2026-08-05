@@ -4,6 +4,15 @@
  * best-effort directory sync, both documented at length in
  * third_party/binjson-structures/src/bjio_posix.c and not restated
  * here. */
+/* openat/mkdirat/unlinkat: glibc gates them behind a feature-test
+ * macro where macOS exposes them unconditionally -- which is exactly
+ * how the omission builds on one and breaks on the other (root.c and
+ * main.c carry the same guard). Before any include, or it does
+ * nothing. */
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "instns.h"
 
 #include "bjio_posix.h"

@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."      # the repo root: every path below is from there
 
-SERVER=wasm/lib/nisaba-server
+SERVER=build/lib/nisaba-server
 DIR=$(mktemp -d "${TMPDIR:-/tmp}/nisaba-cluster.XXXXXX")
 
 # The cluster, written down once: node id, the port CLIENTS use, and the
@@ -99,9 +99,9 @@ echo "  8097-8099 (clients) and 9001-9003 (peers) are free"
 # ---------------------------------------------------------------------
 step "Building the server (once)"
 # The native build needs nothing but a cc. The deployment target is
-# wasm32-wasip2 -- ./wasm/build-server.sh with no flag builds that, and
+# wasm32-wasip2 -- ./build/build-server.sh with no flag builds that, and
 # it is run with: wasmtime run -S inherit-network --dir DIR::. ...
-[ -x "$SERVER" ] || run ./wasm/build-server.sh --native
+[ -x "$SERVER" ] || run ./build/build-server.sh --native
 echo "$SERVER is ready"
 
 # ---------------------------------------------------------------------

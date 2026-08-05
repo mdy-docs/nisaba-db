@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
 # Fetch the pinned wasi-sdk for this host and print where it is, so that
-# `./wasm/build-native.sh --wasi` -- the only check whose memory model
+# `./build/build-native.sh --wasi` -- the only check whose memory model
 # resembles the one this library ships on -- runs on a developer machine
 # and not just on a CI runner.
 #
-#   ./wasm/get-wasi-sdk.sh              fetch if missing, print the path
-#   ./wasm/get-wasi-sdk.sh --dir DIR    install into DIR instead
-#   ./wasm/get-wasi-sdk.sh --force      re-fetch over an existing copy
-#   ./wasm/get-wasi-sdk.sh --print-url  print the asset URL and stop
+#   ./build/get-wasi-sdk.sh              fetch if missing, print the path
+#   ./build/get-wasi-sdk.sh --dir DIR    install into DIR instead
+#   ./build/get-wasi-sdk.sh --force      re-fetch over an existing copy
+#   ./build/get-wasi-sdk.sh --print-url  print the asset URL and stop
 #
 # A no-op when a usable toolchain is already there, so it is safe to run
 # before every build. The PATH is the only thing on stdout -- every
 # message goes to stderr -- so a caller can say:
 #
-#   WASI_SDK=$(./wasm/get-wasi-sdk.sh) ./wasm/build-native.sh --wasi
+#   WASI_SDK=$(./build/get-wasi-sdk.sh) ./build/build-native.sh --wasi
 #
 # though it does not have to: build-native.sh looks in the same places
-# this installs to (find_wasi_sdk in wasm/build-common.sh), which is why
+# this installs to (find_wasi_sdk in build/build-common.sh), which is why
 # CI runs this script rather than its own copy of the URL. The version,
-# the tag and the asset name all come from wasm/build-common.sh; nothing
+# the tag and the asset name all come from build/build-common.sh; nothing
 # about the pin is written down here.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-. wasm/build-common.sh
+. build/build-common.sh
 
 DEST=""
 FORCE=0

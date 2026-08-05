@@ -1,7 +1,7 @@
 /**
  * db.js — public entry point for the document database (mirrors the
  * parent binjson project's own src/db.js, which re-exports the same set
- * from its own combined WASM module -- see wasm/nisaba-wasm.js's own top
+ * from its own combined WASM module -- see src/nisaba-wasm.js's own top
  * comment for why the parent doesn't just re-export from here instead).
  *
  * This is the full-fat, in-process entry (node console, the Worker side
@@ -27,7 +27,7 @@ export {
   UnindexableValueError,
   ChangeStreamOverflowError,
   InvalidIdError
-} from '../wasm/nisaba-wasm.js';
+} from './nisaba-wasm.js';
 
 // Main-thread-safe surface: the pure-JS (no WASM) codec and the Worker RPC
 // bridge. See src/db-remote.js for the doc comments.

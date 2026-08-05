@@ -2,7 +2,7 @@
  * The S3 backup agent (src/db-backup.js): a real nisaba-server on one
  * side, real MinIO on the other — docs/s3-backup.md step 5. Skips
  * unless BOTH are available: the native server binary (built by
- * ./wasm/build-server.sh --native) and something answering at
+ * ./build/build-server.sh --native) and something answering at
  * NISABA_S3_TEST_ENDPOINT (default http://127.0.0.1:9000, the
  * documented MinIO dev setup). What these prove: a shipped generation
  * in S3 is byte-identical to the member's on-disk generation, the
@@ -24,7 +24,7 @@ import {
   SNAP_PREFIX as BACKUP_SNAP_PREFIX
 } from '../src/db-backup.js';
 
-const NATIVE = 'wasm/lib/nisaba-server';
+const NATIVE = 'build/lib/nisaba-server';
 const haveNative = fs.existsSync(NATIVE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -296,7 +296,7 @@ describe.skipIf(!haveNative || !haveMinio)('one artifact, three hands: C server,
   beforeAll(async () => {
     s3 = new S3Client({ bucket, endpoint: ENDPOINT, ...CREDS });
     await s3.createBucket();
-    const { ready } = await import('../wasm/nisaba-wasm.js');
+    const { ready } = await import('../src/nisaba-wasm.js');
     await ready();
     wasm = {
       NodeFSStorageProvider: (await import('../src/db-node.js')).NodeFSStorageProvider,

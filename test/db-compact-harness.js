@@ -15,7 +15,7 @@
  * survive the trip (raw structured-clone would strip an ObjectId to a
  * plain object -- see that harness's comment).
  */
-import { ready, connect, OPFSStorageProvider } from '../wasm/nisaba-wasm.js';
+import { ready, connect, OPFSStorageProvider } from '../src/nisaba-wasm.js';
 import { encode, decode } from '../third_party/binjson/js/binjson.js';
 
 let db = null;

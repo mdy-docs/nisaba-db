@@ -11,7 +11,7 @@
  * claim this repo rests on, and it cannot be checked from inside C.
  *
  * Both cases skip unless their artifact has been built --
- * ./wasm/build-server.sh --native and --wasip2 -- because `npm test`
+ * ./build/build-server.sh --native and --wasip2 -- because `npm test`
  * does not build the server, the same way it does not build the WASM
  * module. CI builds both and then runs this.
  */
@@ -21,19 +21,19 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
+import { ready, encode, decode } from '../src/nisaba-wasm.js';
 import { connect, connectClient, ObjectId } from '../src/db.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
 import { connectServer, ServerError, WIRE_OPS, ChangeStreamOverflowError } from '../src/db-server-client.js';
-import { BPlusTree, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { BPlusTree, EntryLog, MemoryHandle } from '../src/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { TcpRaftTransport } from '../src/raft-transport-tcp.js';
 import { joinGroup, leaveGroup } from '../src/raft-host.js';
 
 await ready();
 
-const NATIVE = 'wasm/lib/nisaba-server';
-const WASIP2 = 'wasm/lib/nisaba-server-wasip2.wasm';
+const NATIVE = 'build/lib/nisaba-server';
+const WASIP2 = 'build/lib/nisaba-server-wasip2.wasm';
 const have = (p) => fs.existsSync(p);
 const wasmtime = (() => {
   const r = spawnSync('sh', ['-c', 'command -v wasmtime'], { encoding: 'utf8' });
@@ -478,7 +478,7 @@ async function startServer(engine, port, extra = [], docs = 0, reuse = null) {
 
 /*
  * A skip that is loud where it matters. `npm test` does not build the
- * server, so a developer who has not run ./wasm/build-server.sh should
+ * server, so a developer who has not run ./build/build-server.sh should
  * see these skip rather than fail -- but CI builds both artifacts and
  * installs wasmtime, and a suite that quietly stops covering the thing it
  * names is worse than no suite. NISABA_SERVER_TESTS=required (set in

@@ -21,7 +21,7 @@
 // event>} messages (no id) stream out once `watch` has been started; and
 // {id, rpc: true, handle, method, argsPayload} in, {id, ok, rpcResult, error}
 // out for the generic console bridge (see rpcInvoke below).
-import { ready, OPFSStorageProvider, connectClient } from '../wasm/nisaba-wasm.js';
+import { ready, OPFSStorageProvider, connectClient } from './nisaba-wasm.js';
 // Pure JS, not the WASM build: the message handler's decode(argsPayload)
 // can run before ready() has ever been awaited (e.g. the very first
 // message this worker receives) -- same reasoning as index.html's own
@@ -110,7 +110,7 @@ const handles = new Map();
 
 // A method call's result needs a handle (rather than being sent as plain
 // data) if it's itself a live remote object -- a Client/Db/Collection/
-// cursor/ChangeStream, whether the real wasm/nisaba-wasm.js classes
+// cursor/ChangeStream, whether the real src/nisaba-wasm.js classes
 // (direct connect()/connectClient()) or db-coordinator.js's SharedDb/
 // SharedCollection/cursor duck-types (connectShared(), used by the notes
 // demo) -- so duck-type on the method names those shapes actually share,

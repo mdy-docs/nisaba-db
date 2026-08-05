@@ -16,7 +16,7 @@
     "./backup": { "types": "./types/backup.d.ts", "default": "./src/db-backup.js" },
     "./s3": { "types": "./types/s3.d.ts", "default": "./src/s3.js" },
     "./extended-json": { "default": "./src/extended-json.js" },
-    "./wasm": { "types": "./types/wasm.d.ts", "default": "./wasm/nisaba-wasm.js" },
+    "./wasm": { "types": "./types/wasm.d.ts", "default": "./src/nisaba-wasm.js" },
     "./coordinator": { "types": "./types/coordinator.d.ts", "default": "./src/db-coordinator.js" },
     "./wal": { "types": "./types/wal.d.ts", "default": "./src/db-wal.js" },
     "./wal-instance": { "default": "./src/db-wal-instance.js" },
@@ -29,7 +29,7 @@
     "./raft-monitor": { "types": "./types/raft-monitor.d.ts", "default": "./src/raft-monitor.js" }
   },
   "files": [
-    "wasm",
+    "build",
     "bin",
     "src",
     "types",
@@ -46,8 +46,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:browser": "vitest run --config vitest.browser.config.js",
-    "bench": "node bench/bench.js",
-    "build:wasm": "./wasm/build-wasm.sh",
+    "bench": "node test/bench.js",
+    "build:wasm": "./build/build-wasm.sh",
     "prepack": "npm run build:wasm",
     "dev": "vite",
     "build": "vite build",

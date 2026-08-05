@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
 # Fetch the pinned wasmtime for this host and print where it is, so that
-# `./wasm/build-native.sh --wasi` can run the harness under a SECOND WASI
+# `./build/build-native.sh --wasi` can run the harness under a SECOND WASI
 # host rather than only Node's.
 #
-#   ./wasm/get-wasmtime.sh              fetch if missing, print the path
-#   ./wasm/get-wasmtime.sh --dir DIR    install into DIR instead
-#   ./wasm/get-wasmtime.sh --force      re-fetch over an existing copy
-#   ./wasm/get-wasmtime.sh --print-url  print the asset URL and stop
+#   ./build/get-wasmtime.sh              fetch if missing, print the path
+#   ./build/get-wasmtime.sh --dir DIR    install into DIR instead
+#   ./build/get-wasmtime.sh --force      re-fetch over an existing copy
+#   ./build/get-wasmtime.sh --print-url  print the asset URL and stop
 #
 # Optional, unlike its wasi-sdk sibling: without a wasmtime, --wasi still
 # runs under Node's host and says it skipped the second one. With one, it
 # runs both, which is how a rights-based disagreement between hosts gets
-# noticed -- see the wasmtime section of wasm/build-common.sh, where the
+# noticed -- see the wasmtime section of build/build-common.sh, where the
 # version and the URL come from.
 #
-# Everything else here mirrors wasm/get-wasi-sdk.sh: no-op when a usable
+# Everything else here mirrors build/get-wasi-sdk.sh: no-op when a usable
 # copy is already there, path on stdout and messages on stderr, so
 #
-#   WASMTIME=$(./wasm/get-wasmtime.sh) ./wasm/build-native.sh --wasi
+#   WASMTIME=$(./build/get-wasmtime.sh) ./build/build-native.sh --wasi
 #
 # works, though it does not have to -- build-native.sh looks in the same
 # places this installs to.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-. wasm/build-common.sh
+. build/build-common.sh
 
 DEST=""
 FORCE=0

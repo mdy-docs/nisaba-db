@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const { ready } = await import('./nisaba-db/wasm/nisaba-wasm.js');
+const { ready } = await import('./nisaba-db/src/nisaba-wasm.js');
 await ready();
 
 const { connect, MemoryStorageProvider } = await import('./nisaba-db/src/db.js');

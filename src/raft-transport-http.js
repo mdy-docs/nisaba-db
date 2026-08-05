@@ -29,7 +29,7 @@
  *     rejected at the caller; transport-level failures reject as-is.
  */
 import http from 'node:http';
-import { encode, decode } from '../wasm/nisaba-wasm.js';
+import { encode, decode } from './nisaba-wasm.js';
 
 const MAX_BODY_DEFAULT = 64 * 1024 * 1024; // a frame is at most a snapshot chunk + overhead
 

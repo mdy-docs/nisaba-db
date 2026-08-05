@@ -2,7 +2,7 @@
  * Storage exhaustion (docs/roadmap.md P1 #9): the most likely real-world
  * browser failure is OPFS throwing QuotaExceededError mid-write. A JS
  * exception from a sync access handle must never propagate up through the
- * WASM frames -- before bridgeHandle (wasm/nisaba-wasm.js) existed, doing
+ * WASM frames -- before bridgeHandle (src/nisaba-wasm.js) existed, doing
  * so abandoned C mid-mutation and left a phantom document in the live
  * primary tree (absent from the indexes) that the next successful write
  * committed durably. These tests drive a provider whose handles throw once
@@ -12,7 +12,7 @@
  * and invisible after a crash-style reopen.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { ready, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { ready, MemoryHandle } from '../src/nisaba-wasm.js';
 import { connect, MemoryStorageProvider } from '../src/db.js';
 
 await ready();

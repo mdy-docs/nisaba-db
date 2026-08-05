@@ -9,7 +9,7 @@
  * command retraction, crash recovery, and replay idempotence.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, ObjectId, EntryLog, encode, decode } from '../wasm/nisaba-wasm.js';
+import { ready, ObjectId, EntryLog, encode, decode } from '../src/nisaba-wasm.js';
 import { MemoryStorageProvider } from '../src/db.js';
 import { connectWal, WAL_FILE } from '../src/db-wal.js';
 
@@ -193,7 +193,7 @@ describe('WAL: what gets logged', () => {
   });
 
   it('no logged command carries a filter: every one names a single _id', async () => {
-    // The invariant the C grammar exists to hold (wasm/include/db_wal.h).
+    // The invariant the C grammar exists to hold (engine/include/db_wal.h).
     // A command carrying a filter would have apply re-run a query against
     // the very state replay is in the middle of reproducing -- which is
     // how the retired `uu`/`ru` opcodes worked, and why they are gone.
@@ -328,7 +328,7 @@ describe('WAL: crash recovery', () => {
   it('an upsert is logged as a plain insert, and replays to the identical _id', async () => {
     // The upsert opcodes that carried a filter into the log are gone: the
     // planner resolves an upsert the whole way and logs the document it
-    // would have inserted (wasm/include/db_wal.h). So what survives a
+    // would have inserted (engine/include/db_wal.h). So what survives a
     // crash between sync and apply is not "re-run this filter and see" --
     // it is one document with one _id, which is why replay is exact.
     const provider = new MemoryStorageProvider();

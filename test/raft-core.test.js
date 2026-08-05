@@ -18,7 +18,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ready, EntryLog, MemoryHandle, RaftCore, RAFT_ROLE, RN_EFFECT, ENTRYLOG_TYPE
-} from '../wasm/nisaba-wasm.js';
+} from '../src/nisaba-wasm.js';
 
 await ready();
 

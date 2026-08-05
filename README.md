@@ -14,7 +14,7 @@ format and value types) and
 [binjson-structures](https://github.com/mdy-docs/binjson-structures)
 (the B+ tree primary store and secondary equality index, R-tree for geo
 indexes, text index for `$text`-style search) — `nisaba`'s own C code
-(`wasm/src/db.c`/`db_query.c`/`db_update.c`/`db_keyenc.c`/`db_wasm.c`, plus
+(`engine/src/db.c`/`db_query.c`/`db_update.c`/`db_keyenc.c`/`db_wasm.c`, plus
 `regex.c` as the `$regex` adapter over regex-engine) is the CRUD/query/
 update layer built on top of those, not a data structure itself.
 
@@ -36,7 +36,7 @@ own standalone WASM build links this package's sources together with
 checkouts of binjson, binjson-structures, and regex-engine into one
 binary; its JS wrapper keeps its own self-contained copy of the codec
 and tree-wrapper classes for the same reason (see the top comment of
-`wasm/nisaba-wasm.js`).
+`src/nisaba-wasm.js`).
 
 Those checkouts are git submodules of *this* repo
 (`third_party/binjson`, `third_party/binjson-structures`,
@@ -49,8 +49,52 @@ same binary.
 
 ```
 git submodule update --init
-./wasm/build-wasm.sh
+./build/build-wasm.sh
 ```
+
+## Map of the repo
+
+Two languages, one rule: a directory holds one kind of thing, and is
+named for what it holds — not for one of the targets it builds to.
+
+```
+engine/       The portable C engine (~16k lines): documents, queries,
+              updates, indexes, the WAL grammar, the Raft state machine.
+              It opens no file, reads no clock, has no socket.
+  src/          the logic, compiled into every target
+  include/      its headers
+  jsabi/        the emscripten-only JS-ABI adapters + exports.txt --
+                excluded from every native build by location, not by list
+  sources.txt   the one manifest every build reads
+server/       The C server process: server/main.c and friends over the
+              engine. Native, wasm32-wasip1, or wasip2 -- one main, three
+              targets, and the engine cannot tell which.
+src/          ALL the JavaScript, single source of truth: the WASM driver
+              (nisaba-wasm.js), storage providers, the TCP client, the
+              HTTP front end and its browser client, replication hosts,
+              the S3 backup agent.
+bin/          The JS entry points: db, db-http, db-backup.
+build/        The build scripts (build-wasm/-native/-server.sh over
+              build-common.sh), pinned-toolchain fetchers, and lib/ --
+              every build's output, gitignored.
+test/         The JS suites (vitest), the native C harness (test/native/),
+              and the benchmark (test/bench.js).
+types/        The .d.ts surface, one file per export.
+packages/     Publishable distributions, ASSEMBLED: nothing in a package
+              directory is a source of truth -- each build script beside a
+              package copies its closure from the repo at pack time, so a
+              package cannot drift from what the repo builds and tests.
+              (nisaba-db = embedded, client = TCP, http-client = browser,
+              http-front + backup-agent = deployables, swift +
+              macos-example = native embedding.)
+third_party/  Submodules: binjson, binjson-structures, regex-engine.
+docs/         The document of record; start at deployment-shapes.md.
+examples/     Runnable examples; index.html + vite serve the browser demo.
+```
+
+"wasm" names a build *target* here, never a directory: the engine
+compiles to native, wasip1/2, and emscripten alike, and the code that is
+genuinely emscripten-specific is exactly the contents of `engine/jsabi/`.
 
 ## Usage
 

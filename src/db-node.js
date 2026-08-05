@@ -27,7 +27,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { checkDbName } from '../wasm/nisaba-wasm.js';
+import { checkDbName } from './nisaba-wasm.js';
 
 const LOCK_FILE = '.nisaba-lock';
 

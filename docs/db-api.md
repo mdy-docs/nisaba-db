@@ -1,8 +1,8 @@
 # Document database API reference
 
 A MongoDB-driver-shaped document database, implemented in C/WASM
-(`wasm/src/db*.c`, `wasm/include/db*.h`) with a thin JS bridge
-(`wasm/nisaba-wasm.js`/`src/db.js`, plus `src/db-coordinator.js` for
+(`engine/src/db*.c`, `engine/include/db*.h`) with a thin JS bridge
+(`src/nisaba-wasm.js`/`src/db.js`, plus `src/db-coordinator.js` for
 multi-tab sharing). This document is a complete reference for the
 JS-facing API; see `docs/db-plan.md` for the milestone-by-milestone
 design history and exact scope decisions behind each feature.
@@ -544,7 +544,7 @@ rejected) and no positional array operators (`$`, `$[]`, `$[<id>]`) yet.**
 | `$mul` | `{ $mul: { price: 1.1 } }` | Like `$inc` but multiplies; missing field seeds at `0` (matches real MongoDB). |
 | `$min` / `$max` | `{ $min: { score: 10 } }` | Keeps the smaller/larger value (same ordering as `$gt`/`$lt`); missing field is seeded directly; an incomparable pair is an error (unlike a filter, a value-producing op can't silently do nothing). |
 | `$rename` | `{ $rename: { nick: 'nickname' } }` | Renaming a missing field is a total no-op — it does *not* touch a pre-existing destination field either. Destination can't collide with another operator's target or another rename's destination. |
-| `$currentDate` | `{ $currentDate: { lastSeen: true } }` or `{ $type: 'date' }` | Resolved entirely client-side (in `wasm/nisaba-wasm.js`, rewritten into `$set` before crossing into C — only the JS host has a clock). `{$type: 'timestamp'}` isn't supported (no timestamp wire type). |
+| `$currentDate` | `{ $currentDate: { lastSeen: true } }` or `{ $type: 'date' }` | Resolved entirely client-side (in `src/nisaba-wasm.js`, rewritten into `$set` before crossing into C — only the JS host has a clock). `{$type: 'timestamp'}` isn't supported (no timestamp wire type). |
 | `$setOnInsert` | `{ $setOnInsert: { createdAt: new Date() } }` | Applied only when `upsert: true` actually inserts a new document; a complete no-op on a normal matched update (still reserves the field against other operators). |
 | `$addToSet` | `{ $addToSet: { tags: 'admin' } }` or `{ $addToSet: { tags: { $each: ['admin', 'root'] } } }` | Appends only if not already present (byte-equality); `$each` batch is deduped against existing elements and against itself. |
 | `$push` | `{ $push: { tags: 'admin' } }` or `{ $push: { scores: { $each: [4, 2], $slice: -3, $sort: -1, $position: 0 } } }` | Modifier form triggered by an operand object containing `$each`. `$slice` keeps first N (positive) / last \|N\| (negative) after insertion. `$sort` (`1`/`-1` value comparison only — no document-key sort for subdocument arrays) overrides `$position` when both given. |

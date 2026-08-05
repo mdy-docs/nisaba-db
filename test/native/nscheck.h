@@ -81,7 +81,7 @@ int nscheck_declare(nscheck *k, const char *name, uint32_t len);
  * of dc_compact_plan's own output: newEntry.file, then every
  * build[].files[] in order, then newEntry.journal.
  *
- * That order is not decorative -- it is the order wasm/nisaba-wasm.js
+ * That order is not decorative -- it is the order src/nisaba-wasm.js
  * awaits them in, and the order dc_compact_execute consumes `sources`
  * in. Keeping one function that knows it means a plan gaining a file
  * teaches the host, the executor and this checker at once.

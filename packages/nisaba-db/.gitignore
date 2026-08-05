@@ -1,7 +1,7 @@
 # Everything here is assembled from the repository by build.mjs at pack
 # time; the repo files are the single source of truth.
 /src/
-/wasm/
+/build/
 /types/
 /third_party/
 *.tgz

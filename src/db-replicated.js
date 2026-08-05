@@ -47,7 +47,7 @@
  * the RaftNode owns replay, applying exactly the committed prefix — an
  * uncommitted local suffix stays unapplied until a leader settles it.
  */
-import { connect, isDeterministicError } from '../wasm/nisaba-wasm.js';
+import { connect, isDeterministicError } from './nisaba-wasm.js';
 import { RaftNode, NotLeaderError } from './raft.js';
 import {
   WalDb, SNAP_PREFIX, openWalStorage, reconcileLogWithAppliedFloor

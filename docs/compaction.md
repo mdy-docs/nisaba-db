@@ -4,7 +4,7 @@ How `Collection.compact()` / `Db.compact()` reclaim the space append-only
 storage costs, and why the atomic unit of compaction is a collection's
 *entire file set* swapped through *one catalog commit*.
 
-Implementation: `wasm/nisaba-wasm.js` (`Collection.compact`, `Db.compact`,
+Implementation: `src/nisaba-wasm.js` (`Collection.compact`, `Db.compact`,
 `Db._sweepOrphans`, the `g<N>-` naming helpers), on top of the per-structure
 streaming rewriters that already existed (`bpt_compact` in
 `binjson-structures/src/bplustree.c`, `rt_compact` in `rtree.c`). Tests:
@@ -160,7 +160,7 @@ queues:
   collection waits for it** and then runs against the new generation,
   and symmetrically **a compact waits for every in-flight operation to
   drain** before touching a file (`_compacting`/`_inFlight` in
-  `wasm/nisaba-wasm.js` — a prototype wrapper applies the gate + count
+  `src/nisaba-wasm.js` — a prototype wrapper applies the gate + count
   to every public method in one place; the constructor comment carries
   the invariants). Interleaving is what this exists to prevent in both
   directions: a mutation during the build phase would make the new

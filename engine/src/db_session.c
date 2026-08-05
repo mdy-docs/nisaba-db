@@ -119,7 +119,7 @@ typedef struct {
      * operation two runs against a database operation one has already
      * changed. That is what MongoDB does, and what both other
      * implementations here do -- do_bulk_write plans each operation
-     * after applying the last, and runBulkWrite (wasm/nisaba-wasm.js)
+     * after applying the last, and runBulkWrite (src/nisaba-wasm.js)
      * dispatches each to its own logged method, awaited.
      *
      * A replica cannot cheat that by planning the list up front, because

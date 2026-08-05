@@ -76,7 +76,7 @@ and tests. From a repo checkout:
 
 ```sh
 cd packages/nisaba-db
-npm run build      # assembles src/, wasm/, types/, third_party/
+npm run build      # assembles src/, build/, types/, third_party/
 npm test           # a smoke round-trip over both providers
 npm pack           # the publishable tarball
 ```

@@ -7,7 +7,7 @@
  * stays there -- deliberately, and it is now ONE loop shared by both
  * collection implementations rather than the two near-identical copies
  * that src/db-wal.js's own comment described as "Same loop as the inner
- * bulkWrite (wasm/nisaba-wasm.js)".
+ * bulkWrite (src/nisaba-wasm.js)".
  *
  * What is NOT orchestration is the grammar: which operation names exist,
  * and which fields each one requires. That is a rule about what the

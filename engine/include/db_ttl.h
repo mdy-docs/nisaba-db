@@ -7,7 +7,7 @@
  * every document whose indexed Date is older than the cutoff.
  *
  * Two decisions live in that sentence, and both were duplicated verbatim
- * in JavaScript -- once in wasm/nisaba-wasm.js and once in src/db-wal.js,
+ * in JavaScript -- once in src/nisaba-wasm.js and once in src/db-wal.js,
  * whose own header comment notes "pruneExpired's TTL cutoffs become
  * concrete Dates inside ordinary logged deletes":
  *

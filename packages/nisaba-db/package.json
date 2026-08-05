@@ -9,11 +9,11 @@
     ".": { "types": "./types/nisaba.d.ts", "default": "./src/db.js" },
     "./node": { "types": "./types/node.d.ts", "default": "./src/db-node.js" },
     "./coordinator": { "types": "./types/coordinator.d.ts", "default": "./src/db-coordinator.js" },
-    "./wasm": { "types": "./types/wasm.d.ts", "default": "./wasm/nisaba-wasm.js" }
+    "./wasm": { "types": "./types/wasm.d.ts", "default": "./src/nisaba-wasm.js" }
   },
   "files": [
     "src",
-    "wasm",
+    "build",
     "types",
     "third_party"
   ],

@@ -3,7 +3,7 @@
  *
  * This example demonstrates how to use the document database (src/db.js)
  * directly from JavaScript — the same API the `db` CLI tool (bin/db.js)
- * and the driver-shaped Collection class in wasm/nisaba-wasm.js expose:
+ * and the driver-shaped Collection class in src/nisaba-wasm.js expose:
  * - Connecting to a database and creating collections
  * - insertOne / findOne / find / deleteOne / replaceOne / countDocuments
  * - Query operators ($gt, $in, $exists, $and, $or, ...), sort/skip/limit,
@@ -13,7 +13,7 @@
  * See docs/db-plan.md for the design and current limitations.
  */
 
-import { ready } from '../wasm/nisaba-wasm.js';
+import { ready } from '../src/nisaba-wasm.js';
 import { connect, OPFSStorageProvider } from '../src/db.js';
 
 // Set up node-opfs for Node.js environment

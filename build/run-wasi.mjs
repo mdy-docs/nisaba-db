@@ -1,9 +1,9 @@
 /*
  * run-wasi.mjs — run a wasm32-wasip1 binary under Node's WASI host.
  *
- *   node --experimental-wasi-unstable-preview1 wasm/run-wasi.mjs <file.wasm>
+ *   node --experimental-wasi-unstable-preview1 build/run-wasi.mjs <file.wasm>
  *
- * Used by wasm/build-native.sh --wasi to execute the native C harness on
+ * Used by build/build-native.sh --wasi to execute the native C harness on
  * the WASI target, which is how this repo finds out whether "the same C
  * sources, built twice" is actually true rather than merely plausible.
  *

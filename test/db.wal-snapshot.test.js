@@ -8,7 +8,7 @@
  * restore, and the dropCollection barrier (no resurrection on replay).
  */
 import { describe, it, expect } from 'vitest';
-import { ready, ObjectId, EntryLog, encode } from '../wasm/nisaba-wasm.js';
+import { ready, ObjectId, EntryLog, encode } from '../src/nisaba-wasm.js';
 import { MemoryStorageProvider } from '../src/db.js';
 import { readFileSync } from 'node:fs';
 import {

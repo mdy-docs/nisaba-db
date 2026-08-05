@@ -8,7 +8,7 @@ purpose — this page is cheap now and expensive after the first change.
 
 Every database carries a format version in its catalog under the
 reserved key `__format__` (`DB_FORMAT_KEY`/`DB_FORMAT_VERSION` in
-`wasm/nisaba-wasm.js`; enforced by `test/db.format.test.js`):
+`src/nisaba-wasm.js`; enforced by `test/db.format.test.js`):
 
 - `Db.open()` stamps a fresh database with the current version.
 - A database with **no stamp** predates the stamp mechanism and is by
@@ -23,7 +23,7 @@ reserved key `__format__` (`DB_FORMAT_KEY`/`DB_FORMAT_VERSION` in
 The stamp names the version of the *whole database layout*: catalog
 entry shapes, file naming (`g<N>-` generations, `coll-`/`idx-`
 prefixes), journal record layout (which has its own magic + version
-field inside `DCTJ` records — `wasm/src/db.c`), and the tree/index file
+field inside `DCTJ` records — `engine/src/db.c`), and the tree/index file
 formats beneath (binjson-structures' own metadata carries a `version`
 field per tree).
 

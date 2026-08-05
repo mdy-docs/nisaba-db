@@ -10,7 +10,7 @@
  * restart catch-up, and snapshot install of a blank replacement member.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, ObjectId } from '../wasm/nisaba-wasm.js';
+import { ready, ObjectId } from '../src/nisaba-wasm.js';
 import { MemoryStorageProvider } from '../src/db.js';
 import { connectReplicated, NotLeaderError } from '../src/db-replicated.js';
 import { Sim, MemoryNetwork, leaders, until, settle } from './raft-harness.js';

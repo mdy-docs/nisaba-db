@@ -20,7 +20,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import {
   ready, orderedKey, compositeKey, compositeUpperBound
-} from '../wasm/nisaba-wasm.js';
+} from '../src/nisaba-wasm.js';
 
 const hex = (bytes) => Buffer.from(bytes).toString('hex');
 

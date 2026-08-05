@@ -68,7 +68,7 @@ export { ObjectId };
 /**
  * The ops the wire has — the same list db-server-client.js declares,
  * for the same reason: to say what a refusal is refusing. The owner is
- * OP_NAMES in wasm/src/db_request.c.
+ * OP_NAMES in engine/src/db_request.c.
  */
 export const WIRE_OPS = [
   'ping', 'listDatabases', 'dropDatabase',

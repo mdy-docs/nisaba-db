@@ -4,7 +4,7 @@
  * concurrency").
  *
  * FileSystemSyncAccessHandle (what every OPFS file in this repo uses, via
- * OPFSStorageProvider/registerHandle in wasm/nisaba-wasm.js) takes an exclusive,
+ * OPFSStorageProvider/registerHandle in src/nisaba-wasm.js) takes an exclusive,
  * origin-wide lock per file: only one context can have a collection's files
  * open at a time. `connectShared` lets many tabs/workers share one logical
  * database anyway, by electing exactly one of them the "leader" (the only
@@ -37,7 +37,7 @@
  *     JSON, so ObjectId/Date survive the trip unchanged.
  *
  * `SharedDb`/`SharedCollection` mirror Db/Collection's public API exactly
- * (wasm/nisaba-wasm.js) so existing single-tab code barely changes to adopt
+ * (src/nisaba-wasm.js) so existing single-tab code barely changes to adopt
  * this -- test/db-coordinator.test.js enforces the parity by reflection.
  * The only structural difference is `find()`'s cursor resolving with one
  * RPC call on its first pull (toArray()/next()/iteration) rather than
@@ -45,7 +45,7 @@
  * `err.result`/`err.writeErrors`) are re-attached on the follower side so
  * error handling code works unchanged too.
  */
-import { encode, decode, connect, ChangeStream, Collection } from '../wasm/nisaba-wasm.js';
+import { encode, decode, connect, ChangeStream, Collection } from './nisaba-wasm.js';
 
 const REQUEST_TIMEOUT_MS = 5000;
 const REELECT_WAIT_MS = 2000;
@@ -417,7 +417,7 @@ class SharedCollection {
 
 
   /**
-   * Mirrors Collection.find()'s lazy cursor (wasm/nisaba-wasm.js): chain
+   * Mirrors Collection.find()'s lazy cursor (src/nisaba-wasm.js): chain
    * setters mutate local state only; toArray()/next()/iteration make
    * exactly one RPC call with the fully resolved filter+options, then hand
    * documents out locally. There is no streaming batch protocol across the
@@ -458,10 +458,10 @@ class SharedCollection {
 
   /** Runs on the leader (the only context holding the files). An operation
    * from any tab that races the swap simply queues behind it on the real
-   * Collection's compaction gate (wasm/nisaba-wasm.js, _compacting) -- a
+   * Collection's compaction gate (src/nisaba-wasm.js, _compacting) -- a
    * brief wait inside the normal RPC timeout, not an error. */
 
-  /** Same shape/scope limits as Collection.watch() (wasm/nisaba-wasm.js),
+  /** Same shape/scope limits as Collection.watch() (src/nisaba-wasm.js),
    * but sees writes from every tab sharing this database, not just this
    * one -- the leader rebroadcasts its real Collection's change events to
    * every other tab (see Coordinator._ensureRebroadcast). */

@@ -4,7 +4,7 @@
  * Every host so far has done this in its own language: read the catalog,
  * find the entry, work out which files the collection is made of, open
  * each one, attach each index in the right order, recover the journal.
- * `Db.collection()` in wasm/nisaba-wasm.js is that code, in JavaScript,
+ * `Db.collection()` in src/nisaba-wasm.js is that code, in JavaScript,
  * and it is the reason a process with no JavaScript can perform a
  * committed entry (dc_wal_apply) but cannot find the collection to
  * perform it against.

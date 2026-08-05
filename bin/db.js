@@ -2,7 +2,7 @@
 import os from 'node:os';
 import path from 'node:path';
 // The value types and the codec, from the pure-JS binjson -- the same
-// classes wasm/nisaba-wasm.js re-exports, so an ObjectId is an ObjectId
+// classes src/nisaba-wasm.js re-exports, so an ObjectId is an ObjectId
 // either way. Imported from here rather than from there because with
 // --server this process holds no database: the engine, the storage
 // provider and ready() are loaded below only when there is one to open.
@@ -310,7 +310,7 @@ async function main() {
   } else {
     // Loaded here rather than at the top so a client is a client: with
     // --server this process never instantiates the WASM engine at all.
-    const { ready, connectClient } = await import('../wasm/nisaba-wasm.js');
+    const { ready, connectClient } = await import('../src/nisaba-wasm.js');
     const { NodeFSStorageProvider } = await import('../src/db-node.js');
     await ready();
     const provider = new NodeFSStorageProvider(DATA_ROOT);

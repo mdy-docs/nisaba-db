@@ -400,7 +400,7 @@ static void accumulate(const uint8_t *res, size_t res_len,
  * because a LOGGED COMMAND already names the one document it touched:
  * the planner expanded updateMany into one command per matched document
  * before any of this ran. The derivation is the one every other host of
- * this library makes (wasm/nisaba-wasm.js's _applyCommand), including
+ * this library makes (src/nisaba-wasm.js's _applyCommand), including
  * the one read it cannot avoid -- an update names its CHANGES, not its
  * outcome, so the document has to be read back to say what it now is.
  * Live, that read happens right after the apply; replayed, it happens
@@ -462,7 +462,7 @@ static int build_event(dc_collection *c, const char *coll, uint32_t coll_len,
     if (!b) { dbuf_free(&after); return BJ_ERR_OOM; }
     bj_begin_object(b);
     /* `ns` first, then the event: the shape an in-process watcher gets
-     * (wasm/nisaba-wasm.js's _emitChange), so a consumer reads the same
+     * (src/nisaba-wasm.js's _emitChange), so a consumer reads the same
      * object whichever side of a socket it is on. */
     PUT_KEY(b, "ns");
     bj_begin_object(b);
@@ -1663,7 +1663,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
              * an arbitrary sort needs every match before it can emit the
              * first ordered result, which is why dc_cursor_open has no
              * sort parameter and why the in-process cursor
-             * (wasm/nisaba-wasm.js) refuses next() on a sorted find too.
+             * (src/nisaba-wasm.js) refuses next() on a sorted find too.
              * Three layers, one rule, said once each -- rather than this
              * one quietly materialising the lot and calling it a cursor.
              */

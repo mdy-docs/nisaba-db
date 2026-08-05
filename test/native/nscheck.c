@@ -148,7 +148,7 @@ int nscheck_declare_compact_plan(nscheck *k, const uint8_t *plan, size_t plan_le
     if (!found) return BJ_ERR_STATE;
 
     /* The primary first, then the indexes, then the journal -- the order
-     * wasm/nisaba-wasm.js awaits them in and dc_compact_execute consumes
+     * src/nisaba-wasm.js awaits them in and dc_compact_execute consumes
      * them in. */
     if ((e = declare_field(k, entry, entry_len, "file"))) return e;
 

@@ -2,10 +2,10 @@
 # Build the database SERVER -- server/main.c over this package's C
 # sources, with no JavaScript in the process.
 #
-#   ./wasm/build-server.sh              wasm32-wasip2, sockets + --stdio
-#   ./wasm/build-server.sh --native     a native binary, same sources
-#   ./wasm/build-server.sh --wasip1     wasm32-wasip1, --stdio only
-#   ./wasm/build-server.sh --run [args] build, then run it
+#   ./build/build-server.sh              wasm32-wasip2, sockets + --stdio
+#   ./build/build-server.sh --native     a native binary, same sources
+#   ./build/build-server.sh --wasip1     wasm32-wasip1, --stdio only
+#   ./build/build-server.sh --run [args] build, then run it
 #
 # THREE TARGETS, ONE MAIN. The point of building all three from one file
 # is the claim this whole effort rests on: the engine is C, the host is a
@@ -17,14 +17,14 @@
 # at all -- not a missing right, no such function -- so the wasip1 build
 # serves --stdio and says so if asked for a port.
 #
-# Sources come from wasm/build-common.sh, the same manifest the browser
+# Sources come from build/build-common.sh, the same manifest the browser
 # and native builds read, minus the JS-ABI adapters. The server main is
 # added here rather than in the manifest for the reason test/native's is:
 # a file defining main() must not enter a library build.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-. wasm/build-common.sh
+. build/build-common.sh
 
 TARGET=wasip2
 RUN=0
@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
 done
 
 require_submodules
-mkdir -p wasm/lib
+mkdir -p build/lib
 
 SOURCES=()
 while IFS= read -r src; do SOURCES+=("$src"); done < <(all_sources native)
@@ -55,7 +55,7 @@ LIBS=()
 case "$TARGET" in
   native)
     CC="${CC:-cc}"
-    OUT=wasm/lib/nisaba-server
+    OUT=build/lib/nisaba-server
     FLAGS+=(-DNISABA_SOCKETS=1)
     LIBS+=(-lm)   # geo.c/textindex.c/db_session.c: cos, log, floor
     ;;
@@ -63,7 +63,7 @@ case "$TARGET" in
     SDK="$(find_wasi_sdk)" || { wasi_sdk_missing; exit 1; }
     warn_unpinned_wasi_sdk "$SDK"
     CC="$SDK/bin/clang"
-    OUT="wasm/lib/nisaba-server-$TARGET.wasm"
+    OUT="build/lib/nisaba-server-$TARGET.wasm"
     FLAGS+=(
       "--target=wasm32-$TARGET"
       --sysroot="$SDK/share/wasi-sysroot"
@@ -87,7 +87,7 @@ if [ "$RUN" = 1 ]; then
     native) exec "./$OUT" ${RUN_ARGS+"${RUN_ARGS[@]}"} ;;
     *)
       WT="$(find_wasmtime)" || {
-        echo "error: no wasmtime to run it with -- ./wasm/get-wasmtime.sh" >&2
+        echo "error: no wasmtime to run it with -- ./build/get-wasmtime.sh" >&2
         exit 1
       }
       # -S inherit-network for the listener; the database directory is

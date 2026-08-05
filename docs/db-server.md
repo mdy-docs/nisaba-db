@@ -13,9 +13,9 @@ depend on sockets (preview1 has none).
 ## Building and running
 
 ```sh
-./wasm/build-server.sh              # wasm32-wasip2  (sockets + --stdio)
-./wasm/build-server.sh --native     # a native binary, same sources
-./wasm/build-server.sh --wasip1     # wasm32-wasip1, --stdio only
+./build/build-server.sh              # wasm32-wasip2  (sockets + --stdio)
+./build/build-server.sh --native     # a native binary, same sources
+./build/build-server.sh --wasip1     # wasm32-wasip1, --stdio only
 ```
 
 The ROOT directory is the working directory (native) or the preopen
@@ -23,7 +23,7 @@ mapped to `.` (WASI). One process per root, for its whole lifetime:
 
 ```sh
 wasmtime run -S inherit-network --dir ~/.nisaba::. \
-  wasm/lib/nisaba-server-wasip2.wasm --port 8097
+  build/lib/nisaba-server-wasip2.wasm --port 8097
 
 cd ~/.nisaba && nisaba-server --port 8097          # or natively
 cd /tmp/brand-new && nisaba-server --port 8097     # an empty directory is an empty instance
@@ -437,7 +437,7 @@ present because an insert's id was chosen by whoever asked, while an
 upsert's was resolved here.
 
 In a host that shares a process with the engine, that loop is JavaScript's
-(`wasm/include/db_bulk.h` says why, and it stays true there). Over a
+(`engine/include/db_bulk.h` says why, and it stays true there). Over a
 socket the same loop would be N round trips — and a client with no engine
 in it has no `dc_bulk_parse` to check a list of operations with. So the
 list goes over whole and C runs it.
@@ -491,7 +491,7 @@ now outlive the request that made it.
 stages and hands back what it produced — including the decision to push a
 *leading* `$match` into the underlying scan, so the planner and any index
 serve it. That decision lives with the planner it feeds
-(`wasm/include/db_agg.h`), not in a client, and the subset itself
+(`engine/include/db_agg.h`), not in a client, and the subset itself
 (`$match`, `$sort`, `$skip`, `$limit`, `$project`, `$group`, `$count`) is
 named in exactly one place.
 
@@ -737,7 +737,7 @@ is scanning that collection.
 bytes a write needs if it *turns out* to need one — an upsert that
 matched nothing, which is the only write whose need for an id cannot be
 known until it has run. Generating one needs a clock, which
-`wasm/include/db.h` keeps out of the engine deliberately, so a write that
+`engine/include/db.h` keeps out of the engine deliberately, so a write that
 needed an id and was not given one is refused rather than given an id
 invented in C.
 
@@ -805,7 +805,7 @@ cannot apply or a state that has drifted, and the ambiguity resolves
 toward stopping.
 
 Everything the server decides lives behind one function,
-`dbs_handle(dbs*, req, req_len, dbuf *out)` (`wasm/include/db_session.h`),
+`dbs_handle(dbs*, req, req_len, dbuf *out)` (`engine/include/db_session.h`),
 which is why the protocol is tested in `test/native/main.c` over buffers
 with no socket and no port.
 

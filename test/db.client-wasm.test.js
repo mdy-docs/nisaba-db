@@ -7,7 +7,7 @@
  * databases)".
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { ready } from '../wasm/nisaba-wasm.js';
+import { ready } from '../src/nisaba-wasm.js';
 import { connectClient, MemoryStorageProvider, OPFSStorageProvider } from '../src/db.js';
 import { bootstrapOPFS } from './binjson.suite.js';
 

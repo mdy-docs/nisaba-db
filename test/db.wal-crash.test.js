@@ -37,7 +37,7 @@
  * stay put.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, ObjectId, MemoryHandle, decode } from '../wasm/nisaba-wasm.js';
+import { ready, ObjectId, MemoryHandle, decode } from '../src/nisaba-wasm.js';
 import { MemoryStorageProvider } from '../src/db.js';
 import { connectWal } from '../src/db-wal.js';
 

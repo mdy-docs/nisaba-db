@@ -5,7 +5,7 @@
  * from src/raft.js, all on the deterministic simulator.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { ready, EntryLog, MemoryHandle } from '../src/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { RaftGroupHost } from '../src/raft-host.js';
 import { Sim, MemoryNetwork, KvMachine, kvSet, until, settle, rpc } from './raft-harness.js';
@@ -327,7 +327,7 @@ describe('raft: learners (non-voting members)', () => {
     net.register(deadVoter.node.id, (msg) => deadVoter.node.handleMessage(msg));
 
     // A learner refuses votes outright, pre or real.
-    const { EntryLog: EL, MemoryHandle: MH } = await import('../wasm/nisaba-wasm.js');
+    const { EntryLog: EL, MemoryHandle: MH } = await import('../src/nisaba-wasm.js');
     const learnerLog = new EL(new MH());
     await learnerLog.open();
     const { RaftNode: RN } = await import('../src/raft.js');

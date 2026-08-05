@@ -23,7 +23,7 @@
  * double-apply; a counter cannot.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, decode, ENTRYLOG_TYPE, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { ready, decode, ENTRYLOG_TYPE, MemoryHandle } from '../src/nisaba-wasm.js';
 import {
   Sim, MemoryNetwork, bootNode, stopNode, takeSnapshot, makeDisk,
   leaders, until, settle, kvSet, kvInc

@@ -28,8 +28,8 @@ import { connectServer, ObjectId } from '../src/db-server-client.js';
 import { toExtendedJson } from '../src/extended-json.js';
 import { DbHttpFront } from '../src/db-http-front.js';
 
-const NATIVE = 'wasm/lib/nisaba-server';
-const WASIP2 = 'wasm/lib/nisaba-server-wasip2.wasm';
+const NATIVE = 'build/lib/nisaba-server';
+const WASIP2 = 'build/lib/nisaba-server-wasip2.wasm';
 const have = (p) => fs.existsSync(p);
 const wasmtime = (() => {
   const r = spawnSync('sh', ['-c', 'command -v wasmtime'], { encoding: 'utf8' });

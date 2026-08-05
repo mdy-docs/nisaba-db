@@ -29,7 +29,7 @@ import {
 } from '../src/db-http-client.js';
 import { WIRE_OPS as TCP_WIRE_OPS } from '../src/db-server-client.js';
 
-const NATIVE = 'wasm/lib/nisaba-server';
+const NATIVE = 'build/lib/nisaba-server';
 const REQUIRED = process.env.NISABA_SERVER_TESTS === 'required';
 
 /* A base far from db.server.test.js's 18000 and db.http-front.test.js's

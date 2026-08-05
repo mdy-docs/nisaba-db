@@ -4,10 +4,11 @@
 > `nisaba-web` repo's `docs/` (where this package used to live before being
 > split into its own `nisaba` repo). File paths throughout reflect the
 > layout at the time each milestone was written (e.g. `c/db.c`,
-> `src/binjson-wasm.js`) and predate this package's own later reorg (C
-> sources moved under `wasm/`, the JS wrapper renamed to
-> `wasm/nisaba-wasm.js`) — read as history, not as current paths. See
-> `docs/db-api.md` for a reference that's current.
+> `src/binjson-wasm.js`) and predate this package's own later reorgs
+> (the C sources moved under `wasm/`, then again to `engine/`; the JS
+> wrapper became `wasm/nisaba-wasm.js`, now `src/nisaba-wasm.js`) —
+> read as history, not as current paths. See `docs/db-api.md` for a
+> reference that's current.
 
 A MongoDB-driver-shaped document database built on the existing persistent
 data structures (`bplustree.c`, `rtree.c`, `textindex.c`, `textlog.c`),

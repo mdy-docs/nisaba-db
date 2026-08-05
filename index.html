@@ -90,7 +90,7 @@
     // to encode/decode), and createRemoteBridge for wrapping a Worker's RPC
     // handle as a local-feeling proxy (see db-remote.js's own doc comments).
     // Deliberately NOT './src/db.js': that full entry statically re-exports
-    // from wasm/nisaba-wasm.js, which would load ~160 KB of WASM-glue JS on
+    // from src/nisaba-wasm.js, which would load ~160 KB of WASM-glue JS on
     // this thread that it never uses.
     import { encode, decode, ObjectId, Pointer, createRemoteBridge } from './src/db-remote.js';
 

@@ -10,7 +10,7 @@
  *    node: module (the browser claim, checked rather than asserted),
  *    addresses normalize, and Extended JSON round-trips the wire's
  *    types through the package's own copy.
- *  - when wasm/lib/nisaba-server has been built: a LIVE round trip —
+ *  - when build/lib/nisaba-server has been built: a LIVE round trip —
  *    server, front end (from the repo; it is the thing this client
  *    talks to, not part of it), and the packaged client doing insert,
  *    find and a change stream. Skipped otherwise, the same way the
@@ -51,10 +51,10 @@ if (String(across._id) !== String(id) || across.when.getTime() !== 0 || across.b
 console.log('smoke ok: the closure imports, is node:-free, and round-trips the wire types');
 
 /* The live half, against a built server with the repo's front end in front. */
-const NATIVE = path.join(repo, 'wasm', 'lib', 'nisaba-server');
+const NATIVE = path.join(repo, 'build', 'lib', 'nisaba-server');
 if (!fs.existsSync(NATIVE)) {
-  console.log('smoke skipped the live round-trip: wasm/lib/nisaba-server is not built ' +
-              '(./wasm/build-server.sh --native)');
+  console.log('smoke skipped the live round-trip: build/lib/nisaba-server is not built ' +
+              '(./build/build-server.sh --native)');
   process.exit(0);
 }
 const { DbHttpFront } = await import(path.join(repo, 'src', 'db-http-front.js'));

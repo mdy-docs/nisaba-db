@@ -10,7 +10,7 @@
  * file is copied from the repo root at pack time (prepack runs this), so
  * the package can never drift from what the repository builds and tests.
  * The copied tree mirrors the repo's layout exactly, because the source
- * files import each other by relative path ('../wasm/nisaba-wasm.js',
+ * files import each other by relative path ('../src/nisaba-wasm.js',
  * '../third_party/binjson/js/binjson.js') and preserving the shape is
  * what lets them ship unmodified.
  *
@@ -45,9 +45,9 @@ const CLOSURE = [
   // The browser's multi-tab coordination (runs inside a worker).
   'src/db-coordinator.js',
   // The engine wrapper and the engine.
-  'wasm/nisaba-wasm.js',
-  'wasm/lib/nisaba.wasm.mjs',
-  'wasm/lib/nisaba.wasm',
+  'src/nisaba-wasm.js',
+  'build/lib/nisaba.wasm.mjs',
+  'build/lib/nisaba.wasm',
   // The leaf modules the above import.
   'third_party/binjson/js/binjson.js',
   'third_party/binjson-structures/wasm/structures-core.js',
@@ -61,9 +61,9 @@ const CLOSURE = [
 
 // The engine is a build artifact the repository does not commit; make it
 // if it is not there, with the one script that owns how it is made.
-if (!fs.existsSync(path.join(repo, 'wasm', 'lib', 'nisaba.wasm'))) {
-  console.log('nisaba.wasm not built; running wasm/build-wasm.sh ...');
-  execFileSync(path.join(repo, 'wasm', 'build-wasm.sh'), { cwd: repo, stdio: 'inherit' });
+if (!fs.existsSync(path.join(repo, 'build', 'lib', 'nisaba.wasm'))) {
+  console.log('nisaba.wasm not built; running build/build-wasm.sh ...');
+  execFileSync(path.join(repo, 'build', 'build-wasm.sh'), { cwd: repo, stdio: 'inherit' });
 }
 
 for (const rel of CLOSURE) {

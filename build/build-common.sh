@@ -4,7 +4,7 @@
 # not executable on its own.
 #
 # The point of this file is that the two targets read ONE list. A source
-# added to wasm/sources.txt is compiled by both, or deliberately excluded
+# added to engine/sources.txt is compiled by both, or deliberately excluded
 # by name below -- there is no way to add a file to the browser build and
 # silently forget the server build.
 #
@@ -35,8 +35,8 @@ require_submodules() {
 # The pinned toolchains: where they are, and where they come from.
 #
 # This is the ONE place each version is written down. build-native.sh
-# --wasi finds them through here, wasm/get-wasi-sdk.sh and
-# wasm/get-wasmtime.sh fetch them through here, and CI runs those same
+# --wasi finds them through here, build/get-wasi-sdk.sh and
+# build/get-wasmtime.sh fetch them through here, and CI runs those same
 # scripts -- so a bump is one line, and a runner and a developer's machine
 # cannot end up on different toolchains, which is the whole reason
 # anything is pinned (a codegen change should arrive as a commit, not as a
@@ -192,10 +192,10 @@ warn_unpinned_wasi_sdk() {
 # variable that was missing, which is what this used to print.
 wasi_sdk_missing() {
   local dir
-  echo "error: no wasi-sdk $WASI_SDK_VERSION found (--wasi needs one; the version is pinned in wasm/build-common.sh)" >&2
+  echo "error: no wasi-sdk $WASI_SDK_VERSION found (--wasi needs one; the version is pinned in build/build-common.sh)" >&2
   echo "  looked in:" >&2
   while IFS= read -r dir; do echo "    $dir" >&2; done < <(wasi_sdk_candidates)
-  echo "  fetch it:  ./wasm/get-wasi-sdk.sh" >&2
+  echo "  fetch it:  ./build/get-wasi-sdk.sh" >&2
   echo "  or point at your own:  WASI_SDK=/path/to/wasi-sdk $0 --wasi" >&2
 }
 
@@ -263,15 +263,19 @@ warn_unpinned_wasmtime() {
   fi
 }
 
-# Sources that are the JS ABI, not logic, and so are excluded from every
-# non-emscripten build. Listed explicitly rather than matched as *_wasm.c
-# because that glob is wrong twice over:
+# Third-party sources that are the JS ABI, not logic, and so are excluded
+# from every non-emscripten build. This repository's own JS-ABI sources
+# are not listed: they live in engine/jsabi/, and the loop below excludes
+# that whole directory -- the split is structural, not a list to maintain.
+# The suffix glob *_wasm.c would be wrong in BOTH directions:
 #
 #   - third_party/regex-engine/src/regex_wasm.c is a genuine portable
 #     shim, not JS glue -- its own header says it exists "so the shim's
 #     own translation unit and native callers (e.g. test/smoke.c) share
-#     one declaration". The native build NEEDS it; wasm/src/regex.c
-#     includes regex_wasm.h and calls straight into it.
+#     one declaration". The native build NEEDS it; engine/src/regex.c
+#     includes regex_wasm.h and calls straight into it. This repo's own
+#     portable flat-ABI shims (db_wal_wasm.c, raft_core/drive/msg_wasm.c)
+#     live in engine/src for the same reason: every target compiles them.
 #   - src/hostio.c matches no glob at all, but is the single file that
 #     hard-codes the EM_JS bridge, and is exactly what a native host
 #     replaces with its own bj_io (see its own comment, and
@@ -292,17 +296,6 @@ NATIVE_EXCLUDE=(
   third_party/binjson-structures/src/textlog_wasm.c
   third_party/binjson-structures/src/entrylog_wasm.c
   third_party/binjson-structures/src/textindex_wasm.c
-  wasm/src/db_names_wasm.c
-  wasm/src/db_validate_wasm.c
-  wasm/src/db_ttl_wasm.c
-  wasm/src/db_bulk_wasm.c
-  wasm/src/db_catalog_wasm.c
-  # Both of these build a bj_ns through bjns_bridge.c, which is itself
-  # emscripten-only (its mirror in NATIVE_EXTRA is the POSIX adapter).
-  wasm/src/raft_node_wasm.c
-  wasm/src/db_wasm.c
-  wasm/src/db_agg_wasm.c
-  wasm/src/db_currentdate_wasm.c
 )
 
 # Sources only a non-emscripten build links: the POSIX bj_io/bj_ns adapter
@@ -325,15 +318,19 @@ all_sources() {
     # compiler and VM at v0.3.0. Listed in dependency-free order -- the
     # link does not care -- and kept inline rather than in a manifest for
     # the same reason binjson's two are: this submodule ships no
-    # wasm/sources.txt of its own.
+    # engine/sources.txt of its own.
     echo third_party/regex-engine/src/re_lexer.c
     echo third_party/regex-engine/src/re_parser.c
     echo third_party/regex-engine/src/re_compiler.c
     echo third_party/regex-engine/src/re_vm.c
     echo third_party/regex-engine/src/regex_wasm.c
-    read_manifest wasm/sources.txt
+    read_manifest engine/sources.txt
   } | while IFS= read -r src; do
     if [ "$mode" = native ]; then
+      # This repo's emscripten-only JS-ABI layer is a DIRECTORY, so its
+      # exclusion needs no list: a new adapter lands in engine/jsabi/
+      # and is out of every native build by construction.
+      case "$src" in engine/jsabi/*) continue ;; esac
       excluded=0
       for ex in "${NATIVE_EXCLUDE[@]}"; do
         [ "$src" = "$ex" ] && { excluded=1; break; }
@@ -349,7 +346,7 @@ all_sources() {
 
 # Include paths shared by every target.
 INCLUDE_FLAGS=(
-  -Iwasm/include
+  -Iengine/include
   -Ithird_party/binjson/include
   -Ithird_party/binjson-structures/include
   -Ithird_party/regex-engine/include
@@ -389,6 +386,6 @@ _bjw_consumed
 _bjw_value_size
 EOF
     read_manifest third_party/binjson-structures/wasm/exports.txt
-    read_manifest wasm/exports.txt
+    read_manifest engine/jsabi/exports.txt
   } | paste -sd, -
 }

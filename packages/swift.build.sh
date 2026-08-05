@@ -7,8 +7,8 @@
 # copied from the repo at assemble time, so the Swift package can never
 # drift from what the repository builds and tests.
 #
-# The source list is wasm/build-common.sh's `all_sources native` -- the
-# SAME list wasm/build-native.sh compiles and CI runs under ASan/UBSan --
+# The source list is build/build-common.sh's `all_sources native` -- the
+# SAME list build/build-native.sh compiles and CI runs under ASan/UBSan --
 # plus server/root.c, the POSIX dbi_root implementation the native test
 # harness links for the same reason we do: it is the one real
 # openat/readdir/unlinkat implementation of db_instance.h's directory
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-. wasm/build-common.sh
+. build/build-common.sh
 require_submodules
 
 PKG=packages/swift/Sources/CNisaba
@@ -42,7 +42,7 @@ cp server/root.c "$PKG/src/"
 # Private header the regex engine's sources share among themselves.
 cp third_party/regex-engine/src/re_internal.h "$PKG/src/"
 
-cp wasm/include/*.h \
+cp engine/include/*.h \
    third_party/binjson/include/*.h \
    third_party/binjson-structures/include/*.h \
    third_party/regex-engine/include/*.h \

@@ -11,10 +11,10 @@ and every rule behind it [`http-front.md`](http-front.md)'s.
 ## 1. The server — one process, one root directory
 
 ```sh
-./wasm/build-server.sh --native      # → wasm/lib/nisaba-server
+./build/build-server.sh --native      # → build/lib/nisaba-server
 
 mkdir -p ~/nisaba-data && cd ~/nisaba-data
-/path/to/repo/wasm/lib/nisaba-server --port 8097
+/path/to/repo/build/lib/nisaba-server --port 8097
 # nisaba: serving 127.0.0.1:8097 (max 64 clients, idle timeout 60s)
 ```
 
@@ -26,9 +26,9 @@ The deployment target is wasip2 under wasmtime — same code, same root
 rule, with the directory granted by the host instead of `cd`:
 
 ```sh
-./wasm/build-server.sh              # → wasm/lib/nisaba-server-wasip2.wasm
+./build/build-server.sh              # → build/lib/nisaba-server-wasip2.wasm
 wasmtime run -S inherit-network --dir ~/nisaba-data::. \
-  wasm/lib/nisaba-server-wasip2.wasm --port 8097
+  build/lib/nisaba-server-wasip2.wasm --port 8097
 ```
 
 ## 2. The HTTP front end — HTTP on one side, binjson frames on the other

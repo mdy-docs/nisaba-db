@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# Build the standalone nisaba WASM module: wasm/lib/nisaba.wasm +
-# wasm/lib/nisaba.wasm.mjs (the ES module loader), loaded by
+# Build the standalone nisaba WASM module: build/lib/nisaba.wasm +
+# build/lib/nisaba.wasm.mjs (the ES module loader), loaded by
 # wasm/nisaba-wasm.js. Mirrors the parent project's c/build-wasm.sh (same
 # flags, same combined-binary shape) but links only this package's own
 # sources plus its nested binjson/binjson-structures/regex-engine
 # submodules -- nothing here depends on the parent repo. Requires `emcc`
-# on PATH (emsdk; the committed wasm/lib artifacts were built with 5.0.7,
+# on PATH (emsdk; the committed build/lib artifacts were built with 5.0.7,
 # which CI pins -- keep .github/workflows/ci.yml in lockstep when
 # upgrading) and the submodules checked out
 # (`git submodule update --init`).
 #
-# The source and export lists live in wasm/sources.txt and
-# wasm/exports.txt, read via wasm/build-common.sh, which is the same
-# file wasm/build-native.sh reads -- so the browser and server targets
+# The source and export lists live in engine/sources.txt and
+# engine/jsabi/exports.txt, read via build/build-common.sh, which is the same
+# file build/build-native.sh reads -- so the browser and server targets
 # cannot drift about what this package contains.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-. wasm/build-common.sh
+. build/build-common.sh
 
-mkdir -p wasm/lib
+mkdir -p build/lib
 require_submodules
 
 # See the parent project's c/build-wasm.sh for why the stack size/overflow
@@ -52,7 +52,7 @@ emcc "${SOURCES[@]}" \
   "${COMMON_FLAGS[@]}" \
   -sEXPORT_NAME=createNisabaModule \
   -sEXPORTED_FUNCTIONS="$(wasm_exports)" \
-  -o wasm/lib/nisaba.mjs
+  -o build/lib/nisaba.mjs
 
-mv wasm/lib/nisaba.mjs wasm/lib/nisaba.wasm.mjs
-echo "built wasm/lib/nisaba.wasm.mjs ($(wc -c < wasm/lib/nisaba.wasm) bytes wasm)"
+mv build/lib/nisaba.mjs build/lib/nisaba.wasm.mjs
+echo "built build/lib/nisaba.wasm.mjs ($(wc -c < build/lib/nisaba.wasm) bytes wasm)"

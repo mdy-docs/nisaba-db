@@ -1,5 +1,5 @@
 /**
- * Types for `nisaba/wasm` (wasm/nisaba-wasm.js) -- the full module. The
+ * Types for `nisaba/wasm` (src/nisaba-wasm.js) -- the full module. The
  * database-level surface is typed precisely (re-used from the main
  * entry); the lower-level structure classes (B+ tree, R-tree, text
  * index/log, diff/patch) are exported but deliberately left loose --

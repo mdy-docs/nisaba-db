@@ -1,7 +1,7 @@
 /**
  * db-remote.js — the main-thread half of a main-thread/Worker split, kept
  * as its own entry point (`nisaba/remote`) so a browser main thread can
- * import it without pulling in wasm/nisaba-wasm.js's whole module graph
+ * import it without pulling in src/nisaba-wasm.js's whole module graph
  * (~160 KB of JS incl. the emscripten glue). This module's only import is
  * the pure-JS binjson codec; the WASM-backed Db/Collection/etc. live
  * behind the package's main entry (src/db.js) and belong in the Worker
@@ -15,7 +15,7 @@
  * on the main thread, which never calls ready() and shouldn't have to just
  * to marshal postMessage payloads to/from a Worker (see createRemoteBridge
  * below, and index.html's own use of it). Deliberately not the WASM-backed
- * encode/decode wasm/nisaba-wasm.js's Db/Collection classes use internally
+ * encode/decode src/nisaba-wasm.js's Db/Collection classes use internally
  * (those require ready() first); this is the same codec src/db-worker.js
  * uses for the same reason on its side of the postMessage boundary.
  */

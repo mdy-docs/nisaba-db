@@ -50,7 +50,7 @@ Every shape is assembled from these. Nothing below is per-shape.
               │ wasm exports           │ dbs_handle         │ raft_node
    ┌──────────┴─────────┐   ┌──────────┴────────┐  ┌────────┴────────┐
    │ JS DRIVER          │   │ REQUEST GRAMMAR   │  │ RAFT HOST       │
-   │ wasm/nisaba-wasm.js│   │ wasm/src/         │  │ src/raft.js     │
+   │ src/nisaba-wasm.js│   │ engine/src/         │  │ src/raft.js     │
    │ Db · Collection ·  │   │   db_request.c    │  │ timers, socket, │
    │ ChangeStream       │   │   db_session.c    │  │ the outbox pump │
    │ + storage providers│   │ the op table over │  │                 │
@@ -82,7 +82,7 @@ reach for instead of IndexedDB. No network, works offline.
    │        │  await users.insertOne({...})             │
    │        ▼                                           │
    │  ┌─ Worker ────────────────────────────────────┐   │
-   │  │  wasm/nisaba-wasm.js   the JS bridge        │   │
+   │  │  src/nisaba-wasm.js   the JS bridge        │   │
    │  │      │                                      │   │
    │  │      │  1. ask C which files this needs     │   │
    │  │      │  2. await OPFS handles for them      │   │
@@ -104,7 +104,7 @@ only wants to marshal calls to that Worker.
 
 ### The bridge is not minimal
 
-`wasm/nisaba-wasm.js` is ~3,900 lines: roughly 2,000 of codec, handle
+`src/nisaba-wasm.js` is ~3,900 lines: roughly 2,000 of codec, handle
 table and glue, then `Collection` (~1,500), `Db` (~270) and the storage
 providers (~150).
 
@@ -135,7 +135,7 @@ The claim above — that the bridge's size follows from the async-open
 constraint — was an assumption until it was measured. It is half true,
 and the half that is false is the interesting one.
 
-`wasm/nisaba-wasm.js` is 3,937 lines, and it is five things, not one:
+`src/nisaba-wasm.js` is 3,937 lines, and it is five things, not one:
 
 | Part | Lines | |
 | --- | ---: | --- |
@@ -165,7 +165,7 @@ touches the storage provider:
 
 **The 983 do not open anything.** They run against a collection whose
 files are already open, and every one of them is an operation
-`wasm/src/db_request.c` already implements for shape 4. The async-open
+`engine/src/db_request.c` already implements for shape 4. The async-open
 constraint does not reach them: it forces *opening* to be planned in C
 and executed in JS, and opening is the other 794 lines.
 
@@ -339,7 +339,7 @@ writes, followers converging, failover when one dies.
 
 | Piece | Where | Tests |
 | --- | --- | --- |
-| Raft state machine (roles, terms, timers, commit arithmetic, the two hot RPC handlers) | **C** — `wasm/include/raft_node.h` | via the host |
+| Raft state machine (roles, terms, timers, commit arithmetic, the two hot RPC handlers) | **C** — `engine/include/raft_node.h` | via the host |
 | Raft host (timers, sockets, the outbox pump) | `src/raft.js` | 26 |
 | Many groups in one process | `src/raft-host.js` | 12 |
 | Peer transport, TCP | `src/raft-transport-tcp.js` | 5 |
@@ -409,7 +409,7 @@ the answer rather than re-deriving the term rule.
 message kinds are the node's now: it serves an install, receives one,
 verifies it and adopts it — the generation's files onto the live names,
 its own log rebased onto the boundary — through a `bj_ns` it is handed
-(`wasm/include/raft_node.h`). The JavaScript implementation went with
+(`engine/include/raft_node.h`). The JavaScript implementation went with
 it; what remains on any host is opening a file, which is asynchronous in
 a browser, and the close/reopen an adoption runs between.
 

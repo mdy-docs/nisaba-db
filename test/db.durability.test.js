@@ -17,7 +17,7 @@
  * being durable.
  */
 import { describe, it, expect, beforeAll } from 'vitest';
-import { ready, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { ready, EntryLog, MemoryHandle } from '../src/nisaba-wasm.js';
 
 beforeAll(async () => { await ready(); });
 

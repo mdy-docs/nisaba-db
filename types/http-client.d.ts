@@ -22,7 +22,7 @@ export type {
   RemoteInsertManyResult, RemoteBulkWriteResult, RemoteChangeEvent
 };
 
-/** The op names the wire carries; wasm/src/db_request.c owns the list. */
+/** The op names the wire carries; engine/src/db_request.c owns the list. */
 export const WIRE_OPS: readonly string[];
 
 /** A refusal from the server, carried through the front end verbatim:

@@ -37,7 +37,7 @@
  */
 import {
   connectClient, isDeterministicError, decode, encode, EntryLog, dbCatalogFile
-} from '../wasm/nisaba-wasm.js';
+} from './nisaba-wasm.js';
 import { RaftNode, NotLeaderError } from './raft.js';
 import { SNAP_PREFIX, openWalStorage } from './db-wal.js';
 import { WalInstance } from './db-wal-instance.js';

@@ -9,7 +9,7 @@
  * THE STATE MACHINE IS NOT HERE ANY MORE (phase 7c). Role, term
  * transitions, the election timer and its round, the heartbeat timer, the
  * per-peer replication cursors, the commit arithmetic and the two hot RPC
- * handlers all live in C (wasm/include/raft_node.h, over raft_core.h /
+ * handlers all live in C (engine/include/raft_node.h, over raft_core.h /
  * raft_msg.h / raft_drive.h). This file is the HOST: it owns exactly the
  * things C cannot own without a JavaScript runtime, and nothing else.
  *
@@ -55,7 +55,7 @@
  * returns the reply bytes — the host wires the two together (a WebSocket
  * adapter in the service, an in-memory network in tests). The node never
  * owns a socket, and the transport never reads a field: it FRAMES, it
- * does not interpret. The grammar is C's (wasm/include/raft_msg.h), so
+ * does not interpret. The grammar is C's (engine/include/raft_msg.h), so
  * requestVote and appendEntries are never decoded on this side at all:
  * they go to C as the bytes they arrived as, run there against this
  * node's own log, and the reply comes back as the bytes to send.
@@ -152,7 +152,7 @@
 import {
   ENTRYLOG_TYPE, EntryLog, encode, decode, raftMsg,
   RaftCore, RAFT_ROLE, RN_EFFECT
-} from '../wasm/nisaba-wasm.js';
+} from './nisaba-wasm.js';
 
 export class NotLeaderError extends Error {
   /** @param {number} leaderId - the last known leader (0 if unknown) */
@@ -246,7 +246,7 @@ export class RaftNode {
     this.snapshotChunkBytes = snapshotChunkBytes;
     this.random = random;
 
-    /** The state machine itself (wasm/include/raft_node.h). Everything
+    /** The state machine itself (engine/include/raft_node.h). Everything
      * below is the host's half; anything that looks like a Raft decision
      * is a question asked of this. */
     this._core = new RaftCore(id, log, { electionTimeoutMs, heartbeatMs, maxBatchBytes });

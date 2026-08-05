@@ -8,7 +8,7 @@
  * next(), and cursor lifecycle/cleanup.
  */
 import { describe, it, expect } from 'vitest';
-import { ready } from '../wasm/nisaba-wasm.js';
+import { ready } from '../src/nisaba-wasm.js';
 import { connect, MemoryStorageProvider } from '../src/db.js';
 
 await ready();

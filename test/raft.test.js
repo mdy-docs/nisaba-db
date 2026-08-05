@@ -8,7 +8,7 @@
  * EntryLog, and single-node degenerate clusters.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, encode, decode } from '../wasm/nisaba-wasm.js';
+import { ready, encode, decode } from '../src/nisaba-wasm.js';
 import { NotLeaderError } from '../src/raft.js';
 import {
   Sim, MemoryNetwork, makeCluster, bootNode, stopNode, takeSnapshot, makeDisk,

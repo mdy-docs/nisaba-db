@@ -2,7 +2,7 @@
  * db-names.test.js — the file-naming scheme and format stamp, through the
  * JS surface.
  *
- * The scheme moved into C (wasm/src/db_names.c) so the catalog, the
+ * The scheme moved into C (engine/src/db_names.c) so the catalog, the
  * compaction generation flip and the orphan sweep can follow it there --
  * a host that cannot name a file cannot own a catalog. These assertions
  * are the names the JS produced before the move; test/native/main.c
@@ -16,7 +16,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import {
   ready, dbCatalogFile, dbFormatKey, dbFormatVersion,
   collectionFileName, indexFileName, textIndexFileNames, journalFileName, isDbFile
-} from '../wasm/nisaba-wasm.js';
+} from '../src/nisaba-wasm.js';
 
 beforeAll(async () => { await ready(); });
 

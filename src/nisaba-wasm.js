@@ -3,7 +3,7 @@
  * buildable and usable independently of the rest of the parent project
  * (see build-wasm.sh in this directory).
  *
- * This file owns this package's combined binary (wasm/lib), the module
+ * This file owns this package's combined binary (build/lib), the module
  * lifecycle (ready/requireModule), a self-contained copy of the binjson
  * codec bound to that binary, the host I/O bridge (bridgeHandle), and
  * the Db/Collection/ChangeStream/StorageProvider/Client layer. The
@@ -34,7 +34,7 @@
  * The WASM module loads asynchronously; call and await `ready()` once
  * before using any of these synchronously-shaped APIs.
  */
-import createModule from './lib/nisaba.wasm.mjs';
+import createModule from '../build/lib/nisaba.wasm.mjs';
 import {
   TYPE,
   ObjectId,
@@ -53,7 +53,7 @@ const EV = {
   OBJ_BEGIN: 12, KEY: 13, OBJ_END: 14
 };
 
-// Error messages come from C (dc_strerror in wasm/src/db_validate.c).
+// Error messages come from C (dc_strerror in engine/src/db_validate.c).
 // They used to be a literal map here, under a comment reading "must match
 // the BJ_ERR_* constants in c/binjson.h" -- a hand-maintained second copy
 // of C's own error vocabulary, kept in sync by nothing.
@@ -660,7 +660,7 @@ const DB_DEFAULT_ORDER = 32;
 // ---------------------------------------------------------------------------
 // File naming and the format stamp: marshalling only.
 //
-// The scheme itself lives in wasm/src/db_names.c (see db_names.h for the
+// The scheme itself lives in engine/src/db_names.c (see db_names.h for the
 // generation-prefix rationale and docs/format-compatibility.md for what the
 // stamp covers). It used to live here, on the argument -- recorded in
 // docs/db-plan.md -- that JS must compute a file name before it can open
@@ -748,7 +748,7 @@ function toObjectId(id) {
   );
 }
 
-// Name and key-spec validation lives in wasm/src/db_validate.c. Only the
+// Name and key-spec validation lives in engine/src/db_validate.c. Only the
 // JS-type gate stays here: C is handed bytes, so "is this even a string"
 // is a question only JavaScript can ask. Everything past that -- empty,
 // contains '/', contains NUL, is the reserved format-stamp key -- is C's.
@@ -1008,7 +1008,7 @@ async function runBulkWrite(target, operations, ordered) {
 
 /**
  * WAL command opcodes, as db_wal.h numbers them. The wire spellings ("i",
- * "u", "createIndex", ...) exist only in wasm/src/db_wal.c -- this side
+ * "u", "createIndex", ...) exist only in engine/src/db_wal.c -- this side
  * dispatches on numbers it cannot mistype.
  */
 const WAL_OP = Object.freeze({
@@ -1161,7 +1161,7 @@ function raftDecide(name, input, context) {
 }
 
 /**
- * The Raft rules whose violation is a consensus bug (wasm/include/
+ * The Raft rules whose violation is a consensus bug (engine/include/
  * raft_core.h). src/raft.js decides nothing about safety on its own any
  * more: it gathers the inputs, asks, and carries out the answer in the
  * order it is given -- the order being itself a rule, since a vote must
@@ -1244,7 +1244,7 @@ const raft = {
 };
 
 /**
- * The leader's and candidate's own bookkeeping (wasm/include/raft_drive.h):
+ * The leader's and candidate's own bookkeeping (engine/include/raft_drive.h):
  * tallying an election round, choosing what a peer is owed, and walking a
  * snapshot as a chunk stream.
  *
@@ -1326,7 +1326,7 @@ const raftDrive = {
 };
 
 /**
- * The replication state machine and its outbox (wasm/include/raft_node.h).
+ * The replication state machine and its outbox (engine/include/raft_node.h).
  *
  * This is the seam that lets Raft leave JavaScript. Instead of
  * `await transport.call(peer, msg)` -- which suspends the state machine
@@ -1859,7 +1859,7 @@ function withRaftState(st, fn) {
 
 /**
  * The Raft wire grammar and the two RPC handlers that run entirely in C
- * (wasm/include/raft_msg.h).
+ * (engine/include/raft_msg.h).
  *
  * These take the message as the bytes it arrived as and return the reply
  * as the bytes to send back. Nothing decodes an AppendEntries in
@@ -3492,7 +3492,7 @@ class Collection {
   }
 
   /**
-   * Replicated-log integration (dc_applied_index in wasm/include/db.h):
+   * Replicated-log integration (dc_applied_index in engine/include/db.h):
    * the last log index applied to this collection -- read from the
    * primary tree, which every document mutation commits. 0 = the
    * collection is not log-driven. The apply loop resumes replay from

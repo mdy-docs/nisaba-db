@@ -6,7 +6,7 @@
  * with real timers, electing and committing outside the simulator.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { ready, EntryLog, MemoryHandle } from '../src/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { RaftGroupHost, joinGroup, leaveGroup } from '../src/raft-host.js';
 import { TcpRaftTransport } from '../src/raft-transport-tcp.js';

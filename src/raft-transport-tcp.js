@@ -24,7 +24,7 @@
  * are the retry policy.
  */
 import net from 'node:net';
-import { encode, decode } from '../wasm/nisaba-wasm.js';
+import { encode, decode } from './nisaba-wasm.js';
 
 const HEADER = 4;
 const MAX_FRAME = 64 * 1024 * 1024; // sanity cap: a frame is at most a snapshot chunk + overhead

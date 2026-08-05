@@ -4,8 +4,8 @@
  * on top of the persistent B+ tree, no secondary indexes yet.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { ready } from '../wasm/nisaba-wasm.js';
-import { ObjectId } from '../wasm/nisaba-wasm.js';
+import { ready } from '../src/nisaba-wasm.js';
+import { ObjectId } from '../src/nisaba-wasm.js';
 import { connect, MemoryStorageProvider, OPFSStorageProvider } from '../src/db.js';
 import { bootstrapOPFS } from './binjson.suite.js';
 

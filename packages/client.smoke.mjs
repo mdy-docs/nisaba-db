@@ -9,7 +9,7 @@
  *  - always: the closure is complete — the client imports, and the codec
  *    it shipped round-trips the values the wire is made of (ObjectId,
  *    dates, binary) without reaching outside the package.
- *  - when wasm/lib/nisaba-server has been built: a LIVE round-trip —
+ *  - when build/lib/nisaba-server has been built: a LIVE round-trip —
  *    spawn the server on a temp root, insert, find, close. Skipped
  *    otherwise, the same way the repo's own server tests skip: `npm
  *    test` does not build the server.
@@ -42,10 +42,10 @@ if (!(new ServerError(-41, 'x') instanceof Error)) throw new Error('ServerError 
 console.log('smoke ok: the closure imports and the codec round-trips');
 
 /* The live half, against a built server. */
-const NATIVE = path.join(repo, 'wasm', 'lib', 'nisaba-server');
+const NATIVE = path.join(repo, 'build', 'lib', 'nisaba-server');
 if (!fs.existsSync(NATIVE)) {
-  console.log('smoke skipped the live round-trip: wasm/lib/nisaba-server is not built ' +
-              '(./wasm/build-server.sh --native)');
+  console.log('smoke skipped the live round-trip: build/lib/nisaba-server is not built ' +
+              '(./build/build-server.sh --native)');
   process.exit(0);
 }
 

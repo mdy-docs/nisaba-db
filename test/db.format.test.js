@@ -6,7 +6,7 @@
  * anything stamped newer than the build understands.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, BPlusTree, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { ready, BPlusTree, MemoryHandle } from '../src/nisaba-wasm.js';
 import { connect, MemoryStorageProvider } from '../src/db.js';
 
 await ready();

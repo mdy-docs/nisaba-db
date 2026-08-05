@@ -9,7 +9,7 @@
  *    package alone, constructs, starts, and serves its banner. No
  *    server is needed for any of that: the front end dials members per
  *    request, which is itself part of the claim.
- *  - when wasm/lib/nisaba-server has been built: a LIVE round trip —
+ *  - when build/lib/nisaba-server has been built: a LIVE round trip —
  *    spawn the server, put the front in front of it, insert and find
  *    over plain HTTP. Skipped otherwise, the same way the repo's own
  *    server tests skip.
@@ -37,10 +37,10 @@ await front.stop();
 console.log('smoke ok: the closure imports, starts, and speaks its grammar');
 
 /* The live half, against a built server. */
-const NATIVE = path.join(repo, 'wasm', 'lib', 'nisaba-server');
+const NATIVE = path.join(repo, 'build', 'lib', 'nisaba-server');
 if (!fs.existsSync(NATIVE)) {
-  console.log('smoke skipped the live round-trip: wasm/lib/nisaba-server is not built ' +
-              '(./wasm/build-server.sh --native)');
+  console.log('smoke skipped the live round-trip: build/lib/nisaba-server is not built ' +
+              '(./build/build-server.sh --native)');
   process.exit(0);
 }
 

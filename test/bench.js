@@ -2,12 +2,16 @@
 /**
  * Benchmark suite (docs/roadmap.md P2): tracks the WASM-boundary cost of
  * the hot paths so a change that regresses marshaling or the C engine
- * shows up as a number, not a hunch. Informational -- no CI gate; run it
- * before/after a change you suspect:
+ * shows up as a number, not a hunch. Informational -- the NUMBERS gate
+ * nothing; CI runs a tiny-N smoke only so bit-rot shows up the day an
+ * API contract moves, not the day someone next reaches for it (this
+ * file sat broken for three weeks when ready() became the caller's to
+ * await, which is how that step earned its place). Run it before/after
+ * a change you suspect:
  *
  *   npm run bench                 # in-memory, N=1000
- *   node bench/bench.js --n 100000
- *   node bench/bench.js --provider node   # real files via NodeFSStorageProvider
+ *   node test/bench.js --n 100000
+ *   node test/bench.js --provider node   # real files via NodeFSStorageProvider
  *
  * Results print as ops/sec over wall time for N operations after a small
  * untimed warmup. Absolute numbers vary by machine; the point is
@@ -16,7 +20,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { connect, MemoryStorageProvider, ObjectId } from '../src/db.js';
+import { connect, MemoryStorageProvider } from '../src/db.js';
+import { ready } from '../src/nisaba-wasm.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
 
 const args = process.argv.slice(2);
@@ -58,6 +63,7 @@ const doc = (i) => ({
 
 async function main() {
   console.log(`nisaba bench  provider=${PROVIDER}  N=${N}  node ${process.version}`);
+  await ready();
   const provider = makeProvider();
   const db = await connect(provider);
   const coll = await db.collection('bench');
@@ -114,6 +120,11 @@ async function main() {
   });
 
   await db.close();
+  // One opener per database directory: db.close() closes the files, but
+  // the advisory .nisaba-lock is the PROVIDER's, so it must be released
+  // before the reopen's own provider can take it. Untimed, because
+  // releasing a lock is teardown, not part of what "reopen" measures.
+  if (PROVIDER === 'node') await provider.close();
 
   const t0 = performance.now();
   const provider2 = PROVIDER === 'memory' ? provider : new NodeFSStorageProvider(tmpDir);
@@ -123,7 +134,6 @@ async function main() {
   console.log(`${'reopen (recovery + first read)'.padEnd(38)} ${String(1).padStart(8)} ops  ${(performance.now() - t0).toFixed(1).padStart(9)} ms`);
   await reopened.close();
   if (provider2.close) await provider2.close();
-  if (provider !== provider2 && provider.close) await provider.close();
 
   if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
 }

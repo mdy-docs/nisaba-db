@@ -3,25 +3,25 @@
 # the same C sources the browser build links, compiled by a plain
 # compiler, with no emscripten, no WASM and no JavaScript in the process.
 #
-#   ./wasm/build-native.sh              build + run under ASan/UBSan
-#   ./wasm/build-native.sh --no-run     build only
-#   ./wasm/build-native.sh --no-san     build + run without sanitizers
-#   ./wasm/build-native.sh --fuzz [n]   run the structures' hostile-file
+#   ./build/build-native.sh              build + run under ASan/UBSan
+#   ./build/build-native.sh --no-run     build only
+#   ./build/build-native.sh --no-san     build + run without sanitizers
+#   ./build/build-native.sh --fuzz [n]   run the structures' hostile-file
 #                                       fuzz harness instead
-#   ./wasm/build-native.sh --wasi       cross-compile to wasm32-wasip1
+#   ./build/build-native.sh --wasi       cross-compile to wasm32-wasip1
 #                                       and run it
 #
 # --wasi is the end-to-end proof of the whole C-pushdown effort: the same
 # manifest, the same sources, a different toolchain, and the harness has
 # to pass unchanged. It runs the result through Node's WASI host
-# (wasm/run-wasi.mjs) rather than a standalone runtime -- the artifact
+# (build/run-wasi.mjs) rather than a standalone runtime -- the artifact
 # imports nothing but wasi_snapshot_preview1 either way, and every CI
 # runner already has Node.
 #
-# It needs a wasi-sdk, at the version pinned in wasm/build-common.sh. To
+# It needs a wasi-sdk, at the version pinned in build/build-common.sh. To
 # get one:
 #
-#   ./wasm/get-wasi-sdk.sh      # fetches the pin, beside this repository
+#   ./build/get-wasi-sdk.sh      # fetches the pin, beside this repository
 #
 # and then --wasi finds it with no environment set up, along with an
 # explicit $WASI_SDK or a copy in /opt/wasi-sdk (which is where CI's own
@@ -36,7 +36,7 @@
 # consumer's checkout does not have -- so running it from here is the
 # only way this repo's CI gets fuzz coverage of the structures it links.
 #
-# The source list comes from wasm/build-common.sh -- the same file
+# The source list comes from build/build-common.sh -- the same file
 # build-wasm.sh reads -- minus the JS-ABI adapters and hostio.c, whose
 # job this build does with test/native/memfs.c instead. That shared
 # manifest is the point: a C source cannot enter the browser build
@@ -44,7 +44,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-. wasm/build-common.sh
+. build/build-common.sh
 
 RUN=1
 SAN=1
@@ -89,9 +89,9 @@ FLAGS=(
 
 if [ "$WASI" = 1 ]; then
   # Discovery, not an env var the caller has to know about: $WASI_SDK if
-  # it is set, then what ./wasm/get-wasi-sdk.sh installs, then the shared
+  # it is set, then what ./build/get-wasi-sdk.sh installs, then the shared
   # location CI uses. All three, and the pinned version they must be,
-  # are wasm/build-common.sh's.
+  # are build/build-common.sh's.
   #
   # Into its own name first: assigning straight to WASI_SDK would clear
   # the caller's value on the failing path, and the message below is
@@ -155,10 +155,10 @@ if [ "$RUN" = 1 ]; then
     RC=0
 
     # Node's WASI host: always, because every runner and every developer
-    # machine already has one. See wasm/run-wasi.mjs for why this is Node
+    # machine already has one. See build/run-wasi.mjs for why this is Node
     # and not a runtime that would have to be pinned and installed.
     echo "run: node WASI host"
-    node --experimental-wasi-unstable-preview1 wasm/run-wasi.mjs "$OUT" "$@" || RC=1
+    node --experimental-wasi-unstable-preview1 build/run-wasi.mjs "$OUT" "$@" || RC=1
 
     # And wasmtime, when there is one. A second host is not a second copy
     # of the same check: preview1 is rights-based and the two disagree
@@ -175,7 +175,7 @@ if [ "$RUN" = 1 ]; then
       "$WASMTIME_EXE" run --dir "$WT_SCRATCH::." "$OUT" "$@" || RC=1
       rm -rf -- "$WT_SCRATCH"
     else
-      echo "skip: wasmtime (./wasm/get-wasmtime.sh installs the pinned one)"
+      echo "skip: wasmtime (./build/get-wasmtime.sh installs the pinned one)"
     fi
     exit "$RC"
   fi

@@ -15,7 +15,7 @@
  * types, not arbitrary classes, are structured-clone-aware), matching how
  * db-coordinator.js's own RPC payloads are encoded for the same reason.
  */
-import { ready, OPFSStorageProvider } from '../wasm/nisaba-wasm.js';
+import { ready, OPFSStorageProvider } from '../src/nisaba-wasm.js';
 // Pure JS, not the WASM build: the message handler's decode(argsPayload)
 // runs unconditionally, including on the very first message (before
 // ready() is ever awaited) -- same reasoning as src/db-worker.js's own

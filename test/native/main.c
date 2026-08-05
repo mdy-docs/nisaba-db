@@ -1,10 +1,10 @@
 /*
  * main.c — the native C test harness for the document layer.
  *
- * Drives wasm/include/db.h's dc_* API directly, with no JavaScript, no
+ * Drives engine/include/db.h's dc_* API directly, with no JavaScript, no
  * emscripten and no WASM anywhere in the process: a plain executable
  * linking the same C sources the browser build links, over an in-memory
- * bj_io (memfs.h). Built and run by wasm/build-native.sh.
+ * bj_io (memfs.h). Built and run by build/build-native.sh.
  *
  * Why this exists. Until now every line of C in this repo was tested only
  * through the JS wrapper, which means (a) no ASan/UBSan, ever, (b) a full
@@ -2711,7 +2711,7 @@ TEST(a_bulk_writes_later_operation_sees_its_earlier_ones) {
      * operation two runs against a database operation one has already
      * changed. That is what MongoDB does, and it is what both other
      * implementations here do -- do_bulk_write plans each operation
-     * after applying the last, and runBulkWrite (wasm/nisaba-wasm.js)
+     * after applying the last, and runBulkWrite (src/nisaba-wasm.js)
      * dispatches each to its own logged method, awaited, so a
      * WalCollection proposes and applies them one at a time.
      *
@@ -4720,7 +4720,7 @@ TEST(explain_names_the_plan_the_same_way_for_every_host) {
      * dc_explain consults the very planners the queries consult, so its
      * report cannot drift from what a query would actually do. What
      * could drift is the NAME: "equality" was an array in
-     * wasm/nisaba-wasm.js until a second host needed it, and two hosts
+     * src/nisaba-wasm.js until a second host needed it, and two hosts
      * spelling one plan differently is a fact with two owners. It lives
      * in C now (dc_explain_source), which is what this checks -- through
      * the wire, on a database with a real index on it.

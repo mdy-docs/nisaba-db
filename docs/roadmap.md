@@ -6,7 +6,7 @@ in the browser and directly from Node.js.
 
 **Verdict:** the hard part is done unusually well. The durability core —
 append-only files with CRC-trailer commits, the cross-file journal
-(`wasm/src/db.c`, magic+version+CRC), catalog-flip compaction
+(`engine/src/db.c`, magic+version+CRC), catalog-flip compaction
 (`docs/compaction.md`), orphan sweeping, byte-level crash-window tests —
 is more rigorous than most embedded databases ever get. What's missing is
 almost entirely *productization*: the layer between "correct engine" and
@@ -33,7 +33,7 @@ so scalar `_id`s are a format-v2 migration, now recorded below; scalar
 `_id`s throw `InvalidIdError` pointing at the unique-index alternative.
 #4 shipped with its own dedicated suite (`test/db.nodefs.test.js`)
 rather than parametrizing the OPFS tests — parametrization is still
-worth doing. #5: wasm/lib turned out to be gitignored (artifacts build at pack
+worth doing. #5: build/lib turned out to be gitignored (artifacts build at pack
 time, never committed), so every CI job builds from the C sources with
 a pinned emsdk before testing -- each run inherently verifies sources
 and wrapper agree; no byte-diff gate (emcc output isn't reproducible
@@ -61,7 +61,7 @@ the whole public surface is already enumerated in `docs/db-api.md`.
 
 ### 2. Named, coded errors ✅
 
-`codeError()` (`wasm/nisaba-wasm.js`) produces bare `Error`s: `e.code`
+`codeError()` (`src/nisaba-wasm.js`) produces bare `Error`s: `e.code`
 is `undefined`, `e.name` is `"Error"`. Programmatic handling requires
 message matching — we personally lost debugging time to the old
 "builder state error" for exactly this reason. The ERR map already has
@@ -132,14 +132,14 @@ else on this list is trustworthy without this.
 - GitHub Actions: job 1 `npm test` (node suite; includes the node-opfs
   OPFS paths), job 2 `npm run test:browser` under Playwright Chromium
   (the real-OPFS compaction + coordinator handover tests), job 3 the
-  WASM build (`./wasm/build-wasm.sh` with emsdk pinned) verifying the
-  committed `wasm/lib/` artifacts match the sources.
+  WASM build (`./build/build-wasm.sh` with emsdk pinned) verifying the
+  committed `build/lib/` artifacts match the sources.
 - Acceptance: red PRs on any suite failure; the browser suite runs
   somewhere at last.
 
 ### 6. README/doc import hygiene ✅
 
-README's usage block imports `./wasm/nisaba-wasm.js`; docs mix relative
+README's usage block imports `./src/nisaba-wasm.js`; docs mix relative
 paths. Teach the curated entries: `@mdy-docs/nisaba-db`, `@mdy-docs/nisaba-db/remote`,
 `@mdy-docs/nisaba-db/coordinator` (and `@mdy-docs/nisaba-db/node` once #4 lands). Also correct
 the `ready()` ceremony: `connect()` transitively awaits it

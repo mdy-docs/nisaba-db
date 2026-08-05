@@ -1,8 +1,8 @@
-// End-to-end sanity check of the actual compiled wasm/nisaba-wasm.js
+// End-to-end sanity check of the actual compiled src/nisaba-wasm.js
 // (not a mock) against a real in-memory database -- run with:
 //   node test/node_smoke.mjs
 // after `git submodule update --init && ./build-wasm.sh`.
-import { ready, connect, MemoryStorageProvider, ObjectId } from '../wasm/nisaba-wasm.js';
+import { ready, connect, MemoryStorageProvider, ObjectId } from '../src/nisaba-wasm.js';
 
 let failures = 0;
 function check(cond, what) {

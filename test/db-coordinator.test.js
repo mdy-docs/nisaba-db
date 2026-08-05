@@ -17,7 +17,7 @@
  * installed).
  */
 import { describe, it, expect } from 'vitest';
-import { ready, MemoryStorageProvider, ObjectId, encode } from '../wasm/nisaba-wasm.js';
+import { ready, MemoryStorageProvider, ObjectId, encode } from '../src/nisaba-wasm.js';
 import { connect } from '../src/db.js';
 import { connectShared } from '../src/db-coordinator.js';
 

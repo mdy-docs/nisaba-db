@@ -32,7 +32,7 @@
  *               sockets at all -- so the same binary is testable
  *               everywhere the engine builds.
  *   (default)   a TCP listener. Needs sockets, which means wasm32-wasip2
- *               or native; see wasm/build-server.sh.
+ *               or native; see build/build-server.sh.
  *
  * ONE PROCESS PER DATA DIRECTORY, and the directory is "." -- the
  * preopen, under WASI, and the working directory natively. The process

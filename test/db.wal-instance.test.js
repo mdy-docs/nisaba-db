@@ -9,7 +9,7 @@
  * root written by the server opens here, and an entry FORGED into the
  * log by this host (durable but unapplied — the crashed-before-apply
  * shape) is replayed by the C process. It skips unless the native
- * server has been built (./wasm/build-server.sh --native), the same
+ * server has been built (./build/build-server.sh --native), the same
  * rule test/db.server.test.js skips by.
  */
 import { describe, it, expect } from 'vitest';
@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   ready, ObjectId, EntryLog, ENTRYLOG_TYPE, decode, encode, walPlan, WAL_REQ
-} from '../wasm/nisaba-wasm.js';
+} from '../src/nisaba-wasm.js';
 import { MemoryStorageProvider } from '../src/db.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
 import { connectWal, WAL_FILE } from '../src/db-wal.js';
@@ -215,7 +215,7 @@ describe('WAL instance: snapshots span the root', () => {
 
 /* ---- the cross-host half: one artifact, two hosts ---------------------- */
 
-const NATIVE = 'wasm/lib/nisaba-server';
+const NATIVE = 'build/lib/nisaba-server';
 const have = fs.existsSync(NATIVE);
 
 let nextPort = 9310;

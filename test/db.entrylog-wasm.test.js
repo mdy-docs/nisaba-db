@@ -1,13 +1,13 @@
 /**
  * Smoke test for the EntryLog (Raft log / write-ahead log) surface compiled
- * into this package's own WASM binary (wasm/build-wasm.sh): create, append/
+ * into this package's own WASM binary (build/build-wasm.sh): create, append/
  * sync/get, hard state, truncation, reopen persistence, and compaction. The
  * full behavioral suite (durability, crash recovery, tiling) lives in the
  * binjson-structures repo itself -- this only proves the exports are wired
  * up and functional in nisaba's build.
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { ready, EntryLog, ENTRYLOG_TYPE, deleteFile, getFileHandle } from '../wasm/nisaba-wasm.js';
+import { ready, EntryLog, ENTRYLOG_TYPE, deleteFile, getFileHandle } from '../src/nisaba-wasm.js';
 import { bootstrapOPFS } from './binjson.suite.js';
 
 await ready();

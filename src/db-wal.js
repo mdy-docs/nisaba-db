@@ -12,7 +12,7 @@
  *
  * Determinism: a command must replay to the identical state on any
  * replica, so ALL nondeterminism resolves at proposal time, before the
- * command is logged. The resolving itself is C's — wasm/include/db_wal.h
+ * command is logged. The resolving itself is C's — engine/include/db_wal.h
  * owns the command grammar and the planner that produces it — and what
  * it guarantees is stronger than a list of rules:
  *
@@ -36,7 +36,7 @@
  * Multi-document writes (insertMany/updateMany/deleteMany/bulkWrite)
  * decompose into per-document commands — one log entry each, one sync()
  * for the whole batch (group commit) — because the engine commits those
- * ops per document (dc_update_many in wasm/src/db.c): a single entry
+ * ops per document (dc_update_many in engine/src/db.c): a single entry
  * spanning several commits could persist its appliedIndex with the first
  * commit and lose the rest to a crash. Per-document entries make every
  * entry exactly one collection commit, which is what makes replay exact.
@@ -92,7 +92,7 @@ import {
   WAL_PLAN,
   dbCatalogFile,
   isDbFile
-} from '../wasm/nisaba-wasm.js';
+} from './nisaba-wasm.js';
 
 const WAL_FILE = '__wal__.bj';
 
@@ -135,7 +135,7 @@ function providerDirectory(provider) {
 
 /**
  * One entry ~= one collection commit. The command grammar itself lives in
- * wasm/include/db_wal.h — which opcodes exist, what each requires, and
+ * engine/include/db_wal.h — which opcodes exist, what each requires, and
  * what a request resolves to. This file plans through walPlan and
  * dispatches on WAL_OP, so no opcode spelling appears in JavaScript.
  *
@@ -640,7 +640,7 @@ class WalCollection {
     return this._findOneAndWrite(WAL_REQ.REPLACE_ONE, filter, replacement, upsert, returnDocument);
   }
 
-  /** Same loop as the inner bulkWrite (wasm/nisaba-wasm.js), dispatching
+  /** Same loop as the inner bulkWrite (src/nisaba-wasm.js), dispatching
    * to this class's logged methods; each sub-operation proposes and
    * applies individually, exactly as the inner one commits per call. */
   async bulkWrite(operations, { ordered = true } = {}) {

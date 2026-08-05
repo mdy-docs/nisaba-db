@@ -3,7 +3,7 @@
  *
  * These are the conventions that decide what a collection, index, journal
  * or catalog is *called* on disk. They were JavaScript
- * (wasm/nisaba-wasm.js) because of an argument recorded in
+ * (src/nisaba-wasm.js) because of an argument recorded in
  * docs/db-plan.md: JS must compute a file name before it can open the
  * file, so the name cannot be learned from the catalog first. That is
  * true, and it is an argument for JS *asking* for a name -- not for JS
@@ -51,7 +51,7 @@ extern "C" {
 /* The B+ tree order every collection, index and catalog in this format is
  * written with. A tree is opened with the order it was written with, so
  * this is a property of the format rather than a tuning knob -- and
- * DB_DEFAULT_ORDER in wasm/nisaba-wasm.js must agree with it, because a
+ * DB_DEFAULT_ORDER in src/nisaba-wasm.js must agree with it, because a
  * JS host and a native one open the same files. */
 #define DC_DEFAULT_ORDER 32
 

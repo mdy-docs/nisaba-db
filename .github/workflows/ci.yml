@@ -1,4 +1,4 @@
-# CI (docs/roadmap.md P0 #5). wasm/lib is gitignored (artifacts are built
+# CI (docs/roadmap.md P0 #5). build/lib is gitignored (artifacts are built
 # at `npm pack` time via prepack, never committed), so the emsdk jobs start
 # by building the WASM module from the C sources with a pinned emsdk --
 # which also means every run verifies sources and JS wrapper agree. Three
@@ -13,8 +13,8 @@
 #            invisible.
 #   wasi:    the same C harness cross-compiled to wasm32-wasip1 and run
 #            under TWO WASI hosts -- Node's, and wasmtime -- at the
-#            versions this repo pins (wasm/build-common.sh, fetched by
-#            wasm/get-wasi-sdk.sh and wasm/get-wasmtime.sh, the same
+#            versions this repo pins (build/build-common.sh, fetched by
+#            build/get-wasi-sdk.sh and build/get-wasmtime.sh, the same
 #            commands a developer runs, which is the point: this job used
 #            to be the only place the target could run at all). Two hosts
 #            because preview1 is rights-based and they do not agree on
@@ -50,13 +50,13 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # test/native/ drives wasm/include/db.h's dc_* API directly. No npm
+      # test/native/ drives engine/include/db.h's dc_* API directly. No npm
       # install, no emsdk -- if this needs either, something has leaked
       # back across the boundary this job exists to defend.
       - name: C harness (ASan + UBSan)
-        run: ./wasm/build-native.sh
+        run: ./build/build-native.sh
       - name: Structures fuzz (ASan + UBSan)
-        run: ./wasm/build-native.sh --fuzz 20000
+        run: ./build/build-native.sh --fuzz 20000
 
   wasi:
     runs-on: ubuntu-latest
@@ -64,7 +64,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           submodules: recursive
-      # node:wasi only -- no npm install. wasm/run-wasi.mjs imports nothing
+      # node:wasi only -- no npm install. build/run-wasi.mjs imports nothing
       # but Node builtins, so this job stays as dependency-free as `native`
       # and for the same reason: it defends a boundary that npm is on the
       # wrong side of.
@@ -73,7 +73,7 @@ jobs:
           node-version: 24
       # Pinned like emsdk is. A toolchain bump that changes codegen should
       # arrive as a commit, not as a Tuesday -- and the pin itself lives
-      # in wasm/build-common.sh, which this script reads, so a bump is one
+      # in build/build-common.sh, which this script reads, so a bump is one
       # edit and this job cannot end up on a different toolchain from the
       # one a developer runs. That is the whole reason CI calls the script
       # instead of keeping its own copy of the URL.
@@ -83,27 +83,27 @@ jobs:
       # two steps below need no environment at all -- they are exactly
       # what a developer types.
       - name: Install wasi-sdk (pinned)
-        run: ./wasm/get-wasi-sdk.sh --dir /opt/wasi-sdk
+        run: ./build/get-wasi-sdk.sh --dir /opt/wasi-sdk
       # The second WASI host, pinned and fetched the same way. Node's host
       # and wasmtime disagree about what rights a preopened directory
       # carries, and the two steps below run under BOTH -- which is how
       # that class of difference gets caught rather than shipped. Also on
       # build-native.sh's search path, so again: no environment.
       - name: Install wasmtime (pinned)
-        run: ./wasm/get-wasmtime.sh --dir /opt/wasmtime
+        run: ./build/get-wasmtime.sh --dir /opt/wasmtime
       - name: C harness on wasm32-wasip1
-        run: ./wasm/build-native.sh --wasi
+        run: ./build/build-native.sh --wasi
       - name: Structures fuzz on wasm32-wasip1
-        run: ./wasm/build-native.sh --wasi --fuzz 20000
+        run: ./build/build-native.sh --wasi --fuzz 20000
       # The server, on all three targets it can be built for. Building it
       # here is most of the value: one main() over one engine, and a
       # target that stops compiling is a boundary that has moved.
       # test/db.server.test.js drives the artifacts in the `node` job.
       - name: Server binaries (native, wasip1, wasip2)
         run: |
-          ./wasm/build-server.sh --native
-          ./wasm/build-server.sh --wasip1
-          ./wasm/build-server.sh --wasip2
+          ./build/build-server.sh --native
+          ./build/build-server.sh --wasip1
+          ./build/build-server.sh --wasip2
 
   node:
     runs-on: ubuntu-latest
@@ -122,22 +122,22 @@ jobs:
           cache: npm
       - uses: mymindstorm/setup-emsdk@v16
         with:
-          # Keep in lockstep with wasm/build-wasm.sh's header comment.
+          # Keep in lockstep with build/build-wasm.sh's header comment.
           version: 5.0.7
       - run: npm ci
-      - run: ./wasm/build-wasm.sh
+      - run: ./build/build-wasm.sh
       # test/db.server.test.js skips unless these exist, and skipping
       # quietly is how a suite stops covering the thing it names. The
       # native build needs no toolchain beyond cc; wasip2 and wasmtime
       # are what let it drive the deployment target over a real socket.
       - name: Install wasi-sdk and wasmtime (pinned)
         run: |
-          ./wasm/get-wasi-sdk.sh --dir /opt/wasi-sdk
-          ./wasm/get-wasmtime.sh --dir /opt/wasmtime
+          ./build/get-wasi-sdk.sh --dir /opt/wasi-sdk
+          ./build/get-wasmtime.sh --dir /opt/wasmtime
       - name: Build the server (native + wasip2)
         run: |
-          ./wasm/build-server.sh --native
-          ./wasm/build-server.sh --wasip2
+          ./build/build-server.sh --native
+          ./build/build-server.sh --wasip2
       # NISABA_SERVER_TESTS=required: everything above exists in this job,
       # so a server suite that SKIPS here is a broken job reporting green.
       # It asserts the artifacts and wasmtime are there and fails if they
@@ -147,6 +147,17 @@ jobs:
       # the deployment target, driven by the shipped client rather than
       # by a test's own protocol code.
       - run: PATH="/opt/wasmtime:$PATH" NISABA_SERVER_TESTS=required npm test
+      # The bench is informational -- its NUMBERS gate nothing, and a
+      # 50-op run says nothing about performance. What this step gates
+      # is that the bench still RUNS: it is the one entry point no test
+      # imports, so it is the one that rots silently when an API
+      # contract moves (it sat broken for three weeks when ready()
+      # became the caller's to await). Both providers, because they are
+      # different code paths into the same engine.
+      - name: Bench smoke (runs, not measures)
+        run: |
+          node test/bench.js --n 50
+          node test/bench.js --n 50 --provider node
 
   browser:
     runs-on: ubuntu-latest
@@ -162,6 +173,6 @@ jobs:
         with:
           version: 5.0.7
       - run: npm ci
-      - run: ./wasm/build-wasm.sh
+      - run: ./build/build-wasm.sh
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser

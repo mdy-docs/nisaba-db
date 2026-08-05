@@ -8,7 +8,7 @@
  * including a database whose directory must NOT survive the install).
  */
 import { describe, it, expect } from 'vitest';
-import { ready, ObjectId } from '../wasm/nisaba-wasm.js';
+import { ready, ObjectId } from '../src/nisaba-wasm.js';
 import { MemoryStorageProvider } from '../src/db.js';
 import { connectReplicatedInstance, NotLeaderError } from '../src/db-replicated-instance.js';
 import { Sim, MemoryNetwork, leaders, until, settle } from './raft-harness.js';
@@ -223,7 +223,7 @@ import path from 'node:path';
 import { TcpRaftTransport } from '../src/raft-transport-tcp.js';
 import { connectServer } from '../src/db-server-client.js';
 
-const NATIVE = 'wasm/lib/nisaba-server';
+const NATIVE = 'build/lib/nisaba-server';
 const haveNative = fs.existsSync(NATIVE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 

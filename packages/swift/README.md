@@ -12,8 +12,8 @@ values, ObjectIds, and the request loop.
 ./packages/swift.build.sh
 ```
 
-This copies the native C source closure — `wasm/build-common.sh`'s
-`all_sources native`, the very list `wasm/build-native.sh` compiles and
+This copies the native C source closure — `build/build-common.sh`'s
+`all_sources native`, the very list `build/build-native.sh` compiles and
 CI runs under ASan/UBSan, plus `server/root.c` (the POSIX directory
 seam) — into the package. Re-run it after pulling changes to the C.
 Nothing under `Sources/CNisaba` is a source of truth; see the script's

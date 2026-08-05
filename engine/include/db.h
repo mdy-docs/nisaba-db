@@ -125,7 +125,7 @@ extern "C" {
 #define DC_ERR_UNINDEXABLE_VALUE (-14)
 /* An upsert's filter pins an `_id` that this format cannot store as one
  * (only ObjectIds are storable keys -- see the InvalidIdError text in
- * wasm/nisaba-wasm.js for the full rationale). Distinct from the generic
+ * src/nisaba-wasm.js for the full rationale). Distinct from the generic
  * BJ_ERR_STATE the other _id checks return, because this one is reached
  * through a *filter* rather than a document, where JS's toObjectId gate
  * never runs and the caller therefore gets no earlier warning. */
@@ -433,7 +433,7 @@ const char *dc_explain_source(int kind);
  * remember, which matters now that a cursor can outlive a single request
  * (the server pages one over several, docs/db-server.md). The JS
  * Collection.compact() still declines earlier and more politely, with
- * its own gate over in-flight operations (wasm/nisaba-wasm.js,
+ * its own gate over in-flight operations (src/nisaba-wasm.js,
  * docs/compaction.md); this is the floor underneath it.
  */
 typedef struct dc_cursor dc_cursor;

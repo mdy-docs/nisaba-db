@@ -1,5 +1,5 @@
 # WASM exported functions for the document-collection layer in this
-# package, one per line -- everything wasm/nisaba-wasm.js's Collection/Db
+# package, one per line -- everything src/nisaba-wasm.js's Collection/Db
 # classes call. Consumed by build-wasm.sh, which appends this list to
 # -sEXPORTED_FUNCTIONS alongside binjson's _bjw_* codec symbols and
 # third_party/binjson-structures/wasm/exports.txt.

@@ -9,7 +9,7 @@ import { describe, it, expect } from 'vitest';
 import {
   ready, MemoryStorageProvider, ObjectId,
   NisabaError, DuplicateKeyError, MissingIndexedFieldError, UnindexableValueError, InvalidIdError
-} from '../wasm/nisaba-wasm.js';
+} from '../src/nisaba-wasm.js';
 import { connect } from '../src/db.js';
 import { connectShared } from '../src/db-coordinator.js';
 

@@ -1,7 +1,7 @@
 /**
  * Replication roadmap step 1 (docs/replicaton-roadmap.md): the collection-
  * level applied index -- dc_applied_index/dc_set_applied_index in
- * wasm/src/db.c, surfaced as Collection.appliedIndex()/setAppliedIndex().
+ * engine/src/db.c, surfaced as Collection.appliedIndex()/setAppliedIndex().
  *
  * The contract under test (db.h): setAppliedIndex stages the entry's index
  * onto the primary tree and every attached index structure; each file's
@@ -13,7 +13,7 @@
  * exactly from appliedIndex() + 1.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, ObjectId, EntryLog, encode, decode, getFileHandle, deleteFile } from '../wasm/nisaba-wasm.js';
+import { ready, ObjectId, EntryLog, encode, decode, getFileHandle, deleteFile } from '../src/nisaba-wasm.js';
 import { connect, MemoryStorageProvider, OPFSStorageProvider } from '../src/db.js';
 import { bootstrapOPFS } from './binjson.suite.js';
 

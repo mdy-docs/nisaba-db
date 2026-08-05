@@ -32,7 +32,7 @@
  * idle groups send nothing at all — it is deliberately not implemented
  * here.
  */
-import { encode, decode } from '../wasm/nisaba-wasm.js';
+import { encode, decode } from './nisaba-wasm.js';
 
 
 export class RaftGroupHost {

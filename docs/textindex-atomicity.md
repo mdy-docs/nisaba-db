@@ -3,7 +3,7 @@
 > Moved here from the parent `nisaba-web` repo's `docs/`. The paths below
 > (`c/textindex.c`, `src/binjson-wasm.js`) reflect the layout at the time
 > this was written and predate this package's own reorg (C moved under
-> `wasm/`, wrapper renamed to `wasm/nisaba-wasm.js`) — the design/algorithm
+> `wasm/`, wrapper renamed to `src/nisaba-wasm.js`) — the design/algorithm
 > described is unchanged, only the file locations.
 
 How the C/WASM text index makes `add` / `remove` / `clear` atomic across its

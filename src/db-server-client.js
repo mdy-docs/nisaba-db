@@ -78,7 +78,7 @@ export { encode, decode, ObjectId, Pointer };
 
 /**
  * The ops the wire has, named here once. The other copy is OP_NAMES in
- * wasm/src/db_request.c, which is the owner -- this list exists to say
+ * engine/src/db_request.c, which is the owner -- this list exists to say
  * what a refusal is refusing, not to decide anything.
  */
 export const WIRE_OPS = [
@@ -1030,7 +1030,7 @@ function database(conn, name) {
  *     const billing   = client.db('billing');
  *
  * `client.db(name)` sends nothing -- it is a handle, exactly as
- * `Client.db(name)` is in process (wasm/nisaba-wasm.js). The mirror is
+ * `Client.db(name)` is in process (src/nisaba-wasm.js). The mirror is
  * deliberate: `connect`/`connectClient` there, and here the one that
  * holds many, with a socket where the provider is.
  *

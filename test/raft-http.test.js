@@ -7,7 +7,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import http from 'node:http';
-import { ready, EntryLog, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { ready, EntryLog, MemoryHandle } from '../src/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { RaftGroupHost } from '../src/raft-host.js';
 import { HttpRaftTransport } from '../src/raft-transport-http.js';

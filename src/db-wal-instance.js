@@ -48,7 +48,7 @@ import {
   encode,
   dbCatalogFile,
   isDbFile
-} from '../wasm/nisaba-wasm.js';
+} from './nisaba-wasm.js';
 import {
   WalDb, WAL_FILE, SNAP_PREFIX, openWalStorage, providerDirectory
 } from './db-wal.js';

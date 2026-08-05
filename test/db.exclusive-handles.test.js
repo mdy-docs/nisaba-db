@@ -19,7 +19,7 @@
  * than in a browser run later.
  */
 import { describe, it, expect } from 'vitest';
-import { ready } from '../wasm/nisaba-wasm.js';
+import { ready } from '../src/nisaba-wasm.js';
 import { connect, MemoryStorageProvider, ObjectId } from '../src/db.js';
 
 await ready();

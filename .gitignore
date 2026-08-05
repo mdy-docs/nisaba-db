@@ -1,5 +1,5 @@
-wasm/lib/
-# wasm/get-wasi-sdk.sh and get-wasmtime.sh install beside the repository,
+build/lib/
+# build/get-wasi-sdk.sh and get-wasmtime.sh install beside the repository,
 # not in it -- but --dir can point anywhere, and 600 MB of toolchain must
 # never become a commit.
 wasi-sdk-*/

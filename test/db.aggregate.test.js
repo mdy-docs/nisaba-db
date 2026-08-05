@@ -6,7 +6,7 @@
  * report is the dispatch's truth, not a JS guess.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, MemoryStorageProvider, ObjectId } from '../wasm/nisaba-wasm.js';
+import { ready, MemoryStorageProvider, ObjectId } from '../src/nisaba-wasm.js';
 import { connect } from '../src/db.js';
 
 await ready();

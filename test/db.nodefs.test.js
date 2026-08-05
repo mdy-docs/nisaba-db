@@ -9,7 +9,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ready, ObjectId } from '../wasm/nisaba-wasm.js';
+import { ready, ObjectId } from '../src/nisaba-wasm.js';
 import { connect, connectClient, NodeFSStorageProvider } from '../src/db-node.js';
 
 await ready();

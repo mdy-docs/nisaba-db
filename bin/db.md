@@ -135,16 +135,16 @@ database a `watch` is attached to.
 
 The database also builds as a server: one process holding one directory,
 speaking binjson over a socket, with no JavaScript in it at all
-(`server/main.c`, built by `./wasm/build-server.sh` — see
+(`server/main.c`, built by `./build/build-server.sh` — see
 [`docs/db-server.md`](../docs/db-server.md)). `--server` points this CLI
 at one instead of opening files itself.
 
 ```sh
 # start one over a ROOT -- a directory with a subdirectory per database.
-./wasm/lib/nisaba-server --port 8097            # (cwd = the root)
+./build/lib/nisaba-server --port 8097            # (cwd = the root)
 # or as the wasm32-wasip2 command it is meant to be deployed as
 wasmtime run -S inherit-network --dir ~/.nisaba::. \
-  wasm/lib/nisaba-server-wasip2.wasm --port 8097
+  build/lib/nisaba-server-wasip2.wasm --port 8097
 
 db --server 127.0.0.1:8097 mydb count users
 db --server 8097 mydb insert users '{"name":"Ada","team":"core"}'  # bare port = loopback

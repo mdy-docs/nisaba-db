@@ -12,7 +12,7 @@
  * plain Node.
  */
 import { describe, it, expect } from 'vitest';
-import { ready, MemoryHandle } from '../wasm/nisaba-wasm.js';
+import { ready, MemoryHandle } from '../src/nisaba-wasm.js';
 import { connect, MemoryStorageProvider, ObjectId } from '../src/db.js';
 
 await ready();
@@ -339,7 +339,7 @@ describe('db: collection compaction', () => {
   });
 
   it('an abandoned, unexhausted cursor is eventually reclaimed by GC so compact() can proceed', async () => {
-    // Exercises the cursorFinalizer safety net (wasm/nisaba-wasm.js);
+    // Exercises the cursorFinalizer safety net (src/nisaba-wasm.js);
     // requires --expose-gc (vitest.config.js passes it) and tolerates
     // FinalizationRegistry's lazy timing by polling.
     if (typeof globalThis.gc !== 'function') return; // no gc hook -- covered only where exposed

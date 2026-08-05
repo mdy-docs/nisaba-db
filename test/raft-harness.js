@@ -16,7 +16,7 @@
  */
 import {
   EntryLog, MemoryStorageProvider, SnapshotStore, encode, decode
-} from '../wasm/nisaba-wasm.js';
+} from '../src/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 
 /** The KV machine's live state, and the snapshot store's prefix. */

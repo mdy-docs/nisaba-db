@@ -14,9 +14,9 @@
     "third_party"
   ],
   "scripts": {
-    "build": "node ../nisaba-client-js.build.mjs",
-    "prepack": "node ../nisaba-client-js.build.mjs",
-    "test": "node ../nisaba-client-js.smoke.mjs"
+    "build": "node ../client.build.mjs",
+    "prepack": "node ../client.build.mjs",
+    "test": "node ../client.smoke.mjs"
   },
   "keywords": [
     "database",
@@ -32,7 +32,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/mdy-docs/nisaba-db.git",
-    "directory": "packages/nisaba-client-js"
+    "directory": "packages/client"
   },
   "homepage": "https://github.com/mdy-docs/nisaba-db#readme",
   "bugs": {

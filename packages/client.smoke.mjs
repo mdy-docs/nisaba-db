@@ -1,6 +1,6 @@
 /**
  * The smallest proof the assembled package works. Lives beside the
- * package (see nisaba-client-js.build.mjs's header) and runs against the
+ * package (see client.build.mjs's header) and runs against the
  * assembled files inside it, after `npm run build`.
  *
  * Two layers, because the client's one dependency-free claim and its
@@ -27,7 +27,7 @@ const repo = path.resolve(here, '..');
 const {
   connectServer, parseAddress, WIRE_OPS, ServerError,
   encode, decode, ObjectId
-} = await import('./nisaba-client-js/src/db-server-client.js');
+} = await import('./client/src/db-server-client.js');
 
 /* The closure, without a socket. */
 if (!WIRE_OPS.includes('find') || !WIRE_OPS.includes('bulkWrite')) {

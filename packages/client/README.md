@@ -71,13 +71,13 @@ everything it had queued; on a replicated server the
 ## Building this package
 
 Every shipped file is copied from the repository at pack time
-(`prepack` runs `../nisaba-client-js.build.mjs` — the assembly script
+(`prepack` runs `../client.build.mjs` — the assembly script
 lives beside this directory, not in it, so the package holds only what
 ships), and the package cannot drift from what the repository builds
 and tests. From a repo checkout:
 
 ```sh
-cd packages/nisaba-client-js
+cd packages/client
 npm run build      # assembles src/, types/, third_party/
 npm test           # a smoke test; a live round-trip if the server is built
 npm pack           # the publishable tarball

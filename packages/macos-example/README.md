@@ -15,7 +15,7 @@ show collections
 
 ```sh
 ./packages/swift.build.sh     # once, from the repo root: assemble the C
-cd packages/macos
+cd packages/macos-example
 swift run                     # or: swift run NisabaREPL --root ~/somewhere
 ```
 

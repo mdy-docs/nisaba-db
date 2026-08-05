@@ -1,11 +1,12 @@
 /**
- * Assemble the publishable nisaba-client-js package from the repository.
+ * Assemble the publishable client package (npm:
+ * @mdy-docs/nisaba-client-js) from the repository.
  *
  * Lives BESIDE the package, not in it, for the same reason
  * nisaba-db.build.mjs does: the package directory holds only what ships
  * (plus its package.json and README), and this script is the monorepo's,
  * reachable from the package's build/prepack scripts as
- * ../nisaba-client-js.build.mjs.
+ * ../client.build.mjs.
  *
  * Nothing in the package directory is a source of truth: every shipped
  * file is copied from the repo root at pack time (prepack runs this), so
@@ -33,7 +34,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));   // packages/
 const repo = path.resolve(here, '..');
-const pkg = path.join(here, 'nisaba-client-js');
+const pkg = path.join(here, 'client');
 
 const CLOSURE = [
   // The client: the whole runtime surface.

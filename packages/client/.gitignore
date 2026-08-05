@@ -1,5 +1,5 @@
 # Everything here is assembled from the repository by
-# ../nisaba-client-js.build.mjs at pack time; the repo files are the
+# ../client.build.mjs at pack time; the repo files are the
 # single source of truth.
 /src/
 /types/

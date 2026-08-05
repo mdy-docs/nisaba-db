@@ -1,0 +1,47 @@
+{
+  "name": "@mdy-docs/nisaba-client-js",
+  "version": "0.1.0",
+  "description": "The JavaScript client for the nisaba database server: the MongoDB-driver-shaped API translated to binjson frames over a TCP socket. Pure JS — no engine, no WASM, no storage; the database is somewhere else.",
+  "type": "module",
+  "main": "src/db-server-client.js",
+  "types": "types/server-client.d.ts",
+  "exports": {
+    ".": { "types": "./types/server-client.d.ts", "default": "./src/db-server-client.js" }
+  },
+  "files": [
+    "src",
+    "types",
+    "third_party"
+  ],
+  "scripts": {
+    "build": "node ../nisaba-client-js.build.mjs",
+    "prepack": "node ../nisaba-client-js.build.mjs",
+    "test": "node ../nisaba-client-js.smoke.mjs"
+  },
+  "keywords": [
+    "database",
+    "document-database",
+    "database-client",
+    "mongodb",
+    "tcp",
+    "wire-protocol",
+    "binjson"
+  ],
+  "author": "Daniel Walton",
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdy-docs/nisaba-db.git",
+    "directory": "packages/nisaba-client-js"
+  },
+  "homepage": "https://github.com/mdy-docs/nisaba-db#readme",
+  "bugs": {
+    "url": "https://github.com/mdy-docs/nisaba-db/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

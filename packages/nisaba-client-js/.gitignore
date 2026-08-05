@@ -1,0 +1,8 @@
+# Everything here is assembled from the repository by
+# ../nisaba-client-js.build.mjs at pack time; the repo files are the
+# single source of truth.
+/src/
+/types/
+/third_party/
+*.tgz
+node_modules/

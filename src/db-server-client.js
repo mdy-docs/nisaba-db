@@ -65,7 +65,7 @@
  * never watches never sees one, so the old sentence still holds for it
  * word for word.
  *
- * WHAT IS NOT HERE. The wire has thirty-one ops (WIRE_OPS below) and this
+ * WHAT IS NOT HERE. The wire has a fixed op set (WIRE_OPS below) and this
  * client has exactly those. Asking for anything else gets a sentence
  * saying so rather than a TypeError about undefined not being a
  * function. Adding a method here without adding the op to db_request.c

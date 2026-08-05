@@ -99,7 +99,7 @@ OIDs). Keep natural keys in their own field with a unique index:
 | `@mdy-docs/nisaba-db` | the full in-process database (browser Worker, or anywhere) |
 | `@mdy-docs/nisaba-db/node` | ↑ plus `NodeFSStorageProvider` (imports `node:fs` — Node only) |
 | `@mdy-docs/nisaba-db/remote` | WASM-free main-thread half: pure-JS codec + `createRemoteBridge` (~27 KB module graph) |
-| `@mdy-docs/nisaba-db/server-client` | WASM-free client for a database *server* process (`server/main.c`) over a socket — `connectServer('host:port')`, thirty-one operations — everything the in-process `Collection` has, `watch()` included — no engine in the client |
+| `@mdy-docs/nisaba-db/server-client` | WASM-free client for a database *server* process (`server/main.c`) over a socket — `connectServer('host:port')`, the wire's whole op set — everything the in-process `Collection` has, `watch()` and snapshot reads included — no engine in the client |
 | `@mdy-docs/nisaba-db/coordinator` | `connectShared` — multi-tab sharing via leader election (Worker-side) |
 | `@mdy-docs/nisaba-db/wasm` | everything, including the low-level tree/index classes |
 
@@ -135,6 +135,11 @@ Deliberate scope limits, stated up front rather than discovered late:
   process: one directory, binjson over a socket, `wasm32-wasip2` or
   native, with no JavaScript in it. The wire, the invariants, and what it
   does not do yet.
+- [`docs/s3-backup.md`](docs/s3-backup.md) — automatic backup to
+  S3-compatible storage (`db-backup once|watch|restore`): a Node agent
+  ships the Raft snapshot generation — the artifact the cluster already
+  produces — with MinIO as the development target, and restore boots a
+  new cluster of one from the bucket.
 - [`docs/db-plan.md`](docs/db-plan.md) — milestone-by-milestone design
   history and scope decisions (historical; see the note at its top).
 - [`docs/textindex-atomicity.md`](docs/textindex-atomicity.md) — how the

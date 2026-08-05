@@ -2198,10 +2198,13 @@ int replica_tick(replica *r, uint64_t now) {
         for (uint32_t i = 0; i < n; i++) {
             int kind = rn_effect_kind_at(r->node, i);
             if (kind == RN_EFFECT_NEEDS_SNAPSHOT) {
-                /* Nothing here compacts the log, so no peer can fall
-                 * below its base and this cannot fire. If it ever does,
-                 * that peer is stuck and no message will unstick it --
-                 * so it is said out loud rather than ignored. */
+                /* The log DOES compact now (snapshot_take, above), so a
+                 * peer below the base is an expected state -- and the
+                 * node serves it an install from the store, so this
+                 * effect fires only when there is no adopted generation
+                 * to serve FROM (a crash swept it, a disk lost it).
+                 * That peer is stuck until a snapshot commits, and it
+                 * is said out loud rather than ignored. */
                 if (!r->said_no_snapshot) {
                     r->said_no_snapshot = 1;
                     fprintf(stderr, "replica: peer %llu needs a snapshot and this build"

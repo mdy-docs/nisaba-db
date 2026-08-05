@@ -105,6 +105,53 @@ async function generationsIn(s3, instance) {
     .sort((a, b) => b - a);
 }
 
+/** The prefix belongs to ONE member (the file header says why): checked
+ * against the newest committed manifest's metadata. */
+async function guardMember(s3, instance, member) {
+  for (const gen of await generationsIn(s3, instance)) {
+    const head = await s3.headObject(`${instance}/gen-${gen}/manifest.bj`);
+    if (!head) continue;
+    const theirs = head.metadata.member;
+    if (theirs && theirs !== member) {
+      throw new Error(
+        `s3 prefix '${instance}' holds generations from member ${theirs}; ` +
+        `this run targets ${member}. Generation numbers are per-member -- ` +
+        'give each member its own --instance prefix'
+      );
+    }
+    break;   // the newest committed manifest is the authority
+  }
+}
+
+/**
+ * Upload one generation: every file through `readFile(entry)` --
+ * size-checked against the manifest -- then the manifest bytes LAST,
+ * with the member facts as metadata. The caller has already verified
+ * what it can (CRCs stream-side or file-side); the size check here is
+ * the one thing both paths owe.
+ */
+async function uploadGeneration({ s3, instance, gen, manifest, manifestBytes, member, readFile, log }) {
+  for (const f of manifest.files) {
+    const body = await readFile(f);
+    if (body.length !== f.size) {
+      throw new Error(`generation file ${f.role}: got ${body.length} bytes, manifest says ${f.size}`);
+    }
+    if (crc32(body) !== f.crc) {
+      throw new Error(`generation file ${f.role}: CRC mismatch against the manifest`);
+    }
+    await s3.putObject(`${instance}/gen-${gen}/${f.role}.bj`, body);
+  }
+  await s3.putObject(`${instance}/gen-${gen}/manifest.bj`, manifestBytes, {
+    metadata: {
+      member,
+      gen: String(gen),
+      boundary: String(manifest.lastIncludedIndex),
+      shippedat: new Date().toISOString()
+    }
+  });
+  log('shipped', { gen, boundary: manifest.lastIncludedIndex });
+}
+
 export class BackupAgent {
   /**
    * @param {object} options
@@ -131,23 +178,9 @@ export class BackupAgent {
 
   _generations() { return generationsIn(this.s3, this.instance); }
 
-  /** The prefix belongs to ONE member. Checked once per run, against
-   * the newest committed manifest's metadata. */
   async _guardMember() {
     if (this._memberChecked) return;
-    for (const gen of await this._generations()) {
-      const head = await this.s3.headObject(this._key(gen, 'manifest.bj'));
-      if (!head) continue;
-      const theirs = head.metadata.member;
-      if (theirs && theirs !== this.member) {
-        throw new Error(
-          `s3 prefix '${this.instance}' holds generations from member ${theirs}; ` +
-          `this agent targets ${this.member}. Generation numbers are per-member -- ` +
-          'give each member its own --instance prefix'
-        );
-      }
-      break;   // the newest committed manifest is the authority
-    }
+    await guardMember(this.s3, this.instance, this.member);
     this._memberChecked = true;
   }
 
@@ -199,13 +232,15 @@ export class BackupAgent {
     }
 
     this._log('shipping', { gen, boundary, files: manifest.files.length });
-    let manifestBytes;
     try {
-      for (const f of manifest.files) {
-        const body = await this._fetchFile(gen, f);
-        await this.s3.putObject(this._key(gen, `${f.role}.bj`), body);
-      }
-      manifestBytes = Buffer.from(await this.client.readSnapshotManifest(gen));
+      const manifestBytes = Buffer.from(await this.client.readSnapshotManifest(gen));
+      verifyManifestBytes(manifestBytes);
+      await uploadGeneration({
+        s3: this.s3, instance: this.instance, gen, manifest, manifestBytes,
+        member: this.member,
+        readFile: (f) => this._fetchFile(gen, f),
+        log: this._log
+      });
     } catch (err) {
       if (err instanceof ServerError && err.code === -73) {
         this._log('superseded', { gen });
@@ -213,17 +248,7 @@ export class BackupAgent {
       }
       throw err;
     }
-    verifyManifestBytes(manifestBytes);
-    await this.s3.putObject(this._key(gen, 'manifest.bj'), manifestBytes, {
-      metadata: {
-        member: this.member,
-        gen: String(gen),
-        boundary: String(boundary),
-        shippedat: new Date().toISOString()
-      }
-    });
     this._lastShipped = boundary;
-    this._log('shipped', { gen, boundary });
     return { shipped: true, gen, boundary };
   }
 
@@ -344,4 +369,50 @@ export async function restoreFromS3({ s3, instance, into, gen = null, log = () =
     lastIncludedTerm: manifest.lastIncludedTerm,
     files: manifest.files.length
   };
+}
+
+/**
+ * Ship a generation straight from a DIRECTORY (docs/s3-backup.md step
+ * 7): the path for a member with no client wire to ask -- a JS-hosted
+ * instance (connectWalInstance / connectReplicatedInstance), or a
+ * stopped server's root. The generation is immutable once committed, so
+ * reading it beside a live owner is safe for the same reason the wire
+ * ops are; the LIVE files are never touched. The newest generation
+ * whose manifest validates is the one shipped -- a torn newest falls
+ * back to its predecessor, the store's own adoption rule.
+ */
+export async function shipGenerationFromDir({ dir, s3, instance, member, log = () => {} }) {
+  await guardMember(s3, instance, member);
+  const pattern = new RegExp(`^${SNAP_PREFIX}-(\\d+)\\.manifest\\.bj$`);
+  const gens = fs.readdirSync(dir)
+    .map((n) => pattern.exec(n))
+    .filter(Boolean)
+    .map((m) => Number(m[1]))
+    .sort((a, b) => b - a);
+
+  for (const gen of gens) {
+    let manifestBytes, manifest;
+    try {
+      manifestBytes = fs.readFileSync(path.join(dir, `${SNAP_PREFIX}-${gen}.manifest.bj`));
+      manifest = verifyManifestBytes(manifestBytes);
+    } catch {
+      continue;   // torn or unreadable: the predecessor is the committed one
+    }
+    if (await s3.headObject(`${instance}/gen-${gen}/manifest.bj`)) {
+      return { shipped: false, gen, boundary: manifest.lastIncludedIndex };
+    }
+    log('shipping', { gen, boundary: manifest.lastIncludedIndex, files: manifest.files.length });
+    await uploadGeneration({
+      s3, instance, gen, manifest, manifestBytes, member,
+      readFile: (f) => {
+        if (f.name.includes('/') || f.name.includes('\\') || f.name.includes('..')) {
+          throw new Error(`manifest names a path, not a file: '${f.name}'`);
+        }
+        return fs.readFileSync(path.join(dir, f.name));
+      },
+      log
+    });
+    return { shipped: true, gen, boundary: manifest.lastIncludedIndex };
+  }
+  return { shipped: false, absent: true };
 }

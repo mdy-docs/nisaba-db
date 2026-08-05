@@ -53,13 +53,13 @@ Every shape is assembled from these. Nothing below is per-shape.
    │ wasm/nisaba-wasm.js│   │ wasm/src/         │  │ src/raft.js     │
    │ Db · Collection ·  │   │   db_request.c    │  │ timers, socket, │
    │ ChangeStream       │   │   db_session.c    │  │ the outbox pump │
-   │ + storage providers│   │ 31 ops over       │  │                 │
+   │ + storage providers│   │ the op table over │  │                 │
    │ + plan/execute     │   │ binjson objects   │  │                 │
    └────────────────────┘   └───────────────────┘  └─────────────────┘
         shapes 1, 2, 3, 5          shape 4              shape 5
 ```
 
-**Two drivers.** The same thirty-one operations exist twice: once as
+**Two drivers.** The same operation set exists twice: once as
 `Collection`/`Db` in JavaScript, once as the request grammar in C. Part
 of that is forced and part is not; the audit under shape 1 measures
 which, and the answer is 44/54.
@@ -277,7 +277,7 @@ over a socket.
                   ┌──────────▼───────────────────────────┐
                   │ nisaba-server        server/main.c   │
                   │   poll() over the listener + clients │
-                  │   dbs_handle: 31 ops, one at a time  │
+                  │   dbs_handle: the ops, one at a time │
                   │   cursors · change streams · sessions│
                   │   NO JavaScript in this process      │
                   └──────────┬───────────────────────────┘
@@ -290,9 +290,10 @@ targets from the same sources: native, `wasm32-wasip1` (`--stdio` only —
 preview1 has no sockets at all, which is what proves the transport is
 separable), and `wasm32-wasip2` under `wasmtime`, the deployment target.
 
-Thirty-one operations — everything the in-process `Collection`/`Db` have
-except `storageEstimate`. Bounded connection table, idle reclamation,
-paged cursors, change streams, compaction, DDL.
+Every operation the in-process `Collection`/`Db` have except
+`storageEstimate`, plus the instance and snapshot ops. Bounded
+connection table, idle reclamation, paged cursors, change streams,
+compaction, DDL.
 
 **Verified by** `test/db.server.test.js` (52 cases), run twice over in
 CI — against the native binary and against the wasip2 command under

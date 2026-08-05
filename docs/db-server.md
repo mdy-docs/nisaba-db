@@ -354,9 +354,11 @@ other refusal is a response.
 
 **One request object in, one response object out** — except for change
 events, which are the other kind of frame and are described below.
-Thirty-one operations: twenty about a collection's documents, five about
-its schema, two about a cursor, two about a change stream, and two about
-none of those (`listCollections` and `ping`).
+The operations, by what they are about: a collection's documents, its
+schema, a cursor, a change stream, the instance (`listCollections`,
+`listDatabases`, `dropDatabase`, `ping`), and the snapshot store
+(`snapshot`, `latestSnapshot`, `readSnapshotFile`). The table is the
+authority; a count here would be one edit behind it.
 
 | Request | Response |
 | --- | --- |

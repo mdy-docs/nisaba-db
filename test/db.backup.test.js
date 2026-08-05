@@ -20,7 +20,7 @@ import path from 'node:path';
 import { connectServer } from '../src/db-server-client.js';
 import { S3Client } from '../src/s3.js';
 import {
-  BackupAgent, restoreFromS3, verifyManifestBytes, crc32,
+  BackupAgent, restoreFromS3, shipGenerationFromDir, verifyManifestBytes, crc32,
   SNAP_PREFIX as BACKUP_SNAP_PREFIX
 } from '../src/db-backup.js';
 
@@ -50,7 +50,7 @@ const haveMinio = await (async () => {
 })();
 
 describe.skipIf(!haveNative || !haveMinio)('the backup agent: nisaba-server to MinIO', () => {
-  const port = 21000 + (process.pid % 500);
+  const port = 31000 + (process.pid % 400);
   const bucket = `nisaba-backup-test-${Date.now().toString(36)}`;
   let proc = null;
   let dir = null;
@@ -167,7 +167,7 @@ describe.skipIf(!haveNative || !haveMinio)('the backup agent: nisaba-server to M
 });
 
 describe.skipIf(!haveNative || !haveMinio)('the restore half: S3 back to a serving member', () => {
-  const port = 21600 + (process.pid % 300);
+  const port = 31600 + (process.pid % 300);
   const bucket = `nisaba-restore-test-${Date.now().toString(36)}`;
   let srcProc = null;
   let srcDir = null;
@@ -277,5 +277,118 @@ describe.skipIf(!haveNative || !haveMinio)('the restore half: S3 back to a servi
       await new Promise((res) => dst.proc.once('exit', res));
     }
     fs.rmSync(path.dirname(into), { recursive: true, force: true });
+  }, 60000);
+});
+
+/*
+ * The cross-host S3 round trip (docs/s3-backup.md step 7): the artifact
+ * in the bucket is the SAME artifact whichever host wrote it or reads
+ * it. One direction backs up a C member and restores into a JS-hosted
+ * instance; the other snapshots a JS-hosted instance, ships it from its
+ * directory (a JS host has no client wire to ask -- that is what
+ * shipGenerationFromDir is for), and restores into a C server.
+ */
+describe.skipIf(!haveNative || !haveMinio)('one artifact, three hands: C server, S3, JS host', () => {
+  const bucket = `nisaba-xhost-test-${Date.now().toString(36)}`;
+  let s3 = null;
+  let wasm = null;   // loaded lazily: only this suite needs the engine
+
+  beforeAll(async () => {
+    s3 = new S3Client({ bucket, endpoint: ENDPOINT, ...CREDS });
+    await s3.createBucket();
+    const { ready } = await import('../wasm/nisaba-wasm.js');
+    await ready();
+    wasm = {
+      NodeFSStorageProvider: (await import('../src/db-node.js')).NodeFSStorageProvider,
+      ...(await import('../src/db-wal-instance.js'))
+    };
+    return async () => {
+      for (const { key } of (await s3.list('')).keys) await s3.deleteObject(key);
+      await s3._request('DELETE', '');
+    };
+  }, 60000);
+
+  it('backed up from a C member, restored into a JS-hosted instance', async () => {
+    // The C member: two databases, one shipped generation.
+    const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-xh-c-'));
+    const port = 32300 + (process.pid % 300);
+    const proc = spawn(path.resolve(NATIVE), ['--port', String(port), '--raft', '1'],
+      { cwd: srcDir, stdio: ['ignore', 'pipe', 'pipe'] });
+    let client = null;
+    for (let i = 0; i < 100 && !client; i++) {
+      client = await connectServer(`127.0.0.1:${port}`).catch(() => null);
+      if (!client) await sleep(100);
+    }
+    const users = client.db('appa').collection('users');
+    for (let i = 0; i < 4; i++) await users.insertOne({ i });
+    await client.db('appb').collection('things').insertOne({ n: 42 });
+    const agent = new BackupAgent({ client, s3, instance: 'c2js', member: `127.0.0.1:${port}` });
+    const shipped = await agent.once();
+    expect(shipped.shipped).toBe(true);
+    await client.close();
+    proc.kill();
+    await new Promise((r) => proc.once('exit', r));
+    fs.rmSync(srcDir, { recursive: true, force: true });
+
+    // The JS side: restore from S3, adopt, open, read, write.
+    const dstDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-xh-js-')) + '/root';
+    await restoreFromS3({ s3, instance: 'c2js', into: dstDir });
+    const provider = new wasm.NodeFSStorageProvider(dstDir);
+    await wasm.restoreLatestInstanceSnapshot(provider);
+    const inst = await wasm.connectWalInstance(provider);
+    expect(await (await (await inst.db('appa')).collection('users')).countDocuments({})).toBe(4);
+    expect(await (await (await inst.db('appb')).collection('things')).countDocuments({})).toBe(1);
+    await (await (await inst.db('appa')).collection('users')).insertOne({ fresh: true });
+    expect(await (await (await inst.db('appa')).collection('users')).countDocuments({})).toBe(5);
+    await inst.close();
+    await provider.close();
+    fs.rmSync(path.dirname(dstDir), { recursive: true, force: true });
+  }, 60000);
+
+  it('snapshotted by a JS-hosted instance, shipped from its directory, restored into a C server', async () => {
+    // The JS member: two databases, an instance-wide generation on disk.
+    const srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-xh-js2-')) + '/root';
+    fs.mkdirSync(srcDir, { recursive: true });
+    const provider = new wasm.NodeFSStorageProvider(srcDir);
+    const inst = await wasm.connectWalInstance(provider);
+    const users = await (await inst.db('dbx')).collection('users');
+    for (let i = 0; i < 6; i++) await users.insertOne({ i });
+    await (await (await inst.db('dby')).collection('things')).insertOne({ n: 7 });
+    await inst.snapshot();
+    await inst.close();
+    await provider.close();
+
+    const shipped = await shipGenerationFromDir({ dir: srcDir, s3, instance: 'js2c', member: 'js-host' });
+    expect(shipped.shipped).toBe(true);
+    // Re-shipping the same generation from disk is a no-op too.
+    expect((await shipGenerationFromDir({ dir: srcDir, s3, instance: 'js2c', member: 'js-host' })).shipped).toBe(false);
+    fs.rmSync(path.dirname(srcDir), { recursive: true, force: true });
+
+    // The C side: restore from S3, boot, adopt, read, write.
+    const dstDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-xh-c2-')) + '/root';
+    const r = await restoreFromS3({ s3, instance: 'js2c', into: dstDir });
+    expect(r.gen).toBe(1);
+    const port = 32650 + (process.pid % 300);
+    const proc = spawn(path.resolve(NATIVE), ['--port', String(port), '--raft', '1'],
+      { cwd: dstDir, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    proc.stderr.on('data', (c) => { stderr += c; });
+    let client = null;
+    for (let i = 0; i < 100 && !client; i++) {
+      client = await connectServer(`127.0.0.1:${port}`).catch(() => null);
+      if (!client) await sleep(100);
+    }
+    try {
+      expect(stderr).toMatch(/restoring snapshot at index/);
+      expect(await client.db('dbx').collection('users').countDocuments({})).toBe(6);
+      expect(await client.db('dby').collection('things').countDocuments({})).toBe(1);
+      await client.db('dbx').collection('users').insertOne({ fromC: true });
+      expect(await client.db('dbx').collection('users').countDocuments({})).toBe(7);
+    } finally {
+      await client.close().catch(() => {});
+      proc.kill();
+      await new Promise((res) => proc.once('exit', res));
+    }
+    fs.rmSync(path.dirname(dstDir), { recursive: true, force: true });
   }, 60000);
 });

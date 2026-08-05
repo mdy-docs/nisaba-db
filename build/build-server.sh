@@ -29,13 +29,19 @@ cd "$(dirname "$0")/.."
 TARGET=wasip2
 RUN=0
 RUN_ARGS=()
+ARCH=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --native) TARGET=native; shift ;;
     --wasip1) TARGET=wasip1; shift ;;
     --wasip2) TARGET=wasip2; shift ;;
+    # macOS cross-arch: clang there compiles for either CPU with -arch,
+    # which is how release CI builds both slices of a universal binary
+    # on one arm64 runner (lipo joins them). Suffixes the output so the
+    # two builds cannot overwrite each other. Meaningless off macOS.
+    --arch)   ARCH="${2:?--arch needs an architecture (arm64|x86_64)}"; shift 2 ;;
     --run)    RUN=1; shift; RUN_ARGS=("$@"); break ;;
-    *) echo "usage: $0 [--native|--wasip1|--wasip2] [--run [args...]]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--native|--wasip1|--wasip2] [--arch arm64|x86_64] [--run [args...]]" >&2; exit 2 ;;
   esac
 done
 
@@ -58,6 +64,10 @@ case "$TARGET" in
     OUT=build/lib/nisaba-server
     FLAGS+=(-DNISABA_SOCKETS=1)
     LIBS+=(-lm)   # geo.c/textindex.c/db_session.c: cos, log, floor
+    if [ -n "$ARCH" ]; then
+      FLAGS+=(-arch "$ARCH")
+      OUT="$OUT-$ARCH"
+    fi
     ;;
   wasip1|wasip2)
     SDK="$(find_wasi_sdk)" || { wasi_sdk_missing; exit 1; }

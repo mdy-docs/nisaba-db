@@ -1,0 +1,193 @@
+# The artifact factory. ci.yml is the correctness gate; this workflow
+# builds the DOWNLOADABLE server -- the thing a user runs -- for every
+# platform it ships on, proves each artifact over a real socket on the
+# OS it was built for (build/smoke-server.mjs), and, on a version tag,
+# attaches the set to a GitHub Release.
+#
+# The set, and why it is this set (the Windows story especially):
+#
+#   nisaba-server-linux-x86_64.tar.gz    native, ubuntu-24.04
+#   nisaba-server-linux-arm64.tar.gz     native, ubuntu-24.04-arm
+#   nisaba-server-macos-universal.tar.gz both slices from ONE arm64
+#                                        runner (--arch + lipo); the
+#                                        x86_64 slice is smoked under
+#                                        Rosetta, so both halves of the
+#                                        fat binary are proven, not one
+#   nisaba-server-wasip2.wasm            the deployment target itself,
+#                                        platform-neutral
+#   nisaba-server-windows-x86_64.zip     the wasip2 artifact + the
+#                                        pinned wasmtime + a .cmd
+#                                        launcher. There is no native
+#                                        .exe to build: the server is
+#                                        one C source over POSIX (poll,
+#                                        BSD sockets, openat), and
+#                                        wasip2-under-wasmtime is how
+#                                        that runs on Windows -- same
+#                                        artifact, same wire, same
+#                                        on-disk format as every other
+#                                        platform. A Win32 port would
+#                                        be a project, not a build
+#                                        flag; until someone wants it,
+#                                        this bundle is the honest
+#                                        Windows build, and it is
+#                                        smoke-tested on a real Windows
+#                                        runner like all the others.
+#
+# Unix binaries travel as .tar.gz because upload-artifact does not
+# preserve the execute bit; a tarball does. The wasmtime version comes
+# from the pin in build/build-common.sh -- read at run time, never
+# written down twice.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      # The C harness under ASan/UBSan first: an artifact from sources
+      # that cannot pass it is not worth packaging. On arm64 this is
+      # also coverage ci.yml does not have -- its native job is x86_64.
+      - name: C harness (ASan + UBSan)
+        run: ./build/build-native.sh
+      - name: Build the server
+        run: ./build/build-server.sh --native
+      - name: Smoke it over a socket
+        run: node build/smoke-server.mjs "$PWD/build/lib/nisaba-server"
+      - name: Package
+        run: tar -C build/lib -czf "nisaba-server-linux-${{ matrix.arch }}.tar.gz" nisaba-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nisaba-server-linux-${{ matrix.arch }}
+          path: nisaba-server-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: C harness (ASan + UBSan)
+        run: ./build/build-native.sh
+      # Rosetta, so the x86_64 slice can be RUN below, not just linked.
+      # A no-op when the image already has it.
+      - name: Install Rosetta
+        run: softwareupdate --install-rosetta --agree-to-license || true
+      - name: Build both slices
+        run: |
+          ./build/build-server.sh --native --arch arm64
+          ./build/build-server.sh --native --arch x86_64
+      - name: One universal binary
+        run: |
+          lipo -create build/lib/nisaba-server-arm64 build/lib/nisaba-server-x86_64 \
+               -output build/lib/nisaba-server
+          lipo -info build/lib/nisaba-server
+      - name: Smoke the arm64 slice (native)
+        run: node build/smoke-server.mjs "$PWD/build/lib/nisaba-server"
+      - name: Smoke the x86_64 slice (Rosetta)
+        run: node build/smoke-server.mjs arch -x86_64 "$PWD/build/lib/nisaba-server"
+      - name: Package
+        run: tar -C build/lib -czf nisaba-server-macos-universal.tar.gz nisaba-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nisaba-server-macos-universal
+          path: nisaba-server-macos-universal.tar.gz
+          if-no-files-found: error
+
+  wasip2:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      # The pinned toolchains, via the same scripts a developer runs
+      # (the pins live in build/build-common.sh; see ci.yml's wasi job
+      # for why CI calls the scripts instead of keeping its own URLs).
+      - name: Install wasi-sdk and wasmtime (pinned)
+        run: |
+          ./build/get-wasi-sdk.sh --dir /opt/wasi-sdk
+          ./build/get-wasmtime.sh --dir /opt/wasmtime
+      - name: Build the wasip2 component
+        run: ./build/build-server.sh --wasip2
+      - name: Smoke it under wasmtime
+        run: node build/smoke-server.mjs --wasmtime /opt/wasmtime/wasmtime "$PWD/build/lib/nisaba-server-wasip2.wasm"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nisaba-server-wasip2
+          path: build/lib/nisaba-server-wasip2.wasm
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    needs: wasip2
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with:
+          name: nisaba-server-wasip2
+      # The SAME wasmtime version the repo pins for every other host,
+      # read from build-common.sh rather than written down again here.
+      - name: Fetch the pinned wasmtime for Windows
+        run: |
+          V="$(grep '^WASMTIME_VERSION=' build/build-common.sh | cut -d'"' -f2)"
+          echo "wasmtime $V"
+          curl -fLo wasmtime.zip "https://github.com/bytecodealliance/wasmtime/releases/download/v$V/wasmtime-v$V-x86_64-windows.zip"
+          tar -xf wasmtime.zip
+          mv "wasmtime-v$V-x86_64-windows" wasmtime-dist
+      - name: Assemble the bundle
+        run: |
+          mkdir nisaba-server-windows-x86_64
+          cp wasmtime-dist/wasmtime.exe nisaba-server-windows-x86_64/
+          cp nisaba-server-wasip2.wasm  nisaba-server-windows-x86_64/
+          cp build/windows/nisaba-server.cmd build/windows/README.txt nisaba-server-windows-x86_64/
+      - name: Smoke it on Windows
+        run: node build/smoke-server.mjs --wasmtime nisaba-server-windows-x86_64/wasmtime.exe nisaba-server-windows-x86_64/nisaba-server-wasip2.wasm
+      - name: Package
+        run: tar -acf nisaba-server-windows-x86_64.zip nisaba-server-windows-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nisaba-server-windows-x86_64
+          path: nisaba-server-windows-x86_64.zip
+          if-no-files-found: error
+
+  # Tags only: v* gets a Release carrying the whole set. Every-push
+  # runs stop at the artifacts above (downloadable from the run page).
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, macos, wasip2, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release and attach the set
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag || true
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber

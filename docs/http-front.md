@@ -210,6 +210,20 @@ retry is safe" (`db_session.h`) — so re-asking is safe for both. A
 transport failure mid-request is 502 because the answer is unknown, and
 only the caller knows whether its write is safe to repeat.
 
+## The JavaScript client for this grammar
+
+`src/db-http-client.js` (`connectHttp`), the browser-capable member of
+the client family: the TCP client's driver-shaped surface, spelled
+against fetch. Extended JSON is converted at the boundary, a batched
+find rides a session it opens and closes itself, and `watch()` reads
+the SSE endpoint with fetch rather than EventSource — EventSource
+cannot say "the watch was refused", and the refusal is the part a
+caller must see. Code written against `db-server-client.js` connects
+with `connectHttp` instead and reads the same answers; the comparison
+is `test/db.http-client.test.js`'s shape. Published as
+`@mdy-docs/nisaba-client-http` (this front end itself ships as
+`@mdy-docs/nisaba-http-front`).
+
 ## Out of scope
 
 Authentication, TLS, rate limiting, tenancy: a gateway's job, as this

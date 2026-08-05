@@ -10,7 +10,10 @@
 import { describe, it, expect } from 'vitest';
 import { ready, ObjectId, EntryLog, encode } from '../wasm/nisaba-wasm.js';
 import { MemoryStorageProvider } from '../src/db.js';
-import { connectWal, restoreLatestSnapshot, WAL_FILE } from '../src/db-wal.js';
+import { readFileSync } from 'node:fs';
+import {
+  connectWal, restoreLatestSnapshot, WAL_FILE, SNAP_PREFIX, LEGACY_SNAP_PREFIX
+} from '../src/db-wal.js';
 
 await ready();
 
@@ -77,9 +80,9 @@ describe('WAL snapshots: log compaction', () => {
 
     // Generation 1's data files and paired log are gone; only gen 2 remains.
     const files = await provider.listFiles();
-    expect(files.filter((f) => f.startsWith('__snap-1')).length).toBe(0);
-    expect(files).toContain('__snap-log-2.bj');
-    expect(files).not.toContain('__snap-log-1.bj');
+    expect(files.filter((f) => f.startsWith('__snap__-1')).length).toBe(0);
+    expect(files).toContain('__snap__-log-2.bj');
+    expect(files).not.toContain('__snap__-log-1.bj');
     await db.close();
   });
 
@@ -120,7 +123,7 @@ describe('WAL snapshots: log compaction', () => {
 
     await restoreLatestSnapshot(provider);
     for (const f of await provider.listFiles()) {
-      if (/^__snap-log-\d+\.bj$/.test(f) || f === WAL_FILE) await provider.deleteFile(f);
+      if (/^__snap__-log-\d+\.bj$/.test(f) || f === WAL_FILE) await provider.deleteFile(f);
     }
     const db2 = await connectWal(provider);
     const users2 = await db2.collection('users');
@@ -219,7 +222,7 @@ describe('WAL snapshots: crash windows', () => {
     // Forge a crash mid-way through writing the NEXT generation's log: a
     // garbage file at the successor name. Adoption must skip it and open
     // the durable gen-1 log.
-    const torn = await provider.openFile('__snap-log-2.bj', { create: true });
+    const torn = await provider.openFile('__snap__-log-2.bj', { create: true });
     torn.write(new Uint8Array([1, 2, 3, 4, 5]), { at: 0 });
     torn.flush();
     await torn.close();
@@ -244,7 +247,7 @@ describe('WAL snapshots: crash windows', () => {
     await db.snapshot();
     await db.close();
 
-    const manifest = '__snap-1.manifest.bj';
+    const manifest = '__snap__-1.manifest.bj';
     const h = await provider.openFile(manifest, { create: false });
     h.truncate(h.getSize() - 1);      // lose one byte of the CRC
     h.flush();
@@ -255,7 +258,7 @@ describe('WAL snapshots: crash windows', () => {
     // Swept: the refused generation leaves nothing behind for the next
     // open to reconsider.
     const left = await provider.listFiles();
-    expect(left.filter((n) => n.startsWith('__snap-1.') || n.startsWith('__snap-1-'))).toEqual([]);
+    expect(left.filter((n) => n.startsWith('__snap__-1.') || n.startsWith('__snap__-1-'))).toEqual([]);
     // The data itself is untouched -- a snapshot is derived state.
     expect(await (await db2.collection('users')).countDocuments({})).toBe(3);
     await db2.close();
@@ -274,7 +277,7 @@ describe('WAL snapshots: crash windows', () => {
     // Generation 2's manifest validates, but one of its files is gone.
     // Presence at the recorded size is part of adoption, not something
     // discovered later when a restore reads a hole.
-    const gone = (await provider.listFiles()).find((n) => n.startsWith('__snap-2-'));
+    const gone = (await provider.listFiles()).find((n) => n.startsWith('__snap__-2-'));
     expect(gone).toBeTruthy();
     await provider.deleteFile(gone);
 
@@ -319,7 +322,7 @@ describe('WAL snapshots: crash windows', () => {
     await db.close();
 
     // Forge the crash window on the generation log: durable but unapplied.
-    const log = new EntryLog(await provider.openFile('__snap-log-1.bj', { create: false }));
+    const log = new EntryLog(await provider.openFile('__snap__-log-1.bj', { create: false }));
     await log.open();
     log.append(log.currentTerm, encode({ c: 'users', op: 'i', doc: { _id: oid(9), from: 'log' } }));
     log.sync();
@@ -330,6 +333,101 @@ describe('WAL snapshots: crash windows', () => {
     expect(await users2.countDocuments({})).toBe(4);
     expect((await users2.findOne({ _id: oid(9) })).from).toBe('log');
     expect(await users2.appliedIndex()).toBe(4);
+    await db2.close();
+  });
+});
+
+/**
+ * The canonical snapshot prefix (docs/s3-backup.md, "One snapshot, two
+ * hosts", step 1): this host writes the C server's prefix, and a root
+ * written under the old '__snap' default is adopted into it at open —
+ * through the store's own install machinery, so the migration inherits
+ * the CRC verification and manifest-last commit it already trusts.
+ */
+describe('canonical snapshot prefix', () => {
+  const isLegacyName = (n) => /^__snap-/.test(n);
+  const isCanonicalName = (n) => n.startsWith(`${SNAP_PREFIX}-`);
+
+  it('SNAP_PREFIX is the C server\'s REPLICA_SNAP_PREFIX, verbatim', () => {
+    expect(SNAP_PREFIX).toBe('__snap__');
+    // The tripwire: the C constant is the owner of this string. If the
+    // server ever renames it, this is the test that says the two hosts
+    // no longer write the same artifact.
+    const replica = readFileSync(new URL('../server/replica.c', import.meta.url), 'utf8');
+    expect(replica).toMatch(/#define\s+REPLICA_SNAP_PREFIX\s+"__snap__"/);
+  });
+
+  it('a fresh root snapshots under the canonical prefix only', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider);
+    const users = await db.collection('users');
+    for (let i = 1; i <= 3; i++) await users.insertOne({ _id: oid(i), i });
+    await db.snapshot();
+    await db.close();
+
+    const names = await provider.listFiles();
+    expect(names.some(isCanonicalName)).toBe(true);
+    expect(names.some(isLegacyName)).toBe(false);
+  });
+
+  it('a legacy root is adopted at open: same data, same boundary, canonical files', async () => {
+    const provider = new MemoryStorageProvider();
+    let db = await connectWal(provider, { snapshotPrefix: LEGACY_SNAP_PREFIX });
+    let users = await db.collection('users');
+    for (let i = 1; i <= 5; i++) await users.insertOne({ _id: oid(i), i });
+    await db.snapshot();
+    // A suffix beyond the boundary: replay must survive the migration.
+    for (let i = 6; i <= 8; i++) await users.insertOne({ _id: oid(i), i });
+    const want = await stateOf(db, 'users');
+    await db.close();
+    expect((await provider.listFiles()).some(isLegacyName)).toBe(true);
+
+    db = await connectWal(provider);   // the canonical default migrates
+    expect(await stateOf(db, 'users')).toEqual(want);
+    expect(db.log.baseIndex).toBe(5);              // the legacy boundary, kept
+    expect(db.snapshots.latest.lastIncludedIndex).toBe(5);
+    const names = await provider.listFiles();
+    expect(names.some(isLegacyName)).toBe(false);  // nothing legacy survives
+    expect(names.some(isCanonicalName)).toBe(true);
+
+    // Fully operational after adoption: write, snapshot, reopen.
+    users = await db.collection('users');
+    await users.insertOne({ _id: oid(9), i: 9 });
+    await db.snapshot();
+    await db.close();
+    db = await connectWal(provider);
+    expect((await stateOf(db, 'users')).length).toBe(9);
+    await db.close();
+  });
+
+  it('reopening a migrated root is a fixpoint', async () => {
+    const provider = new MemoryStorageProvider();
+    let db = await connectWal(provider, { snapshotPrefix: LEGACY_SNAP_PREFIX });
+    await (await db.collection('users')).insertOne({ _id: oid(1), i: 1 });
+    await db.snapshot();
+    await db.close();
+
+    db = await connectWal(provider);
+    await db.close();
+    const first = (await provider.listFiles()).sort();
+    db = await connectWal(provider);
+    await db.close();
+    expect((await provider.listFiles()).sort()).toEqual(first);
+  });
+
+  it('restoreLatestSnapshot reads a legacy root without a migration first', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider, { snapshotPrefix: LEGACY_SNAP_PREFIX });
+    const users = await db.collection('users');
+    for (let i = 1; i <= 5; i++) await users.insertOne({ _id: oid(i), i });
+    await db.snapshot();
+    const want = await stateOf(db, 'users');
+    await db.close();
+
+    const snap = await restoreLatestSnapshot(provider);   // canonical default
+    expect(snap.lastIncludedIndex).toBe(5);
+    const db2 = await connectWal(provider, { snapshotPrefix: LEGACY_SNAP_PREFIX });
+    expect(await stateOf(db2, 'users')).toEqual(want);
     await db2.close();
   });
 });

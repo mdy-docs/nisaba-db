@@ -95,7 +95,28 @@ import {
 } from '../wasm/nisaba-wasm.js';
 
 const WAL_FILE = '__wal__.bj';
-const SNAP_PREFIX = '__snap';
+
+/**
+ * The snapshot store's file prefix: `__snap__-<gen>-<role>.bj` and kin.
+ * The C server's, verbatim (REPLICA_SNAP_PREFIX, server/replica.c),
+ * because a generation must be the same artifact whichever host wrote
+ * it (docs/s3-backup.md, "One snapshot, two hosts"). This host's
+ * original prefix was '__snap'; a root still wearing it is adopted into
+ * a canonical generation at open (openWalStorage) — by the store's own
+ * install machinery, not a rename — so no root stays legacy past its
+ * first open.
+ */
+const SNAP_PREFIX = '__snap__';
+const LEGACY_SNAP_PREFIX = '__snap';
+
+/** A legacy-prefixed store file of any kind — data, manifest, or paired
+ * log. Canonical names ('__snap__-…') do not match: their seventh
+ * character is '_', not '-'. */
+const isLegacySnapFile = (name) => name.startsWith(`${LEGACY_SNAP_PREFIX}-`);
+
+/** Legacy generation files only (data + manifest, never a log) — what
+ * the migration may delete once a canonical generation is durable. */
+const LEGACY_GEN_FILE = /^__snap-\d+(?:-.+\.bj|\.manifest\.bj)$/;
 
 /** Adapt a StorageProvider (openFile/deleteFile/listFiles) to the
  * directory-handle shape SnapshotStore consumes (getFileHandle/
@@ -659,7 +680,9 @@ class WalCollection {
  * pruned after a successor is durable), then the legacy fixed-name file
  * — and replay whatever committed suffix the collections haven't
  * applied. Options pass through to connect() (order, autoCompact), plus
- * `snapshotPrefix` (default '__snap').
+ * `snapshotPrefix` (default '__snap__' — the C server's, see
+ * SNAP_PREFIX above; a root written under the old '__snap' default is
+ * adopted into the canonical prefix here, at open).
  */
 /**
  * Open the snapshot store (when the provider can list files) and adopt
@@ -670,15 +693,19 @@ class WalCollection {
  */
 export async function openWalStorage(provider, { snapshotPrefix = SNAP_PREFIX } = {}) {
   let store = null;
+  let legacyLogs = [];
   if (typeof provider.listFiles === 'function') {
     store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
     await store.open();
+    if (snapshotPrefix === SNAP_PREFIX) {
+      legacyLogs = await adoptLegacyGenerations(provider, store);
+    }
   }
 
   let log = null;
   let logName = null;
   const candidates = store ? await store.logCandidates() : [];
-  candidates.push(WAL_FILE);
+  candidates.push(...legacyLogs, WAL_FILE);
   for (const name of candidates) {
     try {
       const l = new EntryLog(await provider.openFile(name, { create: false }));
@@ -707,12 +734,111 @@ export async function openWalStorage(provider, { snapshotPrefix = SNAP_PREFIX } 
   }
 
   if (store) {
+    if (isLegacySnapFile(logName)) {
+      ({ log, logName } = await adoptLegacyLog(provider, store, log, logName));
+    }
     await store.pruneLogs(logName);
     if (logName !== WAL_FILE) {
       try { await provider.deleteFile(WAL_FILE); } catch { /* best-effort */ }
     }
+    for (const name of legacyLogs) {
+      if (name !== logName) {
+        try { await provider.deleteFile(name); } catch { /* best-effort */ }
+      }
+    }
   }
   return { store, log, logName };
+}
+
+/**
+ * Adopt a legacy-prefixed ('__snap') root into the canonical store: copy
+ * the newest valid legacy generation into a canonical one through the
+ * store's own install machinery — copyFile verifies every byte against
+ * the legacy manifest's CRC, commit() recomputes and re-manifests, and
+ * the canonical manifest written last is the commit point, so a crash
+ * anywhere leaves either the legacy generation intact or both, never
+ * neither. Already-migrated roots (a canonical boundary at or past the
+ * legacy one) skip straight to the sweep. Returns the legacy PAIRED-LOG
+ * candidates, which the caller must still consider when choosing a log:
+ * the live log of a legacy root wears the legacy name until
+ * adoptLegacyLog moves it.
+ */
+async function adoptLegacyGenerations(provider, store) {
+  const names = (await provider.listFiles()).filter(isLegacySnapFile);
+  if (names.length === 0) return [];
+  const legacyStore = new SnapshotStore(providerDirectory(provider), { prefix: LEGACY_SNAP_PREFIX });
+  await legacyStore.open();   // sweeps crashed/superseded legacy generations itself
+  try {
+    const logs = await legacyStore.logCandidates();
+    const theirs = legacyStore.latest;
+    if (theirs && (!store.latest || store.latest.lastIncludedIndex < theirs.lastIncludedIndex)) {
+      const tx = await store.begin();
+      try {
+        for (const { role } of theirs.files) {
+          await legacyStore.copyFile(role, await tx.createFile(role));
+        }
+        await tx.commit({
+          lastIncludedIndex: theirs.lastIncludedIndex,
+          lastIncludedTerm: theirs.lastIncludedTerm,
+          config: theirs.config ?? null
+        });
+      } catch (err) {
+        await tx.abort();
+        throw err;
+      }
+    }
+    // The canonical generation is durable (or was already newer): the
+    // legacy generation's data and manifest go now. Its logs survive
+    // until the caller has a canonical log in use.
+    for (const name of names) {
+      if (LEGACY_GEN_FILE.test(name)) {
+        try { await provider.deleteFile(name); } catch { /* best-effort */ }
+      }
+    }
+    return logs;
+  } finally {
+    legacyStore.close();
+  }
+}
+
+/**
+ * Move the live entry log off a legacy-prefixed name: byte-copy it to
+ * the canonical paired-log name (or to the legacy fixed-name WAL_FILE in
+ * the degenerate case of a legacy log with no generation to pair with —
+ * both carry base index/term in their header, so the name carries no
+ * meaning the copy loses). Flushed before the source is deleted by the
+ * caller's sweep; a crash between leaves both openable, canonical first
+ * in candidate order, and the sweep re-runs at the next open.
+ */
+async function adoptLegacyLog(provider, store, log, legacyName) {
+  await log.close();
+  let name, handle;
+  if (store.latest) {
+    ({ name, handle } = await store.createLogFile());
+  } else {
+    name = WAL_FILE;
+    handle = await provider.openFile(WAL_FILE, { create: true });
+  }
+  const src = await provider.openFile(legacyName, { create: false });
+  try {
+    handle.truncate(0);
+    const size = src.getSize();
+    const CH = 65536;
+    const buf = new Uint8Array(Math.min(CH, size) || 1);
+    for (let at = 0; at < size; at += CH) {
+      const n = Math.min(CH, size - at);
+      const view = buf.subarray(0, n);
+      src.read(view, { at });
+      handle.write(view, { at });
+    }
+    handle.flush();
+  } finally {
+    await src.close();
+    await handle.close();
+  }
+  const fresh = new EntryLog(await provider.openFile(name, { create: false }));
+  await fresh.open();
+  return { log: fresh, logName: name };
 }
 
 /**
@@ -785,11 +911,21 @@ export async function restoreLatestSnapshot(provider, { snapshotPrefix = SNAP_PR
   if (typeof provider.listFiles !== 'function') {
     throw new Error('restoreLatestSnapshot requires a storage provider with listFiles()');
   }
-  const store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
+  let store = new SnapshotStore(providerDirectory(provider), { prefix: snapshotPrefix });
   await store.open();
   // This store is local to the call, so it must release its C context
   // here -- nobody else holds a reference to close it later.
-  try { return await restoreFromStore(provider, store); } finally { store.close(); }
+  try {
+    if (!store.latest && snapshotPrefix === SNAP_PREFIX) {
+      // A root the canonical prefix has not reached yet: a disaster
+      // restore must not need a connectWal() migration first, so read
+      // the legacy store directly.
+      store.close();
+      store = new SnapshotStore(providerDirectory(provider), { prefix: LEGACY_SNAP_PREFIX });
+      await store.open();
+    }
+    return await restoreFromStore(provider, store);
+  } finally { store.close(); }
 }
 
 /** The store-half of restoreLatestSnapshot, for callers that already
@@ -805,4 +941,4 @@ export async function restoreFromStore(provider, store) {
   return store.latest;
 }
 
-export { WalDb, WalCollection, WAL_FILE, SNAP_PREFIX, providerDirectory };
+export { WalDb, WalCollection, WAL_FILE, SNAP_PREFIX, LEGACY_SNAP_PREFIX, providerDirectory };

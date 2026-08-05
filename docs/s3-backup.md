@@ -469,10 +469,24 @@ two tracks can proceed in parallel after it.
    `describe.skipIf` otherwise: bucket idempotence, binary round-trip,
    awkward key names through signing AND listing, real pagination,
    prefix+delimiter, and the 404 error shape.
-5. **`src/db-backup.js` + `bin/backup.js`, backup half.** Test: server
-   `--raft 1 --snapshot-entries 8`, writes past the trigger, agent
-   ships to MinIO, assert the S3 listing matches the manifest and the
-   manifest is last.
+5. ✅ **`src/db-backup.js` + `bin/backup.js`, backup half — built.**
+   `BackupAgent` ships the committed generation chunk-by-chunk with
+   size and CRC-32 checked against the manifest in transit (bjfile's
+   polynomial, a transport check on top of the store's verify rule,
+   not a fourth opinion), files first and `manifest.bj` last; the
+   stored manifest is the server's plus `member`/`instance`/
+   `shippedAt`. Re-shipping is a head-check no-op; a `-73`
+   supersession mid-transfer restarts from `latestSnapshot` (bounded);
+   retention prunes manifest-first; and the per-member prefix guard
+   stops a run pointed at the wrong member. `once` and `watch` (poll
+   on `ping().base`, optional `--every` wall-clock cadence) ship as
+   `db-backup` in the root package's bin. Tested in
+   `test/db.backup.test.js` — real server, real MinIO, skipping unless
+   both are present: byte-identical round-trip of every generation
+   file against the member's disk, manifest-last listing, no-op
+   re-ship, manifest-first pruning, the mixed-prefix refusal, and
+   watch shipping gen 3 on the member's own `--snapshot-entries`
+   cadence with nobody calling `snapshot`.
 6. **Restore half.** Test: wipe the root, `db-backup restore`, start
    the server on the restored directory, assert
    `snapshot install adopted at index N` on stderr, every document

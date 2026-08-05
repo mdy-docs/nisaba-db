@@ -35,7 +35,8 @@
   ],
   "bin": {
     "db": "bin/db.js",
-    "db-http": "bin/http-front.js"
+    "db-http": "bin/http-front.js",
+    "db-backup": "bin/backup.js"
   },
   "scripts": {
     "test": "vitest run",

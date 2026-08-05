@@ -308,7 +308,9 @@ wasmtime — driven by the shipped client, not by test-local protocol code.
   reverted work stays on `wip/http-transport` as a record of what the
   other path costs. See [Decisions](#decisions) B.
 
-- **No TLS, no auth, no tenants.** Loopback only. The README places
+- **No TLS, no auth, no tenants.** Loopback by default; `--bind` and
+  `--raft-bind`/`--raft-advertise` widen a wire consciously, behind
+  whatever perimeter the deployment provides. The README places
   REST/WebSocket gateways and the control plane in the parent project,
   not here.
 

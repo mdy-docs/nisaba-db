@@ -188,6 +188,14 @@ int rmsg_build_join(const uint8_t *record, uint32_t record_len, dbuf *out);
 int rmsg_build_leave(uint64_t id, dbuf *out);
 
 /*
+ * A TimeoutNow (section 3.10): a transferring leader certifying the
+ * receiver is fully caught up and telling it to stand NOW. Sent by the
+ * node itself since leadership transfer moved into it (rn_transfer);
+ * `leader_id` is the sender, which is the transferring leader.
+ */
+int rmsg_build_timeout_now(uint64_t term, uint64_t leader_id, dbuf *out);
+
+/*
  * ...and that answer, read back. Every span points into `msg` and dies
  * with it.
  *

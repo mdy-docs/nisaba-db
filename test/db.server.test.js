@@ -1021,6 +1021,142 @@ for (const engine of ENGINES) {
       await write('epsilon');
       await agree(['alpha', 'beta', 'contested', 'delta', 'epsilon', 'gamma', 'redirected']);
     }, 30000);
+
+    /*
+     * transferLeadership: the section 3.10 flow on the CLIENT wire
+     * (docs/db-server.md). The named member ends up leading -- not
+     * merely "somebody else", which a kill already proves above --
+     * because TimeoutNow skips pre-vote precisely so the chosen member
+     * wins while the old leader still lives. No data moves: the target
+     * already holds the log, which is what makes this the way to drain
+     * a member.
+     */
+    it('hands leadership to the member a transferLeadership names', async () => {
+      const live = nodes.filter((n) => n.alive);
+      const stats = await Promise.all(live.map(async (m) => [m, await statusOf(m)]));
+      const leader = stats.find(([, s]) => s.role === 'leader')[0];
+      const target = stats.find(([m, s]) => s.role !== 'leader' && m.alive)[0];
+
+      const c = await connectServer(leader.port);
+      try {
+        // An unknown member is refused before anything moves: it could
+        // not win the election a transfer triggers.
+        await expect(c.transferLeadership(99)).rejects.toMatchObject({ code: -52 });
+        // To itself: leadership is already exactly there.
+        await c.transferLeadership(leader.id);
+        expect((await statusOf(leader)).role).toBe('leader');
+        // The real one resolves once leadership has LEFT the old leader.
+        await c.transferLeadership(target.id);
+      } finally { await c.close(); }
+
+      // The chosen member leads. Its election needs a round trip or
+      // two, so the claim is retried rather than assumed.
+      let s = null;
+      const until = Date.now() + 15000;
+      while (Date.now() < until) {
+        s = await statusOf(target);
+        if (s.role === 'leader') break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(s.role).toBe('leader');
+
+      // And the cluster takes writes again, where the transfer pointed.
+      const took = await write('handoff');
+      expect(took.id).toBe(target.id);
+      await agree(['alpha', 'beta', 'contested', 'delta', 'epsilon', 'gamma',
+                   'handoff', 'redirected']);
+    }, 30000);
+
+    it('a follower refuses transferLeadership exactly as it refuses a write', async () => {
+      const stats = await Promise.all(nodes.filter((n) => n.alive)
+        .map(async (m) => [m, await statusOf(m)]));
+      const follower = stats.find(([, s]) => s.role !== 'leader')[0];
+      const c = await connectServer(follower.port);
+      try {
+        await expect(c.transferLeadership(follower.id === 1 ? 2 : 1))
+          .rejects.toMatchObject({ code: -63 });
+      } finally { await c.close(); }
+    });
+  });
+
+  /*
+   * The widened binds (docs/db-server.md's flag table): both wires
+   * listen on loopback until --bind / --raft-bind widen them, and a
+   * wildcard peer bind must ADVERTISE a dialable address -- the log
+   * records each member's address forever, and 0.0.0.0 reaches nobody.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: widened binds (${engine.name})`, () => {
+    it('serves clients on --bind 0.0.0.0, reached over loopback', async () => {
+      const port = nextPort();
+      const { proc } = await startServer(engine, port, ['--bind', '0.0.0.0'], -1);
+      try {
+        const c = await connectServer(port);
+        try { expect((await c.ping()).pong).toBe(true); }
+        finally { await c.close(); }
+      } finally { proc.kill(); }
+    });
+
+    it('replicates over a widened peer wire, dialing the ADVERTISED address', async () => {
+      const base = nextPort();
+      const members = [1, 2].map((id) => ({
+        id, port: base + id - 1, raftPort: base + 10 + id - 1
+      }));
+      const widened = (m) => [
+        '--raft', String(m.id), '--raft-port', String(m.raftPort),
+        '--raft-bind', '0.0.0.0', '--raft-advertise', '127.0.0.1',
+        ...members.filter((o) => o.id !== m.id)
+          .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+      ];
+      const procs = [];
+      try {
+        for (const m of members) {
+          procs.push((await startServer(engine, m.port, widened(m), -1)).proc);
+        }
+        // A committed write IS the proof: two voters, so nothing commits
+        // unless the peer wire -- bound wide, dialed at the advertised
+        // address -- carried it to the other member.
+        let wrote = false, last = null;
+        const until = Date.now() + 20000;
+        while (!wrote && Date.now() < until) {
+          for (const m of members) {
+            let db = null;
+            try {
+              db = (await connectServer(m.port)).db(DB);
+              await db.collection('users').insertOne({ name: 'wide' });
+              wrote = true;
+              break;
+            } catch (err) { last = err; }
+            finally { try { await db?.close(); } catch { /* gone */ } }
+          }
+          if (!wrote) await new Promise((r) => setTimeout(r, 100));
+        }
+        if (!wrote) throw new Error(`nothing committed: ${last?.message}`);
+      } finally {
+        for (const p of procs) p.kill();
+      }
+      /* 60s, ABOVE startServer's own 30s rejection: a member that never
+       * says "serving" should fail this test with that sentence and its
+       * name, not with a bare timeout that says neither. */
+    }, 60000);
+
+    it('refuses a wildcard peer bind with nothing advertised', async () => {
+      const run = (args) => new Promise((resolve) => {
+        const [cmd, argv, opts] = engine.argv(os.tmpdir(), 0, args);
+        const cleaned = argv.filter((a, i) => a !== '--port' && argv[i - 1] !== '--port');
+        const proc = spawn(cmd, cleaned, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+        let err = '';
+        proc.stderr.on('data', (d) => { err += String(d); });
+        proc.once('exit', (code) => resolve({ code, err }));
+      });
+      const wild = await run(['--raft', '1', '--raft-port', String(nextPort() + 20),
+                              '--raft-bind', '0.0.0.0']);
+      expect(wild.code).not.toBe(0);
+      expect(wild.err).toMatch(/where to LISTEN, not where the others dial/);
+
+      const orphan = await run(['--raft-bind', '10.0.0.1']);
+      expect(orphan.code).not.toBe(0);
+      expect(orphan.err).toMatch(/--raft-bind and --raft-advertise need --raft-port/);
+    });
   });
 
   /*
@@ -2109,6 +2245,13 @@ for (const engine of ENGINES) {
       expect((await users.findOne({ name: 'Ada' })).onCall).toBe(true);
       expect((await users.deleteMany({ team: 'research' })).deletedCount).toBe(1);
       expect(await users.countDocuments({})).toBe(3);
+    });
+
+    it('refuses transferLeadership: a server with no log is its own leader', async () => {
+      const c = await connectServer(port);
+      try {
+        await expect(c.transferLeadership(2)).rejects.toMatchObject({ code: -74 });
+      } finally { await c.close(); }
     });
 
     it('dates a field with this end clock, since C will not read one', async () => {

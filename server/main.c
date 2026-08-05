@@ -503,7 +503,13 @@ static void refuse_and_close(int fd, int code) {
     close(fd);
 }
 
-static int listen_on(int port) {
+static int listen_on(const char *host, int port) {
+    struct in_addr a;
+    if (inet_pton(AF_INET, host, &a) != 1) {
+        fprintf(stderr, "--bind %s is not an IPv4 address\n", host);
+        return -1;
+    }
+
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return -1; }
     int one = 1;
@@ -513,7 +519,7 @@ static int listen_on(int port) {
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    addr.sin_addr.s_addr = htonl(0x7f000001);   /* loopback only */
+    addr.sin_addr = a;                  /* loopback unless --bind widened it */
 
     if (bind(srv, (struct sockaddr *)&addr, sizeof addr) != 0) { perror("bind"); close(srv); return -1; }
     if (listen(srv, 16) != 0) { perror("listen"); close(srv); return -1; }
@@ -881,16 +887,23 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
 
 static void usage(const char *me) {
     fprintf(stderr,
-            "usage: %s [--stdio] [--port N] [--order N] [--max-clients N]\n"
-            "           [--idle-timeout SECONDS] [--raft NODE_ID]\n"
-            "           [--raft-port N] [--peer ID@HOST:PORT ...]\n"
+            "usage: %s [--stdio] [--port N] [--bind HOST] [--order N]\n"
+            "           [--max-clients N] [--idle-timeout SECONDS] [--raft NODE_ID]\n"
+            "           [--raft-port N] [--raft-bind HOST] [--raft-advertise HOST]\n"
+            "           [--peer ID@HOST:PORT ...]\n"
             "           [--join HOST:PORT ...] [--leave NODE_ID]\n"
             "           [--snapshot-entries N]\n"
             "  serves the instance in the preopened directory \".\"\n"
+            "  --bind: where the client wire listens (default 127.0.0.1;\n"
+            "         widen it consciously -- there is no auth on this wire)\n"
             "  --raft replicates every write through a log before applying it\n"
             "  --snapshot-entries: applied entries between local snapshots, which\n"
             "         bound the log (default 8192; 0 never compacts)\n"
             "  --raft-port is where the other members reach this one\n"
+            "  --raft-bind: where the peer wire listens (default 127.0.0.1)\n"
+            "  --raft-advertise: the address the OTHERS dial -- the one a\n"
+            "         bootstrap or join writes into the log; required when\n"
+            "         --raft-bind is 0.0.0.0\n"
             "  --peer names a member and where to reach IT; repeat per member\n"
             "  --join asks a RUNNING cluster to admit this node, knowing only a\n"
             "         seed address; repeat for more seeds. Use INSTEAD of --peer\n"
@@ -983,6 +996,16 @@ int main(int argc, char **argv) {
      * empty is a group of one: a replica with nobody to count but
      * itself, which is what --raft alone has always meant. */
     int raft_port = 0;
+    /*
+     * Where each wire LISTENS: loopback unless consciously widened,
+     * the same default the HTTP front's --listen keeps. --raft-advertise
+     * is the third fact binding cannot answer: the address of RECORD --
+     * what a bootstrap or a join writes into the log for the others to
+     * dial forever after -- which a wildcard bind cannot be.
+     */
+    const char *bind_host = "127.0.0.1";
+    const char *raft_bind = "127.0.0.1";
+    const char *raft_advertise = NULL;
     const char *peer_spec[PEERS_MAX];
     int n_peers = 0;
     /* Seeds: addresses of members already running, for a node that wants
@@ -1028,6 +1051,9 @@ int main(int argc, char **argv) {
                 return 2;
             }
         }
+        else if (strcmp(argv[i], "--bind") == 0 && i + 1 < argc) bind_host = argv[++i];
+        else if (strcmp(argv[i], "--raft-bind") == 0 && i + 1 < argc) raft_bind = argv[++i];
+        else if (strcmp(argv[i], "--raft-advertise") == 0 && i + 1 < argc) raft_advertise = argv[++i];
         else if (strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
             if (n_peers >= PEERS_MAX) {
                 fprintf(stderr, "at most %d peers\n", PEERS_MAX);
@@ -1114,6 +1140,25 @@ int main(int argc, char **argv) {
                         " serve peers with\n");
         return 2;
     }
+    /* The peer-wire flags describe a peer wire; without --raft-port
+     * there is none for them to describe. */
+    if ((strcmp(raft_bind, "127.0.0.1") != 0 || raft_advertise) && !raft_port) {
+        fprintf(stderr, "--raft-bind and --raft-advertise need --raft-port:"
+                        " they describe the peer wire\n");
+        return 2;
+    }
+    /*
+     * The address of record must be dialable. peers_self_host feeds the
+     * member record a bootstrap or a join writes into the log, and the
+     * others dial what the log says forever after -- so a wildcard bind
+     * with nothing advertised would write down an address that reaches
+     * nobody, and the failure would look exactly like a slow follower.
+     */
+    if (raft_port && !raft_advertise && strcmp(raft_bind, "0.0.0.0") == 0) {
+        fprintf(stderr, "--raft-bind 0.0.0.0 is where to LISTEN, not where the"
+                        " others dial: add --raft-advertise HOST\n");
+        return 2;
+    }
 
     int dirfd = open(".", O_RDONLY);
     if (dirfd < 0) { perror("open ."); return 1; }
@@ -1168,8 +1213,9 @@ int main(int argc, char **argv) {
     peers *px = NULL;
     if (raft_port) {
         if (peers_new(&px) != BJ_OK ||
-            peers_listen(px, "127.0.0.1", raft_port) != BJ_OK) {
-            fprintf(stderr, "cannot listen for peers on 127.0.0.1:%d\n", raft_port);
+            peers_listen(px, raft_bind, raft_port) != BJ_OK ||
+            (raft_advertise && peers_set_advertised(px, raft_advertise) != BJ_OK)) {
+            fprintf(stderr, "cannot listen for peers on %s:%d\n", raft_bind, raft_port);
             peers_free(px);
             dbi_close(inst);
             root_free(rst);
@@ -1210,7 +1256,11 @@ int main(int argc, char **argv) {
     dbuf members = {0};
     if (n_seeds) {
         char why[256];
-        e = join_cluster(seeds, n_seeds, (uint64_t)node_id, "127.0.0.1", raft_port,
+        /* What the joiner announces is the address of record --
+         * peers_self_host, which --raft-advertise overrode when the
+         * bind address was not the dialable one. */
+        e = join_cluster(seeds, n_seeds, (uint64_t)node_id,
+                         peers_self_host(px), raft_port,
                          &members, why, sizeof why);
         if (e != BJ_OK) {
             fprintf(stderr, "could not join: %s\n", why);
@@ -1257,12 +1307,12 @@ int main(int argc, char **argv) {
         rc = serve(inst, rep, STDIN_FILENO, STDOUT_FILENO) == 0 ? 0 : 1;
     } else {
 #if defined(NISABA_SOCKETS)
-        int srv = listen_on(port);
+        int srv = listen_on(bind_host, port);
         if (srv < 0) { rc = 1; goto done; }
         /* The line the tests (and a person) wait for: it means bound and
          * listening, not merely started. */
-        fprintf(stderr, "nisaba: serving 127.0.0.1:%d (max %d clients, idle timeout %ds)\n",
-                port, max_clients, idle_seconds);
+        fprintf(stderr, "nisaba: serving %s:%d (max %d clients, idle timeout %ds)\n",
+                bind_host, port, max_clients, idle_seconds);
         fflush(stderr);
         rc = serve_forever(&inst, rep, px, srv, max_clients, idle_seconds,
                            &rootops, order, rst) == 0 ? 0 : 1;

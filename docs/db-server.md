@@ -56,13 +56,16 @@ data and reporting nothing wrong.
 
 | Flag | |
 | --- | --- |
-| `--port N` | TCP listener on loopback (default 8097). Needs sockets: wasip2 or native |
+| `--port N` | TCP listener (default 8097, on loopback). Needs sockets: wasip2 or native |
+| `--bind HOST` | where the client wire listens (default 127.0.0.1). Widen it consciously: there is no auth on this wire, so a wider bind belongs behind a gateway or a private network |
 | `--stdio` | frames on stdin/stdout. Every target, including wasip1 |
 | `--order N` | B+ tree order for files this process **creates** (default 32, min 3) |
 | `--max-clients N` | connections held at once (default and ceiling 64) |
 | `--idle-timeout N` | seconds of silence before a connection's slot is taken back (default 60; 0 disables) |
 | `--raft ID` | this process is a cluster member with that node id |
-| `--raft-port N` | where the other members reach this one (loopback) |
+| `--raft-port N` | where the other members reach this one |
+| `--raft-bind HOST` | where the peer wire listens (default 127.0.0.1) |
+| `--raft-advertise HOST` | the address the OTHERS dial — what a bootstrap or a `--join` writes into the log as this member's address of record. Defaults to `--raft-bind`; required when that is `0.0.0.0`, which is where to listen, not an address anyone can call |
 | `--peer ID@HOST:PORT` | another member and where to reach IT; repeat once per member |
 | `--join HOST:PORT` | ask a RUNNING cluster to admit this node, knowing only a seed address; repeat for more seeds. Use **instead of** `--peer` |
 | `--snapshot-entries N` | applied entries between local snapshots, which bound the log (default 8192; 0 never compacts) |
@@ -394,6 +397,7 @@ authority; a count here would be one edit behind it.
 | `{op:'snapshot'}` | `{ok:true, snapshot:{gen, lastIncludedIndex, lastIncludedTerm, config, files}}` — take a generation NOW |
 | `{op:'latestSnapshot'}` | same shape — the committed generation's manifest |
 | `{op:'readSnapshotFile', gen, role, offset?}` | `{ok:true, data, eof, size}` — one ≤ 4 MB chunk of one generation file |
+| `{op:'transferLeadership', to}` | `{ok:true}` — once leadership has actually LEFT this member |
 
 The three snapshot ops (docs/s3-backup.md) are **per-member** — a
 follower answers them, because its committed generation is a true
@@ -403,6 +407,21 @@ exist to compact one), and with `-73` when no generation has been
 committed yet or the one named has been superseded and pruned — the
 caller re-asks `latestSnapshot` and restarts. Everything served is the
 committed generation, which is immutable: no quiesce, no lock, no pin.
+
+`transferLeadership` is the section 3.10 flow, leader-only: the leader
+brings `to` fully up to date, tells it to stand NOW (TimeoutNow — a
+real election that skips pre-vote, because leader stickiness exists
+precisely to block challengers while this still-live leader is heard
+from), and answers once leadership has actually left. While the
+transfer is in the air, new reads and writes are refused `-63` with the
+TARGET as the leader hint — rerouting clients land where leadership is
+headed. Transfer to the member itself is `{ok:true}` immediately; a
+server with no log refuses `-74` (it is its own leader); an unknown or
+non-voting target is refused (a learner cannot win the election this
+triggers); and if leadership has not moved within 2× the max election
+timeout the answer is `-75` — this member still leads, the fence is
+lifted, and a retry is safe. It is the zero-data-copy drain: the target
+already holds the log, so moving leadership moves no data.
 
 `result` is `{acknowledged, matchedCount, modifiedCount, deletedCount,
 insertedCount, upsertedId}` for a single write, and
@@ -883,8 +902,10 @@ Stated here rather than discovered later.
   stream still watches one collection, whole events; without a log, an
   overflowed consumer still re-watches rather than resuming.
 - **No `sort` on the find-one-and-\* family**, as above.
-- **No TLS, no auth, no tenants.** Loopback only. Those belong to the
-  gateway in front, not to the database
+- **No TLS, no auth, no tenants.** Loopback by default; `--bind` and
+  `--raft-bind` widen a wire consciously, and what stands between a
+  widened wire and the world — TLS, auth, a private network — belongs
+  to the deployment perimeter, not to the database
   (`docs/replicaton-roadmap.md` step 4 records that boundary).
 
 ## Why not `wasi:http`

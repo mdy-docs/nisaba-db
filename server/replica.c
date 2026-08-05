@@ -135,6 +135,12 @@ struct replica {
     int        said_snap_failed;
     conversation conv[REPLICA_MAX_CONV];
     pending    waiting[REPLICA_MAX_PENDING];
+    /* The client waiting on a transferLeadership, if any: the node owns
+     * the transfer itself (rn_transfer), this is only where its answer
+     * goes. NULL when nobody asked -- or the asker hung up, in which
+     * case leadership moves anyway and the answer has nowhere to go,
+     * exactly like a proposer's (replica_drop_client). */
+    pending   *transfer_waiter;
 };
 
 static conversation *conv_open(replica *r, uint64_t theirs, uint64_t from) {
@@ -1625,8 +1631,7 @@ static int serve_peers(replica *r) {
  * send a client back to whichever member it just asked. NULL while there
  * is no leader, which is an election in progress and a "try again".
  */
-static const uint8_t *leader_record(const replica *r, uint32_t *len) {
-    uint64_t want = replica_leader_id(r);
+static const uint8_t *member_record(const replica *r, uint64_t want, uint32_t *len) {
     if (!want) return NULL;
     uint32_t alen = 0;
     const uint8_t *adopted = rn_adopted(r->node, &alen);
@@ -1656,14 +1661,15 @@ static const uint8_t *leader_record(const replica *r, uint32_t *len) {
     return NULL;
 }
 
-/* Build a refusal into `out`, with the leader's id and record when there
- * is one. */
-static int refuse(const replica *r, int code, dbuf *out) {
+/* Build a refusal into `out`, naming `toward` as where to go instead --
+ * usually the leader, but a refusal fenced by a transfer names the
+ * TARGET, because that is where leadership is headed. */
+static int refuse_toward(const replica *r, int code, uint64_t toward, dbuf *out) {
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     const char *msg = dc_strerror(code);
     uint32_t rlen = 0;
-    const uint8_t *rec = leader_record(r, &rlen);
+    const uint8_t *rec = member_record(r, toward, &rlen);
     int e = bj_begin_object(b);
     if (!e) e = bj_put_key(b, (const uint8_t *)"ok", 2);
     if (!e) e = bj_put_bool(b, 0);
@@ -1672,7 +1678,7 @@ static int refuse(const replica *r, int code, dbuf *out) {
     if (!e) e = bj_put_key(b, (const uint8_t *)"msg", 3);
     if (!e) e = bj_put_string(b, (const uint8_t *)msg, (uint32_t)strlen(msg));
     if (!e) e = bj_put_key(b, (const uint8_t *)"leaderId", 8);
-    if (!e) e = bj_put_int(b, (int64_t)replica_leader_id(r));
+    if (!e) e = bj_put_int(b, (int64_t)toward);
     if (!e && rec) e = bj_put_key(b, (const uint8_t *)"leader", 6);
     if (!e && rec) e = bj_put_raw(b, rec, rlen);
     if (!e) e = bj_end_object(b);
@@ -1684,6 +1690,11 @@ static int refuse(const replica *r, int code, dbuf *out) {
     }
     bj_builder_free(b);
     return e;
+}
+
+/* The common shape: the refusal points at the leader. */
+static int refuse(const replica *r, int code, dbuf *out) {
+    return refuse_toward(r, code, replica_leader_id(r), out);
 }
 
 /*
@@ -2026,6 +2037,92 @@ static int snapshot_read_file(replica *r, const uint8_t *req, size_t len, dbuf *
     return e;
 }
 
+/* ---- transferLeadership (raft_node.h's rn_transfer) ---------------------
+ *
+ * The client wire's handle on the section 3.10 flow: the leader brings
+ * `to` fully up to date, tells it to stand NOW, and the answer comes
+ * back once leadership has actually moved -- or the node gives up at
+ * its deadline and says so (-75). The node owns the whole of that; this
+ * side parses the request, holds the asker, and fences new reads and
+ * writes toward the target while leadership is in the air.
+ */
+
+static int answer_ok(dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"ok", 2);
+    if (!e) e = bj_put_bool(b, 1);
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *d = bj_builder_data(b, &len);
+        e = d ? dbuf_put(out, d, len) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+static int transfer_submit(replica *r, pending *p, uint64_t client,
+                           const uint8_t *req, size_t len, dbuf *out) {
+    if (!replica_is_leader(r)) {
+        int e = refuse(r, DC_ERR_NOT_LEADER, out);
+        return e ? e : 0;
+    }
+
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(req, len, (const uint8_t *)"to", 2, &v, &vlen, &found)) {
+        int e = refuse(r, DC_ERR_REQ_MALFORMED, out);
+        return e ? e : 0;
+    }
+    if (!found) {
+        int e = refuse(r, DC_ERR_REQ_MISSING_FIELD, out);
+        return e ? e : 0;
+    }
+    cur c = { v, vlen, 0 };
+    uint64_t to = 0;
+    if (read_u64(&c, &to) != BJ_OK || !to) {
+        int e = refuse(r, DC_ERR_REQ_MALFORMED, out);
+        return e ? e : 0;
+    }
+
+    /* Transfer to self: leadership is already exactly there. */
+    if (to == r->self_id) {
+        int e = answer_ok(out);
+        return e ? e : 0;
+    }
+
+    /* One at a time, the serialization rule membership changes follow.
+     * The refusal points at the TARGET already in flight: that is where
+     * leadership is headed, and where the asker should look. */
+    if (rn_transfer_target(r->node)) {
+        int e = refuse_toward(r, DC_ERR_NOT_LEADER, rn_transfer_target(r->node), out);
+        return e ? e : 0;
+    }
+
+    int e = rn_transfer(r->node, to);
+    if (e == RAFT_ERR_PEER || e == RAFT_ERR_BUSY) {
+        e = refuse(r, e, out);
+        return e ? e : 0;
+    }
+    if (e == BJ_ERR_STATE) {    /* lost leadership between the checks */
+        e = refuse(r, DC_ERR_NOT_LEADER, out);
+        return e ? e : 0;
+    }
+    if (e) return e;
+
+    p->used = 1;
+    p->client = client;
+    p->token = 0;
+    p->done = 0;
+    r->transfer_waiter = p;
+    /* A target that was already current has a TimeoutNow in the outbox
+     * NOW; one that was not has the entries that close its gap. */
+    e = flush_out(r);
+    return e ? e : 1;
+}
+
 int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
                    dbuf *out) {
     if (!r) return BJ_ERR_STATE;
@@ -2058,15 +2155,32 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
         return e ? e : 0;
     }
 
-    if ((kind == DBS_REQ_READ || kind == DBS_REQ_WRITE) && !replica_is_leader(r)) {
-        /*
-         * Reads as well as writes. A follower is behind by at least a
-         * round trip and cannot tell by how much, so an answer from it
-         * is staleness presented as authority
-         * (docs/replicaton-roadmap.md, the step 6 decision).
-         */
-        int e = refuse(r, DC_ERR_NOT_LEADER, out);
-        return e ? e : 0;
+    if (kind == DBS_REQ_TRANSFER) return transfer_submit(r, p, client, req, len, out);
+
+    if (kind == DBS_REQ_READ || kind == DBS_REQ_WRITE) {
+        if (!replica_is_leader(r)) {
+            /*
+             * Reads as well as writes. A follower is behind by at least
+             * a round trip and cannot tell by how much, so an answer
+             * from it is staleness presented as authority
+             * (docs/replicaton-roadmap.md, the step 6 decision).
+             */
+            int e = refuse(r, DC_ERR_NOT_LEADER, out);
+            return e ? e : 0;
+        }
+        if (rn_transfer_target(r->node)) {
+            /*
+             * Leadership is in the air (transfer_submit): a write taken
+             * now would be proposed by a node doing its best to stop
+             * leading, and a read's barrier proven by a quorum it is
+             * abdicating. Refused toward the TARGET, so rerouting
+             * clients land where leadership is headed -- and if the
+             * transfer times out instead, the fence lifts by itself.
+             */
+            int e = refuse_toward(r, DC_ERR_NOT_LEADER,
+                                  rn_transfer_target(r->node), out);
+            return e ? e : 0;
+        }
     }
     if (kind == DBS_REQ_READ) return submit_read(r, p, client, req, len, out);
 
@@ -2219,6 +2333,23 @@ int replica_tick(replica *r, uint64_t now) {
                 if (e) return e;
                 continue;
             }
+            if (kind == RN_EFFECT_TRANSFER) {
+                /* The transfer ended: leadership left (flag 1) or the
+                 * node gave up at its deadline (flag 0). Either way the
+                 * asker -- if it is still on the wire -- gets its
+                 * answer, and the fence is already down (the node
+                 * disarmed before emitting). */
+                pending *tp = r->transfer_waiter;
+                r->transfer_waiter = NULL;
+                if (!tp) continue;
+                tp->answer.len = 0;
+                e = rn_effect_flag(r->node, i)
+                        ? answer_ok(&tp->answer)
+                        : refuse(r, DC_ERR_TRANSFER_FAILED, &tp->answer);
+                if (e) return e;
+                tp->done = 1;
+                continue;
+            }
             if (kind != RN_EFFECT_SETTLED) continue;
             pending *p = pending_find(r, rn_effect_arg(r->node, i));
             if (!p) continue;   /* nobody is waiting on it any more */
@@ -2287,9 +2418,12 @@ void replica_drop_client(replica *r, uint64_t client) {
         pending *p = &r->waiting[i];
         if (!p->used || p->client != client) continue;
         /* A read holds a barrier and no plan; a write holds a plan and
-         * no barrier. Both have to be given back. */
+         * no barrier; a transfer waiter holds neither -- the transfer
+         * itself is the node's and proceeds, its answer now has nowhere
+         * to go. Whatever was held is given back. */
+        if (r->transfer_waiter == p) r->transfer_waiter = NULL;
         if (p->barrier) rn_read_release(r->node, p->barrier);
-        else if (!p->done) dbi_abandon(r->inst, p->token);
+        else if (!p->done && p->token) dbi_abandon(r->inst, p->token);
         pending_release(p);
     }
 }

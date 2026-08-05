@@ -206,6 +206,15 @@ extern "C" {
 #define DC_ERR_NO_SNAPSHOT_STORE    (-72)
 #define DC_ERR_SNAPSHOT_GONE        (-73)
 
+/* transferLeadership (server/replica.c, raft_node.h's rn_transfer).
+ * -74 mirrors -72: this server runs without a log, so it is its own
+ * leader and there is nobody to hand off to -- true for as long as it
+ * runs that way, and the remedy is --raft. -75 is about NOW: the
+ * deadline passed with this member still leading (the target is down,
+ * unreachable, or refusing); the fence is lifted and a retry is safe. */
+#define DC_ERR_NOT_REPLICATED       (-74)
+#define DC_ERR_TRANSFER_FAILED      (-75)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)
@@ -248,7 +257,12 @@ typedef enum {
      * they are PER-MEMBER -- a follower's generation is a true prefix
      * of history and serving it offloads the leader -- so the routing
      * layer must answer them before the leader check refuses them. */
-    DBS_REQ_SNAPSHOT = 4
+    DBS_REQ_SNAPSHOT = 4,
+    /* transferLeadership. Its own kind because it is the REPLICATION
+     * layer's and nobody else's: it never reaches a session, the
+     * routing layer (server/replica.c) answers it on the leader, and an
+     * instance with no log refuses it with -74 (db_instance.c). */
+    DBS_REQ_TRANSFER = 5
 } dbs_req_kind;
 
 void dbs_request_kind(const uint8_t *req, size_t req_len, int *kind);

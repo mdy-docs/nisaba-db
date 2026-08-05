@@ -279,6 +279,14 @@ static int instance_op(dbi *i, const uint8_t *req, size_t len, dbuf *out) {
         dbuf_free(&names);
         return e ? e : 1;
     }
+    if (op_is(req, len, "transferLeadership")) {
+        /* Replication's, like the snapshot ops below: server/replica.c
+         * answers it before routing ever reaches here, on the leader.
+         * An instance asked directly has no log, no peers and no
+         * leadership to move, and the refusal says so. */
+        int e = dbs_refusal(DC_ERR_NOT_REPLICATED, out);
+        return e ? e : 1;
+    }
     if (op_is(req, len, "snapshot") || op_is(req, len, "latestSnapshot") ||
         op_is(req, len, "readSnapshotFile")) {
         /* Instance-level, but not this layer's: the snapshot store
@@ -309,10 +317,11 @@ static int instance_op(dbi *i, const uint8_t *req, size_t len, dbuf *out) {
 void dbi_request_kind(const uint8_t *req, size_t req_len, int *kind) {
     *kind = DBS_REQ_NONE;
     if (!req) return;
-    /* The instance's own three, which never reach a session. */
+    /* The instance's own ops, which never reach a session. */
     if (op_is(req, req_len, "ping")) { *kind = DBS_REQ_STATUS; return; }
     if (op_is(req, req_len, "listDatabases")) { *kind = DBS_REQ_READ; return; }
     if (op_is(req, req_len, "dropDatabase"))  { *kind = DBS_REQ_WRITE; return; }
+    if (op_is(req, req_len, "transferLeadership")) { *kind = DBS_REQ_TRANSFER; return; }
     dbs_request_kind(req, req_len, kind);
 }
 

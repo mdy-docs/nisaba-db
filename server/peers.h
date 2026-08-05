@@ -130,6 +130,15 @@ int  peers_remove(peers *p, uint64_t id);
  * cannot be called, which is a member that can never be replicated to. */
 int  peers_listen(peers *p, const char *host, int port);
 
+/*
+ * The address the OTHERS dial, when it is not the one peers_listen
+ * bound. peers_self_host feeds the member record a bootstrap or a join
+ * writes into the log -- the address of record, forever -- and a bind
+ * address is not always dialable: 0.0.0.0 is where to LISTEN, not
+ * where to call. BJ_ERR_STATE if it does not fit.
+ */
+int  peers_set_advertised(peers *p, const char *host);
+
 uint32_t    peers_count(const peers *p);
 uint64_t    peers_id_at(const peers *p, uint32_t i);
 const char *peers_host_at(const peers *p, uint32_t i);

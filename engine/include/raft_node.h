@@ -468,7 +468,18 @@ typedef enum {
      * the term it was proposed at) lives here, once, rather than in
      * every host.
      */
-    RN_EFFECT_SETTLED       = 8  /* a proposal finished; arg = index     */
+    RN_EFFECT_SETTLED       = 8, /* a proposal finished; arg = index     */
+    /*
+     * A leadership transfer (rn_transfer) ended: arg is the target it
+     * named. flag 1 means leadership LEFT this node -- however that
+     * happened; the target's election is the expected way, but any
+     * step-down while a transfer is armed is the transfer arriving at
+     * its destination state. flag 0 means the deadline passed with this
+     * node still leading -- the target is down, unreachable, or
+     * refusing -- and the node has disarmed: proposals a host was
+     * fencing may flow again, and a retry is safe.
+     */
+    RN_EFFECT_TRANSFER      = 9  /* a transfer ended; arg = target      */
 } rn_effect_kind;
 
 uint32_t rn_effect_count(const raft_node *n);
@@ -643,6 +654,36 @@ void rn_seed_commit(raft_node *n, uint64_t index);
  * node and a non-voter all decline.
  */
 int rn_campaign(raft_node *n, double random01);
+
+/*
+ * Begin a leadership transfer (section 3.10) to `target`: the other
+ * side of rn_campaign, and the piece that lets a host drain a member
+ * without copying a byte -- the target already holds the log.
+ *
+ * Leader only (RAFT_ERR_STATE otherwise). The target must be another
+ * member that VOTES -- a learner cannot win the election this triggers
+ * -- and an unknown or non-voting target is RAFT_ERR_PEER. One transfer
+ * may be armed at a time (RAFT_ERR_BUSY), the same serialization rule
+ * membership changes follow.
+ *
+ * Armed, the node brings the target fully up to date and, the moment
+ * its match index reaches the last log index, sends it a TimeoutNow --
+ * re-sent if the target answers no or the send fails, on the strength
+ * of the acks heartbeats keep producing. The transfer ends in one of
+ * two ways, each reported as RN_EFFECT_TRANSFER: leadership left this
+ * node (flag 1 -- the target's RequestVote at term+1 is the expected
+ * cause, but any step-down while armed counts), or 2x the max election
+ * timeout passed first (flag 0) and the node disarmed itself.
+ *
+ * What the node does NOT do is fence proposals: whether new writes are
+ * refused while leadership is moving -- and toward whom their refusal
+ * points -- is client-facing policy, and it belongs to the host
+ * (server/replica.c refuses them with the TARGET as the leader hint).
+ */
+int rn_transfer(raft_node *n, uint64_t target);
+
+/* The transfer in flight, or 0. */
+uint64_t rn_transfer_target(const raft_node *n);
 
 /*
  * A message the HOST answered (InstallSnapshot) carrying a leader's

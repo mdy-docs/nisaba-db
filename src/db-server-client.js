@@ -90,6 +90,7 @@ export const WIRE_OPS = [
   'findByIndex', 'pruneExpired', 'watch', 'closeStream',
   'getMore', 'closeCursor', 'compact',
   'snapshot', 'latestSnapshot', 'readSnapshotFile',
+  'transferLeadership',
   'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
   'listCollections'
 ];
@@ -1155,6 +1156,19 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
       let at = 0;
       for (const p of parts) { whole.set(p, at); at += p.length; }
       return whole;
+    },
+    /**
+     * Hand leadership to member `to` (raft_node.h's rn_transfer, the
+     * section 3.10 flow): the leader catches the target up, tells it to
+     * stand NOW, and this resolves once leadership has actually moved
+     * -- the zero-data-copy drain a leader-skewed fleet wants. Leader
+     * only (-63 elsewhere, follow the hint); -74 on a server with no
+     * log; -75 if leadership did not move before the deadline, after
+     * which this member still leads and a retry is safe. Transfer to
+     * the member itself answers ok immediately.
+     */
+    async transferLeadership(to) {
+      await conn.call({ op: 'transferLeadership', to });
     },
     /* The escape hatch: send an op the wire has, `db` and all, and read
      * the response object as it came. A new op is usable from JavaScript

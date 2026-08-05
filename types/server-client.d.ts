@@ -216,6 +216,11 @@ export interface RemoteDb {
   /** The generation's manifest FILE, whole and raw: the binjson record
    * plus the CRC-32 trailer whose validity is the commit. */
   readSnapshotManifest(gen: number): Promise<Uint8Array>;
+  /** Hand leadership to member `to` (the section 3.10 flow); resolves
+   * once leadership has actually moved. Leader only (-63 elsewhere);
+   * -74 on a server with no log; -75 if leadership did not move before
+   * the deadline (this member still leads, and a retry is safe). */
+  transferLeadership(to: number): Promise<void>;
   close(): Promise<void>;
 }
 

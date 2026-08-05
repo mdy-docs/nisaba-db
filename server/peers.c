@@ -472,6 +472,13 @@ int peers_listen(peers *p, const char *host, int port) {
     return BJ_OK;
 }
 
+int peers_set_advertised(peers *p, const char *host) {
+    if (!p || !host || !*host || strlen(host) >= PEERS_HOST_MAX)
+        return BJ_ERR_STATE;
+    snprintf(p->self_host, sizeof p->self_host, "%s", host);
+    return BJ_OK;
+}
+
 uint32_t    peers_count(const peers *p)              { return p ? p->n : 0; }
 uint64_t    peers_id_at(const peers *p, uint32_t i)  { return i < p->n ? p->p[i].id : 0; }
 const char *peers_host_at(const peers *p, uint32_t i){ return i < p->n ? p->p[i].host : NULL; }

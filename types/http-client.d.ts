@@ -101,6 +101,10 @@ export interface HttpClient {
   /** On a replicated server, also where a member says what it is:
    * { pong, role, leaderId, applied, commit, base, last }. */
   ping(): Promise<Document>;
+  /** Hand leadership to member `to`; resolves once leadership has
+   * actually moved. -63 off the leader, -74 without a log, -75 when
+   * the deadline passed (a retry is then safe). */
+  transferLeadership(to: number): Promise<void>;
   /** The escape hatch: {op, db?, coll?, ...rest}. */
   request(req: Document): Promise<Document>;
   /** Closes this side's held state -- open change streams and cursor

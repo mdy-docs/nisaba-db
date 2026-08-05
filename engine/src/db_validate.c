@@ -192,6 +192,14 @@ const char *dc_strerror(int code) {
             return "No committed snapshot generation here, or the one named "
                    "is not the committed one any more; ask latestSnapshot and "
                    "restart from what it says";
+        case DC_ERR_NOT_REPLICATED:
+            return "This server runs without a log: it is its own leader and "
+                   "there is nobody to hand leadership to. Start it with "
+                   "--raft to make it a cluster member";
+        case DC_ERR_TRANSFER_FAILED:
+            return "Leadership did not move before the deadline (the target "
+                   "is down, unreachable, or refused to stand); this member "
+                   "still leads and it is safe to retry";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

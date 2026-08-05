@@ -79,6 +79,7 @@ export const WIRE_OPS = [
   'findByIndex', 'pruneExpired', 'watch', 'closeStream',
   'getMore', 'closeCursor', 'compact',
   'snapshot', 'latestSnapshot', 'readSnapshotFile',
+  'transferLeadership',
   'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
   'listCollections'
 ];
@@ -695,6 +696,14 @@ export async function connectHttp(base) {
     async ping() {
       const { ok, ...status } = await impl._call({ op: 'ping' });
       return status;
+    },
+
+    /** Hand leadership to member `to` (docs/db-server.md); resolves
+     * once leadership has actually moved. Same refusals as the TCP
+     * client's: -63 off the leader, -74 without a log, -75 when the
+     * deadline passed and a retry is safe. */
+    async transferLeadership(to) {
+      await impl._call({ op: 'transferLeadership', to });
     },
 
     /* The escape hatch: {op, db?, coll?, ...rest} — the named parts

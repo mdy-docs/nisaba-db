@@ -253,6 +253,17 @@ struct raft_node {
     uint32_t npending;
 
     /*
+     * Leadership transfer (section 3.10), rn_transfer's state: the
+     * target it named, the deadline it disarms at, and the TimeoutNow's
+     * correlation id once one is out. corr 0 while armed means "not
+     * sent, or send it again" -- a refused or lost TimeoutNow clears it
+     * so the next ack decides afresh.
+     */
+    uint64_t transfer_target;
+    uint64_t transfer_corr;
+    int64_t  transfer_deadline;
+
+    /*
      * Read barriers. `started` is the instant the barrier was taken, and
      * confirming it means a quorum of voters has since been shown to
      * still follow us (rn_peer's ack_covers). `state` is 0 waiting,
@@ -611,6 +622,15 @@ static void become_follower(raft_node *n, uint64_t term, uint64_t leader_id,
     settle_all_lost(n);
     /* A read this node was proving is a read it can no longer prove. */
     lose_reads(n);
+    /* A transfer that was armed has arrived at its destination state:
+     * leadership left this node. However that happened -- the target's
+     * election is the expected way -- it is what the caller of
+     * rn_transfer was waiting to hear. */
+    if (n->transfer_target) {
+        emit(n, RN_EFFECT_TRANSFER, n->transfer_target, 1);
+        n->transfer_target = 0;
+        n->transfer_corr = 0;
+    }
 }
 
 static int replicate_to(raft_node *n, rn_peer *p);
@@ -1827,6 +1847,50 @@ static void advance_commit(raft_node *n) {
 
 /* ---- the clock ---------------------------------------------------------- */
 
+/*
+ * The transfer's trigger, re-checked wherever the target's match index
+ * can have moved and on every leader tick: once the target holds
+ * everything this log has, it is as up to date as a successor can be,
+ * so tell it to stand NOW. One TimeoutNow is out at a time (the corr
+ * says so); a refusal or a lost send clears the corr, and the acks the
+ * heartbeats keep producing decide again.
+ */
+static int maybe_send_timeout_now(raft_node *n) {
+    if (!n->transfer_target || n->transfer_corr || n->role != RAFT_LEADER)
+        return BJ_OK;
+    rn_peer *p = peer_of(n, n->transfer_target);
+    if (!p || p->match < elog_last_index(n->log)) return BJ_OK;
+    dbuf msg = {0};
+    int e = rmsg_build_timeout_now(elog_current_term(n->log), n->self_id, &msg);
+    if (e) { dbuf_free(&msg); return e; }
+    uint64_t corr = fresh_corr(n);
+    e = queue(n, n->transfer_target, corr, 0, msg.data, msg.len);
+    dbuf_free(&msg);
+    if (e) return e;
+    n->transfer_corr = corr;
+    return BJ_OK;
+}
+
+int rn_transfer(raft_node *n, uint64_t target) {
+    if (!n || !n->running || n->role != RAFT_LEADER) return BJ_ERR_STATE;
+    if (n->transfer_target) return RAFT_ERR_BUSY;
+    rn_peer *p = peer_of(n, target);
+    if (!p || !p->voting) return RAFT_ERR_PEER;
+    n->transfer_target = target;
+    n->transfer_corr = 0;
+    n->transfer_deadline = n->now + 2 * n->max_election;
+    /* A target already current is told NOW rather than on the next ack;
+     * one that is behind gets the entries that close the gap, and every
+     * ack of those re-checks. */
+    int e = maybe_send_timeout_now(n);
+    if (e) return e;
+    return n->transfer_corr ? BJ_OK : replicate_to(n, p);
+}
+
+uint64_t rn_transfer_target(const raft_node *n) {
+    return n ? n->transfer_target : 0;
+}
+
 int rn_tick(raft_node *n, int64_t now, double random01) {
     if (!n->running) return BJ_OK;
     n->now = now;
@@ -1838,6 +1902,20 @@ int rn_tick(raft_node *n, int64_t now, double random01) {
          * to be noticed. */
         expire_reads(n);
         int r = check_reads(n);
+        if (n->transfer_target) {
+            if (now >= n->transfer_deadline) {
+                /* Still leading past the deadline: the target is down,
+                 * unreachable or refusing. Disarmed and said out loud,
+                 * so a host that was fencing proposals lifts the fence
+                 * and the caller learns a retry is safe. */
+                emit(n, RN_EFFECT_TRANSFER, n->transfer_target, 0);
+                n->transfer_target = 0;
+                n->transfer_corr = 0;
+            } else {
+                int e = maybe_send_timeout_now(n);
+                if (e) return e;
+            }
+        }
         if (now >= n->heartbeat_due) {
             n->heartbeat_due = now + n->heartbeat_ms;
             int e = replicate_to_all(n);
@@ -2246,6 +2324,12 @@ static int on_append_reply(raft_node *n, rn_peer *p, const uint8_t *reply, uint3
         }
         if (!p->voting && n->commit_index && p->match >= n->commit_index)
             emit(n, RN_EFFECT_PROMOTE, p->id, 0);
+        /* This ack may be the one that proves the transfer target
+         * current (the trigger is its own no-op for every other peer). */
+        if (n->transfer_target == p->id) {
+            int te = maybe_send_timeout_now(n);
+            if (te) return te;
+        }
         if (p->next <= elog_last_index(n->log)) return replicate_to(n, p);
         return BJ_OK;
     }
@@ -2259,6 +2343,29 @@ static int on_append_reply(raft_node *n, rn_peer *p, const uint8_t *reply, uint3
 
 int rn_on_reply(raft_node *n, uint64_t corr, const uint8_t *reply, uint32_t len,
                 double random01) {
+    if (n->transfer_corr && corr == n->transfer_corr) {
+        /* The TimeoutNow's ack, {term, ok}. ok means an election is
+         * coming and the RequestVote at term+1 finishes this, so the
+         * corr STAYS SET -- re-sending against a target whose election
+         * is in flight would bump terms for nothing. A refusal clears
+         * it, and the next ack decides again. A higher term deposes us
+         * like any reply's would -- which is itself the transfer
+         * arriving (become_follower reports it). */
+        const uint8_t *v; size_t vlen; int found = 0;
+        int ok = 0;
+        if (obj_get_field(reply, len, (const uint8_t *)"ok", 2, &v, &vlen, &found) == BJ_OK && found) {
+            cur c = { v, vlen, 0 };
+            read_bool(&c, &ok);
+        }
+        uint64_t term = 0;
+        rmsg_term(reply, len, &term);
+        if (term > elog_current_term(n->log)) {
+            become_follower(n, term, 0, random01);
+            return BJ_OK;
+        }
+        if (!ok) n->transfer_corr = 0;
+        return BJ_OK;
+    }
     rn_peer *p = peer_by_corr(n, corr);
     if (p) {
         p->inflight = 0;
@@ -2286,6 +2393,12 @@ int rn_on_reply(raft_node *n, uint64_t corr, const uint8_t *reply, uint32_t len,
 }
 
 int rn_on_fail(raft_node *n, uint64_t corr) {
+    if (n->transfer_corr && corr == n->transfer_corr) {
+        /* Nobody answered the TimeoutNow. Cleared, so the next ack that
+         * proves the target alive and current sends another. */
+        n->transfer_corr = 0;
+        return BJ_OK;
+    }
     rn_peer *p = peer_by_corr(n, corr);
     if (!p) return BJ_OK;   /* a vote request nobody answered; the timer retries */
     p->inflight = 0;

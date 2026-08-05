@@ -632,6 +632,21 @@ int rmsg_build_leave(uint64_t id, dbuf *out) {
     return e ? (bj_builder_free(b), e) : finish(b, out);
 }
 
+int rmsg_build_timeout_now(uint64_t term, uint64_t leader_id, dbuf *out) {
+    if (!leader_id) return RAFT_ERR_MESSAGE;
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = put_key(b, "kind");
+    if (!e) e = bj_put_string(b, (const uint8_t *)"timeoutNow", 10);
+    if (!e) e = put_key(b, "term");
+    if (!e) e = bj_put_int(b, (int64_t)term);
+    if (!e) e = put_key(b, "leaderId");
+    if (!e) e = bj_put_int(b, (int64_t)leader_id);
+    if (!e) e = bj_end_object(b);
+    return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
 int rmsg_read_membership_reply(const uint8_t *msg, uint32_t len, rmsg_membership *out) {
     memset(out, 0, sizeof(*out));
     const uint8_t *v; size_t vlen; int found = 0;

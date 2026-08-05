@@ -444,6 +444,23 @@ describe.skipIf(!(REQUIRED || have(NATIVE)))('http front end: a three-member clu
     await boot(deposed);   // leave the cluster whole for the next test
   }, 60000);
 
+  it('transferLeadership rides the grammar: leadership moves, the front follows', async () => {
+    // An op the wire grew is usable over HTTP the day it lands in C --
+    // the front end never checked op names, and this one proves it: the
+    // URL grammar carries it, the leader answers once leadership has
+    // actually LEFT it, and the next write finds the member the
+    // transfer chose, exactly as it finds one after a kill.
+    const leader = await leaderOf();
+    const target = MEMBERS.find((m) => m.alive && m.id !== leader.id);
+    const res = await post(front, '/transferLeadership', { to: target.id });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+
+    const write = await post(front, `/db/${DB}/events/insert`, { doc: { seq: 3 } });
+    expect(write.status).toBe(200);
+    expect((await leaderOf()).id).toBe(target.id);
+  }, 60000);
+
   it('a change stream through the front end sees a write made through the front end', async () => {
     const stream = sse(front, `/db/${DB}/feed/watch`);
     expect(await stream.ready).toBe(200);

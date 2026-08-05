@@ -1,0 +1,9 @@
+# Everything here is assembled from the repository by
+# ../http-front.build.mjs at pack time; the repo files are the
+# single source of truth.
+/src/
+/bin/
+/types/
+/third_party/
+*.tgz
+node_modules/

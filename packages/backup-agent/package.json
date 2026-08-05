@@ -1,0 +1,53 @@
+{
+  "name": "@mdy-docs/nisaba-backup",
+  "version": "0.1.0",
+  "description": "The S3 backup agent for the nisaba database server: ships a member's committed snapshot generations to S3-compatible storage (MinIO included), prunes by retention, restores into an empty directory for a fresh server to adopt. Zero-dependency SigV4 S3 client included, exported at ./s3.",
+  "type": "module",
+  "main": "src/db-backup.js",
+  "types": "types/backup.d.ts",
+  "exports": {
+    ".": { "types": "./types/backup.d.ts", "default": "./src/db-backup.js" },
+    "./s3": { "types": "./types/s3.d.ts", "default": "./src/s3.js" }
+  },
+  "bin": {
+    "db-backup": "bin/backup.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "types",
+    "third_party"
+  ],
+  "scripts": {
+    "build": "node ../backup-agent.build.mjs",
+    "prepack": "node ../backup-agent.build.mjs",
+    "test": "node ../backup-agent.smoke.mjs"
+  },
+  "keywords": [
+    "database",
+    "backup",
+    "s3",
+    "minio",
+    "snapshot",
+    "restore",
+    "sigv4",
+    "binjson"
+  ],
+  "author": "Daniel Walton",
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdy-docs/nisaba-db.git",
+    "directory": "packages/backup-agent"
+  },
+  "homepage": "https://github.com/mdy-docs/nisaba-db#readme",
+  "bugs": {
+    "url": "https://github.com/mdy-docs/nisaba-db/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

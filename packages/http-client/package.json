@@ -1,0 +1,49 @@
+{
+  "name": "@mdy-docs/nisaba-client-http",
+  "version": "0.1.0",
+  "description": "The browser-capable JavaScript client for the nisaba HTTP front end: the MongoDB-driver-shaped API over fetch — Extended JSON both ways, session-backed cursors, change streams over Server-Sent Events. Pure JS, no node: modules; runs in a web page and in Node alike.",
+  "type": "module",
+  "main": "src/db-http-client.js",
+  "types": "types/http-client.d.ts",
+  "exports": {
+    ".": { "types": "./types/http-client.d.ts", "default": "./src/db-http-client.js" },
+    "./extended-json": { "default": "./src/extended-json.js" }
+  },
+  "files": [
+    "src",
+    "types",
+    "third_party"
+  ],
+  "scripts": {
+    "build": "node ../http-client.build.mjs",
+    "prepack": "node ../http-client.build.mjs",
+    "test": "node ../http-client.smoke.mjs"
+  },
+  "keywords": [
+    "database",
+    "document-database",
+    "database-client",
+    "browser",
+    "fetch",
+    "server-sent-events",
+    "mongodb",
+    "extended-json"
+  ],
+  "author": "Daniel Walton",
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdy-docs/nisaba-db.git",
+    "directory": "packages/http-client"
+  },
+  "homepage": "https://github.com/mdy-docs/nisaba-db#readme",
+  "bugs": {
+    "url": "https://github.com/mdy-docs/nisaba-db/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

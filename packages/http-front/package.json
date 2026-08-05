@@ -1,0 +1,51 @@
+{
+  "name": "@mdy-docs/nisaba-http-front",
+  "version": "0.1.0",
+  "description": "The HTTP front end for the nisaba database server: an RPC-shaped URL grammar over the server's TCP wire, Extended JSON bodies, sessions for cursors, change streams as Server-Sent Events, and leader-following across a cluster. No engine in the process.",
+  "type": "module",
+  "main": "src/db-http-front.js",
+  "types": "types/http-front.d.ts",
+  "exports": {
+    ".": { "types": "./types/http-front.d.ts", "default": "./src/db-http-front.js" }
+  },
+  "bin": {
+    "db-http": "bin/http-front.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "types",
+    "third_party"
+  ],
+  "scripts": {
+    "build": "node ../http-front.build.mjs",
+    "prepack": "node ../http-front.build.mjs",
+    "test": "node ../http-front.smoke.mjs"
+  },
+  "keywords": [
+    "database",
+    "document-database",
+    "http",
+    "rest",
+    "server-sent-events",
+    "mongodb",
+    "binjson"
+  ],
+  "author": "Daniel Walton",
+  "license": "BSD-2-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mdy-docs/nisaba-db.git",
+    "directory": "packages/http-front"
+  },
+  "homepage": "https://github.com/mdy-docs/nisaba-db#readme",
+  "bugs": {
+    "url": "https://github.com/mdy-docs/nisaba-db/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

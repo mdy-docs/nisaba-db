@@ -457,9 +457,18 @@ two tracks can proceed in parallel after it.
    names across two databases; chunked reads reassembling every
    generation file byte-for-byte (offsets honored, past-end refused);
    and the superseded-generation refusal mid-transfer.
-4. **`src/s3.js`.** Unit-tested against MinIO when it is reachable at
-   `--s3-endpoint`/env, `describe.skipIf` otherwise — the pattern the
-   server tests already use for unbuilt binaries.
+4. ✅ **`src/s3.js` — built.** SigV4 over `node:http`/`https`,
+   path-style, five verbs (`putObject`/`getObject`/`headObject`/
+   `deleteObject`/`list`) plus `createBucket`; bodies are Buffers
+   signed over the real payload hash; `list` pages internally with
+   `encoding-type=url` (whose query-string dialect — `+` is a space —
+   was found by the test, not the docs); every non-2xx is an `S3Error`
+   carrying HTTP's status and S3's own `<Code>`. Tested in
+   `test/s3.test.js` against MinIO when something answers at
+   `NISABA_S3_TEST_ENDPOINT` (default `http://127.0.0.1:9000`),
+   `describe.skipIf` otherwise: bucket idempotence, binary round-trip,
+   awkward key names through signing AND listing, real pagination,
+   prefix+delimiter, and the 404 error shape.
 5. **`src/db-backup.js` + `bin/backup.js`, backup half.** Test: server
    `--raft 1 --snapshot-entries 8`, writes past the trigger, agent
    ships to MinIO, assert the S3 listing matches the manifest and the

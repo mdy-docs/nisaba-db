@@ -389,6 +389,18 @@ none of those (`listCollections` and `ping`).
 | `{op:'listIndexes', coll}` | `{ok:true, indexes:[...]}` |
 | `{op:'compact', coll}` | `{ok:true, result:{generation, bytesBefore, bytesAfter, bytesFreed}}` |
 | `{op:'compact', minBytes, factor, skipBusy}` (no `coll`) | `{ok:true, result:{[coll]: stats\|null}}` |
+| `{op:'snapshot'}` | `{ok:true, snapshot:{gen, lastIncludedIndex, lastIncludedTerm, config, files}}` — take a generation NOW |
+| `{op:'latestSnapshot'}` | same shape — the committed generation's manifest |
+| `{op:'readSnapshotFile', gen, role, offset?}` | `{ok:true, data, eof, size}` — one ≤ 4 MB chunk of one generation file |
+
+The three snapshot ops (docs/s3-backup.md) are **per-member** — a
+follower answers them, because its committed generation is a true
+prefix of history and a backup read from it offloads the leader. They
+are refused with `-72` by a server running without a log (snapshots
+exist to compact one), and with `-73` when no generation has been
+committed yet or the one named has been superseded and pruned — the
+caller re-asks `latestSnapshot` and restarts. Everything served is the
+committed generation, which is immutable: no quiesce, no lock, no pin.
 
 `result` is `{acknowledged, matchedCount, modifiedCount, deletedCount,
 insertedCount, upsertedId}` for a single write, and

@@ -195,6 +195,17 @@ extern "C" {
  * just removed, and only the caller knows whether it means to. */
 #define DC_ERR_DB_DROPPED           (-71)
 
+/* The snapshot ops (docs/s3-backup.md: snapshot, latestSnapshot,
+ * readSnapshotFile). The store they read belongs to the replicated
+ * transport (server/replica.c), so a server running without a log
+ * answers -72 -- true for as long as it runs that way, and the remedy
+ * is --raft, not a retry. -73 is about NOW rather than the server: no
+ * generation has been committed yet, or the generation the request
+ * names has been superseded and pruned mid-transfer; the remedy is to
+ * ask latestSnapshot again and restart from what it says. */
+#define DC_ERR_NO_SNAPSHOT_STORE    (-72)
+#define DC_ERR_SNAPSHOT_GONE        (-73)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)
@@ -229,10 +240,15 @@ extern "C" {
  * and gets the real diagnosis from the code that owns it.
  */
 typedef enum {
-    DBS_REQ_NONE   = 0,
-    DBS_REQ_READ   = 1,
-    DBS_REQ_WRITE  = 2,
-    DBS_REQ_STATUS = 3
+    DBS_REQ_NONE     = 0,
+    DBS_REQ_READ     = 1,
+    DBS_REQ_WRITE    = 2,
+    DBS_REQ_STATUS   = 3,
+    /* The snapshot ops. Their own kind for the same reason STATUS is:
+     * they are PER-MEMBER -- a follower's generation is a true prefix
+     * of history and serving it offloads the leader -- so the routing
+     * layer must answer them before the leader check refuses them. */
+    DBS_REQ_SNAPSHOT = 4
 } dbs_req_kind;
 
 void dbs_request_kind(const uint8_t *req, size_t req_len, int *kind);

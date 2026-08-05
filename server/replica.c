@@ -1824,6 +1824,177 @@ static int replica_status(const replica *r, dbuf *out) {
     return e;
 }
 
+/* ---- the snapshot ops (docs/s3-backup.md step 3) ------------------------
+ *
+ * snapshot, latestSnapshot, readSnapshotFile: the client wire's window
+ * onto the store this file already keeps. PER-MEMBER, deliberately --
+ * they are answered before the leader check, because a follower's
+ * generation is a true prefix of history and serving a backup from one
+ * offloads the leader. Everything served is the COMMITTED generation:
+ * immutable, so no quiesce and no lock; a generation superseded and
+ * pruned mid-transfer refuses further reads (DC_ERR_SNAPSHOT_GONE) and
+ * the caller restarts from latestSnapshot -- a retry, not a pin,
+ * because a pinned generation is disk an operator cannot reclaim, held
+ * by a caller that may never come back.
+ */
+
+/* One bounded chunk of a generation file per request: big enough to
+ * amortize the round trip, small enough that a response frame never
+ * balloons (the client bounds responses at 64 MB). */
+#define REPLICA_READ_MAX (4u * 1024 * 1024)
+
+static int req_op_is(const uint8_t *req, size_t len, const char *name) {
+    const uint8_t *v; size_t vlen; int f = 0;
+    if (obj_get_field(req, len, (const uint8_t *)"op", 2, &v, &vlen, &f) || !f) return 0;
+    cur c = { v, vlen, 0 };
+    const uint8_t *s; uint32_t slen;
+    if (take_string(&c, &s, &slen)) return 0;
+    return slen == (uint32_t)strlen(name) && memcmp(s, name, slen) == 0;
+}
+
+static int req_field_u64(const uint8_t *req, size_t len, const char *key,
+                         uint64_t *out_v, int *found) {
+    const uint8_t *v; size_t vlen; int f = 0;
+    *found = 0;
+    if (obj_get_field(req, len, (const uint8_t *)key, (uint32_t)strlen(key),
+                      &v, &vlen, &f) || !f) return BJ_OK;
+    cur c = { v, vlen, 0 };
+    if (read_u64(&c, out_v)) return DC_ERR_REQ_MALFORMED;
+    *found = 1;
+    return BJ_OK;
+}
+
+/* {ok:true, snapshot:<the manifest record, verbatim>} -- gen, boundary,
+ * config.live and the file list, spliced raw so the record's shape has
+ * exactly one owner (snapstore.h). */
+static int snapshot_answer_latest(replica *r, dbuf *out) {
+    dbuf rec = {0};
+    int has = 0;
+    int e = sst_latest(r->store, &rec, &has);
+    if (e) { dbuf_free(&rec); return e; }
+    if (!has) {
+        dbuf_free(&rec);
+        return refuse(r, DC_ERR_SNAPSHOT_GONE, out);
+    }
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&rec); return BJ_ERR_OOM; }
+    e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"ok", 2);
+    if (!e) e = bj_put_bool(b, 1);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"snapshot", 8);
+    if (!e) e = bj_put_raw(b, rec.data, (uint32_t)rec.len);
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t n = 0;
+        const uint8_t *d = bj_builder_data(b, &n);
+        e = d ? dbuf_put(out, d, n) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    dbuf_free(&rec);
+    return e;
+}
+
+/* Take one NOW: exactly what the --snapshot-entries trigger runs
+ * (snapshot_take + log compaction), with the cadence moved to the
+ * caller. Refused while an install is moving the state machine (-66,
+ * retryable: the moment passes); idempotent when nothing has been
+ * applied since the last boundary -- the committed generation already
+ * IS the snapshot of this state, so it is the answer. */
+static int snapshot_take_now(replica *r, dbuf *out) {
+    if (rn_adopt_pending(r->node) || rn_installing(r->node))
+        return refuse(r, DC_ERR_NOT_CURRENT, out);
+    if (r->applied == 0)
+        return refuse(r, DC_ERR_SNAPSHOT_GONE, out);
+    if (r->applied == elog_base_index(r->log) && sst_has_latest(r->store))
+        return snapshot_answer_latest(r, out);
+    int se = snapshot_take(r);
+    if (se) return refuse(r, se, out);
+    return snapshot_answer_latest(r, out);
+}
+
+/* {gen, role, offset?} -> {ok:true, data, eof, size}: one bounded chunk
+ * of one committed generation file, read straight off the store's
+ * immutable copy. `gen` must be the committed generation -- naming it
+ * is what makes a prune mid-transfer a clean refusal instead of a file
+ * that changes identity between chunks. */
+static int snapshot_read_file(replica *r, const uint8_t *req, size_t len, dbuf *out) {
+    if (!sst_has_latest(r->store))
+        return refuse(r, DC_ERR_SNAPSHOT_GONE, out);
+
+    uint64_t gen = 0, offset = 0;
+    int found = 0;
+    int e = req_field_u64(req, len, "gen", &gen, &found);
+    if (e) return refuse(r, e, out);
+    if (!found) return refuse(r, DC_ERR_REQ_MISSING_FIELD, out);
+    e = req_field_u64(req, len, "offset", &offset, &found);
+    if (e) return refuse(r, e, out);
+
+    const uint8_t *rv; size_t rvlen;
+    found = 0;
+    if (obj_get_field(req, len, (const uint8_t *)"role", 4, &rv, &rvlen, &found))
+        return refuse(r, DC_ERR_REQ_MALFORMED, out);
+    if (!found) return refuse(r, DC_ERR_REQ_MISSING_FIELD, out);
+    cur rc = { rv, rvlen, 0 };
+    const uint8_t *role; uint32_t role_len;
+    if (take_string(&rc, &role, &role_len))
+        return refuse(r, DC_ERR_REQ_MALFORMED, out);
+
+    if (gen != sst_latest_gen(r->store))
+        return refuse(r, DC_ERR_SNAPSHOT_GONE, out);
+
+    dbuf name = {0};
+    e = sst_data_name(r->store, gen, (const char *)role, role_len, &name);
+    if (e) { dbuf_free(&name); return refuse(r, DC_ERR_REQ_MALFORMED, out); }
+
+    bj_io io;
+    e = r->ns->open(r->ns->ctx, (const char *)name.data, (uint32_t)name.len, 0, &io);
+    dbuf_free(&name);
+    /* Absent: a role the manifest never named, or a generation pruned
+     * beneath the caller between its chunks. Same remedy either way. */
+    if (e) return refuse(r, DC_ERR_SNAPSHOT_GONE, out);
+
+    uint64_t total = io.size(io.ctx);
+    if (offset > total) {
+        if (io.close) io.close(io.ctx);
+        return refuse(r, DC_ERR_REQ_MALFORMED, out);
+    }
+    uint32_t want = (uint32_t)((total - offset > REPLICA_READ_MAX)
+                                   ? REPLICA_READ_MAX : (total - offset));
+    uint8_t *buf = (uint8_t *)malloc(want ? want : 1);
+    if (!buf) { if (io.close) io.close(io.ctx); return BJ_ERR_OOM; }
+    uint32_t at = 0;
+    while (!e && at < want) {
+        int64_t got = io.read(io.ctx, offset + at, buf + at, want - at);
+        if (got <= 0) { e = got < 0 ? (int)got : BJ_ERR_EOF; break; }
+        at += (uint32_t)got;
+    }
+    if (io.close) io.close(io.ctx);
+    if (e) { free(buf); return e; }   /* an I/O failure here is the server's trouble, not a refusal */
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { free(buf); return BJ_ERR_OOM; }
+    e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"ok", 2);
+    if (!e) e = bj_put_bool(b, 1);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"data", 4);
+    if (!e) e = bj_put_binary(b, buf, want);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"eof", 3);
+    if (!e) e = bj_put_bool(b, offset + want >= total);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"size", 4);
+    if (!e) e = bj_put_int(b, (int64_t)total);
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t n = 0;
+        const uint8_t *d = bj_builder_data(b, &n);
+        e = d ? dbuf_put(out, d, n) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    free(buf);
+    return e;
+}
+
 int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
                    dbuf *out) {
     if (!r) return BJ_ERR_STATE;
@@ -1846,6 +2017,15 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
     dbi_request_kind(req, len, &kind);
 
     if (kind == DBS_REQ_STATUS) { int e = replica_status(r, out); return e ? e : 0; }
+
+    /* Per-member, before the leader check (db_session.h says why). */
+    if (kind == DBS_REQ_SNAPSHOT) {
+        int e;
+        if (req_op_is(req, len, "snapshot"))            e = snapshot_take_now(r, out);
+        else if (req_op_is(req, len, "latestSnapshot")) e = snapshot_answer_latest(r, out);
+        else                                            e = snapshot_read_file(r, req, len, out);
+        return e ? e : 0;
+    }
 
     if ((kind == DBS_REQ_READ || kind == DBS_REQ_WRITE) && !replica_is_leader(r)) {
         /*

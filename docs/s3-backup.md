@@ -440,12 +440,23 @@ two tracks can proceed in parallel after it.
    which then takes leadership by transfer and serves both databases
    over its own client wire. A mixed cluster is now a deployment
    choice, not a feature. **Step 2 is done.**
-3. **The three ops in C** (`db_request.c`, `db_session.h` refusal
-   code, `docs/db-server.md` op table) **+ the client methods**
-   (`src/db-server-client.js`). Tested in `test/db.server.test.js`
-   native and wasip2, including: refusal without `--raft`, manifest
-   round-trip, chunked read equals the on-disk file byte-for-byte, and
-   the prune-mid-read refusal.
+3. ✅ **The three ops in C — built.** `snapshot`, `latestSnapshot` and
+   `readSnapshotFile` are in `OP_NAMES` with their own request kind
+   (`DBS_REQ_SNAPSHOT`, answered per-member before the leader check),
+   implemented in `server/replica.c` against the committed generation,
+   refused `-72` (`DC_ERR_NO_SNAPSHOT_STORE`) by any log-less path and
+   `-73` (`DC_ERR_SNAPSHOT_GONE`) for a missing or superseded
+   generation — the open refusal-code question is thereby answered.
+   `snapshot` runs exactly the `--snapshot-entries` trigger, refuses
+   `-66` mid-install, and is idempotent at an unchanged boundary. The
+   client methods and `WIRE_OPS` entries landed in the same change
+   (`src/db-server-client.js`, `types/server-client.d.ts`), and
+   `docs/db-server.md` gained the ops. Tested in
+   `test/db.server.test.js`, native and wasip2: all three refused
+   without `--raft`; the manifest round-trip with `"db/file"` live
+   names across two databases; chunked reads reassembling every
+   generation file byte-for-byte (offsets honored, past-end refused);
+   and the superseded-generation refusal mid-transfer.
 4. **`src/s3.js`.** Unit-tested against MinIO when it is reachable at
    `--s3-endpoint`/env, `describe.skipIf` otherwise — the pattern the
    server tests already use for unbuilt binaries.

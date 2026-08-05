@@ -67,7 +67,10 @@ typedef enum {
     OP_FIND_BY_INDEX,
     OP_PRUNE_EXPIRED,
     OP_WATCH,
-    OP_CLOSE_STREAM
+    OP_CLOSE_STREAM,
+    OP_SNAPSHOT,
+    OP_LATEST_SNAPSHOT,
+    OP_READ_SNAPSHOT_FILE
 } dbs_op;
 
 /* The length comes from the literal itself, so the two cannot disagree.
@@ -133,6 +136,14 @@ static const struct {
      * data is current cannot show that either. */
     OP("watch",             OP_WATCH,                DBS_REQ_READ),
     OP("closeStream",       OP_CLOSE_STREAM,         DBS_REQ_NONE),
+    /* The snapshot ops (docs/s3-backup.md): answered by the replicated
+     * transport (server/replica.c), which routes on the kind before the
+     * leader check -- a snapshot is PER-MEMBER. Spelled here because
+     * every op is, so the engine's answer below is "no store here"
+     * rather than an unknown-op refusal masquerading as "not built". */
+    OP("snapshot",          OP_SNAPSHOT,             DBS_REQ_SNAPSHOT),
+    OP("latestSnapshot",    OP_LATEST_SNAPSHOT,      DBS_REQ_SNAPSHOT),
+    OP("readSnapshotFile",  OP_READ_SNAPSHOT_FILE,   DBS_REQ_SNAPSHOT),
 };
 
 #undef OP
@@ -1203,6 +1214,16 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
         bj_builder_free(pb);
         return pe;
     }
+
+    /*
+     * The snapshot ops read the snapshot store, and the store is the
+     * TRANSPORT's (server/replica.c owns it, and answers these before
+     * this function ever sees them). An engine reached directly -- a
+     * server running without a log, or the in-process host -- has no
+     * store, and says exactly that rather than something vaguer.
+     */
+    if (op == OP_SNAPSHOT || op == OP_LATEST_SNAPSHOT || op == OP_READ_SNAPSHOT_FILE)
+        return respond_error(out, DC_ERR_NO_SNAPSHOT_STORE);
 
     /*
      * getMore and closeCursor name a CURSOR, not a collection: the cursor

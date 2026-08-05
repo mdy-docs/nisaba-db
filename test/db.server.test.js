@@ -4053,3 +4053,108 @@ describe.skipIf(!have(NATIVE))('nisaba-server: a drop, then compaction, then a r
     await new Promise((r) => proc.once('exit', r));
   }, 90000);
 });
+
+/*
+ * The snapshot ops (docs/s3-backup.md step 3): snapshot, latestSnapshot,
+ * readSnapshotFile -- the client wire's window onto the generation the
+ * replica already keeps, and the S3 backup agent's whole diet. What
+ * these prove: the refusals a log-less server owes, the manifest
+ * round-trip, that a chunked read reassembles the on-disk generation
+ * file byte-for-byte, and that a generation superseded mid-transfer
+ * refuses cleanly instead of serving a file that changed identity.
+ */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: the snapshot ops ($name)', (engine) => {
+    const port = nextPort();
+    let proc = null;
+    let dir = null;
+    let client = null;
+
+    beforeAll(async () => {
+      ({ proc, dir } = await startServer(engine, port, ['--raft', '1'], -1));
+      client = await connectServer(port);
+      return async () => {
+        await client.close().catch(() => {});
+        proc.kill();
+        await new Promise((r) => proc.once('exit', r));
+      };
+    }, 60000);
+
+    it('all three are refused by a server with no log (-72)', async () => {
+      const bare = await startServer(engine, port + 1, [], -1);
+      const c = await connectServer(port + 1);
+      try {
+        await expect(c.snapshot()).rejects.toMatchObject({ code: -72 });
+        await expect(c.latestSnapshot()).rejects.toMatchObject({ code: -72 });
+        await expect(c.readSnapshotFile(1, 'f0')).rejects.toMatchObject({ code: -72 });
+      } finally {
+        await c.close().catch(() => {});
+        bare.proc.kill();
+        await new Promise((r) => bare.proc.once('exit', r));
+      }
+    }, 60000);
+
+    it('snapshot() takes an instance-wide generation; latestSnapshot answers the same manifest', async () => {
+      // Before anything is committed there is nothing to serve.
+      await expect(client.latestSnapshot()).rejects.toMatchObject({ code: -73 });
+
+      const users = client.db('appa').collection('users');
+      for (let i = 0; i < 5; i++) await users.insertOne({ n: i });
+      await client.db('appb').collection('things').insertOne({ n: 42 });
+
+      const snap = await client.snapshot();
+      expect(snap.gen).toBe(1);
+      expect(snap.lastIncludedIndex).toBeGreaterThan(0);
+      // Instance-wide: every live name is "db/file", both databases in.
+      expect(snap.config.live.every((f) => f.name.includes('/'))).toBe(true);
+      expect(snap.config.live.some((f) => f.name.startsWith('appa/'))).toBe(true);
+      expect(snap.config.live.some((f) => f.name.startsWith('appb/'))).toBe(true);
+      // The op compacts exactly as the --snapshot-entries trigger does.
+      expect((await client.ping()).base).toBe(snap.lastIncludedIndex);
+      expect(await client.latestSnapshot()).toEqual(snap);
+      // Idempotent when nothing has been applied since the boundary:
+      // the committed generation IS the snapshot of this state.
+      expect((await client.snapshot()).gen).toBe(1);
+    }, 60000);
+
+    it('readSnapshotFile reassembles every generation file byte-for-byte', async () => {
+      const snap = await client.latestSnapshot();
+      expect(snap.files.length).toBeGreaterThan(0);
+      for (const f of snap.files) {
+        const chunks = [];
+        let offset = 0;
+        for (;;) {
+          const { data, eof, size } = await client.readSnapshotFile(snap.gen, f.role, offset);
+          expect(size).toBe(f.size);
+          chunks.push(Buffer.from(data));
+          offset += data.length;
+          if (eof) break;
+        }
+        const whole = Buffer.concat(chunks);
+        expect(whole.length).toBe(f.size);
+        expect(whole.equals(fs.readFileSync(path.join(dir, f.name)))).toBe(true);
+      }
+      // Offsets are honored mid-file, and an offset past the end is a
+      // malformed request, not a hang or an empty success.
+      const f0 = snap.files[0];
+      if (f0.size > 1) {
+        const { data } = await client.readSnapshotFile(snap.gen, f0.role, 1);
+        const disk = fs.readFileSync(path.join(dir, f0.name));
+        expect(Buffer.from(data).equals(disk.subarray(1))).toBe(true);
+      }
+      await expect(client.readSnapshotFile(snap.gen, f0.role, f0.size + 1))
+        .rejects.toMatchObject({ code: -40 });
+    }, 60000);
+
+    it('a superseded generation refuses further reads (-73), and the new one serves', async () => {
+      const old = await client.latestSnapshot();
+      await client.db('appa').collection('users').insertOne({ n: 99 });
+      const next = await client.snapshot();
+      expect(next.gen).toBe(old.gen + 1);
+      await expect(client.readSnapshotFile(old.gen, 'f0'))
+        .rejects.toMatchObject({ code: -73 });
+      const { eof } = await client.readSnapshotFile(next.gen, next.files[0].role);
+      expect(eof).toBe(true);
+    }, 60000);
+  }
+);

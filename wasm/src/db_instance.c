@@ -279,6 +279,17 @@ static int instance_op(dbi *i, const uint8_t *req, size_t len, dbuf *out) {
         dbuf_free(&names);
         return e ? e : 1;
     }
+    if (op_is(req, len, "snapshot") || op_is(req, len, "latestSnapshot") ||
+        op_is(req, len, "readSnapshotFile")) {
+        /* Instance-level, but not this layer's: the snapshot store
+         * belongs to the replicated transport (server/replica.c), which
+         * answers these before routing ever reaches here. An instance
+         * asked directly is an instance with no log, and the refusal
+         * says so -- these ops name no database, so letting them fall
+         * through would refuse them for the wrong reason. */
+        int e = dbs_refusal(DC_ERR_NO_SNAPSHOT_STORE, out);
+        return e ? e : 1;
+    }
     if (op_is(req, len, "dropDatabase")) {
         const uint8_t *name; uint32_t nlen; int found = 0;
         int e = req_str(req, len, "db", &name, &nlen, &found);

@@ -184,6 +184,14 @@ const char *dc_strerror(int code) {
             return "The database this request was using was dropped while the "
                    "request was in flight; whatever the request applied is "
                    "gone with it, and no result can be produced";
+        case DC_ERR_NO_SNAPSHOT_STORE:
+            return "This server has no snapshot store: snapshots exist to "
+                   "compact the log, and this server runs without one. Start "
+                   "it with --raft (a cluster of one is fine) to back it up";
+        case DC_ERR_SNAPSHOT_GONE:
+            return "No committed snapshot generation here, or the one named "
+                   "is not the committed one any more; ask latestSnapshot and "
+                   "restart from what it says";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

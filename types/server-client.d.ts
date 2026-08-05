@@ -203,7 +203,28 @@ export interface RemoteDb {
   ping(): Promise<true>;
   /** Send any op the wire has and read the response object as it came. */
   request(req: Document): Promise<Document>;
+  /** Take a snapshot generation NOW (what --snapshot-entries does on
+   * its own cadence) and return its manifest. Refused (-72) by a server
+   * running without a log. */
+  snapshot(): Promise<RemoteSnapshotManifest>;
+  /** The committed generation's manifest; -73 when none exists yet. */
+  latestSnapshot(): Promise<RemoteSnapshotManifest>;
+  /** One bounded chunk (≤ 4 MB) of one generation file; page with
+   * `offset` until `eof`. -73 once the generation is superseded. */
+  readSnapshotFile(gen: number, role: string, offset?: number):
+    Promise<{ data: Uint8Array; eof: boolean; size: number }>;
   close(): Promise<void>;
+}
+
+/** A committed snapshot generation, as snapstore.h manifests it: the
+ * backup artifact (docs/s3-backup.md). `config.live` maps each role
+ * back to the "db/file" live name an adoption restores by. */
+export interface RemoteSnapshotManifest {
+  gen: number;
+  lastIncludedIndex: number;
+  lastIncludedTerm: number;
+  config: { live: Array<{ role: string; name: string }> };
+  files: Array<{ role: string; name: string; size: number; crc: number }>;
 }
 
 /**

@@ -89,6 +89,7 @@ export const WIRE_OPS = [
   'bulkWrite',
   'findByIndex', 'pruneExpired', 'watch', 'closeStream',
   'getMore', 'closeCursor', 'compact',
+  'snapshot', 'latestSnapshot', 'readSnapshotFile',
   'createCollection', 'dropCollection', 'createIndex', 'dropIndex', 'listIndexes',
   'listCollections'
 ];
@@ -1110,6 +1111,32 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
     async ping() {
       const { ok, ...status } = await conn.call({ op: 'ping' });
       return status;
+    },
+    /**
+     * The snapshot ops (docs/s3-backup.md): this MEMBER's committed
+     * generation -- the backup artifact. Per-member and answered by
+     * followers too; a server running without a log refuses all three
+     * with -72, and a generation superseded mid-transfer refuses
+     * further reads with -73 (restart from latestSnapshot()).
+     */
+    /** Take a generation NOW -- what --snapshot-entries does on its own
+     * cadence -- and return its manifest: { gen, lastIncludedIndex,
+     * lastIncludedTerm, config: { live }, files: [{role,name,size,crc}] }. */
+    async snapshot() {
+      return (await conn.call({ op: 'snapshot' })).snapshot;
+    },
+    /** The committed generation's manifest, same shape; -73 when none
+     * has been committed yet. */
+    async latestSnapshot() {
+      return (await conn.call({ op: 'latestSnapshot' })).snapshot;
+    },
+    /** One bounded chunk (≤ 4 MB, the server's cap) of one generation
+     * file: { data, eof, size }. `gen` must be the committed generation
+     * and `role` one of its manifest's roles; page with `offset` until
+     * `eof`. */
+    async readSnapshotFile(gen, role, offset = 0) {
+      const { data, eof, size } = await conn.call({ op: 'readSnapshotFile', gen, role, offset });
+      return { data, eof, size };
     },
     /* The escape hatch: send an op the wire has, `db` and all, and read
      * the response object as it came. A new op is usable from JavaScript

@@ -392,9 +392,38 @@ static int adopt_config(replica *r, const uint8_t *payload, uint32_t len,
     int e = rn_set_members(r->node, ms, (uint32_t)mslen);
     if (e) return e;
     r->config_index = index;
+
     /*
-     * Applied our own removal, or our own demotion to learner. As leader
-     * we committed the entry first, so the new set has it -- and a node
+     * Say that this entry COMMITTED before deciding whether we are still
+     * one of the members it names. Membership takes effect at APPLY
+     * here, and a follower holding the entry keeps the old set until it
+     * learns the entry committed -- which only the leader can tell it.
+     *
+     * A leader applying its OWN removal used to step down first and
+     * replicate second (at the call site below, under a
+     * replica_is_leader guard that the step-down had just falsified), so
+     * the second half never ran: it left carrying the commit index. The
+     * survivors kept a configuration that still listed the departed
+     * leader, and where that configuration's quorum needed it -- the
+     * two-voter shrink, the commonest shape there is -- they could not
+     * elect anyone to tell them otherwise. The group was lost, not slow,
+     * while the caller of the leave had been told it succeeded, because
+     * it had: the entry committed. Raft's "the leader steps down once
+     * C_new is committed" describes the moment AFTER the cluster has
+     * been told.
+     *
+     * Against the peer table as it stands -- the set BEFORE this change,
+     * since sync_peers has not run yet -- which is what we want twice
+     * over: it is a superset of the new members, so a member this entry
+     * REMOVES also hears that it committed, applies its own removal, and
+     * stops campaigning against a cluster that has moved on.
+     */
+    if (rn_role(r->node) == RAFT_LEADER && r->px)
+        for (uint32_t i = 0; i < peers_count(r->px); i++)
+            rn_replicate(r->node, peers_id_at(r->px, i));
+
+    /*
+     * Applied our own removal, or our own demotion to learner. A node
      * that goes on leading a cluster it is not in would be counting a
      * vote nobody else counts.
      */
@@ -1442,8 +1471,13 @@ static int apply_committed(replica *r) {
         if (type == EL_CONFIG && index >= r->config_index) {
             e = adopt_config(r, payload.data, (uint32_t)payload.len, index);
             if (e) break;
-            /* Whoever just arrived has to be caught up, and the entry
-             * that put them here is already behind us. */
+            /* Whoever just ARRIVED has to be caught up, and the entry
+             * that put them here is already behind us: this runs against
+             * the peer table sync_peers has now widened, where
+             * adopt_config's own pass ran against the set as it stood.
+             * A peer in both is asked twice and replicates once
+             * (rn_replicate skips one with a request already in
+             * flight). */
             if (replica_is_leader(r))
                 for (uint32_t i = 0; i < peers_count(r->px); i++)
                     rn_replicate(r->node, peers_id_at(r->px, i));

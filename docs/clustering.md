@@ -168,6 +168,20 @@ survivors even if it *doesn't* learn of the removal (a healthy leader
 refuses pre-votes — see `src/raft.js`). Removing an already-absent id
 is idempotent. Shut the process down afterwards; that part is yours.
 
+**Removing the leader** is the one case with an ordering rule inside it,
+and it is the commonest one a drain hits. Membership takes effect at
+APPLY, so a survivor holding the removal entry keeps the old member set
+until it learns the entry committed — and only the leader can tell it.
+A leader applying its own removal therefore replicates *before* it steps
+down, in the same breath; leaving first would take the commit index with
+it, and in a two-voter group the survivor would then need a quorum whose
+other half had removed itself and would not vote. Nothing could be
+elected to advance the commit index that would have dissolved that
+quorum. The leave would report success — it *had* committed, at the
+leader — and the group would be gone. The restart scan's latest-in-log
+rule still heals that shape if the final message is lost to a crash;
+what it no longer has to heal is the ordinary case.
+
 ## Observability: status and events
 
 Two complementary surfaces, following the classic snapshot/timeline

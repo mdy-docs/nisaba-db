@@ -459,6 +459,53 @@ describe('raft: the end of a node\'s life', () => {
   });
 });
 
+describe('raft: a leader that removes itself', () => {
+  it('tells the survivors the entry committed BEFORE it steps down, so the group needs no heal', async () => {
+    /*
+     * The two-voter shrink — a drain retiring a node that happens to be
+     * leading — and the reason it used to end with a dead group.
+     *
+     * Membership takes effect at APPLY here, so a follower holding the
+     * removal entry keeps the old two-voter set until it learns the
+     * entry committed, and the leader is the only node that can tell
+     * it. Stepping down first and replicating second meant the second
+     * half never ran: the leader left with the commit index, the
+     * survivor went on believing in a quorum of two, and the only other
+     * member of that quorum was a node that had removed itself and
+     * would not vote. Nobody could be elected to advance the commit
+     * index that would have dissolved the quorum needing them. Total
+     * loss of the group, reported to the caller as a successful leave —
+     * which it was, at the leader.
+     *
+     * The old repair was a RESTART of the survivor (the test below,
+     * which still passes and still guards the replay rule it is about).
+     * What is asserted here is that no repair is needed.
+     */
+    const { sim, cluster, leader } = await electedCluster(31, 2);
+    const L = leader();
+    const F = [...cluster.values()].find((m) => m.node.role !== 'leader');
+    const [lid, fid] = [L.node.id, F.node.id];
+    await settle(sim, cluster, L.node.propose(kvSet('kept', 1)));
+
+    const { error } = await settle(sim, cluster, L.node.changeMembership([fid]));
+    if (error) expect(error).toBeInstanceOf(NotLeaderError);
+    expect(L.node.role).not.toBe('leader');
+
+    // Left alone, the survivor applies the removal it already holds,
+    // finds itself the sole voter, and elects itself under the new
+    // electorate. Before the fix this waited out the full 10s bound
+    // with `voters` still [lid, fid] and no leader anywhere.
+    await until(sim, cluster, () => F.node.voters.length === 1 && F.node.role === 'leader');
+    expect(F.node.voters).toEqual([fid]);
+    expect(F.machine.map.get('kept')).toBe(1);
+
+    // ...and it serves, which is the whole point of the group surviving.
+    const w = await settle(sim, cluster, F.node.propose(kvSet('after', 2)));
+    expect(w.error).toBeUndefined();
+    expect(F.machine.map.get('after')).toBe(2);
+  });
+});
+
 describe('raft: config precedence on restart', () => {
   it('a restarted survivor keeps the latest-in-log CONFIG over older replayed ones (leader removed itself)', async () => {
     // The stuck-survivor shape behind graceful node retirement (drain):

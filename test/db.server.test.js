@@ -1683,6 +1683,43 @@ for (const engine of ENGINES) {
       expect([a.id, b.id]).toContain(took.id);
     }, 60000);
 
+    it('removes the LEADER through a survivor, and the survivor serves on alone', async () => {
+      /*
+       * The drain that retires the machine the leader happens to be on,
+       * and the one shape of removal that used to end with a dead group.
+       *
+       * Membership takes effect at APPLY, so the survivor holds the
+       * removal entry without acting on it until it learns the entry
+       * committed -- and the leader is the only member that can say so.
+       * A leader that stepped down first and replicated second left
+       * carrying that fact: the survivor went on believing in a quorum
+       * of two whose other half had removed itself and would not vote,
+       * so no election could be won, so the commit index that would
+       * have dissolved that quorum never advanced. The leave reported
+       * success -- it HAD committed, at the leader -- and the group was
+       * gone. (replica.c's adopt_config.)
+       */
+      const [a, b] = SEEDS;
+      const leader = await write('before-the-leader-goes');
+      const survivor = leader.id === a.id ? b : a;
+
+      // Addressed at the FOLLOWER on purpose: the leave is redirected to
+      // the leader, which commits its own removal -- the path a console
+      // or a drain takes, which never dials the node it is retiring.
+      const left = await runOnce(['--leave', String(leader.id),
+                                  '--join', `127.0.0.1:${survivor.raftPort}`]);
+      expect(left.code).toBe(0);
+      expect(left.err).toMatch(new RegExp(`node ${leader.id} removed`));
+      await stop(leader);
+
+      // One member, and it must know it is now the whole electorate.
+      // Before the fix this could not elect itself and `write` spent its
+      // whole retry budget finding nobody to take the insert.
+      const took = await write('alone-now');
+      expect(took.id).toBe(survivor.id);
+      expect(await namesOn(survivor)).toContain('alone-now');
+    }, 60000);
+
     it('says why, rather than starting, when the flags contradict each other',
        async () => {
       /* Not zero, rather than 2: wasmtime reports any non-zero guest

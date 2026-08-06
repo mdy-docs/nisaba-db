@@ -1145,16 +1145,41 @@ export class RaftNode {
    * ever be proposed; reaching here means it arrived some other way.
    */
   _adoptConfig(members, index) {
+    const wasLeader = this.role === ROLE.LEADER;
     this._setMembers(members);
     this._configIndex = index;
+
+    /*
+     * Tell the members that REMAIN, before deciding whether we are still
+     * one of them. Membership here takes effect at apply, not at append,
+     * so a follower holding this entry keeps the old configuration until
+     * it learns the entry committed — and the only node that can tell it
+     * is the leader.
+     *
+     * A leader applying its OWN removal used to step down first and
+     * replicate second, so the second half never ran: it left with the
+     * commit index still in its pocket. The survivors sat on a config
+     * that still listed the departed leader, and when that config's
+     * quorum needed it (the two-voter shrink, the commonest shape there
+     * is), they could not elect anyone to tell them otherwise. The
+     * group was lost — not slow, lost — while the caller of the leave
+     * had been told it succeeded, because it had: the entry committed.
+     * §4.2.2's "the leader steps down once C_new is committed" is
+     * describing the moment AFTER the cluster has been told.
+     *
+     * The flush is part of the fix, not tidiness: stepping down is what
+     * this outbox is racing, and a message still sitting in it when the
+     * node changes role is a message about a term it no longer holds.
+     */
+    if (wasLeader) {
+      for (const p of this.peers) this._core.replicate(p);
+      this._flush();
+    }
+
     if (!this.voters.includes(this.id) && this.role !== ROLE.FOLLOWER) {
       // Applied our own removal (or demotion to learner): step down; the
-      // host closes a removed node. (As leader we first committed the
-      // entry, so the new set has it.)
+      // host closes a removed node.
       this._core.stepDown(this._log.currentTerm, this.random());
-    }
-    if (this.role === ROLE.LEADER) {
-      for (const p of this.peers) this._core.replicate(p); // catch new members up
     }
     this._flush();
   }

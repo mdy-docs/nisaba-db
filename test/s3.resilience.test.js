@@ -95,12 +95,25 @@ describe('temporary credentials', () => {
     expect(seen[0].headers.authorization).not.toMatch(/x-amz-security-token/);
   });
 
-  it('takes it from the environment like the rest of the credential', () => {
+  it('takes it from the environment, and re-reads it rather than capturing it', async () => {
+    /*
+     * Re-read per request, not frozen in the constructor: an outside
+     * refresher rewriting process.env is how temporary credentials were
+     * kept alive before this client could fetch its own, and a client
+     * that captured the first value would sign with an expired one
+     * forever afterwards.
+     */
     const before = process.env.AWS_SESSION_TOKEN;
-    process.env.AWS_SESSION_TOKEN = 'from-the-env';
+    const { seen, endpoint } = await fakeS3(() => ({ status: 200, body: 'ok' }));
+    const s3 = new S3Client({ bucket: 'b', endpoint, ...CREDS });
     try {
-      expect(new S3Client({ bucket: 'b', endpoint: 'http://127.0.0.1:1', ...CREDS }).sessionToken)
-        .toBe('from-the-env');
+      process.env.AWS_SESSION_TOKEN = 'first';
+      await s3.getObject('k');
+      expect(seen[0].headers['x-amz-security-token']).toBe('first');
+
+      process.env.AWS_SESSION_TOKEN = 'rotated';
+      await s3.getObject('k');
+      expect(seen[1].headers['x-amz-security-token']).toBe('rotated');
     } finally {
       if (before === undefined) delete process.env.AWS_SESSION_TOKEN;
       else process.env.AWS_SESSION_TOKEN = before;

@@ -34,6 +34,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { createHash, createHmac } from 'node:crypto';
+import { credentialProvider } from './aws-credentials.js';
 
 /** A non-2xx answer from the store: `status` is HTTP's, `code` is
  * S3's (<Code> in the error body; '' when the body carried none). */
@@ -126,14 +127,21 @@ export class S3Client {
     }
     this.bucket = bucket;
     this.region = region ?? 'us-east-1';
-    this.accessKeyId = accessKeyId ?? process.env.AWS_ACCESS_KEY_ID;
-    this.secretAccessKey = secretAccessKey ?? process.env.AWS_SECRET_ACCESS_KEY;
-    this.sessionToken = sessionToken ?? process.env.AWS_SESSION_TOKEN ?? null;
     this.maxAttempts = Math.max(1, maxAttempts);
     this.socketTimeoutMs = socketTimeoutMs;
-    if (!this.accessKeyId || !this.secretAccessKey) {
-      throw new Error('S3Client needs credentials: accessKeyId/secretAccessKey or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY');
-    }
+    /*
+     * RESOLVED PER REQUEST, not captured here. A static pair resolves to
+     * itself for nothing; a role's credential is fetched and refreshed
+     * before it expires. Capturing one in this constructor is what made
+     * a control plane that had been up a day answer 403 to every
+     * question about backups, having worked at deploy time
+     * (./aws-credentials.js).
+     *
+     * Which also means "are there any credentials at all" cannot be
+     * answered here any more -- the chain has to be walked to know, and
+     * walking it is a network call. It is answered at first use.
+     */
+    this.credentials = credentialProvider({ accessKeyId, secretAccessKey, sessionToken });
     const url = new URL(endpoint ?? `https://s3.${this.region}.amazonaws.com`);
     this._https = url.protocol === 'https:';
     this._host = url.hostname;
@@ -182,6 +190,7 @@ export class S3Client {
   }
 
   async _send(method, key, { query = {}, body = null, contentType = null, metadata = null } = {}) {
+    const { accessKeyId, secretAccessKey, sessionToken } = await this.credentials.get();
     const path = `/${rfc3986(this.bucket)}${key ? `/${encodeKey(key)}` : ''}`;
     const qs = Object.keys(query).sort()
       .map((k) => `${rfc3986(k)}=${rfc3986(String(query[k]))}`)
@@ -199,7 +208,7 @@ export class S3Client {
     // Temporary credentials carry their token as a SIGNED header --
     // it goes in before signedNames is taken, or the signature covers
     // a request that is not the one being sent.
-    if (this.sessionToken) headers['x-amz-security-token'] = this.sessionToken;
+    if (sessionToken) headers['x-amz-security-token'] = sessionToken;
     if (contentType) headers['content-type'] = contentType;
     if (metadata) {
       for (const [k, v] of Object.entries(metadata)) {
@@ -218,12 +227,12 @@ export class S3Client {
 
     const scope = `${day}/${this.region}/s3/aws4_request`;
     const toSign = ['AWS4-HMAC-SHA256', now, scope, sha256(canonical)].join('\n');
-    const kSigning = hmac(hmac(hmac(hmac(`AWS4${this.secretAccessKey}`, day),
+    const kSigning = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, day),
       this.region), 's3'), 'aws4_request');
     const signature = hmac(kSigning, toSign).toString('hex');
 
     headers.authorization =
-      `AWS4-HMAC-SHA256 Credential=${this.accessKeyId}/${scope}, ` +
+      `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, ` +
       `SignedHeaders=${signedNames.join(';')}, Signature=${signature}`;
     if (body !== null) headers['content-length'] = String(body.length);
 

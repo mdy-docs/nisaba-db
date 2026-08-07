@@ -226,7 +226,12 @@ all three decide whether a backup happens at all:
   OIDC exchange all issue a *triple*, and AWS refuses the key pair
   without `x-amz-security-token`. `S3Client` takes `sessionToken` (or
   `AWS_SESSION_TOKEN`) and signs it — a token outside `SignedHeaders`
-  is a signature over something other than what arrived.
+  is a signature over something other than what arrived. They are also
+  **resolved per request and refreshed before they expire**
+  (`src/aws-credentials.js`): explicit → environment → the container
+  endpoint → IMDSv2. A client that captured one in its constructor
+  would sign with it long after it died, which is a process that worked
+  at deploy time and answers 403 the next morning.
 - **Retry.** AWS answers `503 SlowDown` when a prefix is busy and bare
   `500`s transiently, and documents that clients back off and try
   again. Three attempts by default, exponential with jitter, on 429 and

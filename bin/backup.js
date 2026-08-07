@@ -35,9 +35,13 @@ Commands:
 Options:
   --target host:port     The ONE member this agent backs up. A follower is
                          fine -- its generation is a true prefix of history.
-  --s3-bucket name       Created if absent.
+  --s3-bucket name       Must already exist unless --create-bucket.
+  --create-bucket        Create it if absent. OFF by default: a fleet
+                         agent should not hold s3:CreateBucket, and on
+                         AWS asking without it is a 403 on every run.
   --s3-endpoint url      e.g. http://127.0.0.1:9000 (MinIO). Omit for AWS.
-  --s3-region name       Default us-east-1.
+  --s3-region name       Default us-east-1; REQUIRED without --s3-endpoint,
+                         where it also selects the host and signs.
   --s3-prefix p          Key prefix in front of the instance name.
   --instance name        Names this instance in the bucket. Generation
                          numbers are per-member: one member per instance
@@ -52,7 +56,9 @@ Options:
                          committed).
 
 Durations: 30s, 5m, 1h (a bare number is seconds). Credentials ride
-AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY. docs/s3-backup.md has the story.`);
+AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY, plus AWS_SESSION_TOKEN when
+they are temporary (an instance role, an assumed role, a CI OIDC
+exchange). docs/s3-backup.md has the story.`);
   process.exit(1);
 }
 
@@ -67,8 +73,11 @@ const command = argv.shift();
 if (command !== 'once' && command !== 'watch' && command !== 'restore') usage();
 
 const opts = {
-  region: 'us-east-1', prefix: null, keep: null,
-  pollMs: 5000, everyMs: null, takeSnapshot: true
+  // No region default: with --s3-endpoint the client's own is harmless,
+  // and without one the region picks the AWS host AND signs, so a
+  // default here would quietly defeat the check that asks for it.
+  region: null, prefix: null, keep: null,
+  pollMs: 5000, everyMs: null, takeSnapshot: true, createBucket: false
 };
 for (let i = 0; i < argv.length; i++) {
   const arg = argv[i];
@@ -83,6 +92,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (arg === '--poll') opts.pollMs = duration(next());
   else if (arg === '--every') opts.everyMs = duration(next());
   else if (arg === '--no-snapshot') opts.takeSnapshot = false;
+  else if (arg === '--create-bucket') opts.createBucket = true;
   else if (arg === '--into') opts.into = next();
   else if (arg === '--gen') opts.gen = Number(next());
   else usage();
@@ -113,7 +123,14 @@ start it beside the cluster the backup came from.`);
   process.exit(0);
 }
 
-await s3.createBucket();
+/*
+ * NOT BY DEFAULT. This ran on every invocation once, which is invisible
+ * against a MinIO holding root credentials and wrong everywhere else: a
+ * fleet agent would need s3:CreateBucket to take a backup, and on AWS
+ * an agent without it is refused 403 on every single run. The bucket is
+ * infrastructure -- made once, by whoever makes infrastructure.
+ */
+if (opts.createBucket) await s3.createBucket();
 
 const client = await connectServer(opts.target);
 const agent = new BackupAgent({

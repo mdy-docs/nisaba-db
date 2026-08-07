@@ -18,6 +18,14 @@
  * follow-up when a generation file crosses it, and the failure until
  * then names the limit rather than truncating (docs/s3-backup.md).
  *
+ * THREE THINGS THAT ONLY MATTER AGAINST AWS, and so are easy to leave
+ * out when the only store you ever run against is a MinIO on loopback:
+ * temporary credentials (`sessionToken`, without which an instance
+ * role's key pair is refused), retry with backoff (AWS answers `503
+ * SlowDown` under load and expects it), and a socket timeout (nothing
+ * on loopback ever goes quiet). None of them change a byte of what is
+ * stored; all of them decide whether a backup happens at all.
+ *
  * ListObjectsV2 pages internally (`encoding-type=url`, so keys with
  * any byte S3 allows round-trip), and every non-2xx answer becomes an
  * S3Error carrying the status and S3's own <Code>/<Message> — a
@@ -37,6 +45,17 @@ export class S3Error extends Error {
     this.code = code || '';
   }
 }
+
+/** What S3 asks a client to come back for rather than give up on:
+ * throttling and its own transient faults. Never a 4xx — that is an
+ * answer. */
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+/** A connection that failed in a way another attempt might not. */
+const RETRYABLE_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EHOSTUNREACH'
+]);
+const isRetryableNetworkError = (err) => RETRYABLE_CODES.has(err?.code);
 
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 const hmac = (key, data) => createHmac('sha256', key).update(data).digest();
@@ -70,21 +89,52 @@ export class S3Client {
    * @param {object} options
    * @param {string} options.bucket
    * @param {string} [options.endpoint] - e.g. 'http://127.0.0.1:9000'
-   *   (MinIO); omitted, the AWS regional endpoint for `region`
-   * @param {string} [options.region='us-east-1']
+   *   (MinIO); omitted, the AWS regional endpoint for `region`, which
+   *   is then REQUIRED -- see below
+   * @param {string} [options.region='us-east-1'] - required when
+   *   `endpoint` is omitted
    * @param {string} [options.accessKeyId] - default env AWS_ACCESS_KEY_ID
    * @param {string} [options.secretAccessKey] - default env AWS_SECRET_ACCESS_KEY
+   * @param {string} [options.sessionToken] - default env AWS_SESSION_TOKEN.
+   *   Temporary credentials (an instance role, an assumed role, a CI
+   *   OIDC exchange) are a triple, and the third part is not optional:
+   *   without it AWS rejects the other two. Absent for a static key
+   *   pair and for MinIO, where it is simply never sent.
+   * @param {number} [options.maxAttempts=3] - see `_request`
+   * @param {number} [options.socketTimeoutMs=60000] - inactivity, not
+   *   total: a 4 GB PUT is allowed to take as long as it takes, a
+   *   silent socket is not
    */
-  constructor({ bucket, endpoint, region = 'us-east-1', accessKeyId, secretAccessKey } = {}) {
+  constructor({
+    bucket, endpoint, region, accessKeyId, secretAccessKey, sessionToken,
+    maxAttempts = 3, socketTimeoutMs = 60_000
+  } = {}) {
     if (!bucket) throw new Error('S3Client needs a bucket');
+    /*
+     * REGION IS REQUIRED WHEN THE ENDPOINT IS NOT GIVEN, because then
+     * it picks the host AND signs the request, and a wrong guess fails
+     * as `AuthorizationHeaderMalformed` or a 301 with no body -- which
+     * reads like a broken client rather than an unset variable. An
+     * S3-compatible store addressed by endpoint does not care, so it
+     * keeps the harmless default.
+     */
+    if (!endpoint && !region) {
+      throw new Error(
+        'S3Client needs a region when no endpoint is given: it selects the AWS host and signs ' +
+        'every request, and the wrong one is refused as a malformed signature. Set AWS_REGION.'
+      );
+    }
     this.bucket = bucket;
-    this.region = region;
+    this.region = region ?? 'us-east-1';
     this.accessKeyId = accessKeyId ?? process.env.AWS_ACCESS_KEY_ID;
     this.secretAccessKey = secretAccessKey ?? process.env.AWS_SECRET_ACCESS_KEY;
+    this.sessionToken = sessionToken ?? process.env.AWS_SESSION_TOKEN ?? null;
+    this.maxAttempts = Math.max(1, maxAttempts);
+    this.socketTimeoutMs = socketTimeoutMs;
     if (!this.accessKeyId || !this.secretAccessKey) {
       throw new Error('S3Client needs credentials: accessKeyId/secretAccessKey or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY');
     }
-    const url = new URL(endpoint ?? `https://s3.${region}.amazonaws.com`);
+    const url = new URL(endpoint ?? `https://s3.${this.region}.amazonaws.com`);
     this._https = url.protocol === 'https:';
     this._host = url.hostname;
     this._port = url.port ? Number(url.port) : (this._https ? 443 : 80);
@@ -94,7 +144,44 @@ export class S3Client {
 
   /* ---- one signed request ------------------------------------------- */
 
-  async _request(method, key, { query = {}, body = null, contentType = null, metadata = null } = {}) {
+  /**
+   * One signed attempt, retried when S3 says to.
+   *
+   * RETRY IS NOT OPTIONAL AGAINST AWS. It answers `503 SlowDown` and
+   * bare `500 InternalError` under load and documents that clients back
+   * off and try again; the SDKs do it invisibly, which is why code
+   * written against MinIO -- where it never happens -- looks finished
+   * and is not. A dropped socket is the same story from the other end.
+   *
+   * Every verb here is idempotent (S3 PUT replaces, DELETE of the gone
+   * is success), so a retry cannot half-apply anything. What it can do
+   * is turn a stampede into a worse stampede, hence exponential backoff
+   * with jitter rather than a tight loop.
+   *
+   * A 4xx is never retried: it is an answer, not a hiccup.
+   */
+  async _request(method, key, opts = {}) {
+    let lastErr = null;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const res = await this._send(method, key, opts);
+        if (!RETRYABLE_STATUS.has(res.status) || attempt >= this.maxAttempts) return res;
+        lastErr = new S3Error(res.status, xmlOne(res.body.toString('utf8'), 'Code'), `HTTP ${res.status}`);
+      } catch (err) {
+        if (!isRetryableNetworkError(err) || attempt >= this.maxAttempts) throw err;
+        lastErr = err;
+      }
+      // 100ms, 200ms, 400ms ... each with up to its own width of
+      // jitter, so a fleet that was throttled together does not come
+      // back together.
+      const base = 100 * 2 ** (attempt - 1);
+      await new Promise((r) => setTimeout(r, base + Math.floor(Math.random() * base)));
+    }
+    // eslint-disable-next-line no-unreachable
+    throw lastErr;
+  }
+
+  async _send(method, key, { query = {}, body = null, contentType = null, metadata = null } = {}) {
     const path = `/${rfc3986(this.bucket)}${key ? `/${encodeKey(key)}` : ''}`;
     const qs = Object.keys(query).sort()
       .map((k) => `${rfc3986(k)}=${rfc3986(String(query[k]))}`)
@@ -109,6 +196,10 @@ export class S3Client {
       'x-amz-content-sha256': payloadHash,
       'x-amz-date': now
     };
+    // Temporary credentials carry their token as a SIGNED header --
+    // it goes in before signedNames is taken, or the signature covers
+    // a request that is not the one being sent.
+    if (this.sessionToken) headers['x-amz-security-token'] = this.sessionToken;
     if (contentType) headers['content-type'] = contentType;
     if (metadata) {
       for (const [k, v] of Object.entries(metadata)) {
@@ -152,6 +243,20 @@ export class S3Client {
         }));
         res.on('error', reject);
       });
+      /*
+       * INACTIVITY, not a deadline. A generation file may be gigabytes
+       * and is allowed to take as long as the wire needs; a socket that
+       * has said nothing for a minute is not slow, it is gone. Without
+       * this a half-open connection hangs a backup until something
+       * further out kills it, which on a fleet means a routine stuck
+       * `running` and never due again.
+       */
+      req.setTimeout(this.socketTimeoutMs, () => {
+        req.destroy(Object.assign(
+          new Error(`no data for ${this.socketTimeoutMs}ms from ${this._hostHeader}`),
+          { code: 'ETIMEDOUT' }
+        ));
+      });
       req.on('error', reject);
       if (body !== null) req.write(body);
       req.end();
@@ -160,7 +265,13 @@ export class S3Client {
 
   _throw(res) {
     const text = res.body.toString('utf8');
-    throw new S3Error(res.status, xmlOne(text, 'Code'), xmlOne(text, 'Message'));
+    // S3 names the right region on a mismatch; passing that through
+    // turns "malformed signature" into an instruction.
+    const elsewhere = res.headers?.['x-amz-bucket-region'];
+    const hint = elsewhere && elsewhere !== this.region
+      ? ` (bucket '${this.bucket}' is in ${elsewhere}, this client signed for ${this.region})`
+      : '';
+    throw new S3Error(res.status, xmlOne(text, 'Code'), `${xmlOne(text, 'Message') ?? ''}${hint}`);
   }
 
   /* ---- the five verbs ------------------------------------------------ */

@@ -215,6 +215,50 @@ directions of the full round trip — backed up from a C member,
 restored into a JS host, and the reverse — are tested against real
 MinIO (`test/db.backup.test.js`, "one artifact, three hands").
 
+## Against real AWS, as opposed to MinIO
+
+MinIO proves the dialect — SigV4, path-style addressing, `ListObjectsV2`
+paging, `x-amz-meta-*` round-tripping. Three things it cannot prove,
+because a store on loopback with root credentials never does them, and
+all three decide whether a backup happens at all:
+
+- **Temporary credentials.** An instance role, an assumed role and a CI
+  OIDC exchange all issue a *triple*, and AWS refuses the key pair
+  without `x-amz-security-token`. `S3Client` takes `sessionToken` (or
+  `AWS_SESSION_TOKEN`) and signs it — a token outside `SignedHeaders`
+  is a signature over something other than what arrived.
+- **Retry.** AWS answers `503 SlowDown` when a prefix is busy and bare
+  `500`s transiently, and documents that clients back off and try
+  again. Three attempts by default, exponential with jitter, on 429 and
+  5xx and dropped connections. Never on a 4xx: that is an answer, not a
+  hiccup, and retrying `AccessDenied` turns one misconfiguration into
+  three requests per routine forever.
+- **A socket that goes quiet.** `socketTimeoutMs` is *inactivity*, not
+  a deadline: a multi-gigabyte PUT may take as long as the wire needs,
+  but a connection that has said nothing for a minute is gone. Without
+  it a half-open socket hangs the run that asked, and a scheduler with
+  a no-overlap guard never becomes due again.
+
+Two more things differ and are not the client's to fix. **The region is
+required** when no endpoint is given, because it picks the host *and*
+signs; a wrong one comes back as a malformed signature, so it is asked
+for rather than guessed (S3's own `x-amz-bucket-region` is passed
+through when it disagrees). And **the bucket is not created** unless
+`db-backup --create-bucket` says so: it once was, on every run, which is
+invisible against a MinIO holding root credentials and wrong everywhere
+else — a fleet agent would need `s3:CreateBucket` to take a backup, and
+an agent without it is refused on every attempt.
+
+The IAM policy the agent actually needs is `ListBucket` on the bucket
+plus `GetObject`/`PutObject`/`DeleteObject` on its keys. `ListBucket`
+is not optional: without it S3 answers `403` rather than `404` for a
+missing key, and "no manifest here" is how an uncommitted generation is
+recognised.
+
+`test/s3.resilience.test.js` covers all of this against a hand-written
+S3 rather than MinIO — a real store will not answer `503` twice on
+request, and those are exactly the paths a healthy store never takes.
+
 ## What this deliberately does not do
 
 - **No continuous / point-in-time backup.** Granularity is a

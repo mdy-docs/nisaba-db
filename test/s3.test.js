@@ -97,6 +97,128 @@ describe.skipIf(!reachable)(`s3 client (against ${ENDPOINT})`, () => {
     expect(err.code).toBe('NoSuchKey');
   });
 
+  /** `total` bytes in `chunk`-sized pieces, generated as they are asked
+   * for -- a producer that never holds the whole thing, which is the
+   * only kind worth testing a streaming upload with. */
+  async function* generated(total, chunk = 1024 * 1024, seed = 7) {
+    let sent = 0;
+    while (sent < total) {
+      const n = Math.min(chunk, total - sent);
+      const b = Buffer.allocUnsafe(n);
+      b.fill((seed + (sent / chunk)) % 251);
+      sent += n;
+      yield b;
+    }
+  }
+
+  const PART = 5 * 1024 * 1024;    // S3's floor, so the test crosses it cheaply
+
+  it('takes the single-PUT path when the content fits in one part', async () => {
+    made.add('stream/small.bin');
+    const body = Buffer.from('not big enough to bother');
+    const r = await s3.putObjectStream(
+      'stream/small.bin', (async function* () { yield body; })(), { partSize: PART });
+
+    // No multipart at all: one request, and the bytes were complete
+    // before any were sent.
+    expect(r.parts).toBe(0);
+    expect(r.bytes).toBe(body.length);
+    expect((await s3.getObject('stream/small.bin')).equals(body)).toBe(true);
+  });
+
+  it('an empty body is an object, not a nothing', async () => {
+    made.add('stream/empty.bin');
+    const r = await s3.putObjectStream('stream/empty.bin', (async function* () {})(), { partSize: PART });
+    expect(r).toMatchObject({ parts: 0, bytes: 0 });
+    expect((await s3.headObject('stream/empty.bin')).size).toBe(0);
+  });
+
+  it('switches to multipart when it outgrows a part, and the bytes survive', async () => {
+    // 12 MiB over a 5 MiB part: two full parts and a short last one,
+    // which is the only part allowed to be short.
+    made.add('stream/multi.bin');
+    const total = 12 * 1024 * 1024;
+    const r = await s3.putObjectStream('stream/multi.bin', generated(total), { partSize: PART });
+    expect(r.parts).toBe(3);
+    expect(r.bytes).toBe(total);
+
+    const back = await s3.getObject('stream/multi.bin');
+    expect(back.length).toBe(total);
+    // Spot-check across two part boundaries: a mis-ordered or
+    // mis-sliced part shows up here and nowhere else.
+    const expected = Buffer.concat(await (async () => {
+      const out = []; for await (const c of generated(total)) out.push(c); return out;
+    })());
+    expect(back.equals(expected)).toBe(true);
+  });
+
+  it('carries metadata through a multipart upload', async () => {
+    // The x-amz-meta-* headers ride on the CREATE, not on the parts and
+    // not on the completion -- an easy thing to attach to the wrong
+    // request, and the manifest's member/boundary facts depend on it.
+    made.add('stream/meta.bin');
+    await s3.putObjectStream('stream/meta.bin', generated(11 * 1024 * 1024), {
+      partSize: PART, metadata: { member: '10.0.0.1:20050', gen: '7' }
+    });
+    const head = await s3.headObject('stream/meta.bin');
+    expect(head.metadata).toMatchObject({ member: '10.0.0.1:20050', gen: '7' });
+  });
+
+  it('chunks that do not line up with the part size still make the right object', async () => {
+    made.add('stream/ragged.bin');
+    const total = 11 * 1024 * 1024 + 12345;
+    const r = await s3.putObjectStream('stream/ragged.bin', generated(total, 777_777), { partSize: PART });
+    expect(r.bytes).toBe(total);
+    expect((await s3.headObject('stream/ragged.bin')).size).toBe(total);
+  });
+
+  it('aborts the upload when the producer fails, leaving no object', async () => {
+    /*
+     * A CRC that only fails at the end -- exactly how a corrupted
+     * generation file surfaces -- must not leave an object behind
+     * claiming to be a backup. An abandoned multipart upload is also
+     * billed while it exists and invisible in a listing, so it is
+     * cleaned up rather than left for a lifecycle rule to find.
+     */
+    async function* failsLate() {
+      for await (const c of generated(11 * 1024 * 1024)) yield c;
+      throw new Error('CRC mismatch in transit');
+    }
+    await expect(s3.putObjectStream('stream/aborted.bin', failsLate(), { partSize: PART }))
+      .rejects.toThrow(/CRC mismatch/);
+    expect(await s3.headObject('stream/aborted.bin')).toBeNull();
+  });
+
+  it('holds a part, not a file: 192 MiB streams without 192 MiB of buffers', async () => {
+    /*
+     * THE POINT OF ALL OF THIS. The old path read a generation file
+     * whole and `Buffer.concat`ed it, so peak memory was twice the
+     * largest database file -- on the machine running the tenants,
+     * where an OOM takes more than the backup with it.
+     *
+     * `arrayBuffers` is Buffer memory specifically, which is what used
+     * to balloon. The bound is generous (a part is 5 MiB here) because
+     * the claim is about the SHAPE of the curve, not a byte count: flat
+     * in the size of the content rather than linear in it.
+     */
+    made.add('stream/big.bin');
+    const total = 192 * 1024 * 1024;
+    const base = process.memoryUsage().arrayBuffers;
+    let peak = 0;
+    const watch = setInterval(() => {
+      peak = Math.max(peak, process.memoryUsage().arrayBuffers - base);
+    }, 20);
+    try {
+      const r = await s3.putObjectStream('stream/big.bin', generated(total, 4 * 1024 * 1024), { partSize: PART });
+      expect(r.bytes).toBe(total);
+      expect(r.parts).toBeGreaterThan(30);
+    } finally {
+      clearInterval(watch);
+    }
+    expect((await s3.headObject('stream/big.bin')).size).toBe(total);
+    expect(peak).toBeLessThan(64 * 1024 * 1024);
+  }, 120_000);
+
   it('cleans up after itself', async () => {
     for (const key of made) await s3.deleteObject(key);
     expect((await s3.list('')).keys.length).toBe(0);

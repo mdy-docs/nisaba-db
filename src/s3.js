@@ -12,11 +12,13 @@
  * development (`http://127.0.0.1:9000`), AWS by omitting it (the
  * regional `https://s3.<region>.amazonaws.com`).
  *
- * BODIES ARE BUFFERS, and every PUT is single-part, signed over the
- * real payload hash — the strongest integrity SigV4 offers. The 5 GB
- * single-PUT ceiling is refused loudly by S3 itself; multipart is the
- * follow-up when a generation file crosses it, and the failure until
- * then names the limit rather than truncating (docs/s3-backup.md).
+ * BODIES ARE BUFFERS, signed over the real payload hash — the strongest
+ * integrity SigV4 offers. `putObject` is one request and holds what it
+ * is given; `putObjectStream` takes an async iterable and never holds
+ * more than one part, starting a MULTIPART upload only if the content
+ * turns out to need one. That is what lifts the ceiling from "twice the
+ * largest file, in memory, on the machine running the tenants" to a
+ * fixed part buffer (docs/s3-backup.md).
  *
  * THREE THINGS THAT ONLY MATTER AGAINST AWS, and so are easy to leave
  * out when the only store you ever run against is a MinIO on loopback:
@@ -57,6 +59,14 @@ const RETRYABLE_CODES = new Set([
   'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EHOSTUNREACH'
 ]);
 const isRetryableNetworkError = (err) => RETRYABLE_CODES.has(err?.code);
+
+/** S3's floor for every part but the last, and its cap on part count.
+ * Together they set the largest object a given part size can carry:
+ * 8 MiB parts reach 80 GB, which is far past anything a generation
+ * file has any business being. */
+const MIN_PART_SIZE = 5 * 1024 * 1024;
+const MAX_PARTS = 10_000;
+const DEFAULT_PART_SIZE = 8 * 1024 * 1024;
 
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 const hmac = (key, data) => createHmac('sha256', key).update(data).digest();
@@ -304,6 +314,145 @@ export class S3Client {
     const res = await this._request('PUT', key, { body, contentType, metadata });
     if (res.status !== 200) this._throw(res);
     return { etag: res.headers.etag ?? null };
+  }
+
+  /**
+   * Upload a key from an async iterable of Buffers, WITHOUT EVER
+   * HOLDING THE WHOLE THING.
+   *
+   * Small content takes the single-PUT path unchanged — one request,
+   * and the bytes are complete before any of them are sent, so a
+   * producer that verifies at the end (a CRC over a whole generation
+   * file, say) still fails before anything is stored. Only content that
+   * outgrows `partSize` switches to multipart, which is the case that
+   * used to be impossible rather than merely slower.
+   *
+   * A failure ABORTS the upload. An incomplete multipart upload is not
+   * visible in a listing and is billed until something removes it —
+   * which is a bill nobody can see the reason for. (A lifecycle rule
+   * expiring incomplete uploads is still worth having, for the case
+   * where this process dies before it can apologise.)
+   *
+   * @returns {Promise<{etag: string|null, bytes: number, parts: number}>}
+   *   `bytes` is what was actually sent, which is what a caller
+   *   checking against a manifest should compare.
+   */
+  async putObjectStream(key, chunks, {
+    contentType = 'application/octet-stream', metadata = null, partSize = DEFAULT_PART_SIZE
+  } = {}) {
+    if (partSize < MIN_PART_SIZE) {
+      throw new Error(`partSize ${partSize} is below S3's ${MIN_PART_SIZE}-byte floor for a non-final part`);
+    }
+    let pending = [];
+    let pendingLen = 0;
+    let bytes = 0;
+    let uploadId = null;
+    const parts = [];
+
+    /** Exactly `n` bytes out of the pending chunks, splitting one if it
+     * straddles the boundary -- parts are fixed size, arrivals are not. */
+    const take = (n) => {
+      const out = Buffer.allocUnsafe(n);
+      let filled = 0;
+      while (filled < n) {
+        const head = pending[0];
+        const want = n - filled;
+        if (head.length <= want) {
+          head.copy(out, filled);
+          filled += head.length;
+          pending.shift();
+        } else {
+          head.copy(out, filled, 0, want);
+          filled += want;
+          pending[0] = head.subarray(want);
+        }
+      }
+      pendingLen -= n;
+      return out;
+    };
+
+    const sendPart = async (body) => {
+      if (parts.length >= MAX_PARTS) {
+        throw new Error(
+          `more than ${MAX_PARTS} parts at ${partSize} bytes each; raise partSize`
+        );
+      }
+      const n = parts.length + 1;
+      parts.push({ n, etag: await this._uploadPart(key, uploadId, n, body) });
+    };
+
+    try {
+      for await (const chunk of chunks) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (buf.length === 0) continue;
+        pending.push(buf);
+        pendingLen += buf.length;
+        bytes += buf.length;
+        while (pendingLen >= partSize) {
+          uploadId ??= await this._createMultipart(key, { contentType, metadata });
+          await sendPart(take(partSize));
+        }
+      }
+
+      if (uploadId === null) {
+        const { etag } = await this.putObject(key, pendingLen ? take(pendingLen) : Buffer.alloc(0),
+          { contentType, metadata });
+        return { etag, bytes, parts: 0 };
+      }
+      // The last part is the one allowed to be short, and a zero-length
+      // remainder is not a part at all.
+      if (pendingLen > 0) await sendPart(take(pendingLen));
+      return { etag: await this._completeMultipart(key, uploadId, parts), bytes, parts: parts.length };
+    } catch (err) {
+      if (uploadId) await this._abortMultipart(key, uploadId).catch(() => {});
+      throw err;
+    }
+  }
+
+  async _createMultipart(key, { contentType, metadata }) {
+    const res = await this._request('POST', key, {
+      query: { uploads: '' }, body: Buffer.alloc(0), contentType, metadata
+    });
+    if (res.status !== 200) this._throw(res);
+    const id = xmlOne(res.body.toString('utf8'), 'UploadId');
+    if (!id) throw new S3Error(res.status, '', 'multipart upload began without an UploadId');
+    return id;
+  }
+
+  async _uploadPart(key, uploadId, partNumber, body) {
+    const res = await this._request('PUT', key, {
+      query: { partNumber: String(partNumber), uploadId }, body
+    });
+    if (res.status !== 200) this._throw(res);
+    const etag = res.headers.etag;
+    if (!etag) throw new S3Error(res.status, '', `part ${partNumber} stored without an ETag`);
+    return etag;
+  }
+
+  async _completeMultipart(key, uploadId, parts) {
+    const xml = '<CompleteMultipartUpload>' +
+      parts.map((p) => `<Part><PartNumber>${p.n}</PartNumber><ETag>${p.etag}</ETag></Part>`).join('') +
+      '</CompleteMultipartUpload>';
+    const res = await this._request('POST', key, {
+      query: { uploadId }, body: Buffer.from(xml, 'utf8'), contentType: 'application/xml'
+    });
+    if (res.status !== 200) this._throw(res);
+    const text = res.body.toString('utf8');
+    /*
+     * A 200 THAT IS STILL A FAILURE. S3 may take minutes to assemble the
+     * parts, so it writes the status line first and keeps the connection
+     * alive, then reports the outcome in the body. Reading the status
+     * alone is how a caller concludes an object exists when it does not.
+     */
+    if (/<Error>/.test(text)) {
+      throw new S3Error(200, xmlOne(text, 'Code'), xmlOne(text, 'Message') ?? 'multipart completion failed');
+    }
+    return xmlOne(text, 'ETag') ?? null;
+  }
+
+  async _abortMultipart(key, uploadId) {
+    const res = await this._request('DELETE', key, { query: { uploadId } });
+    if (res.status !== 204 && res.status !== 200) this._throw(res);
   }
 
   async getObject(key) {

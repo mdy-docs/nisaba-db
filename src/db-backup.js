@@ -43,6 +43,7 @@
  * latestSnapshot — a retry, not a pin (docs/s3-backup.md says why).
  */
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { ServerError, decode } from './db-server-client.js';
 
@@ -124,22 +125,32 @@ async function guardMember(s3, instance, member) {
 }
 
 /**
- * Upload one generation: every file through `readFile(entry)` --
- * size-checked against the manifest -- then the manifest bytes LAST,
- * with the member facts as metadata. The caller has already verified
- * what it can (CRCs stream-side or file-side); the size check here is
- * the one thing both paths owe.
+ * Upload one generation: every file STREAMED through `openFile(entry)`
+ * -- an async iterable of chunks -- then the manifest bytes LAST, with
+ * the member facts as metadata.
+ *
+ * Streamed rather than read whole, because a generation file is as big
+ * as the database it copies and this runs on the machine serving that
+ * database. Holding one in memory (and `Buffer.concat`ing it, so twice)
+ * put the ceiling on tenant size at the agent's RAM, and put the
+ * failure -- an OOM -- on the box the tenants are running on rather
+ * than in the backup.
+ *
+ * WHO VERIFIES WHAT. Each producer checks the CRC as it goes, because
+ * only it sees the bytes; the size is checked HERE, against what
+ * `putObjectStream` reports actually sending, because that is the one
+ * number a producer cannot fake by being wrong in two places at once.
+ * A file small enough to stay in one part is still fully verified
+ * before a byte is stored -- only a genuinely large one is written
+ * first and rejected after, which manifest-last already makes safe: a
+ * generation whose manifest never lands never existed.
  */
-async function uploadGeneration({ s3, instance, gen, manifest, manifestBytes, member, readFile, log }) {
+async function uploadGeneration({ s3, instance, gen, manifest, manifestBytes, member, openFile, log }) {
   for (const f of manifest.files) {
-    const body = await readFile(f);
-    if (body.length !== f.size) {
-      throw new Error(`generation file ${f.role}: got ${body.length} bytes, manifest says ${f.size}`);
+    const { bytes } = await s3.putObjectStream(`${instance}/gen-${gen}/${f.role}.bj`, openFile(f));
+    if (bytes !== f.size) {
+      throw new Error(`generation file ${f.role}: sent ${bytes} bytes, manifest says ${f.size}`);
     }
-    if (crc32(body) !== f.crc) {
-      throw new Error(`generation file ${f.role}: CRC mismatch against the manifest`);
-    }
-    await s3.putObject(`${instance}/gen-${gen}/${f.role}.bj`, body);
   }
   await s3.putObject(`${instance}/gen-${gen}/manifest.bj`, manifestBytes, {
     metadata: {
@@ -150,6 +161,29 @@ async function uploadGeneration({ s3, instance, gen, manifest, manifestBytes, me
     }
   });
   log('shipped', { gen, boundary: manifest.lastIncludedIndex });
+}
+
+/** One file off disk in chunks, CRC'd as it goes -- the directory
+ * path's half of the bargain uploadGeneration strikes with its
+ * producers. */
+async function* readFileStream(fullPath, f) {
+  let crc = 0;
+  const handle = await fsp.open(fullPath, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const { bytesRead } = await handle.read(buf, 0, buf.length, null);
+      if (bytesRead === 0) break;
+      const chunk = Buffer.from(buf.subarray(0, bytesRead));   // copied: the buffer is reused
+      crc = crc32(chunk, crc);
+      yield chunk;
+    }
+  } finally {
+    await handle.close();
+  }
+  if (crc !== f.crc) {
+    throw new Error(`generation file ${f.role}: CRC mismatch on disk (got ${crc}, manifest says ${f.crc})`);
+  }
 }
 
 export class BackupAgent {
@@ -184,18 +218,25 @@ export class BackupAgent {
     this._memberChecked = true;
   }
 
-  /** Pull one generation file whole, chunk by chunk, verifying size and
-   * CRC against the manifest entry before anything is uploaded. */
-  async _fetchFile(gen, f) {
-    const chunks = [];
+  /**
+   * One generation file off the wire, chunk by chunk, never whole.
+   *
+   * The CRC is computed as the bytes pass and checked when they run
+   * out -- so a corrupted transfer is caught, but only AFTER the last
+   * chunk has been handed on. For anything small enough to fit one
+   * part that is still before it is stored; for anything larger the
+   * upload is aborted and the manifest never written, which is the
+   * same "it never existed" the commit rule already gives.
+   */
+  async *_readFile(gen, f) {
     let offset = 0;
     let crc = 0;
     for (;;) {
       const { data, eof, size } = await this.client.readSnapshotFile(gen, f.role, offset);
       const chunk = Buffer.from(data.buffer ?? data, data.byteOffset ?? 0, data.byteLength ?? data.length);
       crc = crc32(chunk, crc);
-      chunks.push(chunk);
       offset += chunk.length;
+      yield chunk;
       if (eof) {
         if (offset !== f.size || size !== f.size) {
           throw new Error(`generation file ${f.role}: server sent ${offset} bytes, manifest says ${f.size}`);
@@ -206,7 +247,6 @@ export class BackupAgent {
     if (crc !== f.crc) {
       throw new Error(`generation file ${f.role}: CRC mismatch in transit (got ${crc}, manifest says ${f.crc})`);
     }
-    return Buffer.concat(chunks);
   }
 
   /**
@@ -238,7 +278,7 @@ export class BackupAgent {
       await uploadGeneration({
         s3: this.s3, instance: this.instance, gen, manifest, manifestBytes,
         member: this.member,
-        readFile: (f) => this._fetchFile(gen, f),
+        openFile: (f) => this._readFile(gen, f),
         log: this._log
       });
     } catch (err) {
@@ -404,11 +444,11 @@ export async function shipGenerationFromDir({ dir, s3, instance, member, log = (
     log('shipping', { gen, boundary: manifest.lastIncludedIndex, files: manifest.files.length });
     await uploadGeneration({
       s3, instance, gen, manifest, manifestBytes, member,
-      readFile: (f) => {
+      openFile: (f) => {
         if (f.name.includes('/') || f.name.includes('\\') || f.name.includes('..')) {
           throw new Error(`manifest names a path, not a file: '${f.name}'`);
         }
-        return fs.readFileSync(path.join(dir, f.name));
+        return readFileStream(path.join(dir, f.name), f);
       },
       log
     });

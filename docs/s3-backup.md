@@ -151,6 +151,14 @@ member it holds (as object metadata on each manifest), and a run
 pointed at a different member is stopped: generation numbers are
 per-member, and an interleaved prefix would make the numbering lie.
 
+**Files stream, and are verified by whoever sees the bytes.** The
+producer CRCs as it reads (off the wire, or off disk) and the uploader
+checks the size against what it actually sent — a corrupted transfer
+therefore fails after a large file's bytes are in S3, which
+manifest-last already makes harmless: a generation whose manifest never
+lands never existed, and the abandoned upload is aborted rather than
+left to be billed.
+
 **The S3 layout copies the disk's commit rule:**
 
 ```
@@ -275,10 +283,14 @@ request, and those are exactly the paths a healthy store never takes.
   boundary; without it there is nothing consistent to ship.
 - **No scheduling inside the server.** The engine runs no timers;
   wall-clock cadence belongs to the agent.
-- **No multipart upload.** Bodies are single-part Buffers signed over
-  the real payload hash; a generation file over the 5 GB single-PUT
-  ceiling fails loudly naming the limit, and multipart is the
-  follow-up when one exists in practice.
+- ~~No multipart upload.~~ **Done.** `putObjectStream` takes an async
+  iterable and holds one part, switching to a multipart upload only
+  when the content outgrows one — so a generation file is never read
+  whole and the ceiling is no longer the agent's RAM. Small files still
+  take the single-PUT path, and are therefore still fully verified
+  before a byte is stored. Measured: peak Buffer memory is flat in the
+  file size (89 / 84 / 21 MiB for 96 / 192 / 384 MiB files) where
+  accumulating cost 338 MiB for a 192 MiB file.
 - **No encryption or auth invented here.** SigV4 and TLS to S3;
   encryption at rest is the bucket's policy; auth to the database
   remains the deployment perimeter's job, as everywhere in this

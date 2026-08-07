@@ -151,6 +151,13 @@ member it holds (as object metadata on each manifest), and a run
 pointed at a different member is stopped: generation numbers are
 per-member, and an interleaved prefix would make the numbering lie.
 
+**Restore streams too, range by range.** `getObjectRange` pulls a
+generation file eight megabytes at a time straight to disk, so bringing
+back a large tenant needs a chunk of memory rather than a copy of the
+database. A store that ignores the `Range` header and answers 200 with
+the whole object is refused rather than accepted, since quietly getting
+everything is the memory this exists to bound.
+
 **Files stream, and are verified by whoever sees the bytes.** The
 producer CRCs as it reads (off the wire, or off disk) and the uploader
 checks the size against what it actually sent — a corrupted transfer

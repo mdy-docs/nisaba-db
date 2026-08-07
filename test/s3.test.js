@@ -219,6 +219,27 @@ describe.skipIf(!reachable)(`s3 client (against ${ENDPOINT})`, () => {
     expect(peak).toBeLessThan(64 * 1024 * 1024);
   }, 120_000);
 
+  it('serves a byte range, so a restore need not hold a whole file', async () => {
+    made.add('stream/ranged.bin');
+    const total = 9 * 1024 * 1024;
+    await s3.putObjectStream('stream/ranged.bin', generated(total, 512 * 1024), { partSize: PART });
+
+    const head = await s3.getObjectRange('stream/ranged.bin', 0, 1023);
+    expect(head.length).toBe(1024);
+    // Inclusive of both ends, which is S3's convention and off-by-one
+    // in the obvious place if it is not.
+    const tail = await s3.getObjectRange('stream/ranged.bin', total - 10, total - 1);
+    expect(tail.length).toBe(10);
+
+    // Reassembled range by range, it is the object.
+    const whole = await s3.getObject('stream/ranged.bin');
+    const pieces = [];
+    for (let at = 0; at < total; at += 1_000_003) {      // deliberately not aligned
+      pieces.push(await s3.getObjectRange('stream/ranged.bin', at, Math.min(at + 1_000_003, total) - 1));
+    }
+    expect(Buffer.concat(pieces).equals(whole)).toBe(true);
+  }, 60_000);
+
   it('cleans up after itself', async () => {
     for (const key of made) await s3.deleteObject(key);
     expect((await s3.list('')).keys.length).toBe(0);

@@ -199,7 +199,7 @@ export class S3Client {
     throw lastErr;
   }
 
-  async _send(method, key, { query = {}, body = null, contentType = null, metadata = null } = {}) {
+  async _send(method, key, { query = {}, body = null, contentType = null, metadata = null, range = null } = {}) {
     const { accessKeyId, secretAccessKey, sessionToken } = await this.credentials.get();
     const path = `/${rfc3986(this.bucket)}${key ? `/${encodeKey(key)}` : ''}`;
     const qs = Object.keys(query).sort()
@@ -220,6 +220,9 @@ export class S3Client {
     // a request that is not the one being sent.
     if (sessionToken) headers['x-amz-security-token'] = sessionToken;
     if (contentType) headers['content-type'] = contentType;
+    // Signed like everything else -- a range outside SignedHeaders is a
+    // signature over a request for the whole object.
+    if (range) headers.range = `bytes=${range[0]}-${range[1]}`;
     if (metadata) {
       for (const [k, v] of Object.entries(metadata)) {
         headers[`x-amz-meta-${k.toLowerCase()}`] = String(v);
@@ -458,6 +461,32 @@ export class S3Client {
   async getObject(key) {
     const res = await this._request('GET', key);
     if (res.status !== 200) this._throw(res);
+    return res.body;
+  }
+
+  /**
+   * One byte range of an object, inclusive of both ends.
+   *
+   * The read counterpart of `putObjectStream`, and it exists for the
+   * same reason: a restore that pulled a generation file whole would
+   * need the file's size in memory to put it on disk, which is the
+   * ceiling the write side just stopped having. Ranges rather than a
+   * streamed response body deliberately — each one is an ordinary
+   * signed request, so it retries, times out and reports exactly like
+   * every other call here, and a failure costs one range instead of
+   * the whole download.
+   */
+  async getObjectRange(key, start, end) {
+    const res = await this._request('GET', key, { range: [start, end] });
+    // 206 for a served range; a store that ignores the header and sends
+    // the whole object answers 200, which would silently work and blow
+    // the memory this exists to bound -- so it is refused.
+    if (res.status !== 206) {
+      this._throw(res.status === 200
+        ? { ...res, body: Buffer.from('<Error><Code>RangeIgnored</Code><Message>' +
+            'the store answered 200 to a ranged GET, so it does not support ranges</Message></Error>') }
+        : res);
+    }
     return res.body;
   }
 

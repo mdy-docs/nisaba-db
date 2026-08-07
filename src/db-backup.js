@@ -57,6 +57,11 @@ import { ServerError, decode } from './db-server-client.js';
  */
 export const SNAP_PREFIX = '__snap__';
 
+/** How much of a generation file a restore holds at once. Matches the
+ * ship side's part size, for no deeper reason than that both are "one
+ * bite of a file that may be enormous". */
+const RESTORE_CHUNK = 8 * 1024 * 1024;
+
 /* bjfile_crc32's twin: zlib CRC-32, chainable from 0. */
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -390,14 +395,42 @@ export async function restoreFromS3({ s3, instance, into, gen = null, log = () =
     if (f.name.includes('/') || f.name.includes('\\') || f.name.includes('..')) {
       throw new Error(`manifest names a path, not a file: '${f.name}'`);
     }
-    const body = await s3.getObject(`${instance}/gen-${chosen}/${f.role}.bj`);
-    if (body.length !== f.size) {
-      throw new Error(`${f.role}: S3 holds ${body.length} bytes, the manifest says ${f.size}`);
+    /*
+     * RANGE BY RANGE, straight to disk. Pulling the object whole would
+     * need the database file's size in memory to write it out -- the
+     * same ceiling the ship side lost when it started streaming, and
+     * worse here, because a restore is what someone is doing on their
+     * worst day.
+     *
+     * The CRC is checked when the last range lands, so a damaged copy
+     * leaves a complete-looking file behind. That is safe for the same
+     * reason the ship side is: the manifest is written LAST, and
+     * without it the directory is not a generation -- and the restore
+     * refuses a non-empty directory, so nothing here is ever mistaken
+     * for a finished one.
+     */
+    const key = `${instance}/gen-${chosen}/${f.role}.bj`;
+    const handle = await fsp.open(path.join(into, f.name), 'w');
+    let crc = 0;
+    let got = 0;
+    try {
+      while (got < f.size) {
+        const end = Math.min(got + RESTORE_CHUNK, f.size) - 1;
+        const part = await s3.getObjectRange(key, got, end);
+        if (part.length === 0) throw new Error(`${f.role}: S3 stopped at ${got} of ${f.size} bytes`);
+        crc = crc32(part, crc);
+        await handle.write(part, 0, part.length, got);
+        got += part.length;
+      }
+    } finally {
+      await handle.close();
     }
-    if (crc32(body) !== f.crc) {
+    if (got !== f.size) {
+      throw new Error(`${f.role}: S3 holds ${got} bytes, the manifest says ${f.size}`);
+    }
+    if (crc !== f.crc) {
       throw new Error(`${f.role}: CRC mismatch against the manifest -- the stored copy is damaged`);
     }
-    fs.writeFileSync(path.join(into, f.name), body);
   }
 
   // The commit point, byte-identical, last.

@@ -894,6 +894,7 @@ static void usage(const char *me) {
             "           [--join HOST:PORT ...] [--leave NODE_ID]\n"
             "           [--snapshot-entries N]\n"
             "           [--election-timeout MIN[:MAX]] [--heartbeat MS]\n"
+            "           [--max-batch BYTES]\n"
             "  serves the instance in the preopened directory \".\"\n"
             "  --bind: where the client wire listens (default 127.0.0.1;\n"
             "         widen it consciously -- there is no auth on this wire)\n"
@@ -917,7 +918,11 @@ static void usage(const char *me) {
             "         and give EVERY member of the cluster the same value\n"
             "  --heartbeat: the leader's idle interval in ms (default 50); it\n"
             "         must be well under --election-timeout's minimum, or the\n"
-            "         others depose a leader that is working\n", me);
+            "         others depose a leader that is working\n"
+            "  --max-batch: the replication window in bytes (default 65536).\n"
+            "         One AppendEntries is in flight per follower, so catch-up\n"
+            "         throughput is window/RTT: widen it for members a WAN\n"
+            "         separates\n", me);
 }
 
 /*
@@ -1048,6 +1053,8 @@ int main(int argc, char **argv) {
     uint64_t leave_id = 0;
     /* All zero is replica.h's default clock. */
     replica_timing timing = {0};
+    /* 0 is the engine's default window (64 KB). */
+    long max_batch = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdio") == 0) use_stdio = 1;
@@ -1086,6 +1093,22 @@ int main(int argc, char **argv) {
             long long ms = atoll(argv[++i]);
             if (ms <= 0) { fprintf(stderr, "--heartbeat must be positive\n"); return 2; }
             timing.heartbeat_ms = (int64_t)ms;
+        }
+        else if (strcmp(argv[i], "--max-batch") == 0 && i + 1 < argc) {
+            max_batch = atol(argv[++i]);
+            if (max_batch <= 0) {
+                fprintf(stderr, "--max-batch must be positive (bytes)\n");
+                return 2;
+            }
+            /* Half the peer wire's own frame cap (server/peers.c), so a
+             * batch plus its envelope can never be a frame the reader
+             * refuses -- a window that works until the first full batch
+             * would be the worst kind of accepted. */
+            if (max_batch > 32L * 1024 * 1024) {
+                fprintf(stderr, "--max-batch %ld is larger than the peer wire can promise"
+                                " to carry (max %ld)\n", max_batch, 32L * 1024 * 1024);
+                return 2;
+            }
         }
         else if (strcmp(argv[i], "--raft") == 0 && i + 1 < argc) {
             node_id = atoi(argv[++i]);
@@ -1161,6 +1184,13 @@ int main(int argc, char **argv) {
     if ((timing.min_election_ms || timing.heartbeat_ms) && node_id <= 0) {
         fprintf(stderr, "--election-timeout and --heartbeat need --raft NODE_ID:"
                         " they set the Raft clock\n");
+        return 2;
+    }
+    /* Same reasoning: there is no replication window on a server that
+     * is not replicating. */
+    if (max_batch && node_id <= 0) {
+        fprintf(stderr, "--max-batch needs --raft NODE_ID: it sizes the replication"
+                        " window\n");
         return 2;
     }
     /*
@@ -1364,6 +1394,7 @@ int main(int argc, char **argv) {
             instns_free(&ns);
             return 1;
         }
+        if (max_batch) replica_set_max_batch(rep, (uint32_t)max_batch);
         /* What the LOG says, which is not necessarily what argv said: a
          * restarted member's cluster comes from its own CONFIG entries,
          * and a --peer list that disagrees has already lost. */

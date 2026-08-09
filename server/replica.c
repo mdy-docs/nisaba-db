@@ -1177,6 +1177,12 @@ static int tick_for(int64_t heartbeat_ms) {
     return half > INT32_MAX ? INT32_MAX : (int)half;
 }
 
+void replica_set_max_batch(replica *r, uint32_t bytes) {
+    /* rn_set_limits keeps its default on 0, so this needs no policy of
+     * its own -- one place decides what 0 means. */
+    if (r && r->node) rn_set_limits(r->node, bytes);
+}
+
 void replica_timing_resolve(replica_timing *tm) {
     if (!tm) return;
     int given_min = tm->min_election_ms > 0;

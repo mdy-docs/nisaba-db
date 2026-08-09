@@ -1270,6 +1270,78 @@ for (const engine of ENGINES) {
         for (const p of procs) p.kill();
       }
     }, 60000);
+
+    /*
+     * THE REPLICATION WINDOW (--max-batch). One AppendEntries in
+     * flight per follower, of at most this many bytes -- so a
+     * follower's catch-up throughput is window/RTT, which is the whole
+     * WAN story: 64 KB over a 65 ms link is ~1 MB/s, and widening the
+     * window is the only lever that does not change the protocol.
+     */
+    it('refuses a window that is not one, and one the peer wire cannot carry', async () => {
+      for (const bytes of ['0', '-5']) {
+        const bad = await run(['--raft', '1', '--max-batch', bytes]);
+        expect(bad.code, `--max-batch ${bytes}`).not.toBe(0);
+        expect(bad.err).toMatch(/--max-batch must be positive/);
+      }
+      // Half the peer frame cap: a batch that fits until its envelope
+      // does not would be the worst kind of accepted.
+      const huge = await run(['--raft', '1', '--max-batch', String(999 * 1024 * 1024)]);
+      expect(huge.code).not.toBe(0);
+      expect(huge.err).toMatch(/larger than the peer wire can promise to carry/);
+
+      const lone = await run(['--max-batch', '1048576']);
+      expect(lone.code).not.toBe(0);
+      expect(lone.err).toMatch(/--max-batch needs --raft NODE_ID/);
+    });
+
+    it('replicates through a widened window: bulk data reaches a follower and commits', async () => {
+      const base = nextPort();
+      const members = [1, 2].map((id) => ({
+        id, port: base + id - 1, raftPort: base + 10 + id - 1
+      }));
+      const wide = (m) => [
+        '--raft', String(m.id), '--raft-port', String(m.raftPort),
+        '--max-batch', String(1024 * 1024),
+        ...members.filter((o) => o.id !== m.id)
+          .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+      ];
+      const procs = [];
+      try {
+        for (const m of members) {
+          procs.push((await startServer(engine, m.port, wide(m), -1)).proc);
+        }
+        /*
+         * Bulk enough that batches actually exceed the DEFAULT window:
+         * ~50 documents of ~24 KB is ~1.2 MB proposed faster than one
+         * 64 KB round trip per tick could drain, so a window that was
+         * ignored (or broke the batch builder) would show here as a
+         * hang or a refusal rather than a commit. Two voters: nothing
+         * commits unless the follower really acknowledged it all.
+         */
+        const blob = 'x'.repeat(24 * 1024);
+        let wrote = false, last = null;
+        const until = Date.now() + 30000;
+        while (!wrote && Date.now() < until) {
+          for (const m of members) {
+            let db = null;
+            try {
+              db = (await connectServer(m.port)).db(DB);
+              const docs = Array.from({ length: 50 }, (_, i) => ({ i, blob }));
+              const r = await db.collection('bulk').insertMany(docs);
+              expect(r.insertedCount).toBe(50);
+              wrote = true;
+              break;
+            } catch (err) { last = err; }
+            finally { try { await db?.close(); } catch { /* gone */ } }
+          }
+          if (!wrote) await new Promise((r) => setTimeout(r, 200));
+        }
+        if (!wrote) throw new Error(`nothing committed: ${last?.message}`);
+      } finally {
+        for (const p of procs) p.kill();
+      }
+    }, 90000);
   });
 
   /*

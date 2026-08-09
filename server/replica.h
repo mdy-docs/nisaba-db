@@ -120,6 +120,30 @@ typedef struct {
 void replica_timing_resolve(replica_timing *tm);
 
 /*
+ * The replication window, in bytes (0 = the engine's default, 64 KB).
+ *
+ * Replication is stop-and-wait: the leader keeps ONE AppendEntries in
+ * flight per follower, of at most this many bytes, and sends the next
+ * when the answer arrives. So a follower's catch-up throughput is
+ * window/RTT — which a LAN never notices and a WAN is entirely made
+ * of. At 64 KB over a 65 ms cross-region link the ceiling is ~1 MB/s;
+ * a 1 MB window moves it 16×. The protocol does not change, only how
+ * much each round trip carries.
+ *
+ * The cost of a bigger window is burstiness, not memory safety: one
+ * batch is built at a time, and the peer wire's own frame cap (64 MB,
+ * server/peers.c) is far above anything sane here. Any member can
+ * lead, so give every member the same value — disagreement is not
+ * dangerous the way clock disagreement is, it just makes throughput
+ * depend on who won the last election.
+ *
+ * Called after replica_open and before the poll loop serves: the
+ * window is read when a batch is built, so there is no earlier moment
+ * it is needed at.
+ */
+void replica_set_max_batch(replica *r, uint32_t bytes);
+
+/*
  * Open the log in `ns` and put a node over it.
  *
  * `tm` may be NULL, which is the default clock.

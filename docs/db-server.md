@@ -71,6 +71,7 @@ data and reporting nothing wrong.
 | `--snapshot-entries N` | applied entries between local snapshots, which bound the log (default 8192; 0 never compacts) |
 | `--election-timeout MIN[:MAX]` | milliseconds without hearing from the leader before standing against it, drawn at random from `[MIN,MAX)` per election (default `150:300`; `MAX` defaults to twice `MIN`) |
 | `--heartbeat MS` | the leader's idle interval (default 50). Must be at most half `--election-timeout`'s minimum, or the flag is refused |
+| `--max-batch BYTES` | the replication window (default 65536). One AppendEntries is in flight per follower, so catch-up throughput is window/RTT — widen it for members a WAN separates. Refused above half the peer wire's frame cap |
 | `--leave ID` | ask that cluster to remove member `ID`, then exit without serving; needs `--join` to say who to ask |
 
 **`--order` is a creation parameter, not something a reader has to be
@@ -156,6 +157,28 @@ dead leader goes unnoticed; at `800:1000` a cluster is unavailable for
 writes about a second longer per failover than at the default. That is
 the trade being made, and it is only worth making when the alternative
 is electing continuously.
+
+### The window
+
+The clock decides whether a WAN cluster is *stable*; `--max-batch`
+decides whether it can *keep up*. Replication is stop-and-wait — the
+leader holds one AppendEntries in flight per follower and sends the
+next when the answer lands — so a follower's throughput is the window
+divided by the round trip. The default 64 KB never surfaces on a LAN,
+where the disk is the slow part. Across a 65 ms link it is a ~1 MB/s
+ceiling per follower, and a tenant writing faster than that has a
+follower that never catches up. `--max-batch 1048576` moves the
+ceiling 16× without changing the protocol; the cost is burstiness on
+the wire, and the flag is refused above half the peer wire's own frame
+cap so a batch can never become a frame the reader rejects.
+
+Any member can lead, so give every member the same value —
+disagreement here is not dangerous the way clock disagreement is, it
+just makes throughput depend on who won the last election. Snapshot
+*installs* have their own 64 KB stride that this flag does not widen;
+for catching up a blank member across a WAN, restoring its directory
+from object storage first (the fleet's restore path) beats any
+window.
 
 **`--peer` bootstraps; after that the LOG is the member set.** Every
 member of a cluster started this way has to be given the same list,

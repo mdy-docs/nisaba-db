@@ -21,6 +21,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -131,6 +132,49 @@ function sse(front, pathname, headers = {}) {
   };
 }
 
+/**
+ * The distinction that lets a front end retry a write safely.
+ *
+ * `follows leadership when it moves` failed about one loaded run in
+ * seven with a 502 and `This socket has been ended by the other party`:
+ * the pooled connection to the member that had just been killed was
+ * used once more before its close event was processed, and the front
+ * end could not tell "the write may have been applied and the answer
+ * lost" from "not one byte of it went anywhere". It refused to retry,
+ * correctly under the only rule it had.
+ *
+ * Deterministic here, where the cluster test could only ever be a race:
+ * a server that says goodbye the moment it is dialled puts the socket
+ * in exactly the state a dead member's pooled connection is in.
+ */
+describe('a request that never left', () => {
+  it('is marked neverSent, so a caller may re-ask without risking a double write', async () => {
+    const goodbye = net.createServer((s) => s.end());
+    await new Promise((r) => goodbye.listen(0, '127.0.0.1', r));
+    const client = await connectServer(`127.0.0.1:${goodbye.address().port}`);
+    // Let the FIN land: sockets here are not half-open, so the peer's
+    // FIN ends OUR writable side, and that is the state under test.
+    await new Promise((r) => setTimeout(r, 150));
+
+    await expect(client.request({ op: 'ping' })).rejects.toMatchObject({ neverSent: true });
+    // And it keeps saying so, rather than the flag being a property of
+    // the first failure only.
+    await expect(client.request({ op: 'ping' })).rejects.toMatchObject({ neverSent: true });
+
+    await client.close().catch(() => {});
+    await new Promise((r) => goodbye.close(r));
+  }, 30000);
+
+  /* The negative case lives in the single-server describe below, on the
+   * connection it already holds. Deliberately: `nextPort()` here hands
+   * out 40000 + slot*1000, db.server.test.js hands out 18000 + slot*500
+   * from a parallel worker, and the two ranges MEET once that file is
+   * fifty-odd slots in. Taking one more slot in this file was enough to
+   * push it into a collision and cost a suite run to "native server did
+   * not start". A test that needs no server of its own should not
+   * reserve one. */
+});
+
 describe.each(ENGINES.filter((e) => REQUIRED || e.ready()))(
   'http front end: every op over one server ($name)', (engine) => {
   const DB = 'httpdb';
@@ -154,6 +198,21 @@ describe.each(ENGINES.filter((e) => REQUIRED || e.ready()))(
     const { status, body } = await post(front, '/ping');
     expect(status).toBe(200);
     expect(body).toEqual({ ok: true, pong: true });
+  });
+
+  it('does not mark a refusal the server answered as neverSent', async () => {
+    /*
+     * The negative half of `a request that never left`, and what keeps
+     * that flag meaningful: a server that ANSWERED has been reached, so
+     * nothing about the exchange may be retried on the grounds that it
+     * did not happen. On `direct`, which is a live connection this
+     * describe already holds — a test needing no server of its own must
+     * not reserve a port for one (see the note by that describe).
+     */
+    await expect(direct.request({ op: 'nonsenseOp' })).rejects.toSatisfy(
+      (err) => err.neverSent === undefined,
+      'a refusal the server sent must not be marked neverSent'
+    );
   });
 
   it('creates a collection, inserts, and the direct client sees the same database', async () => {
@@ -447,7 +506,7 @@ describe.skipIf(!(REQUIRED || have(NATIVE)))('http front end: a three-member clu
     // The front end's hint is now a dead member. The next write finds
     // the new leader by asking the survivors, not us.
     const res = await post(front, `/db/${DB}/events/insert`, { doc: { seq: 2 } });
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.ok).toBe(true);
 
     const count = await post(front, `/db/${DB}/events/count`, { filter: {} });

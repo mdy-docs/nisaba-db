@@ -361,19 +361,42 @@ export class DbHttpFront {
 
   /**
    * One request, delivered to whoever leads, however long that takes
-   * within retryMs. Only REFUSALS are retried -- a refusal is the server
-   * declining before doing anything, so re-asking is safe for a write.
-   * A transport failure mid-request is not retried for exactly the
-   * opposite reason: the answer is unknown, and this is the layer that
-   * must say so rather than guess (502).
+   * within retryMs.
+   *
+   * WHAT IS RETRIED IS EXACTLY WHAT PROVABLY DID NOT HAPPEN. Two kinds
+   * of failure qualify, and they are the same fact twice:
+   *
+   *  - a REFUSAL, which is the server declining before doing anything;
+   *  - a request that never left this process, which `neverSent` marks
+   *    (src/db-server-client.js).
+   *
+   * A transport failure mid-request is still not retried, and that is
+   * the point of drawing the line here rather than around "transport
+   * errors": once bytes have gone, the answer is unknown, re-asking
+   * could apply a write twice, and this is the layer that must say so
+   * rather than guess (502).
+   *
+   * `neverSent` matters because the ordinary way to hit it is not
+   * exotic. The pool holds a connection per member; when a leader dies,
+   * that connection is finished the instant its FIN arrives, but the
+   * pool only forgets it when the close event is PROCESSED. A request
+   * issued in between used to become a 502 for a write that had not
+   * happened and could simply have been sent somewhere else — which is
+   * precisely what "follows leadership when it moves" asks of this
+   * loop, and it failed about one loaded run in seven until this
+   * distinction existed.
    */
   async _call(req) {
     const deadline = Date.now() + this.retryMs;
     let lastErr = null;
     for (;;) {
+      // Captured, because the retry below relocates and this is the
+      // address whose pooled connection must be dropped, not whichever
+      // one we relocate to.
+      const address = this._leader;
       let client = null;
       try {
-        client = await this._clientFor(this._leader);
+        client = await this._clientFor(address);
       } catch (err) {
         lastErr = err;                      // nothing was sent: retrying is free
         if (Date.now() >= deadline) throw err;
@@ -384,9 +407,14 @@ export class DbHttpFront {
       try {
         return await client.request(req);
       } catch (err) {
-        if (err instanceof ServerError && CHASEABLE.has(err.code)) {
+        const refused = err instanceof ServerError && CHASEABLE.has(err.code);
+        if (refused || err?.neverSent) {
           lastErr = err;
           if (Date.now() >= deadline) throw err;
+          /* A connection that took nothing is a connection to stop
+           * offering. `onClose` does this too, but that is the event
+           * this raced in the first place, so it is not waited for. */
+          if (err?.neverSent) this._pool.delete(address);
           await sleep(150);
           await this._locate();             // -66 relocates to the same member, which is correct
           continue;

@@ -108,6 +108,19 @@ const DEFAULT_KEEPALIVE_MS = 20000;
  */
 const MAX_FRAME = 64 * 1024 * 1024;
 
+/**
+ * Mark an error as one that carried NO BYTES to the server.
+ *
+ * A property rather than an error class, because the interesting thing
+ * is not what went wrong — that varies — but the one fact a caller
+ * needs to decide whether re-asking is safe. See `request()`, which is
+ * the only place that can know it.
+ */
+function neverSent(err) {
+  err.neverSent = true;
+  return err;
+}
+
 /** A refusal the server sent: {ok:false, code, msg} with dc_strerror text. */
 export class ServerError extends Error {
   constructor(code, message) {
@@ -368,12 +381,47 @@ class Connection {
     }
   }
 
-  /** Send one request, resolve with the response object, refusals included. */
+  /**
+   * Send one request, resolve with the response object, refusals
+   * included.
+   *
+   * ── `neverSent`, AND WHY IT IS WORTH A FLAG ──────────────────────
+   *
+   * A caller that loses a connection mid-request cannot retry a WRITE:
+   * the request may have been applied and only the answer lost, so
+   * re-asking would risk applying it twice. That is why a front end
+   * turns a transport failure into a 502 rather than chasing it
+   * (src/db-http-front.js).
+   *
+   * But there is a case underneath that one where the answer is not
+   * unknown at all: the connection was already finished before a single
+   * byte of this request could go out. Nothing was applied, because
+   * nothing arrived. Retrying is then exactly as safe as retrying a
+   * connection that failed to open — and the common way to reach it is
+   * ordinary: a POOLED connection to a member that has just died, used
+   * once more before its close event has been processed.
+   *
+   * Only this layer can tell the two apart, because only this layer
+   * knows whether the write happened. `writableEnded` is the precise
+   * test: sockets here are not half-open, so the peer's FIN ends our
+   * writable side, and a `write()` after that is the error Node words
+   * as "This socket has been ended by the other party" — an error whose
+   * whole meaning is that it sent nothing. Checking before the write
+   * rather than catching after it keeps it in one tick, so there is no
+   * window where the answer changes underneath the check.
+   *
+   * Callers that cannot use the distinction are unaffected: it is one
+   * extra property on an error they were already receiving.
+   */
   request(req) {
-    if (this._dead) return Promise.reject(this._dead);
+    if (this._dead) return Promise.reject(neverSent(this._dead));
+    const socket = this._socket;
+    if (socket.writableEnded || socket.destroyed) {
+      return Promise.reject(neverSent(new Error('the connection was already closed')));
+    }
     return new Promise((resolve, reject) => {
       this._pending.push({ resolve, reject });
-      this._socket.write(Buffer.from(encode(req)));
+      socket.write(Buffer.from(encode(req)));
     });
   }
 

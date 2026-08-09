@@ -1,24 +1,29 @@
 /**
  * The S3 backup agent (src/db-backup.js): a real nisaba-server on one
- * side, real MinIO on the other — docs/s3-backup.md step 5. Skips
- * unless BOTH are available: the native server binary (built by
- * ./build/build-server.sh --native) and something answering at
- * NISABA_S3_TEST_ENDPOINT (default http://127.0.0.1:9000, the
- * documented MinIO dev setup). What these prove: a shipped generation
- * in S3 is byte-identical to the member's on-disk generation, the
- * manifest commits it last, re-shipping is a no-op, retention prunes
- * manifest-first, the per-member prefix guard refuses a mixed prefix,
- * and watch ships on the member's own entries-driven cadence.
+ * side, an object store in a Map on the other (test/helpers/memory-s3.js,
+ * whose header says why it is not MinIO any more).
+ *
+ * WHAT THESE PROVE is the agent's own rules, which are about snapshots
+ * rather than about S3: a shipped generation is byte-identical to the
+ * member's on-disk generation, the manifest commits it LAST, re-shipping
+ * is a no-op, retention prunes manifest-first, the per-member prefix
+ * guard refuses a mixed prefix, and watch ships on the member's own
+ * entries-driven cadence.
+ *
+ * They used to need MinIO, and so on an ordinary run proved none of it.
+ * Now they need only the native server binary
+ * (./build/build-server.sh --native). The things that genuinely require
+ * a real store — signing, paging, multipart, 503s, a socket that goes
+ * quiet — are tested against the real client, which lives in the
+ * consumer that owns it (nisaba-web's test/s3-client.test.js).
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { spawn } from 'node:child_process';
-import http from 'node:http';
-import https from 'node:https';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { connectServer } from '../src/db-server-client.js';
-import { S3Client } from '../src/s3.js';
+import { memoryS3 } from './helpers/memory-s3.js';
 import {
   BackupAgent, restoreFromS3, shipGenerationFromDir, verifyManifestBytes, crc32,
   SNAP_PREFIX as BACKUP_SNAP_PREFIX
@@ -28,31 +33,10 @@ const NATIVE = 'build/lib/nisaba-server';
 const haveNative = fs.existsSync(NATIVE);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const ENDPOINT = process.env.NISABA_S3_TEST_ENDPOINT ?? 'http://127.0.0.1:9000';
-const CREDS = {
-  accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? 'minioadmin',
-  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? 'minioadmin'
-};
-const haveMinio = await (async () => {
-  try {
-    const u = new URL(ENDPOINT);
-    const mod = u.protocol === 'https:' ? https : http;
-    await new Promise((resolve, reject) => {
-      const req = mod.request(
-        { host: u.hostname, port: u.port || undefined, method: 'GET', path: '/', timeout: 700 },
-        (res) => { res.resume(); resolve(); });
-      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-      req.on('error', reject);
-      req.end();
-    });
-    return true;
-  } catch { return false; }
-})();
 
-describe.skipIf(!haveNative || !haveMinio)('the backup agent: nisaba-server to MinIO', () => {
+describe.skipIf(!haveNative)('the backup agent: nisaba-server to an object store', () => {
   const port = 31000 + (process.pid % 400);
-  const bucket = `nisaba-backup-test-${Date.now().toString(36)}`;
-  let proc = null;
+    let proc = null;
   let dir = null;
   let client = null;
   let s3 = null;
@@ -68,14 +52,9 @@ describe.skipIf(!haveNative || !haveMinio)('the backup agent: nisaba-server to M
       if (!client) await sleep(100);
     }
     if (!client) throw new Error('nisaba-server never started');
-    s3 = new S3Client({ bucket, endpoint: ENDPOINT, ...CREDS });
-    await s3.createBucket();
+    s3 = memoryS3();
     agent = new BackupAgent({ client, s3, instance: 'ci', member: `127.0.0.1:${port}` });
     return async () => {
-      // Empty the bucket and remove it: dev MinIO should not accumulate
-      // a bucket per test run.
-      for (const { key } of (await s3.list('')).keys) await s3.deleteObject(key);
-      await s3._request('DELETE', '');
       await client.close().catch(() => {});
       proc.kill();
       await new Promise((r) => proc.once('exit', r));
@@ -166,9 +145,8 @@ describe.skipIf(!haveNative || !haveMinio)('the backup agent: nisaba-server to M
   }, 60000);
 });
 
-describe.skipIf(!haveNative || !haveMinio)('the restore half: S3 back to a serving member', () => {
+describe.skipIf(!haveNative)('the restore half: S3 back to a serving member', () => {
   const port = 31600 + (process.pid % 300);
-  const bucket = `nisaba-restore-test-${Date.now().toString(36)}`;
   let srcProc = null;
   let srcDir = null;
   let client = null;
@@ -193,8 +171,7 @@ describe.skipIf(!haveNative || !haveMinio)('the restore half: S3 back to a servi
   beforeAll(async () => {
     srcDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-restore-src-'));
     ({ proc: srcProc, client } = await startAt(srcDir, port));
-    s3 = new S3Client({ bucket, endpoint: ENDPOINT, ...CREDS });
-    await s3.createBucket();
+    s3 = memoryS3();
 
     const users = client.db('appa').collection('users');
     for (let i = 0; i < 7; i++) await users.insertOne({ n: i });
@@ -204,8 +181,6 @@ describe.skipIf(!haveNative || !haveMinio)('the restore half: S3 back to a servi
     counts = { appa: 7, appb: 1 };
 
     return async () => {
-      for (const { key } of (await s3.list('')).keys) await s3.deleteObject(key);
-      await s3._request('DELETE', '');
       await client.close().catch(() => {});
       srcProc.kill();
       await new Promise((r) => srcProc.once('exit', r));
@@ -288,14 +263,12 @@ describe.skipIf(!haveNative || !haveMinio)('the restore half: S3 back to a servi
  * directory (a JS host has no client wire to ask -- that is what
  * shipGenerationFromDir is for), and restores into a C server.
  */
-describe.skipIf(!haveNative || !haveMinio)('one artifact, three hands: C server, S3, JS host', () => {
-  const bucket = `nisaba-xhost-test-${Date.now().toString(36)}`;
+describe.skipIf(!haveNative)('one artifact, three hands: C server, S3, JS host', () => {
   let s3 = null;
   let wasm = null;   // loaded lazily: only this suite needs the engine
 
   beforeAll(async () => {
-    s3 = new S3Client({ bucket, endpoint: ENDPOINT, ...CREDS });
-    await s3.createBucket();
+    s3 = memoryS3();
     const { ready } = await import('../src/nisaba-wasm.js');
     await ready();
     wasm = {
@@ -303,8 +276,6 @@ describe.skipIf(!haveNative || !haveMinio)('one artifact, three hands: C server,
       ...(await import('../src/db-wal-instance.js'))
     };
     return async () => {
-      for (const { key } of (await s3.list('')).keys) await s3.deleteObject(key);
-      await s3._request('DELETE', '');
     };
   }, 60000);
 

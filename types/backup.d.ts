@@ -9,8 +9,48 @@
  * member it backs up (connectServer in db-server-client.js); only the
  * snapshot-facing slice of it is needed, and only that slice is
  * required here.
+ *
+ * THE OBJECT STORE IS INJECTED, and this package no longer ships one.
+ * `src/s3.js` was 554 lines of hand-rolled SigV4 that existed because
+ * this package has no runtime dependencies and could not take an AWS
+ * SDK; it now lives in the consumer that already talks to AWS
+ * (nisaba-web's `service/s3-client.js`). Nothing was lost here — the
+ * agent never constructed a client, it took one — and what is written
+ * below is the whole of what it ever asked of it.
  */
-import type { S3Client } from './s3.js';
+
+/**
+ * The eight methods the backup agent calls. STRUCTURAL on purpose: any
+ * object satisfying this will do, which is what lets a caller supply
+ * an SDK-backed client, a MinIO-backed one, or a Map in a test
+ * (test/helpers/memory-s3.js).
+ */
+export interface ObjectStore {
+  /** `delimiter` makes this "what directories are here": keys stop at
+   * the delimiter and common prefixes come back separately. Paged
+   * internally — a partial listing is never an answer. */
+  list(prefix: string, opts?: { delimiter?: string | null; maxKeysPerPage?: number }):
+    Promise<{ keys: Array<{ key: string; size: number }>; prefixes: string[] }>;
+  /** null for a missing object: callers PROBE for a manifest that may
+   * not be there yet, and that miss is the ordinary case. Metadata keys
+   * arrive lowercased, as S3 stores them. */
+  headObject(key: string): Promise<{ size: number; etag: string | null; metadata: Record<string, string> } | null>;
+  getObject(key: string): Promise<Uint8Array>;
+  /** Inclusive of both ends. A store that ignores the range and returns
+   * the whole object must be refused, not accepted — see
+   * docs/s3-backup.md. */
+  getObjectRange(key: string, start: number, end: number): Promise<Uint8Array>;
+  putObject(key: string, body: Uint8Array, opts?: { contentType?: string; metadata?: Record<string, string> | null }): Promise<void>;
+  /** `bytes` is checked against the manifest's size by the caller, so
+   * it must count what actually went, not what was promised. */
+  putObjectStream(key: string, chunks: AsyncIterable<Uint8Array>, opts?: { contentType?: string; metadata?: Record<string, string> | null }):
+    Promise<{ bytes: number }>;
+  deleteObject(key: string): Promise<void>;
+}
+
+/** @deprecated The name the injected store used to have, kept so an
+ * existing annotation still resolves. Prefer `ObjectStore`. */
+export type S3Client = ObjectStore;
 
 /** The canonical snapshot prefix -- the C server's REPLICA_SNAP_PREFIX
  * and the JS WAL host's SNAP_PREFIX, verbatim. */

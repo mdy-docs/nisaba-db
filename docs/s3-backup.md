@@ -1,35 +1,50 @@
 # S3 backup and restore
 
 Automatic backup of a nisaba server (or cluster) to S3-compatible
-object storage — MinIO in development, S3 by dropping one flag. Built;
-this document is the record of what exists and the decisions that
-shaped it. The quick version:
+object storage. Built; this document is the record of what exists and
+the decisions that shaped it.
 
-```sh
-# development storage (MinIO), once:
-MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
-  minio server ~/projects/minio-data --address :9000 --console-address :9001
-
-# back a member up, continuously:
-AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-  db-backup watch \
-    --target 127.0.0.1:8097 \
-    --s3-endpoint http://127.0.0.1:9000 --s3-bucket nisaba-backups \
-    --instance dev --keep 3
-
-# disaster recovery, later:
-db-backup restore --s3-bucket nisaba-backups --instance dev --into ./recovered
-cd recovered && nisaba-server --port 8097 --raft 1
-```
-
-Credentials ride the standard AWS variables; omitting `--s3-endpoint`
-targets AWS itself. Everything below explains why it has this shape.
+> ## The object store client is no longer in this package
+>
+> **`src/s3.js` and `bin/backup.js` have been removed**, along with
+> `src/aws-credentials.js`. What remains is `src/db-backup.js`, which is
+> a **library that takes an object store rather than a program that
+> makes one**.
+>
+> Why: this package has no runtime dependencies, and that is worth more
+> than owning an S3 client. The 554 lines of hand-rolled SigV4,
+> multipart, ranged reads and retry policy existed only because there
+> was nowhere else to put them. There is now — the consumer that already
+> talks to AWS owns it, over `@aws-sdk/client-s3`, and gets AWS's own
+> signing, credential chain and endpoint resolution for free.
+>
+> Nothing was lost on this side. `BackupAgent` never constructed a
+> client; it took one, and the seam was already exactly the eight
+> methods now written down as `ObjectStore` in `types/backup.d.ts`.
+> Everything below about the COMMIT RULE — files first, manifest last,
+> prune manifest-first, one member per prefix, CRC in transit — is
+> unchanged and is what this module is actually for.
+>
+> **To back something up you now supply a store.** In JS:
+>
+> ```js
+> import { BackupAgent } from 'nisaba/backup';
+> import { connectServer } from 'nisaba/server-client';
+>
+> const client = await connectServer('127.0.0.1:8097');
+> const agent = new BackupAgent({ client, s3: yourObjectStore, instance: 'dev', member: '127.0.0.1:8097' });
+> await agent.once({ keep: 3 });     // or agent.watch({ ... })
+> ```
+>
+> `yourObjectStore` is anything with the eight methods. A working
+> SDK-backed one is nisaba-web's `service/s3-client.js`; a Map-backed
+> one for tests is `test/helpers/memory-s3.js` in this repository.
 
 ## Where it lives, and why
 
 Backup coordination is a **Node agent beside the cluster**
-(`src/db-backup.js`, run as `db-backup`), talking to one member over
-the existing client wire and to S3 over HTTP. Neither of the other
+(`src/db-backup.js`), talking to one member over the existing client
+wire and to an object store its caller supplies. Neither of the other
 homes survived contact with the architecture:
 
 - **Not the HTTP front end.** `db-http-front.js` holds sockets and no
@@ -137,11 +152,14 @@ moving the state machine, and is idempotent at an unchanged boundary.
 
 ## The agent
 
-`db-backup` (`bin/backup.js` over `src/db-backup.js`). No engine in
-the process: its imports are the server client and `src/s3.js` — a
-zero-dependency SigV4 client (path-style addressing, five verbs plus
-`createBucket`, internal list pagination, errors as `S3Error` with
-S3's own `<Code>`).
+`src/db-backup.js`, as a library. No engine in the process: its
+imports are the server client and nothing else — the object store
+arrives as a constructor argument (`ObjectStore` in
+`types/backup.d.ts`), so this module has no opinion about how S3 is
+spoken and no dependency that could give it one.
+
+It used to ship its own client and its own `bin/backup.js` wrapper; see
+the note at the top of this file for where those went and why.
 
 **One member, explicit** (`--target`). The leader gives the freshest
 boundary; a follower offloads read I/O and is at worst behind, never
@@ -207,7 +225,7 @@ Two different failures, and only one of them touches S3:
 - **One member lost.** No S3 involved. Start a blank member with
   `--join <seed>`: the leader streams a snapshot install — existing,
   tested machinery. This is the everyday failure.
-- **Everything lost.** `db-backup restore --into <empty-dir>` (a
+- **Everything lost.** `restoreFromS3({ s3, instance, into })` (a
   non-empty directory is refused; restore never merges) downloads the
   newest committed generation — or `--gen N` — with every file
   verified against the manifest, and writes the manifest **last**,
@@ -227,24 +245,31 @@ A backup restores into **either host**: into a C server as above, or
 into a JS-hosted instance via `restoreFromS3` →
 `restoreLatestInstanceSnapshot` → `connectWalInstance`. Both
 directions of the full round trip — backed up from a C member,
-restored into a JS host, and the reverse — are tested against real
-MinIO (`test/db.backup.test.js`, "one artifact, three hands").
+restored into a JS host, and the reverse — are tested on every run
+(`test/db.backup.test.js`, "one artifact, three hands").
 
 ## Against real AWS, as opposed to MinIO
 
-MinIO proves the dialect — SigV4, path-style addressing, `ListObjectsV2`
-paging, `x-amz-meta-*` round-tripping. Three things it cannot prove,
-because a store on loopback with root credentials never does them, and
-all three decide whether a backup happens at all:
+> These three used to be this package's problem and are now its
+> caller's, along with the client. They are recorded here because they
+> are the reasons the hand-rolled client grew the shape it did, and
+> because any store handed to `BackupAgent` still has to get them
+> right — nisaba-web's `service/s3-client.js` and its
+> `test/s3-client.test.js` are where they live now.
+
+MinIO proves the dialect — signing, path-style addressing,
+`ListObjectsV2` paging, `x-amz-meta-*` round-tripping. Three things it
+cannot prove, because a store on loopback with root credentials never
+does them, and all three decide whether a backup happens at all:
 
 - **Temporary credentials.** An instance role, an assumed role and a CI
   OIDC exchange all issue a *triple*, and AWS refuses the key pair
-  without `x-amz-security-token`. `S3Client` takes `sessionToken` (or
-  `AWS_SESSION_TOKEN`) and signs it — a token outside `SignedHeaders`
-  is a signature over something other than what arrived. They are also
-  **resolved per request and refreshed before they expire**
-  (`src/aws-credentials.js`): explicit → environment → the container
-  endpoint → IMDSv2. A client that captured one in its constructor
+  without `x-amz-security-token`. A store must take a `sessionToken`
+  and sign it — a token outside `SignedHeaders` is a signature over
+  something other than what arrived. They must also be **resolved per
+  request and refreshed before they expire**: explicit → environment →
+  the container endpoint → IMDSv2, which is what the AWS SDK's own
+  credential chain does. A client that captured one in its constructor
   would sign with it long after it died, which is a process that worked
   at deploy time and answers 403 the next morning.
 - **Retry.** AWS answers `503 SlowDown` when a prefix is busy and bare
@@ -263,11 +288,12 @@ Two more things differ and are not the client's to fix. **The region is
 required** when no endpoint is given, because it picks the host *and*
 signs; a wrong one comes back as a malformed signature, so it is asked
 for rather than guessed (S3's own `x-amz-bucket-region` is passed
-through when it disagrees). And **the bucket is not created** unless
-`db-backup --create-bucket` says so: it once was, on every run, which is
-invisible against a MinIO holding root credentials and wrong everywhere
-else — a fleet agent would need `s3:CreateBucket` to take a backup, and
-an agent without it is refused on every attempt.
+through when it disagrees). And **the bucket is never created** by anything on the backup path: it
+once was, on every run, which is invisible against a MinIO holding root
+credentials and wrong everywhere else — a fleet agent would need
+`s3:CreateBucket` to take a backup, and an agent without it is refused
+on every attempt. The bucket is expected to exist, and a store handed
+to `BackupAgent` is not asked for a way to make one.
 
 The IAM policy the agent actually needs is `ListBucket` on the bucket
 plus `GetObject`/`PutObject`/`DeleteObject` on its keys. `ListBucket`
@@ -325,9 +351,13 @@ Built in the order the plan set, each step tested before the next
 3. **The wire ops** — `snapshot`/`latestSnapshot`/`readSnapshotFile`,
    kinds, refusal codes, client methods; native and wasip2
    (`test/db.server.test.js`).
-4. **The S3 client** — `src/s3.js` against real MinIO (`test/s3.test.js`).
+4. **The S3 client** — was `src/s3.js` against real MinIO. Retired: the
+   client moved to the consumer that owns it, and its tests with it
+   (see the note at the top).
 5. **The agent, shipping half** — byte-identical round trip, watch on
-   the member's own cadence (`test/db.backup.test.js`).
+   the member's own cadence (`test/db.backup.test.js`, now against an
+   in-memory store so it runs on every push rather than only where
+   MinIO happens to be up).
 6. **The restore half** — boot-and-serve from a restored root, the
    interrupted-restore shape swept, the manifest byte-identity that
    forced `manifest: true` onto the wire and the agent's facts into

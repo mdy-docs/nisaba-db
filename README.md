@@ -73,7 +73,7 @@ src/          ALL the JavaScript, single source of truth: the WASM driver
               (nisaba-wasm.js), storage providers, the TCP client, the
               HTTP front end and its browser client, replication hosts,
               the S3 backup agent.
-bin/          The JS entry points: db, db-http, db-backup.
+bin/          The JS entry points: db, db-http.
 build/        The build scripts (build-wasm/-native/-server.sh over
               build-common.sh), pinned-toolchain fetchers, and lib/ --
               every build's output, gitignored.
@@ -180,10 +180,12 @@ Deliberate scope limits, stated up front rather than discovered late:
   native, with no JavaScript in it. The wire, the invariants, and what it
   does not do yet.
 - [`docs/s3-backup.md`](docs/s3-backup.md) — automatic backup to
-  S3-compatible storage (`db-backup once|watch|restore`): a Node agent
-  ships the Raft snapshot generation — the artifact the cluster already
-  produces — with MinIO as the development target, and restore boots a
-  new cluster of one from the bucket.
+  S3-compatible storage (`nisaba/backup`): a Node agent ships the Raft
+  snapshot generation — the artifact the cluster already produces — and
+  restore boots a new cluster of one from the bucket. **It takes an
+  object store rather than making one**: the S3 client this package used
+  to carry has moved to its consumer, which is what keeps this package
+  free of runtime dependencies. That doc's opening note has the details.
 - [`docs/db-plan.md`](docs/db-plan.md) — milestone-by-milestone design
   history and scope decisions (historical; see the note at its top).
 - [`docs/textindex-atomicity.md`](docs/textindex-atomicity.md) — how the

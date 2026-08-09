@@ -14,7 +14,6 @@
     "./http-front": { "types": "./types/http-front.d.ts", "default": "./src/db-http-front.js" },
     "./http-client": { "types": "./types/http-client.d.ts", "default": "./src/db-http-client.js" },
     "./backup": { "types": "./types/backup.d.ts", "default": "./src/db-backup.js" },
-    "./s3": { "types": "./types/s3.d.ts", "default": "./src/s3.js" },
     "./extended-json": { "default": "./src/extended-json.js" },
     "./wasm": { "types": "./types/wasm.d.ts", "default": "./src/nisaba-wasm.js" },
     "./coordinator": { "types": "./types/coordinator.d.ts", "default": "./src/db-coordinator.js" },
@@ -39,8 +38,7 @@
   ],
   "bin": {
     "db": "bin/db.js",
-    "db-http": "bin/http-front.js",
-    "db-backup": "bin/backup.js"
+    "db-http": "bin/http-front.js"
   },
   "scripts": {
     "test": "vitest run",

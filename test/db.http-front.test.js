@@ -418,13 +418,25 @@ describe.skipIf(!(REQUIRED || have(NATIVE)))('http front end: a three-member clu
   }, 90000);
 
   it('a write reaches the leader without the caller knowing which member that is', async () => {
+    /*
+     * The error body is in the assertion message on purpose. This test
+     * was seen to fail once with a bare `expected 400 to be 200`, on a
+     * machine so loaded the whole suite took twenty times its usual
+     * wall clock, and has not been reproducible since. A 400 here means
+     * a refusal the front end classified as the CALLER's fault
+     * (src/db-http-front.js: anything outside RETRYABLE) — which for a
+     * well-formed write to a healthy cluster is either an engine code
+     * that ought to be retryable and is not, or a request body that did
+     * not fully arrive. Both are worth knowing, and neither is
+     * recoverable from a status code alone.
+     */
     const res = await post(front, `/db/${DB}/events/insert`, { doc: { seq: 1 } });
-    expect(res.status).toBe(200);
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.ok).toBe(true);
 
     // And so does the read that checks it -- reads are the leader's too.
     const count = await post(front, `/db/${DB}/events/count`, { filter: {} });
-    expect(count.status).toBe(200);
+    expect(count.status, JSON.stringify(count.body)).toBe(200);
     expect(count.body.n).toBe(1);
   }, 60000);
 

@@ -333,7 +333,15 @@ int rn_config_in_flight(const raft_node *n);
  * election timeout; `heartbeat` is the leader's idle interval. The
  * random draw is passed IN to every call that can arm a timer, for the
  * replayability reason at the top of this file.
+ *
+ * The defaults are what rn_new installs, and are named here because a
+ * host that offers to override one of them has to be able to leave the
+ * other two alone without writing the numbers down a second time.
  */
+#define RN_DEFAULT_MIN_ELECTION 150
+#define RN_DEFAULT_MAX_ELECTION 300
+#define RN_DEFAULT_HEARTBEAT     50
+
 void rn_set_timing(raft_node *n, int64_t min_election, int64_t max_election,
                    int64_t heartbeat);
 void rn_set_limits(raft_node *n, uint32_t max_batch_bytes);

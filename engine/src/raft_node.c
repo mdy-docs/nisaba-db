@@ -394,9 +394,9 @@ raft_node *rn_new(uint64_t self_id, elog *log) {
     n->role = RAFT_FOLLOWER;
     n->self_voting = 1;
     n->voter_count = 1;
-    n->min_election = 150;
-    n->max_election = 300;
-    n->heartbeat_ms = 50;
+    n->min_election = RN_DEFAULT_MIN_ELECTION;
+    n->max_election = RN_DEFAULT_MAX_ELECTION;
+    n->heartbeat_ms = RN_DEFAULT_HEARTBEAT;
     n->max_batch_bytes = 65536;
     n->chunk_bytes = RN_DEFAULT_CHUNK;
     n->election_deadline = INT64_MAX;

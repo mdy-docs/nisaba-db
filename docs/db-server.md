@@ -69,6 +69,8 @@ data and reporting nothing wrong.
 | `--peer ID@HOST:PORT` | another member and where to reach IT; repeat once per member |
 | `--join HOST:PORT` | ask a RUNNING cluster to admit this node, knowing only a seed address; repeat for more seeds. Use **instead of** `--peer` |
 | `--snapshot-entries N` | applied entries between local snapshots, which bound the log (default 8192; 0 never compacts) |
+| `--election-timeout MIN[:MAX]` | milliseconds without hearing from the leader before standing against it, drawn at random from `[MIN,MAX)` per election (default `150:300`; `MAX` defaults to twice `MIN`) |
+| `--heartbeat MS` | the leader's idle interval (default 50). Must be at most half `--election-timeout`'s minimum, or the flag is refused |
 | `--leave ID` | ask that cluster to remove member `ID`, then exit without serving; needs `--join` to say who to ask |
 
 **`--order` is a creation parameter, not something a reader has to be
@@ -115,6 +117,45 @@ What that costs, accepted deliberately: one database's write rate is
 every database's, and a halt in one halts all of them. Per-database
 placement is not available and is not planned — it was a tenancy
 requirement, and tenancy is a layer above this repository.
+
+### The clock
+
+The defaults — a `150:300` ms election timeout with a 50 ms heartbeat —
+are LAN numbers, and they are a claim about the machines as much as the
+network: a vote must reach the disk before it is answered, so an
+election round is a round trip *plus* a durable write on every member
+that grants. Where that cannot finish inside the timeout there is no
+stable leader, however healthy each part is. The symptom is not an
+error. It is terms climbing, writes timing out, and everything looking
+slow.
+
+Widen both together when that is the environment — a contended CI box, a
+noisy network, storage with a long tail:
+
+```sh
+nisaba-server --raft 1 --raft-port 9001 --election-timeout 800:1000 --heartbeat 250
+```
+
+Three things worth knowing before you do.
+
+**Give every member the same value.** Not the same *draw* — the
+randomisation between `MIN` and `MAX` is per-node and is the point, it
+is what stops two followers campaigning in step — but the same bounds. A
+leader whose heartbeat is not well under the *others'* minimum election
+timeout is a leader they depose on a schedule.
+
+**The ratio is checked, and a bad one is refused at startup** rather
+than run. `--heartbeat` must be at most half `--election-timeout`'s
+minimum: a leader needs more than one chance to be heard inside the
+tightest window a follower might draw. This is Raft's own broadcast
+time ≪ election timeout, and it is refused where the number is still in
+somebody's hand.
+
+**Widening costs failover time.** The election timeout *is* how long a
+dead leader goes unnoticed; at `800:1000` a cluster is unavailable for
+writes about a second longer per failover than at the default. That is
+the trade being made, and it is only worth making when the alternative
+is electing continuously.
 
 **`--peer` bootstraps; after that the LOG is the member set.** Every
 member of a cluster started this way has to be given the same list,

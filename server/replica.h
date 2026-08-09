@@ -87,7 +87,42 @@
 typedef struct replica replica;
 
 /*
+ * The Raft clock, in milliseconds. All zero is the built-in default
+ * (150:300 election, 50 heartbeat), which is tuned for a LAN.
+ *
+ * These are policy, not preference, and the policy is Raft's own:
+ * broadcast time << election timeout << mean time between failures. The
+ * middle term is what a node waits before deciding the leader is gone,
+ * and it has to be comfortably longer than a round trip plus the disk
+ * commit a vote costs -- a machine whose scheduler or disk cannot answer
+ * inside it has no stable leader, however healthy every part of it is.
+ *
+ * A CLUSTER'S MEMBERS MUST AGREE. Not bit-for-bit -- the randomised draw
+ * between min and max is per-node and is the point -- but a leader whose
+ * heartbeat interval is not well under the OTHER members' minimum
+ * election timeout is a leader they will depose on a schedule. Setting
+ * this per-machine is therefore a mistake; it belongs to the cluster,
+ * and whoever places the cluster is who should decide it.
+ */
+typedef struct {
+    int64_t min_election_ms;    /* 0 = default */
+    int64_t max_election_ms;    /* 0 = twice the minimum */
+    int64_t heartbeat_ms;       /* 0 = default */
+} replica_timing;
+
+/*
+ * Fill in every zero field with what replica_open would have used. A
+ * caller that wants to CHECK the clock before committing to it -- argv
+ * is the one that does -- has to resolve it exactly as the open would,
+ * or it validates one set of numbers and runs another. This is that one
+ * way of resolving them, and replica_open calls it too.
+ */
+void replica_timing_resolve(replica_timing *tm);
+
+/*
  * Open the log in `ns` and put a node over it.
+ *
+ * `tm` may be NULL, which is the default clock.
  *
  * The BOOTSTRAP member set is `members` (a binjson ARRAY of records --
  * what a join came back with) when one is given, and otherwise `self_id`
@@ -117,7 +152,7 @@ typedef struct replica replica;
 int  replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
                   const uint8_t *members, uint32_t members_len,
                   uint64_t now, root_state *rt, uint64_t snapshot_entries,
-                  replica **out);
+                  const replica_timing *tm, replica **out);
 void replica_close(replica *r);
 
 /*

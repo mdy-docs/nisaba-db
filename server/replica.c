@@ -126,6 +126,7 @@ struct replica {
     uint64_t   snap_every;      /* applied entries between snapshots; 0 = never */
     uint64_t   applied;
     uint64_t   rnd;             /* the election-timeout draw's state */
+    int        tick_ms;         /* the clock slice, derived from the heartbeat */
     uint64_t   self_id;
     uint64_t   next_corr;       /* inbound ids, minted here */
     uint64_t   config_index;    /* the CONFIG entry in force */
@@ -1151,10 +1152,49 @@ static void startup_sweep(replica *r) {
     dbuf_free(&listing); dbuf_free(&keep); dbuf_free(&prune);
 }
 
+/* ---- the clock ---------------------------------------------------------- */
+
+/*
+ * A tick every heartbeat is enough and is what the JavaScript host does
+ * (RaftGroupHost's tickMs). Asking the node for its exact next deadline
+ * would be a second copy of the timer arithmetic; a slice is the
+ * transport's own business and cannot be wrong, only coarse.
+ *
+ * DERIVED FROM THE HEARTBEAT, not fixed: coarse is only harmless while
+ * the slice is well under the interval it is meant to deliver. A 20ms
+ * slice cannot deliver a 10ms heartbeat at all -- it would round every
+ * beat up and quietly halve the leader's contact rate -- and against a
+ * 500ms heartbeat it is 25 wakeups spent finding nothing to do. Half the
+ * heartbeat is the most that can never round a beat away; 20ms is the
+ * floor, because below that the wakeups cost more than the precision is
+ * worth.
+ */
+#define REPLICA_TICK_MS 20
+
+static int tick_for(int64_t heartbeat_ms) {
+    int64_t half = heartbeat_ms / 2;
+    if (half < REPLICA_TICK_MS) return REPLICA_TICK_MS;
+    return half > INT32_MAX ? INT32_MAX : (int)half;
+}
+
+void replica_timing_resolve(replica_timing *tm) {
+    if (!tm) return;
+    int given_min = tm->min_election_ms > 0;
+    if (!given_min) tm->min_election_ms = RN_DEFAULT_MIN_ELECTION;
+    if (tm->max_election_ms <= 0) {
+        /* Twice the minimum when a minimum was given and no maximum: the
+         * default pair's own ratio, so widening the floor widens the
+         * spread with it instead of collapsing it to nothing. */
+        tm->max_election_ms = given_min ? tm->min_election_ms * 2
+                                        : RN_DEFAULT_MAX_ELECTION;
+    }
+    if (tm->heartbeat_ms <= 0) tm->heartbeat_ms = RN_DEFAULT_HEARTBEAT;
+}
+
 int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
                  const uint8_t *members, uint32_t members_len,
                  uint64_t now, root_state *rt, uint64_t snapshot_entries,
-                 replica **out) {
+                 const replica_timing *tm, replica **out) {
     if (!ns || !inst || !out || !self_id) return BJ_ERR_STATE;
     if (px && peers_count(px) > rn_max_peers()) return RAFT_ERR_CAPACITY;
     *out = NULL;
@@ -1200,6 +1240,20 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
     }
     rn_set_ns(r->node, ns);
     rn_set_snapstore(r->node, r->store);
+
+    /*
+     * The clock, before the timers are armed. Each field falls back on
+     * its own, so a caller that only widens the election timeout keeps
+     * the default heartbeat -- and the tick follows the heartbeat
+     * whichever way it came.
+     */
+    {
+        replica_timing clock = tm ? *tm : (replica_timing){0};
+        replica_timing_resolve(&clock);
+        rn_set_timing(r->node, clock.min_election_ms, clock.max_election_ms,
+                      clock.heartbeat_ms);
+        r->tick_ms = tick_for(clock.heartbeat_ms);
+    }
 
     /*
      * The group to BOOTSTRAP with: the set a join came back with when
@@ -1415,19 +1469,9 @@ uint32_t replica_peer_count(const replica *r) {
     return others;
 }
 
-/* ---- the clock ---------------------------------------------------------- */
-
-/*
- * A tick every heartbeat is enough and is what the JavaScript host does
- * (RaftGroupHost's tickMs). Asking the node for its exact next deadline
- * would be a second copy of the timer arithmetic; a fixed slice is the
- * transport's own business and cannot be wrong, only coarse.
- */
-#define REPLICA_TICK_MS 20
-
 int replica_wait_ms(const replica *r, uint64_t now) {
-    (void)r; (void)now;
-    return REPLICA_TICK_MS;
+    (void)now;
+    return r ? r->tick_ms : REPLICA_TICK_MS;
 }
 
 /* ---- the apply pump ----------------------------------------------------- */

@@ -893,6 +893,7 @@ static void usage(const char *me) {
             "           [--peer ID@HOST:PORT ...]\n"
             "           [--join HOST:PORT ...] [--leave NODE_ID]\n"
             "           [--snapshot-entries N]\n"
+            "           [--election-timeout MIN[:MAX]] [--heartbeat MS]\n"
             "  serves the instance in the preopened directory \".\"\n"
             "  --bind: where the client wire listens (default 127.0.0.1;\n"
             "         widen it consciously -- there is no auth on this wire)\n"
@@ -908,7 +909,15 @@ static void usage(const char *me) {
             "  --join asks a RUNNING cluster to admit this node, knowing only a\n"
             "         seed address; repeat for more seeds. Use INSTEAD of --peer\n"
             "  --leave asks that cluster to remove NODE_ID, then exits without\n"
-            "         serving; it needs --join to say who to ask\n", me);
+            "         serving; it needs --join to say who to ask\n"
+            "  --election-timeout: how long without hearing from the leader\n"
+            "         before standing against it, in ms, drawn at random from\n"
+            "         [MIN,MAX) per election (default 150:300; MAX defaults to\n"
+            "         twice MIN). Widen it for a slow or contended network --\n"
+            "         and give EVERY member of the cluster the same value\n"
+            "  --heartbeat: the leader's idle interval in ms (default 50); it\n"
+            "         must be well under --election-timeout's minimum, or the\n"
+            "         others depose a leader that is working\n", me);
 }
 
 /*
@@ -958,6 +967,29 @@ static int parse_seed(const char *spec, seed_addr *out) {
     int p = atoi(colon + 1);
     if (p <= 0 || p > 65535) return -1;
     out->port = p;
+    return 0;
+}
+
+/*
+ * `MIN` or `MIN:MAX`, in milliseconds. One number is the common case --
+ * "give it longer" -- and the maximum follows it, because the SPREAD is
+ * what stops two followers campaigning in step and a caller who widened
+ * only the floor would have narrowed it to nothing.
+ */
+static int parse_election(const char *spec, int64_t *min_ms, int64_t *max_ms) {
+    char *end = NULL;
+    long long lo = strtoll(spec, &end, 10);
+    if (end == spec || lo <= 0) return -1;
+    long long hi = lo * 2;
+    if (*end == ':') {
+        const char *rest = end + 1;
+        hi = strtoll(rest, &end, 10);
+        if (end == rest || hi <= 0) return -1;
+    }
+    if (*end != '\0') return -1;
+    if (hi < lo) return -1;
+    *min_ms = (int64_t)lo;
+    *max_ms = (int64_t)hi;
     return 0;
 }
 
@@ -1014,6 +1046,8 @@ int main(int argc, char **argv) {
     seed_addr seeds[JOIN_MAX_SEEDS];
     int n_seeds = 0;
     uint64_t leave_id = 0;
+    /* All zero is replica.h's default clock. */
+    replica_timing timing = {0};
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdio") == 0) use_stdio = 1;
@@ -1039,6 +1073,19 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "--snapshot-entries cannot be negative (0 disables)\n");
                 return 2;
             }
+        }
+        else if (strcmp(argv[i], "--election-timeout") == 0 && i + 1 < argc) {
+            if (parse_election(argv[++i], &timing.min_election_ms,
+                               &timing.max_election_ms) != 0) {
+                fprintf(stderr, "bad --election-timeout %s (want MIN[:MAX] in ms,"
+                                " MAX at least MIN)\n", argv[i]);
+                return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--heartbeat") == 0 && i + 1 < argc) {
+            long long ms = atoll(argv[++i]);
+            if (ms <= 0) { fprintf(stderr, "--heartbeat must be positive\n"); return 2; }
+            timing.heartbeat_ms = (int64_t)ms;
         }
         else if (strcmp(argv[i], "--raft") == 0 && i + 1 < argc) {
             node_id = atoi(argv[++i]);
@@ -1107,6 +1154,34 @@ int main(int argc, char **argv) {
     if ((raft_port || n_peers || n_seeds) && node_id <= 0) {
         fprintf(stderr, "--raft-port, --peer and --join need --raft NODE_ID\n");
         return 2;
+    }
+    /* There is no Raft clock to set on a server that is not replicating,
+     * and a flag that was silently ignored is a flag that looks like it
+     * worked. */
+    if ((timing.min_election_ms || timing.heartbeat_ms) && node_id <= 0) {
+        fprintf(stderr, "--election-timeout and --heartbeat need --raft NODE_ID:"
+                        " they set the Raft clock\n");
+        return 2;
+    }
+    /*
+     * Raft's own requirement, refused rather than run: broadcast time <<
+     * election timeout. A leader that beats no oftener than the others'
+     * shortest patience is deposed on a schedule, and the cluster spends
+     * its life electing -- a failure that looks like everything being
+     * slow rather than like a bad number, which is why it is checked
+     * here where the number is still in somebody's hand. Half is the
+     * loosest ratio worth allowing: it gives a leader two chances to be
+     * heard inside the tightest possible window.
+     */
+    {
+        replica_timing chk = timing;
+        replica_timing_resolve(&chk);
+        if (chk.heartbeat_ms * 2 > chk.min_election_ms) {
+            fprintf(stderr, "--heartbeat %lld is too slow for an election timeout of"
+                            " %lld: it must be at most half\n",
+                    (long long)chk.heartbeat_ms, (long long)chk.min_election_ms);
+            return 2;
+        }
     }
     /*
      * BOTH IS A CONTRADICTION, refused rather than resolved by argv
@@ -1280,7 +1355,7 @@ int main(int argc, char **argv) {
     if (node_id > 0) {
         e = replica_open(&ns, inst, (uint64_t)node_id, px,
                          members.data, (uint32_t)members.len, now_ms(),
-                         rst, (uint64_t)snapshot_entries, &rep);
+                         rst, (uint64_t)snapshot_entries, &timing, &rep);
         if (e != BJ_OK) {
             fprintf(stderr, "cannot open the log: %s\n", dc_strerror(e));
             peers_free(px);

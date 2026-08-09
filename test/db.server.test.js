@@ -1160,6 +1160,119 @@ for (const engine of ENGINES) {
   });
 
   /*
+   * THE RAFT CLOCK (--election-timeout / --heartbeat).
+   *
+   * The defaults -- 150:300 with a 50ms beat -- are tuned for a LAN, and
+   * a network or a machine that cannot answer inside them has no stable
+   * leader however healthy every part of it is. They are settable for
+   * that case, and the settings are refused rather than obeyed when they
+   * describe a cluster that could not hold a leader: Raft's broadcast
+   * time << election timeout is a requirement, not advice, and a
+   * violation of it looks from the outside like everything being slow
+   * rather than like a bad number.
+   *
+   * Flags rather than environment, deliberately. A mistyped flag exits
+   * 2; a mistyped variable is ignored, and the symptom of an ignored
+   * timing override is exactly the flakiness it was set to cure. And
+   * environment is per-MACHINE while this is per-CLUSTER -- members that
+   * disagree about the clock depose each other on a schedule.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: the Raft clock (${engine.name})`, () => {
+    const run = (args) => new Promise((resolve) => {
+      const [cmd, argv, opts] = engine.argv(os.tmpdir(), 0, args);
+      const cleaned = argv.filter((a, i) => a !== '--port' && argv[i - 1] !== '--port');
+      const proc = spawn(cmd, cleaned, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+      let err = '';
+      proc.stderr.on('data', (d) => { err += String(d); });
+      proc.once('exit', (code) => resolve({ code, err }));
+    });
+
+    it('refuses a clock it could not hold a leader on', async () => {
+      /* Half is the loosest ratio allowed: two chances to be heard
+       * inside the tightest possible window. 200 against the default
+       * floor of 150 is not one chance. */
+      const slow = await run(['--raft', '1', '--heartbeat', '200']);
+      expect(slow.code).not.toBe(0);
+      expect(slow.err).toMatch(/--heartbeat 200 is too slow for an election timeout of 150/);
+
+      /*
+       * Exactly half is the boundary and is legal -- asserted so that
+       * tightening the rule has to be a decision rather than a rounding.
+       * Proven by getting PAST it to a later refusal, because the thing
+       * an accepted clock does is serve, and a server that serves does
+       * not exit for this test to read a code off.
+       */
+      const edge = await run(['--raft', '1', '--heartbeat', '75',
+                              '--election-timeout', '150', '--raft-bind', '10.0.0.1']);
+      expect(edge.err).not.toMatch(/too slow/);
+      expect(edge.err).toMatch(/--raft-bind and --raft-advertise need --raft-port/);
+    });
+
+    it('refuses a clock that is not a clock', async () => {
+      for (const spec of ['0', '-1', 'soon', '600:', '600:900:1200', '900:600']) {
+        const bad = await run(['--raft', '1', '--election-timeout', spec]);
+        expect(bad.code, `--election-timeout ${spec}`).not.toBe(0);
+        expect(bad.err).toMatch(/bad --election-timeout/);
+      }
+      const beat = await run(['--raft', '1', '--heartbeat', '0']);
+      expect(beat.code).not.toBe(0);
+      expect(beat.err).toMatch(/--heartbeat must be positive/);
+    });
+
+    /* An unreplicated server has no Raft clock to set, and a flag that
+     * was silently ignored is a flag that looks like it worked. */
+    it('refuses the clock on a server that is not replicating', async () => {
+      const lone = await run(['--election-timeout', '600']);
+      expect(lone.code).not.toBe(0);
+      expect(lone.err).toMatch(/need --raft NODE_ID: they set the Raft clock/);
+    });
+
+    /*
+     * And a widened clock is a WORKING clock, which is the part no
+     * argument check can establish. Two voters, so a committed write
+     * proves an election was held and replication ran -- on a 250ms beat
+     * whose derived tick (half the heartbeat, not the fixed 20ms) is
+     * what has to carry both the heartbeats and the apply pump.
+     */
+    it('elects and commits on a deliberately slow clock', async () => {
+      const base = nextPort();
+      const members = [1, 2].map((id) => ({
+        id, port: base + id - 1, raftPort: base + 10 + id - 1
+      }));
+      const slow = (m) => [
+        '--raft', String(m.id), '--raft-port', String(m.raftPort),
+        '--election-timeout', '800:1000', '--heartbeat', '250',
+        ...members.filter((o) => o.id !== m.id)
+          .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+      ];
+      const procs = [];
+      try {
+        for (const m of members) {
+          procs.push((await startServer(engine, m.port, slow(m), -1)).proc);
+        }
+        let wrote = false, last = null;
+        const until = Date.now() + 30000;
+        while (!wrote && Date.now() < until) {
+          for (const m of members) {
+            let db = null;
+            try {
+              db = (await connectServer(m.port)).db(DB);
+              await db.collection('users').insertOne({ name: 'unhurried' });
+              wrote = true;
+              break;
+            } catch (err) { last = err; }
+            finally { try { await db?.close(); } catch { /* gone */ } }
+          }
+          if (!wrote) await new Promise((r) => setTimeout(r, 200));
+        }
+        if (!wrote) throw new Error(`nothing committed: ${last?.message}`);
+      } finally {
+        for (const p of procs) p.kill();
+      }
+    }, 60000);
+  });
+
+  /*
    * ONE CLUSTER, TWO HOSTS: two C members and one member running in
    * Node.
    *

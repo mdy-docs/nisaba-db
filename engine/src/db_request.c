@@ -88,65 +88,90 @@ typedef enum {
  * NONE is the three that touch no database state: `ping`, and the two
  * that release a client's own local resources.
  */
-#define OP(name, code, kind) { name, (uint32_t)(sizeof(name) - 1), code, kind }
+/*
+ * The fourth column is whether the op CAN RUN AGAINST A BARE COLLECTION --
+ * whether run_read below is able to perform it given a dc_collection and
+ * the request bytes, and nothing else. It is a capability, not a policy:
+ * what actually gets moved off the serving thread is decided elsewhere and
+ * is a subset of this (server/replica.c), because a cheap read is better
+ * answered inline than queued.
+ *
+ * NOT offloadable is the DEFAULT, and every op states its answer, so an op
+ * added later cannot be raced by omission. DBS_REQ_READ is not the same
+ * question and does not imply this one: `getMore` reads, but it advances a
+ * cursor the session owns; `watch` reads, but it registers a stream;
+ * `listCollections` reads the catalog rather than a collection; and
+ * `aggregate` reads a collection but answers a failure by naming the stage
+ * that failed, which is a response shape run_read does not build.
+ */
+#define OP(name, code, kind, bare) \
+    { name, (uint32_t)(sizeof(name) - 1), code, kind, bare }
+#define BARE   1    /* run_read can perform it against any dc_collection */
+#define OWNED  0    /* needs the session, or writes, or both */
 
 static const struct {
-    const char *name; uint32_t len; dbs_op op; uint8_t kind;
+    const char *name; uint32_t len; dbs_op op; uint8_t kind; uint8_t bare;
 } OP_NAMES[] = {
-    OP("ping",        OP_PING,        DBS_REQ_STATUS),
-    OP("find",        OP_FIND,        DBS_REQ_READ),
-    OP("findOne",     OP_FIND_ONE,    DBS_REQ_READ),
-    OP("count",       OP_COUNT,       DBS_REQ_READ),
-    OP("distinct",    OP_DISTINCT,    DBS_REQ_READ),
-    OP("insert",      OP_INSERT,      DBS_REQ_WRITE),
-    OP("update",      OP_UPDATE,      DBS_REQ_WRITE),
-    OP("updateMany",  OP_UPDATE_MANY, DBS_REQ_WRITE),
-    OP("replace",     OP_REPLACE,     DBS_REQ_WRITE),
-    OP("delete",      OP_DELETE,      DBS_REQ_WRITE),
-    OP("deleteMany",  OP_DELETE_MANY, DBS_REQ_WRITE),
+    OP("ping",        OP_PING,        DBS_REQ_STATUS, OWNED),
+    /* BARE only WITHOUT batchSize. A batched find opens a cursor, and a
+     * cursor is the session's: it holds a slot in a bounded table, belongs
+     * to a client id, and pins the tree it scans. run_read refuses one
+     * rather than trusting a caller to have checked. */
+    OP("find",        OP_FIND,        DBS_REQ_READ, BARE),
+    OP("findOne",     OP_FIND_ONE,    DBS_REQ_READ, BARE),
+    OP("count",       OP_COUNT,       DBS_REQ_READ, BARE),
+    OP("distinct",    OP_DISTINCT,    DBS_REQ_READ, BARE),
+    OP("insert",      OP_INSERT,      DBS_REQ_WRITE, OWNED),
+    OP("update",      OP_UPDATE,      DBS_REQ_WRITE, OWNED),
+    OP("updateMany",  OP_UPDATE_MANY, DBS_REQ_WRITE, OWNED),
+    OP("replace",     OP_REPLACE,     DBS_REQ_WRITE, OWNED),
+    OP("delete",      OP_DELETE,      DBS_REQ_WRITE, OWNED),
+    OP("deleteMany",  OP_DELETE_MANY, DBS_REQ_WRITE, OWNED),
     /* A cursor batch is a READ like any other: the rule is applied
      * uniformly rather than weakened for paging, so a page sees
      * everything committed when it was asked for and not merely
      * everything committed when the cursor was opened. */
-    OP("getMore",     OP_GET_MORE,    DBS_REQ_READ),
-    OP("closeCursor", OP_CLOSE_CURSOR, DBS_REQ_NONE),
+    OP("getMore",     OP_GET_MORE,    DBS_REQ_READ, OWNED),
+    OP("closeCursor", OP_CLOSE_CURSOR, DBS_REQ_NONE, OWNED),
     /* Compaction rewrites this member's own files. It changes nothing a
      * reader can observe and nothing another replica has to agree with,
      * but it is not a read either -- and a member that cannot take a
      * write has no business rewriting its files underneath the log. */
-    OP("compact",     OP_COMPACT,     DBS_REQ_WRITE),
-    OP("createCollection", OP_CREATE_COLLECTION, DBS_REQ_WRITE),
-    OP("dropCollection",   OP_DROP_COLLECTION,   DBS_REQ_WRITE),
-    OP("createIndex",      OP_CREATE_INDEX,      DBS_REQ_WRITE),
-    OP("dropIndex",        OP_DROP_INDEX,        DBS_REQ_WRITE),
-    OP("listIndexes",      OP_LIST_INDEXES,      DBS_REQ_READ),
-    OP("listCollections",  OP_LIST_COLLECTIONS,  DBS_REQ_READ),
-    OP("insertMany",       OP_INSERT_MANY,       DBS_REQ_WRITE),
-    OP("bulkWrite",        OP_BULK_WRITE,        DBS_REQ_WRITE),
-    OP("aggregate",        OP_AGGREGATE,         DBS_REQ_READ),
-    OP("explain",          OP_EXPLAIN,           DBS_REQ_READ),
-    OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE,  DBS_REQ_WRITE),
-    OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE, DBS_REQ_WRITE),
-    OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE,  DBS_REQ_WRITE),
-    OP("findByIndex",       OP_FIND_BY_INDEX,        DBS_REQ_READ),
+    OP("compact",     OP_COMPACT,     DBS_REQ_WRITE, OWNED),
+    OP("createCollection", OP_CREATE_COLLECTION, DBS_REQ_WRITE, OWNED),
+    OP("dropCollection",   OP_DROP_COLLECTION,   DBS_REQ_WRITE, OWNED),
+    OP("createIndex",      OP_CREATE_INDEX,      DBS_REQ_WRITE, OWNED),
+    OP("dropIndex",        OP_DROP_INDEX,        DBS_REQ_WRITE, OWNED),
+    OP("listIndexes",      OP_LIST_INDEXES,      DBS_REQ_READ, OWNED),
+    OP("listCollections",  OP_LIST_COLLECTIONS,  DBS_REQ_READ, OWNED),
+    OP("insertMany",       OP_INSERT_MANY,       DBS_REQ_WRITE, OWNED),
+    OP("bulkWrite",        OP_BULK_WRITE,        DBS_REQ_WRITE, OWNED),
+    OP("aggregate",        OP_AGGREGATE,         DBS_REQ_READ, OWNED),
+    OP("explain",          OP_EXPLAIN,           DBS_REQ_READ, OWNED),
+    OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE,  DBS_REQ_WRITE, OWNED),
+    OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE, DBS_REQ_WRITE, OWNED),
+    OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE,  DBS_REQ_WRITE, OWNED),
+    OP("findByIndex",       OP_FIND_BY_INDEX,        DBS_REQ_READ, OWNED),
     /* It deletes what a TTL index says is over. */
-    OP("pruneExpired",      OP_PRUNE_EXPIRED,        DBS_REQ_WRITE),
+    OP("pruneExpired",      OP_PRUNE_EXPIRED,        DBS_REQ_WRITE, OWNED),
     /* Opening a stream is a read: what it goes on to deliver is this
      * member's view of what changed, and a member that cannot show its
      * data is current cannot show that either. */
-    OP("watch",             OP_WATCH,                DBS_REQ_READ),
-    OP("closeStream",       OP_CLOSE_STREAM,         DBS_REQ_NONE),
+    OP("watch",             OP_WATCH,                DBS_REQ_READ, OWNED),
+    OP("closeStream",       OP_CLOSE_STREAM,         DBS_REQ_NONE, OWNED),
     /* The snapshot ops (docs/s3-backup.md): answered by the replicated
      * transport (server/replica.c), which routes on the kind before the
      * leader check -- a snapshot is PER-MEMBER. Spelled here because
      * every op is, so the engine's answer below is "no store here"
      * rather than an unknown-op refusal masquerading as "not built". */
-    OP("snapshot",          OP_SNAPSHOT,             DBS_REQ_SNAPSHOT),
-    OP("latestSnapshot",    OP_LATEST_SNAPSHOT,      DBS_REQ_SNAPSHOT),
-    OP("readSnapshotFile",  OP_READ_SNAPSHOT_FILE,   DBS_REQ_SNAPSHOT),
+    OP("snapshot",          OP_SNAPSHOT,             DBS_REQ_SNAPSHOT, OWNED),
+    OP("latestSnapshot",    OP_LATEST_SNAPSHOT,      DBS_REQ_SNAPSHOT, OWNED),
+    OP("readSnapshotFile",  OP_READ_SNAPSHOT_FILE,   DBS_REQ_SNAPSHOT, OWNED),
 };
 
 #undef OP
+#undef BARE
+#undef OWNED
 
 /* ---- reading the request ----------------------------------------------- */
 
@@ -1175,6 +1200,221 @@ static int do_ddl(dbs *s, const char *coll, uint32_t coll_len, int wreq,
 
 /* ---- dispatch ----------------------------------------------------------- */
 
+/*
+ * WHAT AN OP PRODUCED, before it becomes a response.
+ *
+ * These six travelled as six locals of dbs_handle, filled by every case of
+ * its switch and read by the one block at the bottom that assembles the
+ * reply. Naming the group is what lets that block move somewhere a SECOND
+ * caller can reach it -- a read running against a read view rather than
+ * against the session's live collection (dbs_read) -- without the reply
+ * being assembled twice. Two assemblers would be two opinions about what
+ * a `count` answers, and they would agree right up until one changed.
+ *
+ * `body` is raw binjson, spliced in whole. `is_number` and `is_bool_found`
+ * pick which of the three reply shapes this op has; nothing sets both.
+ */
+typedef struct {
+    dbuf        body;
+    const char *body_key;
+    int64_t     number;
+    int         is_number;
+    int         is_bool_found;
+    int         found_doc;
+} made_body;
+
+/* The one place a successful reply is built. */
+static int render_made(const made_body *made, dbuf *out) {
+    bj_builder *rb = bj_builder_new();
+    if (!rb) return BJ_ERR_OOM;
+    bj_begin_object(rb);
+    PUT_KEY(rb, "ok"); bj_put_bool(rb, 1);
+    if (made->is_number) {
+        PUT_KEY(rb, made->body_key); bj_put_int(rb, made->number);
+    } else if (made->is_bool_found) {
+        PUT_KEY(rb, "found"); bj_put_bool(rb, made->found_doc);
+        PUT_KEY(rb, made->body_key);
+        if (made->found_doc && made->body.len)
+            bj_put_raw(rb, made->body.data, (uint32_t)made->body.len);
+        else bj_put_null(rb);
+    } else {
+        PUT_KEY(rb, made->body_key);
+        if (made->body.len) bj_put_raw(rb, made->body.data, (uint32_t)made->body.len);
+        else bj_put_null(rb);
+    }
+    bj_end_object(rb);
+    int e = finish(rb, out);
+    bj_builder_free(rb);
+    return e;
+}
+
+/*
+ * `{}`: the tag, the u32 SIZE OF EVERYTHING AFTER THE FIRST FIVE BYTES (so
+ * 4 -- the count alone), then the count. It said 9 until a command carried
+ * one: nothing had ever MEASURED it, because object_begin reads the count
+ * and ignores the size, so a filter built from it worked while a value
+ * spliced into another object made its container run four bytes past its
+ * own end.
+ */
+static const uint8_t EMPTY_OBJ[9] = { BJ_TYPE_OBJECT, 4,0,0,0, 0,0,0,0 };
+
+/*
+ * The filter an op reads by. An absent one is the empty object -- which is
+ * what "everything" means everywhere else in this library. One function
+ * because two callers need it now, and "absent means everything" is
+ * exactly the kind of default that must not be decided twice.
+ */
+static int read_filter(const uint8_t *req, size_t req_len,
+                       const uint8_t **out, size_t *out_len) {
+    const uint8_t *f = EMPTY_OBJ; size_t flen = sizeof EMPTY_OBJ;
+    int has = 0;
+    int e = field_raw(req, req_len, "filter", &f, &flen, &has);
+    if (e) return e;
+    if (!has) { f = EMPTY_OBJ; flen = sizeof EMPTY_OBJ; }
+    *out = f; *out_len = flen;
+    return BJ_OK;
+}
+
+/*
+ * THE READS THAT NEED NOTHING BUT THE COLLECTION.
+ *
+ * Every op marked BARE in the table above, performed against whatever
+ * dc_collection it is handed -- the session's live one, or a read view of
+ * it (db.h's dc_collection_snapshot). No `dbs`, no client id, no cursor
+ * table, no catalog: the four ops here already touched none of those when
+ * they were cases of dbs_handle's switch, which is why this split is a
+ * MOVE rather than a second implementation of them.
+ *
+ * That distinction is the whole value. A read answered somewhere other
+ * than the middle of the apply loop has to produce byte-identical output
+ * to one answered inline, and the only way to be sure of that is for there
+ * to be one piece of code producing it. Pairs with render_made above,
+ * which is likewise the only assembler.
+ *
+ * `filter` is passed in already resolved rather than re-read, so a caller
+ * that has one does not pay for it twice and cannot resolve it differently.
+ */
+static int run_read(dc_collection *c, int op,
+                    const uint8_t *req, size_t req_len,
+                    const uint8_t *filter, size_t filter_len,
+                    made_body *made) {
+    if (!c || !made) return BJ_ERR_STATE;
+    int e = BJ_OK;
+
+    switch (op) {
+        case OP_FIND: {
+            qry_options qo; int have_opts = 0; int64_t batch = 0;
+            if ((e = read_opts(req, req_len, &qo, &have_opts, &batch))) return e;
+            /* A batched find is the session's (see the table). Refused
+             * here rather than assumed away, because the caller that gets
+             * this wrong would open a cursor nobody owns. */
+            if (batch > 0) return BJ_ERR_STATE;
+
+            uint8_t *docs = NULL; size_t docs_len = 0;
+            e = dc_find(c, filter, (uint32_t)filter_len,
+                        have_opts ? &qo : NULL, &docs, &docs_len);
+            if (e) return e;
+            e = dbuf_put(&made->body, docs, docs_len);
+            free(docs);
+            made->body_key = "docs";
+            return e;
+        }
+        case OP_FIND_ONE: {
+            uint8_t *d = NULL; size_t dlen = 0;
+            e = dc_find_one(c, filter, (uint32_t)filter_len, NULL, 0,
+                            &made->found_doc, &d, &dlen);
+            if (e) return e;
+            if (made->found_doc) e = dbuf_put(&made->body, d, dlen);
+            free(d);
+            made->body_key = "doc";
+            made->is_bool_found = 1;
+            return e;
+        }
+        case OP_COUNT: {
+            int64_t n = 0;
+            e = dc_count(c, filter, (uint32_t)filter_len, &n);
+            if (e) return e;
+            made->number = n; made->is_number = 1; made->body_key = "n";
+            return BJ_OK;
+        }
+        case OP_DISTINCT: {
+            const uint8_t *field; uint32_t field_len; int f = 0;
+            if ((e = field_str(req, req_len, "field", &field, &field_len, &f))) return e;
+            if (!f) return DC_ERR_REQ_MISSING_FIELD;
+            uint8_t *vals = NULL; size_t vals_len = 0;
+            e = dc_distinct(c, (const char *)field, (int)field_len,
+                            filter, (uint32_t)filter_len, &vals, &vals_len);
+            if (e) return e;
+            e = dbuf_put(&made->body, vals, vals_len);
+            free(vals);
+            made->body_key = "values";
+            return e;
+        }
+        default:
+            /* Reached only by a caller that ignored the table's `bare`
+             * column, which is a programming error rather than a request
+             * anyone made. */
+            return BJ_ERR_STATE;
+    }
+}
+
+/* The op this request names, or -1. */
+static int op_of(const uint8_t *req, size_t req_len) {
+    const uint8_t *ops; uint32_t ops_len; int found = 0;
+    if (field_str(req, req_len, "op", &ops, &ops_len, &found) || !found) return -1;
+    for (size_t i = 0; i < sizeof(OP_NAMES) / sizeof(OP_NAMES[0]); i++) {
+        if (ops_len == OP_NAMES[i].len && memcmp(ops, OP_NAMES[i].name, ops_len) == 0)
+            return (int)OP_NAMES[i].op;
+    }
+    return -1;
+}
+
+int dbs_op_count(void) { return (int)(sizeof(OP_NAMES) / sizeof(OP_NAMES[0])); }
+
+int dbs_request_is_bare(const uint8_t *req, size_t req_len) {
+    if (!req) return 0;
+    int op = op_of(req, req_len);
+    if (op < 0) return 0;
+    for (size_t i = 0; i < sizeof(OP_NAMES) / sizeof(OP_NAMES[0]); i++) {
+        if ((int)OP_NAMES[i].op != op) continue;
+        if (!OP_NAMES[i].bare) return 0;
+        /* `find` is bare, a BATCHED find is not, and which one this is
+         * lives in the request rather than in the op name. Answered here
+         * so a caller asking "can this run bare" gets one answer it can
+         * act on, rather than a yes it has to qualify itself. */
+        if (op == OP_FIND) {
+            qry_options qo; int have_opts = 0; int64_t batch = 0;
+            if (read_opts(req, req_len, &qo, &have_opts, &batch)) return 0;
+            if (batch > 0) return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int dbs_read(dc_collection *coll, const uint8_t *req, size_t req_len, dbuf *out) {
+    if (!coll || !req || !out) return BJ_ERR_STATE;
+    if (!dbs_request_is_bare(req, req_len)) return BJ_ERR_STATE;
+
+    const uint8_t *filter = NULL; size_t filter_len = 0;
+    int e = read_filter(req, req_len, &filter, &filter_len);
+    if (e) return respond_error(out, DC_ERR_REQ_MALFORMED);
+
+    made_body made = {0};
+    e = run_read(coll, op_of(req, req_len), req, req_len, filter, filter_len, &made);
+    if (e) {
+        dbuf_free(&made.body);
+        /* A refusal is an ANSWER here, exactly as it is from dbs_handle:
+         * whoever is holding this request has a client waiting on it, and
+         * the error travels as a response rather than as a return code
+         * somebody else has to render. */
+        return respond_error(out, e);
+    }
+    e = render_made(&made, out);
+    dbuf_free(&made.body);
+    return e;
+}
+
 int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                dbuf *out) {
     if (!s || !req || !out) return BJ_ERR_STATE;
@@ -1613,20 +1853,12 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     /* The three raw spans an op may need, read once. An empty filter is
      * the empty object, which is what "everything" means everywhere else
      * in this library. */
-    /* `{}`: the tag, the u32 SIZE OF EVERYTHING AFTER THE FIRST FIVE
-     * BYTES (so 4 -- the count alone), then the count. It said 9 until a
-     * command carried one: nothing had ever MEASURED it, because
-     * object_begin reads the count and ignores the size, so a filter
-     * built from it worked while a value spliced into another object
-     * made its container run four bytes past its own end. */
-    static const uint8_t EMPTY_OBJ[9] = { BJ_TYPE_OBJECT, 4,0,0,0, 0,0,0,0 };
-    const uint8_t *filter = EMPTY_OBJ; size_t filter_len = sizeof EMPTY_OBJ;
+    const uint8_t *filter = NULL; size_t filter_len = 0;
     const uint8_t *doc = NULL;  size_t doc_len = 0;
     const uint8_t *upd = NULL;  size_t upd_len = 0;
     int has = 0;
-    if ((e = field_raw(req, req_len, "filter", &filter, &filter_len, &has)))
+    if ((e = read_filter(req, req_len, &filter, &filter_len)))
         return respond_error(out, DC_ERR_REQ_MALFORMED);
-    if (!has) { filter = EMPTY_OBJ; filter_len = sizeof EMPTY_OBJ; }
     if ((e = field_raw(req, req_len, "doc", &doc, &doc_len, &has)))
         return respond_error(out, DC_ERR_REQ_MALFORMED);
     if (!has) doc = NULL;
@@ -1647,11 +1879,8 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     if ((e = field_ms(req, req_len, &now_ms, &have_now)))
         return respond_error(out, DC_ERR_REQ_MALFORMED);
 
-    dbuf body = {0};
+    made_body made = {0};
     dbuf dates = {0};       /* a $currentDate rewrite, when there was one */
-    const char *body_key = NULL;
-    int64_t number = 0;
-    int is_number = 0, is_bool_found = 0, found_doc = 0;
 
     switch (op) {
         case OP_FIND: {
@@ -1684,50 +1913,19 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                     dbs_cursor_drop(s, client, id);
                     break;
                 }
-                dbuf_free(&body); dbuf_free(&dates);
+                dbuf_free(&made.body); dbuf_free(&dates);
                 return BJ_OK;   /* respond_batch wrote the whole response */
             }
 
-            uint8_t *docs = NULL; size_t docs_len = 0;
-            e = dc_find(c, filter, (uint32_t)filter_len,
-                        have_opts ? &qo : NULL, &docs, &docs_len);
-            if (e) break;
-            e = dbuf_put(&body, docs, docs_len);
-            free(docs);
-            body_key = "docs";
+            /* Not batched, so it needs nothing this function holds. */
+            e = run_read(c, op, req, req_len, filter, filter_len, &made);
             break;
         }
-        case OP_FIND_ONE: {
-            uint8_t *d = NULL; size_t dlen = 0;
-            e = dc_find_one(c, filter, (uint32_t)filter_len, NULL, 0,
-                            &found_doc, &d, &dlen);
-            if (e) break;
-            if (found_doc) e = dbuf_put(&body, d, dlen);
-            free(d);
-            body_key = "doc";
-            is_bool_found = 1;
+        case OP_FIND_ONE:
+        case OP_COUNT:
+        case OP_DISTINCT:
+            e = run_read(c, op, req, req_len, filter, filter_len, &made);
             break;
-        }
-        case OP_COUNT: {
-            int64_t n = 0;
-            e = dc_count(c, filter, (uint32_t)filter_len, &n);
-            if (e) break;
-            number = n; is_number = 1; body_key = "n";
-            break;
-        }
-        case OP_DISTINCT: {
-            const uint8_t *field; uint32_t field_len; int f = 0;
-            if ((e = field_str(req, req_len, "field", &field, &field_len, &f))) break;
-            if (!f) { e = DC_ERR_REQ_MISSING_FIELD; break; }
-            uint8_t *vals = NULL; size_t vals_len = 0;
-            e = dc_distinct(c, (const char *)field, (int)field_len,
-                            filter, (uint32_t)filter_len, &vals, &vals_len);
-            if (e) break;
-            e = dbuf_put(&body, vals, vals_len);
-            free(vals);
-            body_key = "values";
-            break;
-        }
         case OP_CREATE_INDEX: {
             const uint8_t *keys; size_t keys_len; int have = 0;
             if ((e = field_raw(req, req_len, "keys", &keys, &keys_len, &have))) break;
@@ -1752,9 +1950,9 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = obj_get_field(res.data, res.len, (const uint8_t *)"name", 4,
                               &v, &vlen, &f);
             if (!e && !f) e = BJ_ERR_STATE;
-            if (!e) e = dbuf_put(&body, v, vlen);
+            if (!e) e = dbuf_put(&made.body, v, vlen);
             dbuf_free(&res);
-            body_key = "name";
+            made.body_key = "name";
             break;
         }
         case OP_COMPACT: {
@@ -1780,9 +1978,9 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             bj_end_object(cb);
             size_t clen = 0;
             const uint8_t *cdata = bj_builder_data(cb, &clen);
-            e = cdata ? dbuf_put(&body, cdata, clen) : BJ_ERR_OOM;
+            e = cdata ? dbuf_put(&made.body, cdata, clen) : BJ_ERR_OOM;
             bj_builder_free(cb);
-            body_key = "result";
+            made.body_key = "result";
             break;
         }
         case OP_FIND_ONE_AND_UPDATE:
@@ -1834,10 +2032,10 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                           upsert, id, &wr, return_new ? NULL : &pre);
             if (e) { dbuf_free(&pre); break; }
 
-            is_bool_found = 1;
-            body_key = "doc";
+            made.is_bool_found = 1;
+            made.body_key = "doc";
             if (wr.outcome == DC_PLAN_NOTHING) {
-                found_doc = 0;           /* nothing matched, nothing written */
+                made.found_doc = 0;           /* nothing matched, nothing written */
             } else if (return_new) {
                 if (wr.has_target_id) {
                     dbuf idf = {0};
@@ -1845,16 +2043,16 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                     uint8_t *d = NULL; size_t dlen = 0; int got = 0;
                     e = dc_find_one(c, idf.data, (uint32_t)idf.len, NULL, 0, &got, &d, &dlen);
                     dbuf_free(&idf);
-                    if (!e && got) { e = dbuf_put(&body, d, dlen); found_doc = 1; }
+                    if (!e && got) { e = dbuf_put(&made.body, d, dlen); made.found_doc = 1; }
                     free(d);
                 }
             } else if (pre.len) {
-                e = dbuf_put(&body, pre.data, pre.len);
-                found_doc = 1;
+                e = dbuf_put(&made.body, pre.data, pre.len);
+                made.found_doc = 1;
             } else {
                 /* An upsert has no prior state to show, so `before` is
                  * null -- which is what MongoDB answers too. */
-                found_doc = 0;
+                made.found_doc = 0;
             }
             dbuf_free(&pre);
             break;
@@ -1893,7 +2091,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             }
             dbuf_free(&filters);
             if (e) break;
-            number = deleted; is_number = 1; body_key = "deletedCount";
+            made.number = deleted; made.is_number = 1; made.body_key = "deletedCount";
             break;
         }
         case OP_FIND_BY_INDEX: {
@@ -1917,9 +2115,9 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = dc_collection_find_by_index(c, (const char *)ixn, (int)ixn_len,
                                             vals, (uint32_t)vals_len, &docs, &docs_len);
             if (e) break;
-            e = dbuf_put(&body, docs, docs_len);
+            e = dbuf_put(&made.body, docs, docs_len);
             free(docs);
-            body_key = "docs";
+            made.body_key = "docs";
             break;
         }
         case OP_EXPLAIN: {
@@ -1946,9 +2144,9 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             free(name);
             size_t xlen = 0;
             const uint8_t *xdata = bj_builder_data(xb, &xlen);
-            e = xdata ? dbuf_put(&body, xdata, xlen) : BJ_ERR_OOM;
+            e = xdata ? dbuf_put(&made.body, xdata, xlen) : BJ_ERR_OOM;
             bj_builder_free(xb);
-            body_key = "plan";
+            made.body_key = "plan";
             break;
         }
         case OP_AGGREGATE: {
@@ -1976,12 +2174,12 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                  * its operation: a list has positions, and the client is
                  * holding the list. */
                 free(docs);
-                dbuf_free(&body); dbuf_free(&dates);
+                dbuf_free(&made.body); dbuf_free(&dates);
                 return respond_error_at(out, e, bad);
             }
-            e = dbuf_put(&body, docs, docs_len);
+            e = dbuf_put(&made.body, docs, docs_len);
             free(docs);
-            body_key = "docs";
+            made.body_key = "docs";
             break;
         }
         case OP_INSERT_MANY: {
@@ -1993,7 +2191,7 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             e = do_insert_many(s, c, (const char *)coll, coll_len,
                                docs_v, docs_vlen, ordered, out);
             if (e) break;
-            dbuf_free(&body); dbuf_free(&dates);
+            dbuf_free(&made.body); dbuf_free(&dates);
             return BJ_OK;   /* do_insert_many wrote the whole response */
         }
         case OP_INSERT:
@@ -2058,8 +2256,8 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                 break;
             }
             e = do_write(s, c, (const char *)coll, coll_len, wreq,
-                         a, a_len, b, b_len, upsert, id, &body);
-            body_key = "result";
+                         a, a_len, b, b_len, upsert, id, &made.body);
+            made.body_key = "result";
             break;
         }
         default:
@@ -2068,29 +2266,11 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
     }
 
     if (e) {
-        dbuf_free(&body); dbuf_free(&dates);
+        dbuf_free(&made.body); dbuf_free(&dates);
         return respond_error(out, e);
     }
 
-    bj_builder *rb = bj_builder_new();
-    if (!rb) { dbuf_free(&body); dbuf_free(&dates); return BJ_ERR_OOM; }
-    bj_begin_object(rb);
-    PUT_KEY(rb, "ok"); bj_put_bool(rb, 1);
-    if (is_number) {
-        PUT_KEY(rb, body_key); bj_put_int(rb, number);
-    } else if (is_bool_found) {
-        PUT_KEY(rb, "found"); bj_put_bool(rb, found_doc);
-        PUT_KEY(rb, body_key);
-        if (found_doc && body.len) bj_put_raw(rb, body.data, (uint32_t)body.len);
-        else bj_put_null(rb);
-    } else {
-        PUT_KEY(rb, body_key);
-        if (body.len) bj_put_raw(rb, body.data, (uint32_t)body.len);
-        else bj_put_null(rb);
-    }
-    bj_end_object(rb);
-    e = finish(rb, out);
-    bj_builder_free(rb);
-    dbuf_free(&body); dbuf_free(&dates);
+    e = render_made(&made, out);
+    dbuf_free(&made.body); dbuf_free(&dates);
     return e;
 }

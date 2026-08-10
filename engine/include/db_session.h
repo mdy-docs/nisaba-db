@@ -798,6 +798,49 @@ void dbs_close(dbs *s);
 int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
                dbuf *out);
 
+/*
+ * ---- performing a read against a bare collection -------------------------
+ *
+ * dbs_handle needs a whole session: a catalog to resolve a name in, a
+ * cursor table, a client id, a log. A handful of reads need none of that --
+ * they are a function of one collection and the request bytes -- and
+ * dbs_read performs exactly those, against whatever dc_collection it is
+ * given.
+ *
+ * WHY THAT IS WORTH A SECOND ENTRY POINT. A read view (db.h's
+ * dc_collection_snapshot) is a collection pinned at one instant, and a read
+ * answered against one can be answered somewhere other than the middle of
+ * the apply loop -- later, or on another thread. What such a read must NOT
+ * do is answer differently from the same request answered inline, and the
+ * only durable way to guarantee that is for both to run the same code.
+ * They do: dbs_handle routes these ops straight into the same internal
+ * function, and both replies are built by the same assembler.
+ *
+ * dbs_request_is_bare says whether a given request is one of them, read off
+ * the op table so the answer cannot drift from what dbs_read implements.
+ * Ask it FIRST -- dbs_read refuses anything else with BJ_ERR_STATE, which
+ * is a programming error rather than something to report to a client.
+ *
+ * The bare set is `find` WITHOUT batchSize, `findOne`, `count` and
+ * `distinct`. Deliberately not: a batched `find` (a cursor belongs to a
+ * session and a client), `getMore` and `watch` (same), `listCollections`
+ * (reads the catalog, not a collection), `aggregate` (answers a failure by
+ * naming the stage, a reply shape this path does not build) and every
+ * write. A batched `find` is refused by dbs_read even though `find` is
+ * bare, because batchSize is in the request rather than in the op name.
+ *
+ * `coll` may be a read view or a live collection; this call does not care
+ * and changes neither. Whoever holds a view is responsible for it still
+ * being valid -- see dc_collection_snapshot on what invalidates one.
+ */
+int dbs_request_is_bare(const uint8_t *req, size_t req_len);
+int dbs_read(dc_collection *coll, const uint8_t *req, size_t req_len, dbuf *out);
+/* How many ops the table holds. Exposed so a test can assert the table has
+ * an opinion about every one of them rather than about a subset it happens
+ * to have listed -- an op added with no `bare` decision is exactly the gap
+ * that would otherwise be found by a race. */
+int dbs_op_count(void);
+
 /* ---- the replicated fork (db_request.c) ---------------------------------
  *
  * dbs_handle plans a write and applies it in one call, because on a

@@ -2361,6 +2361,202 @@ static int64_t response_docs(const dbuf *res) {
     return (int64_t)count;
 }
 
+TEST(a_bare_read_answers_byte_for_byte_what_the_session_answers) {
+    /*
+     * THE PROPERTY THE WHOLE SPLIT EXISTS FOR.
+     *
+     * dbs_read performs a read against a bare dc_collection -- a read view,
+     * here -- so that one can be answered somewhere other than the middle
+     * of the apply loop. The requirement on it is not "returns the right
+     * answer", which two implementations could both do while disagreeing
+     * on the encoding. It is that the RESPONSE BYTES ARE IDENTICAL to what
+     * dbs_handle produces for the same request, because a client cannot
+     * tell it asked a different code path and must not be able to.
+     *
+     * memcmp, therefore, and not a field-by-field comparison: field-by-
+     * field would pass a response that had gained a key, lost one, or
+     * ordered them differently, and each of those is a difference some
+     * client somewhere is parsing.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-bare-read", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&ns, ORDER, 0, &s) == BJ_OK);
+
+    /* One view, taken once, used for every request below -- the collection
+     * does not change here, so every comparison is against the same state
+     * the session is serving. */
+    dc_collection *view = NULL;
+    CHECK_FATAL(dbs_read_view(s, "users", 5, &view) == BJ_OK);
+
+    /* A filter the attached index serves, a filter that scans, and none. */
+    doc *core = doc_new();
+    doc_str(core, "team", "core");
+    uint32_t core_len; const uint8_t *core_buf = doc_done(core, &core_len);
+    doc *ada = doc_new();
+    doc_str(ada, "name", "Ada");
+    uint32_t ada_len; const uint8_t *ada_buf = doc_done(ada, &ada_len);
+
+    struct { const char *op; const char *key; const uint8_t *val; uint32_t vlen; } cases[] = {
+        { "count",    NULL,     NULL,     0        },
+        { "count",    "filter", core_buf, core_len },
+        { "find",     NULL,     NULL,     0        },
+        { "find",     "filter", core_buf, core_len },
+        { "find",     "filter", ada_buf,  ada_len  },
+        { "findOne",  "filter", ada_buf,  ada_len  },
+        { "findOne",  "filter", core_buf, core_len },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request(cases[i].op, "users", cases[i].key,
+                                 cases[i].val, cases[i].vlen, &req, &req_len);
+        CHECK_I64(dbs_request_is_bare(req, req_len), 1);
+
+        dbuf viaSession = {0}, viaView = {0};
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &viaSession));
+        CHECK_OK(dbs_read(view, req, req_len, &viaView));
+        CHECK_I64(response_ok(&viaSession), 1);
+        CHECK_I64(response_ok(&viaView), 1);
+        if (viaSession.len != viaView.len) {
+            TAP_FAIL("%s case %zu: %zu bytes through the session, %zu through the view",
+                     cases[i].op, i, viaSession.len, viaView.len);
+        } else if (memcmp(viaSession.data, viaView.data, viaSession.len) != 0) {
+            TAP_FAIL("%s case %zu: same length, different bytes", cases[i].op, i);
+        }
+        dbuf_free(&viaSession); dbuf_free(&viaView); bj_builder_free(rb);
+    }
+
+    /* `distinct` carries its field outside `filter`, so it gets its own
+     * request rather than a row in the table above. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *b = bj_builder_new();
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"op", 2);
+        bj_put_string(b, (const uint8_t *)"distinct", 8);
+        bj_put_key(b, (const uint8_t *)"coll", 4);
+        bj_put_string(b, (const uint8_t *)"users", 5);
+        bj_put_key(b, (const uint8_t *)"field", 5);
+        bj_put_string(b, (const uint8_t *)"team", 4);
+        bj_end_object(b);
+        size_t blen = 0;
+        req = bj_builder_data(b, &blen);
+        req_len = (uint32_t)blen;
+
+        CHECK_I64(dbs_request_is_bare(req, req_len), 1);
+        dbuf viaSession = {0}, viaView = {0};
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &viaSession));
+        CHECK_OK(dbs_read(view, req, req_len, &viaView));
+        CHECK_I64(response_ok(&viaView), 1);
+        CHECK_I64((int64_t)viaView.len, (int64_t)viaSession.len);
+        if (viaSession.len == viaView.len)
+            CHECK(memcmp(viaSession.data, viaView.data, viaSession.len) == 0);
+        dbuf_free(&viaSession); dbuf_free(&viaView); bj_builder_free(b);
+    }
+
+    /* A REFUSAL is an answer too, and must travel the same way. A distinct
+     * with no `field` is missing a required one; both paths must say so
+     * with the same bytes rather than one erroring and one responding. */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("distinct", "users", NULL, NULL, 0, &req, &req_len);
+        dbuf viaSession = {0}, viaView = {0};
+        CHECK_OK(dbs_handle(s, 0, req, req_len, &viaSession));
+        CHECK_OK(dbs_read(view, req, req_len, &viaView));
+        CHECK_I64(response_ok(&viaSession), 0);
+        CHECK_I64(response_ok(&viaView), 0);
+        CHECK_I64((int64_t)viaView.len, (int64_t)viaSession.len);
+        if (viaSession.len == viaView.len)
+            CHECK(memcmp(viaSession.data, viaView.data, viaSession.len) == 0);
+        dbuf_free(&viaSession); dbuf_free(&viaView); bj_builder_free(rb);
+    }
+
+    /* And the view is still a view: reads through it did not move it, and
+     * a write through it is refused as it was before. */
+    CHECK_I64(dc_collection_is_view(view), 1);
+
+    doc_free(core); doc_free(ada);
+    dbs_read_view_close(view);
+    dbs_close(s);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
+TEST(the_bare_set_is_exactly_the_ops_that_need_no_session) {
+    /*
+     * The op table's `bare` column is what decides whether a read can be
+     * performed away from the session, and the cost of a wrong entry is an
+     * op racing state nobody checked. So the set is asserted against a
+     * hard-coded list here rather than derived from the same table it is
+     * meant to police -- a test that recomputes the answer from the source
+     * agrees with any answer at all.
+     *
+     * `batchSize` is the interesting one. `find` is bare and a BATCHED find
+     * is not, and the difference lives in the request rather than in the op
+     * name -- so a caller that switched on the op alone would hand a cursor
+     * to somebody with no session to own it.
+     */
+    static const char *BARE[] = { "find", "findOne", "count", "distinct" };
+    static const char *NOT_BARE[] = {
+        "ping", "getMore", "closeCursor", "watch", "closeStream",
+        "listCollections", "listIndexes", "aggregate", "explain",
+        "findByIndex", "insert", "insertMany", "update", "updateMany",
+        "replace", "delete", "deleteMany", "bulkWrite", "compact",
+        "createCollection", "dropCollection", "createIndex", "dropIndex",
+        "findOneAndUpdate", "findOneAndReplace", "findOneAndDelete",
+        "pruneExpired", "snapshot", "latestSnapshot", "readSnapshotFile",
+    };
+
+    for (size_t i = 0; i < sizeof(BARE) / sizeof(BARE[0]); i++) {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request(BARE[i], "users", NULL, NULL, 0, &req, &req_len);
+        if (!dbs_request_is_bare(req, req_len)) TAP_FAIL("%s should be bare", BARE[i]);
+        bj_builder_free(rb);
+    }
+    for (size_t i = 0; i < sizeof(NOT_BARE) / sizeof(NOT_BARE[0]); i++) {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request(NOT_BARE[i], "users", NULL, NULL, 0, &req, &req_len);
+        if (dbs_request_is_bare(req, req_len)) TAP_FAIL("%s must not be bare", NOT_BARE[i]);
+        bj_builder_free(rb);
+    }
+    /* Every op in the table is in one list or the other: an op added
+     * without a decision about this is a gap, and this is what notices. */
+    CHECK_I64((int64_t)(sizeof(BARE) / sizeof(BARE[0]) +
+                        sizeof(NOT_BARE) / sizeof(NOT_BARE[0])),
+              (int64_t)dbs_op_count());
+
+    /* A find with batchSize is not bare, though `find` is. */
+    {
+        doc *o = doc_new();
+        doc_int(o, "batchSize", 2);
+        uint32_t olen; const uint8_t *obuf = doc_done(o, &olen);
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("find", "users", "opts", obuf, olen, &req, &req_len);
+        CHECK_I64(dbs_request_is_bare(req, req_len), 0);
+        bj_builder_free(rb); doc_free(o);
+    }
+    /* An unknown op is not bare, and neither is a request with no op at
+     * all -- both are "no", not "maybe". */
+    {
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("nosuchop", "users", NULL, NULL, 0, &req, &req_len);
+        CHECK_I64(dbs_request_is_bare(req, req_len), 0);
+        bj_builder_free(rb);
+        bj_builder *eb = bj_builder_new();
+        bj_begin_object(eb); bj_end_object(eb);
+        size_t elen = 0;
+        const uint8_t *edata = bj_builder_data(eb, &elen);
+        CHECK_I64(dbs_request_is_bare(edata, elen), 0);
+        bj_builder_free(eb);
+    }
+}
+
 TEST(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it) {
     /*
      * batchSize turns a find into a cursor: one batch now, an id to ask
@@ -11989,6 +12185,8 @@ int main(void) {
     RUN(bulk_grammar_accepts_every_operation_and_orders_the_codes);
     RUN(bulk_grammar_rejects_malformed_lists_and_names_the_index);
     RUN(ttl_cutoff_and_filter);
+    RUN(a_bare_read_answers_byte_for_byte_what_the_session_answers);
+    RUN(the_bare_set_is_exactly_the_ops_that_need_no_session);
     RUN(a_cursor_pages_a_scan_and_belongs_to_whoever_opened_it);
     RUN(ddl_is_a_command_a_second_database_can_be_caught_up_by);
     RUN(a_replicated_write_answers_exactly_what_an_unreplicated_one_does);

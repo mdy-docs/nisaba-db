@@ -1091,6 +1091,47 @@ memory figure meaningless. Point any suite at one with
 NISABA_SERVER_BIN=build/lib/nisaba-server-asan npx vitest run test/db.server.test.js
 ```
 
+### Throughput, measured
+
+`node test/bench-server.js --cluster 3` drives a real 3-member cluster
+across the two axes that decide what a deployment gets: how many
+**sockets** the work arrives on, and how many **callers** are
+outstanding on each. On an M-series laptop over loopback, 2000 documents,
+point lookups by `_id`:
+
+| | 1 socket | 2 | 8 | 32 |
+|---|---|---|---|---|
+| **reads/s** (32 callers) | **28,800** | 27,700 | 24,900 | 19,600 |
+| **writes/s** (32 callers) | 2,700 | **4,300** | 3,800 | 3,800 |
+
+| one socket, callers | 1 | 4 | 16 | 64 |
+|---|---|---|---|---|
+| **reads/s** | 10,600 | 23,300 | 28,200 | **29,300** |
+| **writes/s** | 1,200 | 1,700 | 2,100 | **2,400** |
+
+Three things worth knowing, and one of them is counter-intuitive.
+
+**More sockets make reads worse.** One connection carrying 64 pipelined
+reads beats 32 connections carrying the same work, by about 50%. Nothing
+is being serialised that could be parallel — the extra sockets just cost
+the serving thread more poll and syscall work for the same reads. A
+client pooling connections to go faster would be making itself slower.
+
+**Reads pipeline; writes commit.** A read defers only while its quorum
+barrier is unproven, and concurrent barriers share a round — so a
+pipeline of reads on one socket costs about one round for the batch.
+A write always defers, and `owed` allows one deferred answer per
+connection, so writes are paced by the commit itself: ~2,400/s on one
+socket is roughly one Raft round plus an fsync each. A second socket
+overlaps two commits and buys ~60%; a third buys nothing.
+
+**The ceiling is the thread, not the wire.** Reads plateau near 29k/s
+whatever the shape of the client, which is one core's worth of engine.
+That is the number any future parallel read path has to beat — and it
+has to beat it *while keeping the pipelining*, because a read moved to
+another thread can no longer be answered inline, and a deferred read
+pays its own barrier round instead of sharing one.
+
 ### Concurrency
 
 `test/db.concurrency.test.js` is the busy-server suite: deep pipelines,

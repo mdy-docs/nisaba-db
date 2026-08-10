@@ -29,7 +29,14 @@ import {
 } from '../src/db-http-client.js';
 import { WIRE_OPS as TCP_WIRE_OPS } from '../src/db-server-client.js';
 
-const NATIVE = 'build/lib/nisaba-server';
+/*
+ * The binary under test, overridable so the same suite can be pointed at
+ * a SANITIZED build (`./build/build-server.sh --native --san`, which
+ * writes `-asan`/`-tsan` alongside). Nothing in this repository compiled
+ * server/main.c, replica.c or peers.c under a sanitizer until that flag
+ * existed; this is how the coverage gets used.
+ */
+const NATIVE = process.env.NISABA_SERVER_BIN || 'build/lib/nisaba-server';
 const REQUIRED = process.env.NISABA_SERVER_TESTS === 'required';
 
 /* A base far from db.server.test.js's 18000 and db.http-front.test.js's

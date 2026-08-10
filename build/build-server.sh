@@ -30,11 +30,25 @@ TARGET=wasip2
 RUN=0
 RUN_ARGS=()
 ARCH=""
+SAN=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --native) TARGET=native; shift ;;
     --wasip1) TARGET=wasip1; shift ;;
     --wasip2) TARGET=wasip2; shift ;;
+    # Sanitized SERVER builds. build-native.sh has always sanitized the
+    # engine, but it links only server/root.c -- so main.c, replica.c,
+    # peers.c, join.c and instns.c, which is every line of the poll loop
+    # and the Raft host, have never been compiled under a sanitizer by
+    # any build in this repository. The suite that exercises them hardest
+    # (test/db.server.test.js) drives this binary, so pointing it at a
+    # sanitized one is the cheapest real coverage available.
+    #
+    # Separate outputs, so a sanitized binary can never be mistaken for
+    # a shipping one: they are 2-3x slower and ASan's allocator makes the
+    # memory figures meaningless.
+    --san)    SAN=asan;  shift ;;
+    --tsan)   SAN=tsan;  shift ;;
     # macOS cross-arch: clang there compiles for either CPU with -arch,
     # which is how release CI builds both slices of a universal binary
     # on one arm64 runner (lipo joins them). Suffixes the output so the
@@ -68,8 +82,20 @@ case "$TARGET" in
       FLAGS+=(-arch "$ARCH")
       OUT="$OUT-$ARCH"
     fi
+    case "$SAN" in
+      # -O1 with frame pointers rather than -O2: the optimizer inlines
+      # away the frames a report needs to name, and a report nobody can
+      # read is a report nobody acts on.
+      asan) FLAGS+=(-fsanitize=address,undefined -fno-sanitize-recover=all
+                    -fno-omit-frame-pointer -g -O1)
+            OUT="$OUT-asan" ;;
+      tsan) FLAGS+=(-fsanitize=thread -fno-omit-frame-pointer -g -O1)
+            OUT="$OUT-tsan" ;;
+    esac
     ;;
   wasip1|wasip2)
+    # No sanitizer runtime for these targets, and no threads to race.
+    [ -n "$SAN" ] && { echo "error: --san/--tsan are native-only" >&2; exit 2; }
     SDK="$(find_wasi_sdk)" || { wasi_sdk_missing; exit 1; }
     warn_unpinned_wasi_sdk "$SDK"
     CC="$SDK/bin/clang"

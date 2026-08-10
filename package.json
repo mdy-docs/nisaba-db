@@ -45,6 +45,7 @@
     "test:watch": "vitest",
     "test:browser": "vitest run --config vitest.browser.config.js",
     "bench": "node test/bench.js",
+    "soak": "node test/soak.js",
     "build:wasm": "./build/build-wasm.sh",
     "prepack": "npm run build:wasm",
     "dev": "vite",

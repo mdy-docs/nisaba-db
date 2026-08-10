@@ -159,6 +159,48 @@ jobs:
           node test/bench.js --n 50
           node test/bench.js --n 50 --provider node
 
+  # The SERVER under a sanitizer, which nothing did until this job.
+  # build-native.sh sanitizes the engine but links only server/root.c, so
+  # every line of the poll loop, the Raft host and the peer transport --
+  # main.c, replica.c, peers.c, join.c, instns.c -- was compiled by no
+  # sanitized build anywhere. The suite that drives them hardest is the
+  # one already in this repository, so this job simply points it at a
+  # sanitized binary and then leans on it with the concurrency soak.
+  #
+  # Its own job rather than a step in `node`: an ASan build is 2-3x
+  # slower, so this runs in parallel instead of doubling that job, and a
+  # failure here names the sanitizer rather than "npm test".
+  server-sanitized:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Build the server with ASan + UBSan
+        run: ./build/build-server.sh --native --san
+      # Only the suites that drive the binary. The rest of `npm test` is
+      # the WASM engine in this process, which the `node` job already
+      # covers and a server sanitizer says nothing about.
+      - name: The server suites, against the sanitized binary
+        env:
+          NISABA_SERVER_BIN: build/lib/nisaba-server-asan
+        run: |
+          npx vitest run test/db.concurrency.test.js test/db.server.test.js \
+                        test/db.http-front.test.js test/db.http-client.test.js
+      # Randomized, seeded, and it asserts CONTENT: a file closed under a
+      # reader means a pread on a recycled descriptor, which returns
+      # another file's bytes with no error at all. A run that only
+      # watched for crashes would pass straight through that.
+      - name: Soak (readers + writer + compaction, drops, index churn)
+        env:
+          NISABA_SERVER_BIN: build/lib/nisaba-server-asan
+        run: node test/soak.js --seconds 90 --readers 8 --seed 1
+
   browser:
     runs-on: ubuntu-latest
     steps:

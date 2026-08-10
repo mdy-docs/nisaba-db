@@ -29,7 +29,14 @@ import { connectServer, ObjectId } from '../src/db-server-client.js';
 import { toExtendedJson } from '../src/extended-json.js';
 import { DbHttpFront } from '../src/db-http-front.js';
 
-const NATIVE = 'build/lib/nisaba-server';
+/*
+ * The binary under test, overridable so the same suite can be pointed at
+ * a SANITIZED build (`./build/build-server.sh --native --san`, which
+ * writes `-asan`/`-tsan` alongside). Nothing in this repository compiled
+ * server/main.c, replica.c or peers.c under a sanitizer until that flag
+ * existed; this is how the coverage gets used.
+ */
+const NATIVE = process.env.NISABA_SERVER_BIN || 'build/lib/nisaba-server';
 const WASIP2 = 'build/lib/nisaba-server-wasip2.wasm';
 const have = (p) => fs.existsSync(p);
 const wasmtime = (() => {

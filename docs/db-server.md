@@ -1068,3 +1068,51 @@ that shares no code with the server, against databases the JavaScript
 implementation wrote. CI builds both artifacts and sets
 `NISABA_SERVER_TESTS=required`, so those suites cannot quietly stop
 running.
+
+### Under a sanitizer
+
+`build/build-native.sh` has always sanitized the *engine*, but it links
+only `server/root.c` — so `main.c`, `replica.c`, `peers.c`, `join.c` and
+`instns.c`, which is every line of the poll loop, the Raft host and the
+peer transport, were compiled by no sanitized build anywhere. They are
+now:
+
+```sh
+./build/build-server.sh --native --san    # -> build/lib/nisaba-server-asan
+./build/build-server.sh --native --tsan   # -> build/lib/nisaba-server-tsan
+```
+
+Separate outputs, because a sanitized binary must never be mistaken for
+a shipping one: they run 2–3× slower and ASan's allocator makes any
+memory figure meaningless. Point any suite at one with
+`NISABA_SERVER_BIN`:
+
+```sh
+NISABA_SERVER_BIN=build/lib/nisaba-server-asan npx vitest run test/db.server.test.js
+```
+
+### Concurrency
+
+`test/db.concurrency.test.js` is the busy-server suite: deep pipelines,
+many connections at once, reads racing a writer, a cursor paging while
+its collection grows. Every assertion is a property with an oracle
+rather than "it did not crash" — answers must pair with their own
+request (the wire has no request ids), a read must see a whole state and
+never half of one, and a result set must be prefix-consistent.
+
+`npm run soak` is the same shapes for as long as you like, with the
+destructive operations mixed in — compaction, `dropCollection`,
+`dropIndex` — because those are what free handles and unlink files
+underneath a reader:
+
+```sh
+npm run soak -- --seconds 600 --readers 16
+npm run soak -- --seed 12345          # replay a workload
+NISABA_SERVER_BIN=build/lib/nisaba-server-asan npm run soak
+```
+
+It asserts **content**, deliberately. A file closed under a reader means
+a `pread` against a recycled descriptor, which returns another file's
+bytes with no error at all — so every document carries its own
+collection name and a duplicated field, and a run that only watched for
+crashes would pass straight through the bug worth finding.

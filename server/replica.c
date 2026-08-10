@@ -196,6 +196,21 @@ struct replica {
     rdpool    *readers;
     uint64_t   next_read_seq;   /* 1, 2, 3, ... never reused */
     uint64_t   reads_moved;     /* actually handed to a reader thread */
+    /*
+     * THE DRAIN, COUNTED -- because the drain is the correctness argument
+     * for offloading reads at all, and a soak proves it only by failing to
+     * crash. Racing finds a MISSING barrier approximately never, so these
+     * make "the wait was reached" a fact a test can assert instead of a
+     * property it hopes to have exercised.
+     *
+     * `drain_waits` counts destructive operations that found a reader
+     * inside a view and had to wait; `drained_reads` counts how many reads
+     * those waits were for. A destructive operation on an idle server moves
+     * neither, which is correct and is why the first is not simply "times
+     * the drain was called".
+     */
+    uint64_t   drain_waits;
+    uint64_t   drained_reads;
 };
 
 static conversation *conv_open(replica *r, uint64_t theirs, uint64_t from) {
@@ -2052,8 +2067,18 @@ static int read_is_long(replica *r, const uint8_t *req, size_t len) {
     return lng;
 }
 
-static int submit_read_stale(replica *r, uint64_t client,
+/* Both read paths hand a long read over the same way, and the stale one is
+ * defined first. */
+static int offload_read(replica *r, pending *p, uint64_t client,
+                        const uint8_t *req, size_t len,
+                        uint64_t barrier, dbuf *out, size_t mark);
+
+static int submit_read_stale(replica *r, pending *p, uint64_t client,
                              const uint8_t *req, size_t len, dbuf *out) {
+    /* `out` is the CONNECTION's buffer and may already hold answers built
+     * this batch -- see submit_read. Only what this request appends past
+     * the mark may be taken back. */
+    size_t mark = out->len;
     int e = apply_committed(r);
     if (e) return e;
     /* After the pump, so the floor is tested against everything this
@@ -2063,7 +2088,23 @@ static int submit_read_stale(replica *r, uint64_t client,
         e = refuse(r, DC_ERR_BEHIND, out);
         return e ? e : 0;
     }
-    (void)read_is_long(r, req, len);
+    /*
+     * Long enough to be worth moving? Then move it.
+     *
+     * This matters MORE here than on the leader's path, not less: a
+     * follower refuses a linearizable read outright, so stale reads are
+     * the whole of what one serves -- and a follower is where scan-heavy
+     * work is sent precisely to keep it off the leader. A scan left on the
+     * serving thread here delays every other stale reader AND the apply
+     * pump, which is the thing keeping this member current.
+     *
+     * No barrier: `stale: true` is the client waiving currency, so there
+     * is nothing to prove and the answer waits only on the reader.
+     */
+    if (read_is_long(r, req, len)) {
+        int off = offload_read(r, p, client, req, len, 0, out, mark);
+        if (off >= 0) return off;
+    }
 
     dbuf cmds = {0};
     uint64_t token = 0;
@@ -2132,8 +2173,12 @@ static int offload_read(replica *r, pending *p, uint64_t client,
      * is the reader thread. Checked here rather than left to the tick, so
      * a barrier that was already satisfied does not hold an answer for a
      * round it does not need.
+     *
+     * `barrier` of 0 means there was never one to prove: a STALE read is
+     * the client waiving currency, so it has nothing to wait for but the
+     * reader.
      */
-    if (rn_read_state(r->node, barrier) > 0) {
+    if (barrier && rn_read_state(r->node, barrier) > 0) {
         rn_read_release(r->node, barrier);
         p->barrier = 0;
     }
@@ -2285,6 +2330,13 @@ static int replica_status(const replica *r, dbuf *out) {
      * how an operator sees that happening. */
     if (!e) e = bj_put_key(b, (const uint8_t *)"movedReads", 10);
     if (!e) e = bj_put_int(b, (int64_t)r->reads_moved);
+    /* And how often something destructive had to wait for a reader to come
+     * out of a view before it could unmake a file. Zero on a server that
+     * never overlapped the two, which is most of them. */
+    if (!e) e = bj_put_key(b, (const uint8_t *)"drainWaits", 10);
+    if (!e) e = bj_put_int(b, (int64_t)r->drain_waits);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"drainedReads", 12);
+    if (!e) e = bj_put_int(b, (int64_t)r->drained_reads);
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -2614,7 +2666,7 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
      * transfers is half of what the flag is for.
      */
     if (kind == DBS_REQ_READ && req_reads_stale(req, len))
-        return submit_read_stale(r, client, req, len, out);
+        return submit_read_stale(r, p, client, req, len, out);
 
     if (kind == DBS_REQ_READ || kind == DBS_REQ_WRITE) {
         if (!replica_is_leader(r)) {
@@ -3004,6 +3056,13 @@ int replica_reads_in_flight(const replica *r) {
 
 int replica_wait_reads_idle(replica *r) {
     if (!r || !r->readers) return BJ_OK;
+    /* Recorded BEFORE the wait, and only when there is something to wait
+     * for: this is the seam a test reads to know the barrier was reached. */
+    int waiting_for = rdpool_inflight(r->readers);
+    if (waiting_for > 0) {
+        r->drain_waits++;
+        r->drained_reads += (uint64_t)waiting_for;
+    }
     /*
      * Every outstanding read is WAITED FOR AND DELIVERED, not abandoned.
      * The drain exists so a file can be unmade safely, and a read already

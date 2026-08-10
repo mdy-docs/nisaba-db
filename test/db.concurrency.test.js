@@ -516,6 +516,234 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
     }
   }, 120000);
 
+  it('makes an unmaking operation wait for a reader that is inside a view', async () => {
+    /*
+     * THE DRAIN, ASSERTED RATHER THAN RACED.
+     *
+     * A read view shares the live handles' ios, so it is valid exactly as
+     * long as its files are only appended to. Anything that unmakes one --
+     * drop, compact, index DDL, an install -- has to wait for every reader
+     * to come out first, or a worker's pread lands on a descriptor that has
+     * been closed and possibly reused, which returns another file's bytes
+     * with NO ERROR AT ALL. The soak found that failure on its first run
+     * with threads; what a soak cannot do is prove the fix RAN, because a
+     * missing barrier is found by racing approximately never.
+     *
+     * So the server counts it. `drainWaits` is destructive operations that
+     * found a reader inside a view and waited; `drainedReads` is how many
+     * reads those waits were for. Both stay zero on a server that never
+     * overlapped the two, which is what makes a non-zero one evidence.
+     *
+     * Two independent assertions per operation: the counter moved, and the
+     * operation actually BLOCKED for roughly the rest of the scan. Either
+     * alone could pass a broken drain -- a counter incremented without
+     * waiting, or a wait that happened for an unrelated reason.
+     */
+    const port = TINY_PORT + 8;
+    const { proc, dir } = await startServer(port, ['--raft', '1',
+      '--read-threads', '2', '--read-offload-min', '0']);
+    try {
+      const reader = await connectServer(port);
+      const other = await connectServer(port);
+
+      /* Long enough to still be running when the destructive op arrives.
+       * The length comes from the FILTER -- `^x*y$` against 4,000 x's walks
+       * every character of every document -- because a plain scan of this
+       * collection is milliseconds. */
+      const N = 6000;
+      const PAD = 'x'.repeat(4000);
+      const seed = async () => {
+        for (let n = 0; n < N; n += 100) {
+          await other.db(DB).collection('drained').insertMany(
+            Array.from({ length: 100 }, (_, k) => ({ n: n + k, pad: PAD })));
+        }
+      };
+      await seed();
+
+      const SLOW = { pad: { $regex: '^x*y$' } };
+      /* How long one costs HERE, so the blocking bound below is derived
+       * rather than guessed at on somebody else's hardware. */
+      const t0 = Date.now();
+      expect(await reader.db(DB).collection('drained').countDocuments(SLOW)).toBe(0);
+      const scanMs = Date.now() - t0;
+      expect(scanMs, `a scan takes ${scanMs}ms, too short to overlap`).toBeGreaterThan(500);
+
+      /*
+       * Every kind of unmaking, one at a time. `compact` is performed rather
+       * than logged, so it drains on the REQUEST path; the index DDL and the
+       * drop are logged and drain on the APPLY path. Both paths are covered
+       * here, which is the point of the list rather than one example.
+       */
+      const cases = [
+        ['compact', (db) => db.collection('drained').compact()],
+        ['createIndex', (db) => db.collection('drained').createIndex({ n: 1 })],
+        ['dropIndex', (db) => db.collection('drained').dropIndex('n_1')],
+        ['dropCollection', (db) => db.dropCollection('drained')],
+      ];
+      for (const [what, run] of cases) {
+        const before = await other.ping();
+        /* Issued and NOT awaited: it is running on a worker by the time the
+         * destructive operation below arrives. */
+        const scanning = reader.db(DB).collection('drained').countDocuments(SLOW);
+        await new Promise((r) => setTimeout(r, 120));   // let it get inside
+
+        const started = Date.now();
+        await run(other.db(DB));
+        const blocked = Date.now() - started;
+        const after = await other.ping();
+
+        /* It waited, and it waited for a read. */
+        expect(after.drainWaits, `${what} did not wait for the reader`)
+          .toBeGreaterThan(before.drainWaits);
+        expect(after.drainedReads).toBeGreaterThan(before.drainedReads);
+        /* ...and it really blocked, for something like the rest of the
+         * scan. A third of one is a wide bound for a shared machine; what
+         * it excludes is a counter that moves without a wait behind it. */
+        expect(blocked, `${what} returned in ${blocked}ms against a ${scanMs}ms scan`)
+          .toBeGreaterThan(scanMs / 3);
+
+        /* And the read that was waited for still got its own answer: the
+         * drain DELIVERS them rather than discarding them, or every one of
+         * those clients would wait forever on a reply that was built. */
+        expect(await scanning, `${what} lost the reader's answer`).toBe(0);
+
+        if (what === 'dropCollection') await seed();   // the next case needs it back
+      }
+
+      /* A destructive operation on an IDLE server waits for nothing, which
+       * is what makes the assertions above evidence rather than noise. */
+      const quiet = await other.ping();
+      await other.db(DB).collection('drained').compact();
+      expect((await other.ping()).drainWaits).toBe(quiet.drainWaits);
+
+      await reader.close();
+      await other.close();
+    } finally {
+      proc.kill();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 180000);
+
+  it('makes a FOLLOWER wait for its own reader before applying a drop', async () => {
+    /*
+     * THE APPLY-PATH DRAIN, WHICH THE TEST ABOVE DOES NOT REACH.
+     *
+     * On a leader, a destructive request drains before it is even proposed,
+     * so the drain inside the apply loop is redundant there -- removing it
+     * leaves the test above passing, which is how this gap was found. The
+     * apply drain earns its place on a FOLLOWER: destruction arrives as a
+     * committed entry with no client request behind it, and a follower is
+     * exactly the member holding read views, because stale reads are the
+     * only reads it serves.
+     *
+     * So: two members, both with reader threads. The follower is given a
+     * slow stale read. The leader drops the collection. The follower has to
+     * finish with its view before applying that entry, or its worker is
+     * reading a file that has been unlinked -- and a pread on a recycled
+     * descriptor returns another file's bytes with no error at all.
+     */
+    const base = TINY_PORT + 20;
+    const MEMBERS = [1, 2].map((id) => ({
+      id, port: base + id, raftPort: base + 10 + id
+    }));
+    const argsFor = (m) => [
+      '--raft', String(m.id), '--raft-port', String(m.raftPort),
+      /* Wide, because this test deliberately stalls a member for most of a
+       * second: at 150:300 the follower's own drain looks like a leader
+       * that has gone quiet, and what fails is an election. */
+      '--election-timeout', '2000:4000', '--heartbeat', '400',
+      '--read-threads', '2', '--read-offload-min', '0',
+      ...MEMBERS.filter((o) => o.id !== m.id)
+        .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+    ];
+
+    const started = [];
+    try {
+      for (const m of MEMBERS) started.push(await startServer(m.port, argsFor(m)));
+
+      /* Whoever leads; the other one is the follower under test. */
+      let leader = null, follower = null;
+      for (let i = 0; i < 100 && !leader; i++) {
+        for (const m of MEMBERS) {
+          const c = await connectServer(m.port);
+          const role = (await c.ping()).role;
+          if (role === 'leader') leader = c; else if (role === 'follower') follower = c;
+          if (![leader, follower].includes(c)) await c.close();
+        }
+        if (!leader || !follower) {
+          for (const c of [leader, follower]) await c?.close().catch(() => {});
+          leader = follower = null;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+      expect(leader, 'no leader emerged').not.toBeNull();
+      expect(follower, 'no follower emerged').not.toBeNull();
+
+      const N = 6000;
+      const PAD = 'x'.repeat(4000);
+      for (let n = 0; n < N; n += 100) {
+        await leader.db(DB).collection('replicated').insertMany(
+          Array.from({ length: 100 }, (_, k) => ({ n: n + k, pad: PAD })));
+      }
+
+      /* Wait for the follower to hold all of it, then time one stale scan
+       * so the assertions below are against this machine's own speed. */
+      const stale = { stale: true };
+      const fc = follower.db(DB).collection('replicated');
+      for (let i = 0; i < 100; i++) {
+        if (await fc.countDocuments({}, stale).catch(() => 0) === N) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      expect(await fc.countDocuments({}, stale)).toBe(N);
+
+      const SLOW = { pad: { $regex: '^x*y$' } };
+      const t0 = Date.now();
+      expect(await fc.countDocuments(SLOW, stale)).toBe(0);
+      const scanMs = Date.now() - t0;
+      expect(scanMs, `a stale scan takes ${scanMs}ms, too short to overlap`)
+        .toBeGreaterThan(500);
+
+      /* The follower offloads its stale reads -- which is the point: they
+       * are all it serves, and a scan left on its serving thread delays
+       * both its other readers and the pump keeping it current. */
+      const before = await follower.ping();
+      expect(before.movedReads, 'the follower offloaded nothing').toBeGreaterThan(1);
+
+      /* A slow stale read on the follower, in flight... */
+      const scanning = fc.countDocuments(SLOW, stale);
+      await new Promise((r) => setTimeout(r, 120));
+      /* ...while the LEADER unmakes the files underneath it. */
+      expect(await leader.db(DB).dropCollection('replicated')).toBe(true);
+
+      /* The read still gets its own answer, from the state it was captured
+       * in -- the drain delivers, it does not discard. */
+      expect(await scanning).toBe(0);
+
+      /* And the follower waited, on the apply path, with no client request
+       * of its own to have drained for it. */
+      for (let i = 0; i < 100; i++) {
+        if ((await follower.ping()).drainWaits > before.drainWaits) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const after = await follower.ping();
+      expect(after.drainWaits, 'the follower applied the drop without waiting')
+        .toBeGreaterThan(before.drainWaits);
+      expect(after.drainedReads).toBeGreaterThan(before.drainedReads);
+
+      /* Both members are still alive and agree the collection is gone. */
+      expect((await follower.ping()).pong).toBe(true);
+      await expect(fc.countDocuments({}, stale)).rejects.toMatchObject({ code: -37 });
+
+      await leader.close();
+      await follower.close();
+    } finally {
+      for (const s of started) {
+        s.proc.kill();
+        fs.rmSync(s.dir, { recursive: true, force: true });
+      }
+    }
+  }, 180000);
+
   it('keeps small reads fast while another client scans', async () => {
     /*
      * THE MEASUREMENT THIS WHOLE MILESTONE EXISTS FOR.

@@ -30,8 +30,28 @@
  * That asymmetry is the whole reason this file reports the two
  * separately. The numbers gate nothing; they exist so a change can be
  * argued with evidence.
+ *
+ * THE LAST TWO AXES ARE ABOUT --read-threads, and they are two questions
+ * rather than one. SCAN INTERFERENCE is what a single client's scan does
+ * to everybody else's reads -- the measurement the whole reader-thread
+ * milestone exists for. SCAN SCALING is whether more workers get more
+ * scanning done, which is the only thing that justified N workers over
+ * one. Each runs its own solo server per --read-threads value, because
+ * the flag is per-process, and on a bigger collection than the axes
+ * above, because a scan of 2,000 documents is a fraction of a
+ * millisecond (--scandocs, default 50000).
+ *
+ * Read them together, because on a SHORT scan they trade against each
+ * other. At 8,000 documents on six cores, going from 0 workers to 1 took
+ * eight sockets of point reads from 26% of their idle rate to 102% -- and
+ * took the scanner itself from 609 scans/s to 462: it gives up a quarter
+ * of its own throughput to stop taking three quarters of everybody
+ * else's, because the serving thread it was starving is now busy
+ * answering them. At 50,000 -- the size the isolation problem was
+ * measured at -- there is no trade to make: 4% held becomes 100-104%,
+ * and the scanner stays at 87 scans/s either way.
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -40,11 +60,13 @@ import { connectServer } from '../src/db-server-client.js';
 const BIN = process.env.NISABA_SERVER_BIN || 'build/lib/nisaba-server';
 const DB = 'bench';
 
-const opts = { seconds: 4, cluster: 1, docs: 2000, port: 38000 + (process.pid % 900) };
+const opts = { seconds: 4, cluster: 1, docs: 2000, port: 38000 + (process.pid % 900),
+               scandocs: 50000 };
 for (let i = 2; i < process.argv.length; i++) {
   const key = process.argv[i].replace(/^--/, '');
   if (!(key in opts)) {
-    console.error('usage: node test/bench-server.js [--seconds N] [--cluster 1|3] [--docs N] [--port N]');
+    console.error('usage: node test/bench-server.js [--seconds N] [--cluster 1|3]' +
+                  ' [--docs N] [--port N] [--scandocs N]');
     process.exit(2);
   }
   opts[key] = Number(process.argv[++i]);
@@ -65,6 +87,32 @@ function start(args) {
     const t = setTimeout(() => rej(new Error('server did not start')), 20000);
     p.stderr.on('data', (d) => { if (String(d).includes('serving')) { clearTimeout(t); res(p); } });
   });
+}
+
+/*
+ * A solo server of its own, run and then thrown away. The scan axes below
+ * need one per --read-threads value: the flag is per-process, and the point
+ * of both is to compare a server that has workers against one that does
+ * not, on this machine, while it is as loaded as the other run was.
+ */
+async function withServer(port, extra, body) {
+  const before = { d: dirs.length, p: procs.length };
+  await start(['--port', String(port), '--max-clients', '64', '--raft', '1', ...extra]);
+  const proc = procs[procs.length - 1];
+  try {
+    return await body(port, proc);
+  } finally {
+    proc.kill();
+    procs.splice(before.p, 1);
+    for (const d of dirs.splice(before.d)) fs.rmSync(d, { recursive: true, force: true });
+  }
+}
+
+/** Resident KB, which is what a deployment is billed for. */
+function rssKb(pid) {
+  const out = spawnSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' });
+  const kb = Number(String(out.stdout).trim());
+  return Number.isFinite(kb) && kb > 0 ? kb : 0;
 }
 
 const main = async () => {
@@ -175,6 +223,123 @@ const main = async () => {
 
   console.log('\nWRITES -- one socket, N callers pipelined on it');
   for (const c of [1, 4, 16, 64]) await row(`${c} caller(s)`, 1, c, 'write');
+
+  /*
+   * ---- scans, and what they cost everybody else -------------------------
+   *
+   * The two axes --read-threads is judged on, and they are different
+   * questions. INTERFERENCE is what one client's scan does to every other
+   * client's latency, which is the measurement the whole milestone exists
+   * for. SCALING is whether more workers get more scanning done, which is
+   * the only thing that justified N workers over one.
+   *
+   * Each needs its own server, because the flag is per-process -- and its
+   * own collection size, because a scan of 2,000 documents is a fraction
+   * of a millisecond and neither axis has anything to measure on it.
+   * --read-offload-min 0 so the routing floor never decides for us.
+   */
+  const cpus = os.availableParallelism?.() ?? os.cpus().length;
+  const spare = cpus > 2 ? cpus - 2 : 1;
+  const WORKERS = [0, 1, 2, 4, 8].filter((n) => n <= spare);
+
+  /** `scanners` connections scanning `coll` flat out for `ms`. */
+  async function scanFor(port, coll, scanners, ms) {
+    const cs = await Promise.all(Array.from({ length: scanners }, () => connectServer(port)));
+    const stop = Date.now() + ms;
+    let n = 0;
+    await Promise.all(cs.map(async (c) => {
+      const cl = c.db(DB).collection(coll);
+      // Matches nothing, so every scan walks the whole collection.
+      while (Date.now() < stop) { await cl.countDocuments({ pad: 'zzzzzz' }); n++; }
+    }));
+    const moved = (await cs[0].ping()).movedReads;
+    await Promise.all(cs.map((c) => c.close().catch(() => {})));
+    return { n, moved };
+  }
+
+  /** Seeds `scandocs` documents big enough that a scan is milliseconds. */
+  async function seedScan(port) {
+    const c = await connectServer(port);
+    const coll = c.db(DB).collection('scan');
+    const ids = [];
+    for (let n = 0; n < opts.scandocs; n += 200) {
+      const r = await coll.insertMany(Array.from({ length: Math.min(200, opts.scandocs - n) },
+        (_, k) => ({ n: n + k, pad: 'x'.repeat(80) })));
+      ids.push(...Object.values(r.insertedIds));
+    }
+    await c.close();
+    return ids;
+  }
+
+  console.log(`\nSCAN INTERFERENCE -- 8 sockets of _id reads, with and without` +
+              ` one client scanning ${opts.scandocs} docs`);
+  console.log('  workers      idle reads/s     while scanning        held');
+  for (const w of WORKERS) {
+    await withServer(opts.port + 20 + w, ['--read-threads', String(w),
+                                          '--read-offload-min', '0'], async (port) => {
+      const ids = await seedScan(port);
+      const pickScan = () => ids[(Math.random() * ids.length) | 0];
+      const points = async (ms) => {
+        const cs = await Promise.all(Array.from({ length: 8 }, () => connectServer(port)));
+        const stop = Date.now() + ms;
+        let n = 0;
+        await Promise.all(cs.map(async (c) => {
+          const cl = c.db(DB).collection('scan');
+          while (Date.now() < stop) { await cl.findOne({ _id: pickScan() }); n++; }
+        }));
+        await Promise.all(cs.map((c) => c.close().catch(() => {})));
+        return n;
+      };
+      await points(400);                                       // warm
+      const idle = await points(opts.seconds * 1000) / opts.seconds;
+
+      let go = true;
+      const scanner = await connectServer(port);
+      const scanning = (async () => {
+        const cl = scanner.db(DB).collection('scan');
+        let did = 0;
+        while (go) { await cl.countDocuments({ pad: 'zzzzzz' }); did++; }
+        return did;
+      })();
+      const busy = await points(opts.seconds * 1000) / opts.seconds;
+      go = false;
+      const scans = await scanning;
+      await scanner.close();
+
+      console.log(`  ${String(w).padStart(7)} ${idle.toFixed(0).padStart(17)}` +
+                  ` ${busy.toFixed(0).padStart(18)}` +
+                  ` ${((busy / idle) * 100).toFixed(0).padStart(10)}%` +
+                  `   (${(scans / opts.seconds).toFixed(1)} scans/s)`);
+    });
+  }
+
+  console.log(`\nSCAN SCALING -- N sockets all scanning ${opts.scandocs} docs at once`);
+  const SCANNERS = [1, 2, 4, 8];
+  console.log('  workers ' + SCANNERS.map((s) => `${String(s).padStart(8)} scan`).join('') +
+              '      rssMB');
+  for (const w of WORKERS) {
+    await withServer(opts.port + 40 + w, ['--read-threads', String(w),
+                                          '--read-offload-min', '0'], async (port, proc) => {
+      await seedScan(port);
+      let line = `  ${String(w).padStart(7)} `, peak = 0;
+      const sample = setInterval(() => { peak = Math.max(peak, rssKb(proc.pid)); }, 100);
+      for (const s of SCANNERS) {
+        await scanFor(port, 'scan', s, 400);                   // warm
+        const t0 = Date.now();
+        const { n, moved } = await scanFor(port, 'scan', s, opts.seconds * 1000);
+        line += (n / ((Date.now() - t0) / 1000)).toFixed(1).padStart(13);
+        /* A worker count that moved nothing is a run whose number means
+         * something else entirely, so it is marked rather than averaged in. */
+        if (w > 0 && !moved) line += '!';
+      }
+      clearInterval(sample);
+      console.log(line + `   ${(peak / 1024).toFixed(1)}`);
+    });
+  }
+  if (WORKERS.length < 5) {
+    console.log(`  (${cpus} cpus, so --read-threads above ${spare} is lowered` +
+                ' and was not run)');
+  }
 };
 
 main().then(cleanup, (err) => { console.error(err); cleanup(); process.exit(1); });

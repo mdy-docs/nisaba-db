@@ -73,6 +73,8 @@ data and reporting nothing wrong.
 | `--heartbeat MS` | the leader's idle interval (default 50). Must be at most half `--election-timeout`'s minimum, or the flag is refused |
 | `--max-batch BYTES` | the replication window (default 65536). One AppendEntries is in flight per follower, so catch-up throughput is window/RTT — widen it for members a WAN separates. Refused above half the peer wire's frame cap |
 | `--leave ID` | ask that cluster to remove member `ID`, then exit without serving; needs `--join` to say who to ask |
+| `--read-threads N` | threads that answer LONG reads, so one client's scan stops delaying every other client (default 0 — every read on the serving thread, exactly as before). Needs `--raft`; native only. Lowered to the cpus the machine can spare, loudly |
+| `--read-offload-min DOCS` | how many documents a collection must hold before a scanning read of it is worth moving (default 1000). Below it, a read is cheaper answered inline than queued |
 
 **`--order` is a creation parameter, not something a reader has to be
 told.** A tree records its own order in its metadata and reads it back
@@ -953,6 +955,100 @@ Everything the server decides lives behind one function,
 which is why the protocol is tested in `test/native/main.c` over buffers
 with no socket and no port.
 
+## Long reads, on threads of their own
+
+`--read-threads N` is the one thing that runs anywhere but the serving
+thread, and it exists because of a measurement. A solo native member
+holding 50,000 documents, eight connections doing `_id` point lookups:
+52,389 reads in three seconds, median 0.37 ms. Add **one** connection
+running an unindexed `countDocuments` and the same eight got 1,992 —
+**four percent** — at a median of 11.57 ms, which is one scan exactly.
+Every small read was waiting behind a whole large one.
+
+So this is a **latency-isolation** feature first. With reader threads the
+same eight held 91–101% of their idle throughput at a median of 0.35 ms.
+
+**Cost, not op, decides.** The router asks `dc_explain` — which consults
+the same planners the queries run, so it cannot drift into a second
+opinion about index selection — and moves a read only when it is a `find`
+without `batchSize`, a `count`, a `distinct` or a `findOne`-free bare op
+**and** the plan is a full scan **and** the collection holds more than
+`--read-offload-min` documents. A `{_id}` lookup costs 0.37 ms and stays
+inline: moving it would cost a queue hop and, because one deferred answer
+is allowed per connection, would turn a freely pipelining connection into
+a one-at-a-time one. Equality, text and geo plans stay inline too — an
+equality index's cost depends on how many entries match, which is not
+knowable up front, and geo cannot have a read view at all. `ping` reports
+what the router decided: `longReads`, `shortReads`, `movedReads`.
+
+**A worker touches a read view and nothing else.** `dc_collection_snapshot`
+pins a collection at one instant and opens no file; every offloaded read
+gets its own, so two workers share no tree, no read buffer and no builder.
+The one process-global a read can reach is regex-engine's compiler, whose
+own `docs/ARCHITECTURE.md` says a multi-threaded embedder must serialize
+compilation — `engine/src/regex.c` does, around its single `regex_compile`
+call. Matching stays outside the lock.
+
+**Unmaking a file waits for the readers.** A view shares the live handles'
+ios, so it stays valid exactly as long as its files are only appended to.
+Anything that truncates or replaces one — `dropCollection`, `dropDatabase`,
+`compact`, index DDL, adopting an install — drains the pool to idle first,
+delivering those answers rather than discarding them. Ordinary appends
+proceed with reads in flight. Note that `bpt_pinned` does *not* cover
+this: it counts open cursors, and a snapshot does not register with the
+live tree, so the drain is the mechanism rather than a backstop. `ping`
+reports `drainWaits` and `drainedReads`, which is how the tests assert the
+barrier was reached instead of racing for it.
+
+**More than one worker also scales scans**, which is the only reason N was
+chosen over one. Four connections all scanning 50,000 documents, by worker
+count, on six cores:
+
+| workers | 1 scanner | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 0 | 87.0 | 89.6 | 89.4 | 89.1 |
+| 1 | 86.7 | 89.5 | 90.1 | 89.6 |
+| 2 | 87.1 | 167.9 | 172.6 | 173.5 |
+| 4 | 87.4 | 168.5 | **306.1** | 331.4 |
+| 8 | 85.5 | 153.2 | 310.4 | **396.6** |
+
+Scans/s. One scanner never scales, whatever the worker count, because one
+scan is one thread's work. Scaling tops out near the **core** count rather
+than the worker count — 4.4× at eight workers on six cores — and eight
+were slightly *worse* than four at one and two scanners, which is why
+`--read-threads` is lowered to `cpus - 2` (and to at least one, because
+isolation is the point at any core count). A `$regex` filter scaled
+identically, so serializing compilation costs nothing measurable: a
+compile is microseconds against a scan of hundreds of milliseconds.
+
+A second run through `test/bench-server.js` reproduced it (445.7 at eight
+workers and eight scanners) with one caution the table above rounds away:
+**one** worker with eight scanners can come out slightly *below* none —
+78.9 against 91.7 — because eight scans queue through a single worker and
+each pays the hop as well. One worker buys isolation, not throughput.
+
+**Isolation is not paid for out of scan throughput, at the size it was
+measured at.** The same run, 8 sockets of `_id` reads with one client
+scanning 50,000 documents: 4% of idle throughput held with no workers,
+100–104% with any, and the scanner's own rate 87.0 → 83.7–87.0, which is
+noise. On a *short* scan the trade is real and worth knowing — at 8,000
+documents, one worker took the point reads from 26% to 102% and the
+scanner from 609 scans/s to 462, because the serving thread it had been
+starving is now busy answering them. Both axes are in
+`test/bench-server.js` so the trade stays visible rather than argued.
+
+**A worker costs about 2.3 MB resident**, measured under a fresh `$regex`
+on every read (the worst shape here): eight workers took a server from 7.0
+to 25.8 MB. It is churn retained by a per-thread allocator, not the
+~19.5 KB compiled-pattern cache — a worker running plain scans costs
+~0.06 MB, and one repeating a single pattern ~0.3 MB. It plateaus: 26.1 MB
+to 28.5 over 36,000 compiles, flat from 45 s on. Both halves of that — the
+per-worker bound and the ceiling — are asserted, because a per-worker cost
+without a ceiling is a leak that every other test here would pass.
+
+**Off by default.** `--read-threads 0` is byte-for-byte the old path, which
+is what makes the serial engine a property that can be handed back.
+
 ## Invariants
 
 - **One process per database directory.** The whole answer to concurrent
@@ -962,12 +1058,22 @@ with no socket and no port.
 - **Many connections, one at a time through the engine.** `poll()` over
   the listener and every accepted socket; whichever is ready is served,
   and `dbs_handle` runs to completion for one request before the next is
-  looked at. There are no threads and there is no second engine, so the
-  database sees the same serial stream it saw when there was one
-  connection — what changed is who waits for whom. The sockets are
-  non-blocking and a connection carries the bytes of a request that has
-  only partly arrived and a response that has only partly gone out; a
-  client that stops reading delays nobody but itself.
+  looked at. There is one engine and one session, so the database sees the
+  same serial stream it saw when there was one connection — what changed
+  is who waits for whom. The sockets are non-blocking and a connection
+  carries the bytes of a request that has only partly arrived and a
+  response that has only partly gone out; a client that stops reading
+  delays nobody but itself.
+- **The one exception, and its boundary.** With `--read-threads N` a long
+  scanning read runs on a worker thread — against a **read view**, which
+  is a collection pinned at one instant and private to that one read. A
+  worker performs no write, opens and closes no file, holds no session,
+  and touches nothing another worker or the serving thread can see. Every
+  answer is still assembled, framed and written by the serving thread, so
+  `conn.out` has one owner as it always did. This says "there are no
+  threads" no longer; it does not say the engine is concurrent, and the
+  drain above is what keeps the difference from mattering. Default 0, and
+  wasm has none on either target.
 - **Bounded, and it says so.** `--max-clients` is a fixed table sized at
   startup, for the reason every other table here is bounded: a server
   that grows one per client has a failure mode nobody tests. Nothing is
@@ -1132,6 +1238,15 @@ has to beat it *while keeping the pipelining*, because a read moved to
 another thread can no longer be answered inline, and a deferred read
 pays its own barrier round instead of sharing one.
 
+That is also why `--read-threads` moves **only** long scanning reads and
+leaves point lookups where they are: this plateau is what a moved point
+read would have to beat, and 0.37 ms of work does not survive a queue hop
+plus the loss of pipelining. What it beats instead is the *other* ceiling
+— one core of scanning, ~90 scans/s at 50,000 documents — and the
+interference that one scan inflicts on everybody else. Both are measured
+by the last two axes of the same bench; see "Long reads, on threads of
+their own" above.
+
 **A group of one is now the fastest logged shape**, as it should be:
 ~0.5 ms per sequential write against ~0.7 ms for a cluster, which is a
 log sync and an apply with no network in the way. It was 27 ms — one
@@ -1156,8 +1271,21 @@ underneath a reader:
 ```sh
 npm run soak -- --seconds 600 --readers 16
 npm run soak -- --seed 12345          # replay a workload
+npm run soak -- --readThreads 4       # ...with the reads on worker threads
 NISABA_SERVER_BIN=build/lib/nisaba-server-asan npm run soak
 ```
+
+`--readThreads N` turns on `--raft 1` with it, because a read is moved off
+the serving thread by being *deferred* and only the replicated transport
+can defer one. So `0` soaks the unreplicated serial server this file always
+soaked and anything above it soaks a different server; both are worth
+running. It also reports the number that is actually **running** rather
+than the one asked for, since the server lowers it to the machine.
+
+A soak with threads is where the first real bug in this path turned up — a
+heap-use-after-free in `pf_read` on its very first run, which is a worker
+holding a view whose files a `compact` had just replaced. That is what the
+drain exists for, and what `drainWaits` now makes assertable.
 
 It asserts **content**, deliberately. A file closed under a reader means
 a `pread` against a recycled descriptor, which returns another file's

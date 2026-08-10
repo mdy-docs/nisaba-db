@@ -962,6 +962,9 @@ int  peers_remove(peers *p, uint64_t id) { (void)p; (void)id; return BJ_ERR_STAT
 int  peers_listen(peers *p, const char *host, int port) {
     (void)p; (void)host; (void)port; return BJ_ERR_STATE;
 }
+int  peers_set_advertised(peers *p, const char *host) {
+    (void)p; (void)host; return BJ_ERR_STATE;
+}
 uint32_t    peers_count(const peers *p) { (void)p; return 0; }
 uint64_t    peers_id_at(const peers *p, uint32_t i) { (void)p; (void)i; return 0; }
 const char *peers_host_at(const peers *p, uint32_t i) { (void)p; (void)i; return NULL; }

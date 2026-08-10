@@ -100,6 +100,13 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
+/* And one thing that is NOT in that POSIX: _SC_NPROCESSORS_ONLN, which
+ * --read-threads is sized against, arrived only in Issue 8. Darwin hides
+ * it behind _DARWIN_C_SOURCE, and asking for POSIX above is what hid it --
+ * so the ask is widened here rather than the sizing being given up on. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -157,15 +164,20 @@
 #define MAX_CLIENTS 64
 
 /*
- * The most reader threads --read-threads will run.
+ * The most reader threads --read-threads will run, whatever the machine.
  *
- * A ceiling rather than a guess at the right number: each thread carries
- * its own read buffers per tree it is scanning and its own compiled-regex
- * cache (engine/src/regex.c), so asking for more than the machine has
- * cores buys queueing and pays memory. Sized against MAX_CLIENTS too --
- * one deferred answer per connection means no more reads can be in flight
- * than there are connections, so threads past that number can never all
- * be busy at once.
+ * The BUILD's ceiling, and the only one that refuses rather than lowers:
+ * the machine's own limit is applied to the number in main() (cpus - 2),
+ * which is a runtime fact and cannot be a #define. This one is here so
+ * that a nonsense number is a refusal at the flag rather than sixteen
+ * threads' worth of buffers quietly allocated.
+ *
+ * Sized against MAX_CLIENTS too -- one deferred answer per connection
+ * means no more reads can be in flight than there are connections, so
+ * threads past that number can never all be busy at once. And every
+ * thread costs: measured at ~2.3 MB each under a fresh $regex per read,
+ * which is churn in a per-thread allocator rather than the ~19.5 KB
+ * compiled-pattern cache regex.c accounts for.
  */
 #define SERVER_MAX_READ_THREADS 16
 
@@ -1001,9 +1013,11 @@ static void usage(const char *me) {
             "  --read-threads: how many threads answer LONG reads, so that one\n"
             "         client's scan stops delaying everybody else's (default 0,\n"
             "         which is every read on the serving thread as before).\n"
-            "         Routing is live and reported by `ping` as longReads /\n"
-            "         shortReads; the threads themselves are not built yet, so\n"
-            "         today this decides and counts without moving anything\n"
+            "         Lowered to the cpus this machine can spare, and reported\n"
+            "         by `ping` as readThreads with the routing it did as\n"
+            "         longReads / shortReads / movedReads. More than one also\n"
+            "         scales SCAN throughput, to about the core count: on six\n"
+            "         cores, 4.4x with eight workers\n"
             "  --read-offload-min: how many documents a collection must hold\n"
             "         before a scanning read of it is worth moving (default\n"
             "         %d). Below it a read is cheaper answered inline than\n"
@@ -1334,6 +1348,37 @@ int main(int argc, char **argv) {
                         " --read-threads\n");
         return 2;
     }
+#if SERVER_HAS_READ_THREADS
+    /*
+     * SIZED TO THE MACHINE, and lowered rather than refused.
+     *
+     * Oversubscription is measurably worse here, not merely wasteful. On a
+     * six-core box holding 50,000 documents, eight workers ran ONE scanner
+     * at 85 scans/s where four ran it at 87, and two scanners at 153/s
+     * where four ran them at 168: past the cores there are, another worker
+     * takes the serving thread's turn and hands a scan nothing back.
+     *
+     * Two spare, not one. The serving thread accepts, replicates, applies
+     * and answers every short read -- the whole point being that it stays
+     * responsive while a scan runs -- and the answers still have to be
+     * assembled and written by it.
+     *
+     * On a machine too small to spare two, ONE worker rather than none:
+     * this is a latency-isolation feature first, and one thread that is
+     * not the serving thread delivers that at any core count. Lowered
+     * loudly, because a benchmark that asked for eight and got two must
+     * read its number as two.
+     */
+    if (read_threads > 0) {
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        long room = cpus > 2 ? cpus - 2 : 1;
+        if (cpus > 0 && read_threads > room) {
+            fprintf(stderr, "--read-threads %ld is more than %ld cpu(s) can run:"
+                            " using %ld\n", read_threads, cpus, room);
+            read_threads = room;
+        }
+    }
+#endif
     /*
      * Raft's own requirement, refused rather than run: broadcast time <<
      * election timeout. A leader that beats no oftener than the others'
@@ -1573,12 +1618,22 @@ int main(int argc, char **argv) {
          * listening, not merely started. */
         fprintf(stderr, "nisaba: serving %s:%d (max %d clients, idle timeout %ds)\n",
                 bind_host, port, max_clients, idle_seconds);
+        /* Said only when asked for, so the default line stays the line
+         * every test and every log reader already knows -- and said at
+         * all because the number may have been LOWERED to the machine. */
+        if (read_threads > 0) {
+            fprintf(stderr, "nisaba: %ld reader thread(s) for scans of more than"
+                            " %lld documents\n", read_threads,
+                    (long long)(read_min_docs >= 0 ? read_min_docs
+                                                   : REPLICA_READ_MIN_DOCS));
+        }
         fflush(stderr);
         rc = serve_forever(&inst, rep, px, srv, max_clients, idle_seconds,
                            &rootops, order, rst) == 0 ? 0 : 1;
         close(srv);
 #else
         (void)port;   /* accepted and refused, rather than not accepted */
+        (void)bind_host;
         (void)max_clients;
         (void)idle_seconds;
         fprintf(stderr,

@@ -483,10 +483,17 @@ async function startServer(engine, port, extra = [], docs = 0, reuse = null) {
   // The directory comes back too: a test that wants to read the files
   // afterwards -- with the JS implementation, once the server is gone --
   // needs to know which ones.
+  /* Kept from the first byte, not from the line that resolves: a server
+   * that LOWERED a number it was given says so before it says "serving". */
+  let text = '';
+  proc.stderr.on('data', (d) => { text += String(d); });
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error(`${engine.name} server did not start`)), 30000);
     proc.stderr.on('data', (d) => {
-      if (String(d).includes('serving')) { clearTimeout(t); resolve({ proc, dir }); }
+      if (String(d).includes('serving')) {
+        clearTimeout(t);
+        resolve({ proc, dir, stderr: () => text });
+      }
     });
   });
 }
@@ -1608,6 +1615,47 @@ for (const engine of ENGINES) {
         const c = await connectServer(port);
         expect((await c.ping()).readThreads).toBe(2);
         await c.close();
+      } finally { proc.kill(); }
+    }, 60000);
+
+    it.skipIf(!engine.threads)('runs no more of them than the machine can spare', async () => {
+      /*
+       * MORE WORKERS THAN CORES IS MEASURABLY WORSE, not merely wasteful.
+       * On six cores at 50,000 documents, eight workers ran one scanner at
+       * 85 scans/s where four ran it at 87, and two scanners at 153/s where
+       * four ran them at 168: past the cores there are, another worker takes
+       * the serving thread's turn and gives the scan nothing back.
+       *
+       * So the number is LOWERED rather than the flag refused -- a server
+       * whose deployment template says 8 should run on a 2-core machine --
+       * and it says so on stderr, because a benchmark that asked for eight
+       * and got two has to read its result as two. `ping` reports what is
+       * actually running, which is what makes this checkable at all.
+       *
+       * Two spare, and one at minimum: the serving thread accepts,
+       * replicates, applies and answers every short read, and this is a
+       * latency-isolation feature first -- one thread that is not the
+       * serving thread delivers that at any core count.
+       */
+      const cpus = os.availableParallelism?.() ?? os.cpus().length;
+      const room = cpus > 2 ? cpus - 2 : 1;
+      /* SERVER_MAX_READ_THREADS is 16 and anything past it is REFUSED, not
+       * lowered, so the ask has to stay inside the build's ceiling while
+       * still being outside this machine's. A machine with cores enough
+       * that the two coincide has no lowering to observe. */
+      const asked = Math.min(16, room + 4);
+      if (asked <= room) return;
+
+      const port = nextPort();
+      const { proc, stderr } = await startServer(engine, port,
+        ['--raft', '1', '--read-threads', String(asked)], -1);
+      try {
+        const c = await connectServer(port);
+        expect((await c.ping()).readThreads,
+          `asked for ${asked} on ${cpus} cpus`).toBe(room);
+        await c.close();
+        expect(stderr(), 'lowered the number without saying so')
+          .toMatch(new RegExp(`--read-threads ${asked} is more than ${cpus} cpu`));
       } finally { proc.kill(); }
     }, 60000);
   });

@@ -43,7 +43,7 @@
  *   NISABA_SERVER_BIN=build/lib/nisaba-server-asan npx vitest run test/db.concurrency.test.js
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -814,6 +814,226 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 180000);
+
+  /*
+   * ---- and the second axis: N workers doing N scans at once ---------------
+   *
+   * Everything above this point would be satisfied by ONE worker: isolation
+   * is a matter of a scan not being on the serving thread, and one thread
+   * that is not the serving thread delivers it. N was chosen over one for a
+   * second reason -- scan throughput itself -- and that is a claim about
+   * SCALING which no measurement with a single scanner can support.
+   *
+   * Measured at 50,000 documents on six cores, scans/s by workers x
+   * concurrent scanners:
+   *
+   *        scanners:      1       2       4       8
+   *   0 workers        87.0    89.6    89.4    89.1
+   *   1                86.7    89.5    90.1    89.6
+   *   2                87.1   167.9   172.6   173.5
+   *   4                87.4   168.5   306.1   331.4
+   *   8                85.5   153.2   310.4   396.6
+   *
+   * Three things in that table, and the last two are why the assertion
+   * below is shaped the way it is. One scanner never scales, whatever the
+   * worker count, because one scan is one thread's work. Scaling tops out
+   * near the CORE count rather than the worker count -- 4.4x at eight
+   * workers on six cores -- so the ceiling is the machine's, and the
+   * server now lowers --read-threads to it. And eight workers were slightly
+   * WORSE than four at one and two scanners (85.5 vs 87.4, 153.2 vs 168.5),
+   * which is the oversubscription that lowering is there to prevent.
+   *
+   * A $regex filter scaled identically (3.3 -> 14.9 scans/s, 4.5x), so
+   * serializing pattern compilation -- the one process-global a reader can
+   * reach -- costs nothing measurable at this shape: a compile is
+   * microseconds against a scan of hundreds of milliseconds.
+   */
+  const CPUS = os.availableParallelism?.() ?? os.cpus().length;
+  /*
+   * The two tests below MEASURE, and a sanitized binary is the wrong thing
+   * to measure. TSan carries per-thread shadow and trace state, which is
+   * the memory the second one attributes to a worker: 8.85 MB each under
+   * TSan against 2.35 MB in the build anyone runs, so the bound would have
+   * to be loosened past the point of catching anything. It also distorts
+   * thread scheduling enough to make the first one's ratio marginal.
+   *
+   * Everything else in this file is a CORRECTNESS test and is exactly what
+   * the sanitized runs are for; these two skip there rather than being
+   * given bounds wide enough to pass under a sanitizer, which would be
+   * bounds wide enough to pass anything.
+   */
+  const SANITIZED = /-(a|t|ub|m)san/.test(NATIVE);
+
+  it.skipIf(CPUS < 4 || SANITIZED)('scans more collections at once when it has more workers', async () => {
+    /*
+     * Two servers, identical but for the worker count, given the same work:
+     * four connections scanning back to back. The unthreaded one is the
+     * control, and it is a control rather than a remembered number because
+     * it measures THIS machine while it is as loaded as the other run is.
+     *
+     * The bound is 1.6x against a measured 3.4x. Wide because CI is shared
+     * and its cores are not: what it excludes is a pool that serializes,
+     * which is the failure worth a test -- N workers behind one lock read
+     * exactly like one worker, and every assertion above would still pass.
+     */
+    const SCANNERS = 4;
+    const N = 12000;
+    const PAD = 'x'.repeat(120);
+
+    /** scans/s that `port`'s server sustains with SCANNERS clients. */
+    const scanRate = async (threads, port) => {
+      const s = await startServer(port, ['--raft', '1', '--max-clients', '32',
+        '--read-threads', String(threads), '--read-offload-min', '0']);
+      try {
+        const seeder = await connectServer(port);
+        const coll = seeder.db(DB).collection('scaled');
+        for (let n = 0; n < N; n += 200) {
+          await coll.insertMany(Array.from({ length: 200 },
+            (_, k) => ({ n: n + k, pad: PAD })));
+        }
+        await seeder.close();
+
+        const cs = await Promise.all(Array.from({ length: SCANNERS },
+          () => connectServer(port)));
+        const run = async (ms) => {
+          const stop = Date.now() + ms;
+          let n = 0;
+          await Promise.all(cs.map(async (c) => {
+            const cl = c.db(DB).collection('scaled');
+            /* Matches nothing, so every scan walks the whole collection --
+             * the answer is not the point, the walk is. */
+            while (Date.now() < stop) { await cl.countDocuments({ pad: 'zzzz' }); n++; }
+          }));
+          return n;
+        };
+        await run(300);                                   // warm
+        const t0 = Date.now();
+        const did = await run(2000);
+        const rate = did / ((Date.now() - t0) / 1000);
+        const moved = (await cs[0].ping()).movedReads;
+        await Promise.all(cs.map((c) => c.close().catch(() => {})));
+        return { rate, moved };
+      } finally {
+        s.proc.kill();
+        fs.rmSync(s.dir, { recursive: true, force: true });
+      }
+    };
+
+    /* Never more than the machine can spare, or the "more workers" server
+     * is a server whose extra workers were lowered away again. */
+    const workers = Math.min(SCANNERS, CPUS - 2);
+    const one = await scanRate(0, TINY_PORT + 30);
+    const many = await scanRate(workers, TINY_PORT + 31);
+
+    expect(one.moved, 'a server with no reader threads moved a read').toBe(0);
+    expect(many.moved, 'the scans were not offloaded').toBeGreaterThan(4);
+    /* Both really scanned, or the ratio below is a ratio of noise. */
+    expect(one.rate, `only ${one.rate.toFixed(1)} scans/s with no workers`)
+      .toBeGreaterThan(5);
+
+    const scaled = many.rate / one.rate;
+    expect(scaled, `${workers} workers did ${many.rate.toFixed(1)} scans/s` +
+                   ` against ${one.rate.toFixed(1)} on the serving thread` +
+                   ` (${scaled.toFixed(2)}x)`).toBeGreaterThan(1.6);
+  }, 240000);
+
+  it.skipIf(CPUS < 4 || SANITIZED)('costs a bounded, non-growing amount of memory per worker', async () => {
+    /*
+     * WHAT A WORKER COSTS, measured rather than assumed -- because the
+     * assumption was wrong by twenty times. The plan for this said a worker
+     * costs "up to 8 x ~19.5 KB of compiled-pattern cache" (regex.c's own
+     * arithmetic, and correct about the cache itself). Measured at eight
+     * workers under a fresh $regex on every read: 7.3 MB -> 35.9 MB, about
+     * 3.5 MB each.
+     *
+     * Where it goes, by difference. A worker running plain scans costs
+     * ~0.06 MB. One running a SINGLE repeated pattern -- so it compiles
+     * once and hits its cache forever after -- costs ~0.3 MB. One handed a
+     * new pattern per read costs ~2.3-3.5 MB. So the cost is not the cache
+     * but the CHURN: compiling allocates and frees, and a per-thread
+     * allocator keeps the freed pages. Eight workers on the worst shape
+     * this server has is ~29 MB, which is affordable and is now a number.
+     *
+     * The distinction that matters is retention versus leak, so this test
+     * asserts the second one too: over 36,000 fresh compiles RSS went 26.1
+     * -> 28.5 MB and was flat from 45s on. A per-worker cost that has a
+     * ceiling is a price; one that does not is a bug that a bounded cache
+     * would have hidden from every other test here.
+     */
+    const N = 3000;
+    const PAD = 'x'.repeat(80);
+    const WORKERS = Math.min(8, CPUS - 2);
+
+    /** Resident KB, straight from the OS: what a deployment is billed for. */
+    const rssKb = (pid) => {
+      const out = spawnSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' });
+      const kb = Number(String(out.stdout).trim());
+      return Number.isFinite(kb) && kb > 0 ? kb : 0;
+    };
+
+    /*
+     * `churn` runs fresh-pattern reads for `ms` and reports RSS halfway
+     * through and at the end. Fresh every time: a fixed pattern is a cache
+     * hit from the second read on, and would measure nothing.
+     */
+    const churn = async (threads, port) => {
+      const s = await startServer(port, ['--raft', '1', '--max-clients', '32',
+        '--read-threads', String(threads), '--read-offload-min', '0']);
+      try {
+        const seeder = await connectServer(port);
+        const coll = seeder.db(DB).collection('sized');
+        for (let n = 0; n < N; n += 200) {
+          await coll.insertMany(Array.from({ length: 200 },
+            (_, k) => ({ n: n + k, pad: PAD })));
+        }
+        await seeder.close();
+
+        const cs = await Promise.all(Array.from({ length: 8 }, () => connectServer(port)));
+        let k = 0, reads = 0, half = 0;
+        const t0 = Date.now(), MS = 6000;
+        await Promise.all(cs.map(async (c) => {
+          const cl = c.db(DB).collection('sized');
+          while (Date.now() - t0 < MS) {
+            await cl.countDocuments({ pad: { $regex: `^q${k++}zz$` } });
+            reads++;
+            if (!half && Date.now() - t0 > MS / 2) half = rssKb(s.proc.pid);
+          }
+        }));
+        const end = rssKb(s.proc.pid);
+        await Promise.all(cs.map((c) => c.close().catch(() => {})));
+        return { half, end, reads };
+      } finally {
+        s.proc.kill();
+        fs.rmSync(s.dir, { recursive: true, force: true });
+      }
+    };
+
+    const none = await churn(0, TINY_PORT + 32);
+    const many = await churn(WORKERS, TINY_PORT + 33);
+
+    /* ps is not available everywhere; a missing number is not a failure. */
+    if (!none.end || !many.end) return;
+    expect(many.reads, 'no reads ran, so nothing was measured').toBeGreaterThan(50);
+
+    const perWorkerKb = (many.end - none.end) / WORKERS;
+    /* 8 MB against a measured 3.5, so this fails on a change of KIND --
+     * a per-view buffer that scales with the collection, a cache that
+     * grew a dimension -- rather than on a busy machine's rounding. */
+    expect(perWorkerKb, `${WORKERS} workers cost` +
+      ` ${((many.end - none.end) / 1024).toFixed(1)} MB,` +
+      ` ${(perWorkerKb / 1024).toFixed(2)} MB each` +
+      ` (${(none.end / 1024).toFixed(1)} -> ${(many.end / 1024).toFixed(1)} MB)`)
+      .toBeLessThan(8 * 1024);
+
+    /* And it has a ceiling: the second half of the run, with as many fresh
+     * compiles as the first, must not cost what the first half did. 1.5x is
+     * wide against a measured ~1.05, and what it catches is unbounded
+     * growth rather than a slow one. */
+    expect(many.end, `RSS went ${(many.half / 1024).toFixed(1)} ->` +
+      ` ${(many.end / 1024).toFixed(1)} MB over the second half of` +
+      ` ${many.reads} reads: it is not settling`)
+      .toBeLessThan(many.half * 1.5);
+  }, 240000);
 });
 
   it('says nothing alarming on stderr through all of it', () => {

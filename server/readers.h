@@ -10,6 +10,21 @@
  * a whole large one. That is what this fixes, and it is a latency-isolation
  * fix before it is a throughput one.
  *
+ * WHY THERE IS MORE THAN ONE WORKER, in a second measurement. Isolation
+ * needs exactly one thread that is not the serving thread. Scan throughput
+ * is the other ceiling, and it does scale: the same 50,000 documents, four
+ * connections all scanning at once, went 89 scans/s on the serving thread
+ * to 306 with four workers, and eight workers reached 397 -- 4.4x, on six
+ * cores. It tops out near the CORE count, not the worker count, which is
+ * why main() lowers --read-threads to what the machine can spare: eight
+ * workers were slightly WORSE than four at one and two scanners.
+ *
+ * And a worker is not free: ~2.3 MB of resident memory each under a fresh
+ * $regex on every read, which is churn retained by a per-thread allocator
+ * rather than the ~19.5 KB compiled-pattern cache. It plateaus -- 26.1 MB
+ * to 28.5 over 36,000 compiles, flat from 45s on -- so it is a price and
+ * not a leak, and test/db.concurrency.test.js asserts both halves of that.
+ *
  * WHAT A WORKER IS ALLOWED TO TOUCH, and it is very little:
  *
  *   - a READ VIEW (db.h's dc_collection_snapshot), which is a collection

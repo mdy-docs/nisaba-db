@@ -188,11 +188,16 @@ const main = async () => {
   const counts = new Map(COLLS.map((c) => [c, 0]));
   const stats = { writes: 0, reads: 0, regexReads: 0, compacts: 0, drops: 0, indexes: 0 };
 
+  const writer = await connectServer(opts.port);
+  /* What is RUNNING, not what was asked for: the server lowers
+   * --read-threads to the cpus it can spare, and a soak that reports the
+   * ask would credit eight workers for two workers' coverage. */
+  const running = (await writer.ping()).readThreads ?? 0;
   say(`soak: ${opts.seconds}s, ${opts.readers} readers, seed ${opts.seed}, ` +
-      `port ${opts.port}, ${opts.readThreads} reader thread(s)` +
+      `port ${opts.port}, ${running} reader thread(s)` +
+      `${opts.readThreads > running ? ` (asked for ${opts.readThreads})` : ''}` +
       `${opts.readThreads > 0 ? ' (+--raft 1)' : ''}, ${NATIVE}`);
 
-  const writer = await connectServer(opts.port);
   const readers = await Promise.all(
     Array.from({ length: opts.readers }, () => connectServer(opts.port)));
 

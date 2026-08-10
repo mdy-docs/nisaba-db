@@ -188,6 +188,21 @@ int replica_reap_reads(replica *r);
  */
 int  replica_reads_in_flight(const replica *r);
 /*
+ * WHY a drain happened, because the two are not the same size and a test
+ * that cannot tell them apart cannot say which one it exercised.
+ *
+ * UNMAKE is one collection's files: a drop, a compact, index DDL. INSTALL
+ * is every file in the instance at once -- adopting a snapshot closes the
+ * whole dbi and puts different files where the database looks -- and it is
+ * the only one that arrives with no client request behind it on a member
+ * nobody is writing to. `ping` reports both totals and the install subset.
+ */
+typedef enum {
+    REPLICA_DRAIN_UNMAKE  = 0,
+    REPLICA_DRAIN_INSTALL = 1
+} replica_drain_why;
+
+/*
  * Wait until no reader thread is inside a read view, DELIVERING every answer
  * that lands rather than discarding it -- a read already performed against
  * the state as it was is a good answer, and dropping it would hold its
@@ -197,7 +212,7 @@ int  replica_reads_in_flight(const replica *r);
  * from the serving thread: reads are submitted there, so only there is the
  * count certain to fall.
  */
-int replica_wait_reads_idle(replica *r);
+int replica_wait_reads_idle(replica *r, replica_drain_why why);
 
 /*
  * Open the log in `ns` and put a node over it.

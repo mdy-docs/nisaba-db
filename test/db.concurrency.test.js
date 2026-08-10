@@ -64,8 +64,15 @@ const DB = 'busy';
  * that could grow into either. */
 const PORT = 33000 + (process.pid % 900);
 
-async function startServer(port, extra = []) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-conc-'));
+/*
+ * `reuse` is a directory to start over the top of, and it is what a RESTART
+ * means: a member brought back onto a fresh directory is a first boot with
+ * extra steps, and a member that has to be caught up by a snapshot install
+ * is specifically one that came back to its own files and found the leader's
+ * log had moved past them.
+ */
+async function startServer(port, extra = [], reuse = null) {
+  const dir = reuse ?? fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-conc-'));
   const proc = spawn(path.resolve(NATIVE), ['--port', String(port), ...extra], {
     cwd: dir, stdio: ['ignore', 'pipe', 'pipe']
   });
@@ -516,6 +523,85 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
     }
   }, 120000);
 
+  it('does not reap a connection for silence the SERVER caused', async () => {
+    /*
+     * THE OTHER HALF OF THE SAME TIMER, and the half `owed` cannot cover.
+     *
+     * The test above protects a client waiting on its OWN answer. This one
+     * is about a client waiting on somebody else's: the loop is one thread,
+     * so while it is inside one long piece of work it reads from no socket at
+     * all, and every other connection looks silent for exactly as long as
+     * that took. Their next requests may already be sitting in their socket
+     * buffers, unread. They are not owed anything, so the sweep took their
+     * slots and answered -45 -- "it asked nothing", to a client that had
+     * asked and been ignored.
+     *
+     * Found by a soak, twice, and not on a quiet machine: two sanitized
+     * soaks and a twelve-way compile on twelve cores, four healthy
+     * connections dropped at once. Then pinned down with --idle-timeout 1
+     * against a 250,000-document collection, where a member's OWN snapshot
+     * outlasts the timeout and disconnects the client that is inserting.
+     *
+     * Reproduced here in a second rather than a minute by making the long
+     * work a read: one `^x*y$` scan of this collection walks every character
+     * of every document and takes several seconds, on the serving thread
+     * because no reader threads are asked for. What is being tested is not
+     * about reader threads -- it predates them -- but they sharpen it: more
+     * threads on a busy machine means more passes that run long.
+     */
+    const port = TINY_PORT + 40;
+    const { proc, dir } = await startServer(port,
+      ['--raft', '1', '--idle-timeout', '1']);
+    try {
+      const busy = await connectServer(port);
+      const coll = busy.db(DB).collection('unheard');
+      const N = 6000;
+      const PAD = 'x'.repeat(4000);
+      for (let n = 0; n < N; n += 100) {
+        await coll.insertMany(Array.from({ length: 100 },
+          (_, k) => ({ n: n + k, pad: PAD })));
+      }
+
+      /*
+       * AFTER the seeding, and with the client's own keepalive off. Seeding
+       * 24MB takes several seconds during which a bystander would be
+       * genuinely silent -- and being reaped for that is the timer working,
+       * not failing. What this test is about starts below.
+       */
+      const bystander = await connectServer(port, { keepAliveMs: 0 });
+      expect((await bystander.ping()).pong).toBe(true);
+
+      const started = Date.now();
+      /* Not awaited: it holds the serving thread while the bystander speaks
+       * into a server that cannot listen. */
+      const blocking = coll.countDocuments({ pad: { $regex: '^x*y$' } });
+      await new Promise((r) => setTimeout(r, 200));      // let it get inside
+
+      /* Sent while nobody could be heard, and it must be answered rather
+       * than met with a closed socket. */
+      const said = Date.now();
+      const answer = await bystander.ping().catch((e) => e);
+      const waited = Date.now() - said;
+
+      expect(await blocking).toBe(0);
+      const took = Date.now() - started;
+      /* The stall really did outlast the timeout, or this asserts nothing. */
+      expect(took, `the blocking read took ${took}ms, inside the 1s timeout`)
+        .toBeGreaterThan(1500);
+      expect(answer?.code, `the bystander was closed with ${answer?.code}` +
+        ` after waiting ${waited}ms on a server busy for ${took}ms`).toBeUndefined();
+      expect(answer.pong).toBe(true);
+
+      /* And it is still usable afterwards, not merely answered once. */
+      expect((await bystander.ping()).pong).toBe(true);
+      await busy.close();
+      await bystander.close();
+    } finally {
+      proc.kill();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120000);
+
   it('makes an unmaking operation wait for a reader that is inside a view', async () => {
     /*
      * THE DRAIN, ASSERTED RATHER THAN RACED.
@@ -743,6 +829,185 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
       }
     }
   }, 180000);
+
+  it('still answers a stale read whose files an INSTALL replaced under it', async () => {
+    /*
+     * THE LARGEST UNMAKING THERE IS, AND THE ANSWER MUST SURVIVE IT.
+     *
+     * The two drain tests above cover one collection's files going away.
+     * Adopting a snapshot install replaces EVERY file in the instance at
+     * once -- `adopt_install` closes the whole `dbi` and reopens it over
+     * different files -- and it arrives as a committed entry on a member
+     * with no client request behind it.
+     *
+     * The drain was there and worked. What did not was the step after it:
+     * `replica_adopt` releases every parked request, on the reasoning that
+     * whatever is waiting is waiting on an instance that no longer exists.
+     * True when written, and false the moment a FOLLOWER began offloading
+     * its stale reads -- because then the thing parked is a finished,
+     * correct stale answer that the drain has just paid for, and releasing
+     * it left its client owed an answer that existed nowhere. Owed, so the
+     * idle sweep exempted it. It waited forever.
+     *
+     * Found by test/soak-install.js, which hung inside ninety seconds with
+     * all three of its members answering ping in under 6ms -- a shape no
+     * amount of staring at a green suite would have produced, and one that
+     * only reads NOTHING like a bug until something says which loop is
+     * waiting and on what.
+     *
+     * So: three members, an aggressive snapshot threshold, a follower taken
+     * away long enough for the leader's log base to move past it, and slow
+     * stale reads aimed at that follower the instant it is back. It must be
+     * caught up by an install; that install must wait for the reads; and
+     * every read must come back with the right answer rather than never.
+     */
+    const base = TINY_PORT + 34;
+    const MEMBERS = [1, 2, 3].map((id) => ({
+      id, port: base + id, raftPort: base + 10 + id, dir: null, proc: null
+    }));
+    const argsFor = (m) => [
+      '--raft', String(m.id), '--raft-port', String(m.raftPort),
+      /* Four entries between snapshots, so the base overtakes an absent
+       * member in a fraction of a second. Without aggressive compaction
+       * there is nothing for anyone to install. */
+      '--snapshot-entries', '4',
+      '--election-timeout', '2000:4000', '--heartbeat', '400',
+      '--read-threads', '2', '--read-offload-min', '0',
+      /* Longer than a scan, so a reader blocked behind an install is not
+       * also racing the idle sweep -- that is a different test's subject,
+       * and here it would hide this one's failure behind a -45. */
+      '--idle-timeout', '300',
+      ...MEMBERS.filter((o) => o.id !== m.id)
+        .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+    ];
+    const bring = async (m) => {
+      const s = await startServer(m.port, argsFor(m), m.dir);
+      m.dir = s.dir;
+      m.proc = s.proc;
+      m.stderr = s.stderr;
+    };
+
+    try {
+      for (const m of MEMBERS) await bring(m);
+
+      /** Whoever leads, and one member that does not. */
+      const roles = async () => {
+        const out = [];
+        for (const m of MEMBERS) {
+          if (!m.proc) continue;
+          try {
+            const c = await connectServer(m.port, { keepAliveMs: 0 });
+            const role = (await c.ping()).role;
+            await c.close();
+            out.push({ m, role });
+          } catch { /* not up */ }
+        }
+        return out;
+      };
+      let seen = [];
+      for (let i = 0; i < 100; i++) {
+        seen = await roles();
+        if (seen.some((x) => x.role === 'leader') && seen.length === 3) break;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      const leaderOf = seen.find((x) => x.role === 'leader');
+      expect(leaderOf, 'no leader emerged').toBeTruthy();
+
+      const N = 4000;
+      const PAD = 'x'.repeat(600);
+      const lead = await connectServer(leaderOf.m.port);
+      const coll = lead.db(DB).collection('installed');
+      for (let n = 0; n < N; n += 200) {
+        await coll.insertMany(Array.from({ length: 200 },
+          (_, k) => ({ n: n + k, pad: PAD })));
+      }
+
+      const victim = seen.find((x) => x.role !== 'leader').m;
+      const stale = { stale: true };
+      /* Matches nothing and walks every character of every document, which
+       * is what makes a read long enough to still be running when the
+       * install it is racing adopts. */
+      const SLOW = { pad: { $regex: '^x*y$' } };
+
+      /*
+       * Up to six goes at the overlap, because it IS a race -- the read has
+       * to be in flight at the moment adoption is ready. Each go: take the
+       * follower away, write past its log base, bring it back, and put four
+       * slow stale reads on it at once. The loop ends as soon as an install
+       * has drained a reader, and the assertion afterwards is that it did.
+       */
+      let installDrains = 0, answered = 0, installs = 0;
+      for (let go = 0; go < 6 && !installDrains; go++) {
+        victim.proc.kill();
+        await new Promise((r) => victim.proc.once('exit', r));
+        victim.proc = null;
+
+        /* Enough entries that the leader's base passes the follower's last. */
+        for (let i = 0; i < 8; i++) {
+          await lead.db(DB).collection('churn').insertMany(
+            Array.from({ length: 50 }, (_, k) => ({ n: i * 50 + k })));
+        }
+
+        await bring(victim);
+        const readers = await Promise.all(Array.from({ length: 4 },
+          () => connectServer(victim.port, { keepAliveMs: 0 })));
+        /* Issued and not awaited: they are on workers by the time the
+         * install lands. Every one must come back, and with 0 -- the answer
+         * to SLOW against a collection of x's, whichever state it is read
+         * from. A hang here is the bug. */
+        const reads = readers.map((c) =>
+          c.db(DB).collection('installed').countDocuments(SLOW, stale)
+            .then((v) => { answered++; return v; })
+            .catch((e) => e?.code ?? e?.message));
+
+        /*
+         * Bounded, so the failure SAYS what happened. The bug is a read
+         * that never comes back, and awaiting it plainly turns that into
+         * "the test timed out after four minutes" -- true, unhelpful, and
+         * four minutes long. Thirty seconds is many times the scan and many
+         * times an adoption; nothing legitimate is still going then.
+         */
+        const NEVER = Symbol('never answered');
+        const got = await Promise.all(reads.map((p) => Promise.race([
+          p, new Promise((r) => { const t = setTimeout(() => r(NEVER), 30000); t.unref?.(); })
+        ])));
+        for (const v of got) {
+          expect(v, 'a stale read across an install was never answered:' +
+                    ' its worker finished and the answer was dropped').not.toBe(NEVER);
+          /* -66 while the state machine is moving, or -37 if the install
+           * arrived before this member had the collection, are correct
+           * answers. A number that is not 0 is not. */
+          expect([0, -66, -37, 'ECONNRESET'],
+            `a stale read across an install answered ${String(v)}`).toContain(v);
+        }
+
+        const after = await connectServer(victim.port, { keepAliveMs: 0 });
+        const p = await after.ping();
+        installDrains = p.installDrains ?? 0;
+        await after.close();
+        installs += (victim.stderr().match(/snapshot install adopted/g) || []).length;
+        await Promise.all(readers.map((c) => c.close().catch(() => {})));
+      }
+
+      /* It happened at all... */
+      expect(installs, 'no install was ever adopted, so nothing was tested')
+        .toBeGreaterThan(0);
+      /* ...it waited for a reader, which is the barrier under test... */
+      expect(installDrains, 'no install ever waited for a reader')
+        .toBeGreaterThan(0);
+      /* ...and the reads it waited for were answered rather than dropped,
+       * which is the bug. */
+      expect(answered, 'a stale read was never answered at all')
+        .toBeGreaterThan(0);
+
+      await lead.close();
+    } finally {
+      for (const m of MEMBERS) {
+        m.proc?.kill();
+        if (m.dir) fs.rmSync(m.dir, { recursive: true, force: true });
+      }
+    }
+  }, 240000);
 
   it('keeps small reads fast while another client scans', async () => {
     /*

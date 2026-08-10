@@ -1091,11 +1091,41 @@ is what makes the serial engine a property that can be handed back.
   reset by a request and by its answer going out, so a client dribbling
   one byte at a time is closed like any other client that asked nothing.
   A client that wants to stay warm sends `{op:'ping'}`.
+
+  **And silence the server caused does not count.** Two things are exempt,
+  for the same reason in two shapes. A connection **owed** an answer is
+  never reaped: the pollset stops asking it for `POLLIN` while its answer
+  is being worked on, so its clock could not advance however busy the
+  server is on its behalf. And time the loop spent *working* — a local
+  snapshot streaming every database into a generation, a compact, an index
+  backfill, a reader drain, or just a pass on a badly oversubscribed
+  machine — is measured and **forgiven to every connection**, because one
+  thread inside one long operation reads from no socket at all, and the
+  next request of every other client may already be sitting unread in its
+  buffer. Without that, a healthy client is told "it asked nothing" when
+  it asked and was not heard: reproducible with `--idle-timeout 1` and a
+  250,000-document collection, where a member's own snapshot outlasts the
+  timeout and disconnects the client that is inserting. Time spent in
+  `poll()` is not forgiven — that is where a client *is* heard.
 - **A clock is the transport's, not the engine's.** `server/main.c` reads
   `CLOCK_MONOTONIC`; nothing below it learns what time it is, which is
   why an insert's `_id` is still the caller's. Monotonic so that an NTP
   correction cannot take a connection's slot away, and a clock that
   cannot be read *stops* rather than jumping, so nothing times out.
+
+  **And a reading that goes backwards is discarded, not trusted.** Every
+  timeout here is an unsigned subtraction of two of these readings, so an
+  inversion of a tenth of a second does not read as a small negative — it
+  reads as 2^64 milliseconds. That is not theoretical: a soak on a badly
+  oversubscribed machine had the idle sweep judge **fifteen busy
+  connections silent for 585 million years and close all of them in one
+  pass**, and the same mechanism at a smaller jump explains every stray
+  `-45` on a healthy client seen while soaking this. `CLOCK_MONOTONIC` is
+  not supposed to do it; `now_ms` no longer lets it matter, holding the
+  last reading rather than handing back a smaller one, and the idle sweep
+  ignores a future stamp and says so once if it ever sees one. A server
+  that drops every client when its clock hiccups is worse than one that
+  loses a tenth of a second of accounting.
 - **The transport frames, it does not interpret.** `server/main.c` never
   reads a field of a request or a response.
 - **Nothing is dropped in silence.** Every refusal is a distinct code
@@ -1116,6 +1146,14 @@ Stated here rather than discovered later.
   waiting is always looked at before one further down. Nothing starves
   while requests are small; a stream of large ones from slot 0 would make
   slot 5 wait.
+- **A flush that outlives the timeout can still cost a slot.** A large
+  answer goes out over several passes, polled for `POLLOUT` rather than
+  `POLLIN`, and only a *complete* flush resets the idle clock — so a client
+  reading slowly enough can be reaped mid-answer. Stamping the clock on
+  partial progress would fix it and was deliberately **not** taken: it lets
+  a client trickling one byte at a time hold a slot for ever, which is the
+  bound "a slot has to be earned" exists to keep. Known, bounded by
+  `--idle-timeout`, and preferred to the alternative.
 - **No compaction scheduler for COLLECTIONS.** The engine runs no
   timers, so *when* to sweep stays with whoever is driving
   (`docs/compaction.md`) — which is what `minBytes`/`factor` are for:
@@ -1286,6 +1324,40 @@ A soak with threads is where the first real bug in this path turned up — a
 heap-use-after-free in `pf_read` on its very first run, which is a worker
 holding a view whose files a `compact` had just replaced. That is what the
 drain exists for, and what `drainWaits` now makes assertable.
+
+`npm run soak:install` is the destructive case the one above cannot reach.
+A single member can only be asked to unmake one collection's files;
+**adopting a snapshot install** replaces every file in the instance at once,
+and arrives as a committed entry with no client request behind it. So this
+one runs three members with `--snapshot-entries 4`, kills a non-leader every
+few seconds and brings it back — sometimes onto an empty directory — while
+stale scanning reads are aimed at all three. A member whose log is behind
+the leader's base cannot be caught up by AppendEntries, so it must be
+installed into, and the reads in flight must survive it.
+
+```sh
+npm run soak:install -- --seconds 3600 --readThreads 4
+NISABA_SERVER_BIN=build/lib/nisaba-server-asan npm run soak:install
+```
+
+Two things about it are worth copying into any harness of this kind.
+
+**It refuses to pass vacuously.** A run that adopted no install, moved no
+read to a worker, or never once made an install wait for a reader has not
+tested what it is named for, and fails saying which. That is not
+hypothetical: the first version drained a reader for **one install out of
+189**, because the documents were small enough that every scan finished
+before adoption was ready. It takes deliberate shaping — padded documents,
+capped rather than constantly dropped collections, a member away for only
+a few hundred milliseconds so it comes back still holding data — to open
+that window often enough to mean anything.
+
+**It says what it was waiting for.** Every loop records its in-flight
+request, and a watchdog past the deadline names any that never got an
+answer. The bug this file was written to find presents as a soak that will
+not finish while all three of its members answer `ping` in under 6ms — which
+tells you nothing at all until something says *reader 5 has been waiting
+19.1s on a stale count against member 1, having completed 7,462 before it*.
 
 It asserts **content**, deliberately. A file closed under a reader means
 a `pread` against a recycled descriptor, which returns another file's

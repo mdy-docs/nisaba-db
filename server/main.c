@@ -187,6 +187,17 @@
  * interval never notices. */
 #define DEFAULT_IDLE_TIMEOUT 60
 
+/*
+ * How long one pass of the loop may spend WORKING before the idle timer
+ * forgives every connection that much silence (see the end of the loop).
+ *
+ * A hundred milliseconds is far above an ordinary pass -- a point read is
+ * 0.35ms and a whole scan of 50,000 documents is 11ms -- and far below the
+ * shortest idle timeout anyone would set, so the accounting only moves when
+ * something genuinely blocked the thread.
+ */
+#define PASS_FORGIVE_MS 100
+
 /* A connection's buffers are reused between requests, but a client that
  * once sent a large frame should not hold that memory for the rest of
  * its life -- with MAX_CLIENTS of them, that is the difference between a
@@ -253,7 +264,27 @@ static uint64_t now_ms(void) {
     static uint64_t last = 0;
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return last;
-    last = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    uint64_t ms = (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+    /*
+     * NEVER BACKWARDS, and the invariant belongs here rather than in every
+     * caller. This already tolerated a reading that could not be TAKEN by
+     * returning the last one; it did not tolerate a reading that went
+     * backwards, and every consumer above subtracts two of these into a
+     * uint64_t. One inversion of a tenth of a second therefore does not
+     * read as a small negative -- it reads as 2^64 milliseconds, which is
+     * how the idle sweep came to judge fifteen busy connections silent for
+     * 585 million years and close all of them in a single pass.
+     *
+     * A backwards jump of ~110ms is the only mechanism consistent with that
+     * evidence: the sweep's own three readings are ordered by construction,
+     * so no arithmetic here could have produced it. CLOCK_MONOTONIC is not
+     * supposed to do it. This machine, running two sanitized soaks and a
+     * six-target rebuild at once, appears to have done it anyway -- and a
+     * server that drops every client when its clock hiccups is worse than
+     * one that loses a tenth of a second of accounting.
+     */
+    if (ms < last) return last;
+    last = ms;
     return last;
 }
 
@@ -629,6 +660,50 @@ static int adopt_install(dbi **inst, replica *rep, dbi_root *rootops, int order,
     return e;
 }
 
+/*
+ * Hand every answer the replica has finished to the connection waiting for
+ * it. Drops a connection that has died on the way out, compacting `*np`.
+ *
+ * `serve` says whether to go on and run whatever that client PIPELINED
+ * behind the answer, and it is a parameter rather than always-on because of
+ * one caller. Before an install adopts, the answers already built have to
+ * go out -- they were read from files that are about to be replaced -- but
+ * running a new request there would submit work against an instance that is
+ * one line from being closed, and the reader drain has already gone past.
+ * So that caller delivers with `serve` off and serves afterwards, when the
+ * new instance is the one a request would run against.
+ */
+static int deliver_ready(dbi *inst, replica *rep, conn *cs, int *np, int serve) {
+    for (;;) {
+        uint64_t owner = 0;
+        int have = 0;
+        dbuf answer = {0};
+        if (replica_ready(rep, &owner, &answer, &have) != 0) { dbuf_free(&answer); return -1; }
+        if (!have) { dbuf_free(&answer); return 0; }
+        int found = -1;
+        for (int i = 0; i < *np; i++) if (cs[i].client == owner) { found = i; break; }
+        /* Nobody to give it to: the connection went while its write was in
+         * the log. The entries still committed and still applied -- that is
+         * what committed means. */
+        if (found >= 0) {
+            cs[found].owed = 0;      /* it can be asked things again */
+            /* Its silence starts NOW. It has been waiting on us, possibly
+             * for longer than the idle timeout, and the timer must not take
+             * its slot back the instant it is free to speak again. */
+            cs[found].quiet_since = now_ms();
+            int dead = dbuf_put(&cs[found].out, answer.data, answer.len) != 0;
+            if (!dead && serve) dead = conn_serve(inst, rep, &cs[found]) != 0;
+            if (dead) {
+                conn_gone(inst, rep, &cs[found]);
+                cs[found] = cs[*np - 1];
+                conn_clear(&cs[*np - 1]);
+                (*np)--;
+            }
+        }
+        dbuf_free(&answer);
+    }
+}
+
 static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                          int max_clients, int idle_seconds,
                          dbi_root *rootops, int order, root_state *rst) {
@@ -647,6 +722,12 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
     if (!cs || !pf) { free(cs); free(pf); return -1; }
     for (int i = 0; i < max_clients; i++) cs[i].fd = -1;
     int n = 0;              /* live connections, kept packed at the front of cs */
+    /* The idle timer's honesty, in two numbers: `listened_at` is when this
+     * pass stopped being able to hear anyone, and `unheard_tail` is how long
+     * the previous pass went on working after that. See the forgiveness
+     * before the sweep. */
+    uint64_t listened_at = now_ms();
+    uint64_t unheard_tail = 0;
     /* 1 is --stdio's, so a client id means the same thing in both
      * transports and neither can be mistaken for "no client". */
     uint64_t clients = 1;
@@ -731,6 +812,11 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
             perror("poll");
             break;
         }
+        /* When this pass began WORKING, which is what the forgiveness at the
+         * bottom of the loop is measured from. Not when it began waiting:
+         * poll is where a client is heard, so time spent there is not time
+         * it went unheard in. */
+        const uint64_t pass_began = now_ms();
 
         /*
          * The peers, before the clock: bytes that have arrived are what
@@ -776,10 +862,36 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                  * they have to be finished with before this runs -- the
                  * same rule as a dropped collection, at the largest scale
                  * it comes in. */
-                int rde = replica_wait_reads_idle(rep);
+                int rde = replica_wait_reads_idle(rep, REPLICA_DRAIN_INSTALL);
                 if (rde != 0) {
                     fprintf(stderr, "replica: readers would not finish before an"
                                     " install (%d: %s)\n", rde, dc_strerror(rde));
+                    break;
+                }
+                /*
+                 * AND HAND THEM OVER, before the files they were read from
+                 * stop existing. The drain reaps a finished read into the
+                 * request that is waiting for it; delivery is a later step
+                 * of the same pass, and adoption happens in between --
+                 * `replica_adopt` releases every pending, because whatever
+                 * is waiting there is waiting on an instance that is gone.
+                 *
+                 * That was true when it was written. Once a FOLLOWER began
+                 * offloading its stale reads it stopped being true: the
+                 * answer released is a finished, correct, already-paid-for
+                 * stale read, and the client it belonged to was left owed
+                 * an answer that no longer existed anywhere -- exempt from
+                 * the idle sweep because it was owed, so it waited forever.
+                 * test/soak-install.js hangs within ninety seconds without
+                 * this, on a cluster whose three members are all healthy.
+                 *
+                 * Not `serve`: a request pipelined behind the answer must
+                 * not run here. It would submit work against an instance one
+                 * line from being closed, and the drain is already past.
+                 */
+                if (deliver_ready(inst, rep, cs, &n, /*serve*/0) != 0) {
+                    fprintf(stderr, "replica: an answer could not be delivered"
+                                    " before an install\n");
                     break;
                 }
                 int ae = adopt_install(&inst, rep, rootops, order, rst);
@@ -789,13 +901,94 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                             ae, dc_strerror(ae));
                     break;
                 }
+                /*
+                 * NOW the pipelined requests, against the instance that
+                 * exists. A connection whose answer just went out has
+                 * `owed` clear and may have its next request sitting in its
+                 * input buffer already -- no more bytes are coming, so no
+                 * POLLIN will arrive to prompt it, and without this it waits
+                 * on a server that is not going to ask.
+                 */
+                for (int i = n - 1; i >= 0; i--) {
+                    if (cs[i].owed) continue;
+                    if (conn_serve(inst, rep, &cs[i]) == 0) continue;
+                    conn_gone(inst, rep, &cs[i]);
+                    cs[i] = cs[n - 1];
+                    conn_clear(&cs[n - 1]);
+                    n--;
+                }
             }
         }
 
+        /*
+         * TIME NOBODY COULD HAVE BEEN HEARD IN IS NOT SILENCE ANYBODY CHOSE,
+         * and the idle timer must not charge it to them.
+         *
+         * This loop is one thread. While it is inside a single long piece of
+         * work -- a local snapshot streaming every database into a
+         * generation, a compact, an index backfill, a reader drain, or
+         * simply a machine so oversubscribed that a pass takes seconds -- it
+         * reads from no socket at all. Every connection then looks silent
+         * for exactly as long as that took, and the sweep below reaps the
+         * ones that are not owed an answer. The client did nothing wrong:
+         * its next request may already be sitting in its socket buffer,
+         * unread, and it is closed with -45 before the loop looks at it.
+         * `owed` protects a client waiting on an answer; it does not protect
+         * one whose next request has not been read yet.
+         *
+         * Reproduced with --idle-timeout 1 against a 250,000-document
+         * collection, where a member's own snapshot outlasts the timeout and
+         * disconnects a client that has been inserting without pause. At the
+         * default sixty seconds it takes a badly loaded machine, which is
+         * where it was first seen: two sanitized soaks and a twelve-way
+         * compile on twelve cores, dropping four healthy connections at
+         * once, twice, and never again on a quiet one.
+         *
+         * So the work is measured and forgiven, BEFORE the sweep it would
+         * otherwise decide. Nothing is forgiven for time spent in poll(),
+         * which is where a client is heard. The clamp is not decoration: a
+         * quiet_since pushed past `now` would underflow the unsigned
+         * comparison below and reap instantly.
+         */
         /* Whatever has gone quiet, before anything else: a slot held by a
          * client that is not there any more is the one this exists for. */
         if (idle_ms) {
+            /*
+             * ONE `now` for the forgiveness AND the comparison, which is not
+             * tidiness -- it is the whole safety of this block.
+             *
+             * The first version of this took its own clock reading, clamped
+             * every connection's quiet_since to THAT, and left the sweep
+             * below to compare against a second reading. Two readings can
+             * disagree, and when they did, every quiet_since sat a hundred
+             * milliseconds in the future of the one that mattered:
+             * `now - quiet_since` is UNSIGNED, so a future stamp is not a
+             * small negative but 2^64, every connection is instantly past
+             * every timeout, and the server drops all of them in one pass.
+             * A soak caught it doing exactly that -- fifteen healthy clients
+             * at once, "quiet 18446744073709551508ms" -- which is a far worse
+             * failure than the rare stray -45 the forgiveness was added to
+             * prevent.
+             *
+             * With one reading, `now >= pass_began` holds by construction
+             * (same pass, monotonic clock) so the subtraction cannot
+             * underflow, and the clamp is against the very value the
+             * comparison uses. The guard inside the loop then makes any
+             * future stamp from ANY other source harmless rather than fatal.
+             */
             uint64_t now = now_ms();
+            const uint64_t unheard = unheard_tail + (now - pass_began);
+            unheard_tail = 0;
+            if (unheard > PASS_FORGIVE_MS) {
+                for (int i = 0; i < n; i++) {
+                    cs[i].quiet_since += unheard;
+                    if (cs[i].quiet_since > now) cs[i].quiet_since = now;
+                }
+            }
+            /* From here to the bottom of the pass is the tail the next one
+             * forgives; the sweep and the request loop are both inside it. */
+            listened_at = now;
+
             for (int i = n - 1; i >= 0; i--) {
                 /*
                  * NOT A CONNECTION THAT IS WAITING ON US. `owed` means its
@@ -810,7 +1003,75 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                  * POLLHUP and POLLERR arrive whatever is asked for.
                  */
                 if (cs[i].owed) continue;
+                /*
+                 * NOR ONE THAT HAS ALREADY SPOKEN. This sweep runs BEFORE
+                 * the request loop, so a connection whose POLLIN is set has
+                 * a request sitting in the pollset that this same pass is
+                 * about to serve. Reaping it here answers "it asked nothing"
+                 * to a client whose question we are holding.
+                 *
+                 * It is a narrow race -- the request has to arrive in the
+                 * same pass the timeout expires in -- and narrow is exactly
+                 * why it is worth closing by construction rather than
+                 * waiting to see it again.
+                 */
+                if (pf[i + 1].revents & POLLIN) {
+                    cs[i].quiet_since = now;
+                    continue;
+                }
+                /*
+                 * A STAMP THAT IS NOT IN THE PAST IS NOT EVIDENCE OF
+                 * ANYTHING, and must never be evidence of everything. The
+                 * subtraction below is unsigned, so `quiet_since` one
+                 * millisecond ahead of `now` reads as 2^64 milliseconds of
+                 * silence and takes the slot instantly -- and since the
+                 * clock is shared, whatever put one connection ahead has
+                 * probably put them all ahead, which is a server that drops
+                 * every client at once. Pulled back to now and left alone:
+                 * the next pass judges it against a clock it can trust.
+                 */
+                if (cs[i].quiet_since > now) {
+                    /*
+                     * Defence in depth, and a canary. `now_ms` no longer
+                     * hands out a reading below the previous one, so nothing
+                     * should reach here -- but the cost of being wrong about
+                     * that is every client at once, and the cost of this is a
+                     * comparison. If it ever prints, the clock did something
+                     * the accessor did not catch, and that is worth knowing
+                     * rather than absorbing silently.
+                     */
+                    static int said_future = 0;
+                    if (!said_future) {
+                        said_future = 1;
+                        fprintf(stderr, "nisaba: client %llu was last heard"
+                                        " %llums in the FUTURE; the idle timer"
+                                        " is ignoring it\n",
+                                (unsigned long long)cs[i].client,
+                                (unsigned long long)(cs[i].quiet_since - now));
+                        fflush(stderr);
+                    }
+                    cs[i].quiet_since = now;
+                    continue;
+                }
                 if (now - cs[i].quiet_since < idle_ms) continue;
+                /*
+                 * SAID, not done in silence. Taking a slot back closes a
+                 * client's connection, and "it asked nothing" is a claim
+                 * about the client that the server is not always right
+                 * about -- a pass that ran long, a request already sitting
+                 * unread in its buffer. The state that decided it is one
+                 * line, printed once per reap, which is rare by
+                 * construction; without it the only evidence is a -45 on a
+                 * client that believes it was talking.
+                 */
+                fprintf(stderr, "nisaba: took back slot %d (client %llu):"
+                                " quiet %llums, %zu byte(s) unread, %zu unsent,"
+                                " revents 0x%x\n",
+                        i, (unsigned long long)cs[i].client,
+                        (unsigned long long)(now - cs[i].quiet_since),
+                        cs[i].in_len, cs[i].out.len - cs[i].out_off,
+                        (unsigned)pf[i + 1].revents);
+                fflush(stderr);
                 int fd = cs[i].fd;
                 cs[i].fd = -1;              /* conn_gone must not close it first */
                 conn_gone(inst, rep, &cs[i]);
@@ -913,37 +1174,9 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                                 " (%d: %s)\n", re, dc_strerror(re));
                 break;
             }
-            for (;;) {
-                uint64_t owner = 0;
-                int have = 0;
-                dbuf answer = {0};
-                if (replica_ready(rep, &owner, &answer, &have) != 0) { dbuf_free(&answer); break; }
-                if (!have) { dbuf_free(&answer); break; }
-                int found = -1;
-                for (int i = 0; i < n; i++) if (cs[i].client == owner) { found = i; break; }
-                /* Nobody to give it to: the connection went while its
-                 * write was in the log. The entries still committed and
-                 * still applied -- that is what committed means. */
-                if (found >= 0) {
-                    cs[found].owed = 0;      /* it can be asked things again */
-                    /* Its silence starts NOW. It has been waiting on us,
-                     * possibly for longer than the idle timeout, and the
-                     * timer must not take its slot back the instant it is
-                     * free to speak again. */
-                    cs[found].quiet_since = now_ms();
-                    /* The answer, and then whatever was pipelined behind
-                     * it and has been waiting for exactly this. */
-                    int dead = dbuf_put(&cs[found].out, answer.data, answer.len) != 0;
-                    if (!dead) dead = conn_serve(inst, rep, &cs[found]) != 0;
-                    if (dead) {
-                        conn_gone(inst, rep, &cs[found]);
-                        cs[found] = cs[n - 1];
-                        conn_clear(&cs[n - 1]);
-                        n--;
-                    }
-                }
-                dbuf_free(&answer);
-            }
+            /* ...and then whatever each client pipelined behind its answer
+             * and has been waiting for exactly this. */
+            (void)deliver_ready(inst, rep, cs, &n, /*serve*/1);
         }
 
         if (pf[0].revents & POLLIN) {
@@ -962,6 +1195,14 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                 n++;
             }
         }
+
+        /* The part of this pass that came AFTER the forgiveness above -- a
+         * client's own long compact, an index backfill, a reader drain -- is
+         * time nobody could be heard in either. Carried, because the sweep
+         * it has to be forgiven before is the next pass's. Only when the
+         * timer is on: with it off `listened_at` is never refreshed and this
+         * would grow without bound for nothing to read. */
+        if (idle_ms) unheard_tail = now_ms() - listened_at;
     }
 
     for (int i = 0; i < n; i++) conn_gone(inst, rep, &cs[i]);

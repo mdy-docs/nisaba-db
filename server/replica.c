@@ -211,6 +211,17 @@ struct replica {
      */
     uint64_t   drain_waits;
     uint64_t   drained_reads;
+    /*
+     * And the INSTALL subset of those two, which is not the same case at a
+     * different scale. A drop or a compact unmakes one collection's files
+     * and usually has a client's request behind it; adopting a snapshot
+     * closes the entire instance and arrives as a committed entry on a
+     * member nobody is writing to. A soak that drained a thousand drops
+     * and no installs has not covered the second, and without these two
+     * counters it would look as though it had.
+     */
+    uint64_t   install_drains;
+    uint64_t   install_drained_reads;
 };
 
 static conversation *conv_open(replica *r, uint64_t theirs, uint64_t from) {
@@ -1528,11 +1539,23 @@ int replica_adopt(replica *r, const char *victims, size_t victims_len) {
     r->log = rn_log(r->node);
     r->applied = boundary;
 
-    /* Whatever was waiting is waiting on an instance that no longer
-     * exists. By the time a member is adopting an install it has been a
-     * follower for a while -- reads and writes are refused, so this is
-     * empty in every ordinary run -- but "ordinarily empty" is not a
-     * contract, and a dangling token would be. */
+    /*
+     * Whatever is STILL waiting is waiting on an instance that no longer
+     * exists, and cannot be answered out of one that never held its state.
+     *
+     * This used to say it was empty in every ordinary run, because a
+     * follower refuses reads and writes -- and that was right until a
+     * follower began offloading its STALE reads to worker threads, which is
+     * the one kind of read it does serve. Such a read is drained before
+     * adoption and its finished answer parked here, so releasing the lot
+     * threw away a correct answer and left its client owed one forever.
+     *
+     * The caller now delivers everything the drain landed BEFORE calling
+     * this (server/main.c's install site), so what reaches here is only what
+     * genuinely has no answer: a write parked on a log this node no longer
+     * has. That is not "ordinarily empty" as an accident of routing any
+     * more -- it is empty because the answers were handed over first.
+     */
     for (int i = 0; i < REPLICA_MAX_PENDING; i++)
         if (r->waiting[i].used) pending_release(&r->waiting[i]);
 
@@ -1689,7 +1712,7 @@ static int apply_committed(replica *r) {
              * every write wait out the longest scan.
              */
             if (r->readers && dbi_entry_wrecks_files(payload.data, (uint32_t)payload.len)) {
-                e = replica_wait_reads_idle(r);
+                e = replica_wait_reads_idle(r, REPLICA_DRAIN_UNMAKE);
                 if (e) break;
             }
 
@@ -2337,6 +2360,12 @@ static int replica_status(const replica *r, dbuf *out) {
     if (!e) e = bj_put_int(b, (int64_t)r->drain_waits);
     if (!e) e = bj_put_key(b, (const uint8_t *)"drainedReads", 12);
     if (!e) e = bj_put_int(b, (int64_t)r->drained_reads);
+    /* The install subset of the two above: a whole instance replaced under
+     * a reader, rather than one collection's files. */
+    if (!e) e = bj_put_key(b, (const uint8_t *)"installDrains", 13);
+    if (!e) e = bj_put_int(b, (int64_t)r->install_drains);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"installDrainedReads", 19);
+    if (!e) e = bj_put_int(b, (int64_t)r->install_drained_reads);
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -2706,7 +2735,7 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
      * draining twice costs a comparison against zero.
      */
     if (r->readers && dbi_request_wrecks_files(req, len)) {
-        int de = replica_wait_reads_idle(r);
+        int de = replica_wait_reads_idle(r, REPLICA_DRAIN_UNMAKE);
         if (de) return de;
     }
 
@@ -3054,14 +3083,21 @@ int replica_reads_in_flight(const replica *r) {
     return r ? rdpool_inflight(r->readers) : 0;
 }
 
-int replica_wait_reads_idle(replica *r) {
+int replica_wait_reads_idle(replica *r, replica_drain_why why) {
     if (!r || !r->readers) return BJ_OK;
     /* Recorded BEFORE the wait, and only when there is something to wait
-     * for: this is the seam a test reads to know the barrier was reached. */
+     * for: this is the seam a test reads to know the barrier was reached.
+     * An install is counted twice over -- in the totals and on its own --
+     * because it is the rarest of the three and the largest, so a run that
+     * drained a thousand drops and no installs must not look covered. */
     int waiting_for = rdpool_inflight(r->readers);
     if (waiting_for > 0) {
         r->drain_waits++;
         r->drained_reads += (uint64_t)waiting_for;
+        if (why == REPLICA_DRAIN_INSTALL) {
+            r->install_drains++;
+            r->install_drained_reads += (uint64_t)waiting_for;
+        }
     }
     /*
      * Every outstanding read is WAITED FOR AND DELIVERED, not abandoned.

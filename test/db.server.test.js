@@ -3298,11 +3298,11 @@ for (const engine of ENGINES) {
    * quiet is the same thing from here.
    */
   describe.skipIf(!enabled)(`nisaba-server: idle connections (${engine.name})`, () => {
-    let proc;
+    let proc, stderr;
     const port = nextPort();
 
     beforeAll(async () => {
-      ({ proc } = await startServer(engine, port, ['--idle-timeout', '1']));
+      ({ proc, stderr } = await startServer(engine, port, ['--idle-timeout', '1']));
       return () => { proc.kill(); };
     });
 
@@ -3320,6 +3320,16 @@ for (const engine of ENGINES) {
       expect(err).toBeInstanceOf(ServerError);
       expect(err.code).toBe(-45);
       expect(err.message).toMatch(/idle-timeout/);
+
+      /*
+       * And the SERVER said so, with the state that decided it. "It asked
+       * nothing" is a claim about the client that the server is not always
+       * right about -- a pass that ran long, a request already sitting
+       * unread -- and when it is wrong this line is the only evidence there
+       * is. Asserted here so it cannot quietly stop being printed.
+       */
+      expect(stderr(), 'the server took a slot back without saying so')
+        .toMatch(/took back slot \d+ \(client \d+\): quiet \d+ms/);
       await quiet.close();
     });
 

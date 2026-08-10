@@ -46,6 +46,7 @@
     "test:browser": "vitest run --config vitest.browser.config.js",
     "bench": "node test/bench.js",
     "soak": "node test/soak.js",
+    "soak:install": "node test/soak-install.js",
     "bench:server": "node test/bench-server.js",
     "build:wasm": "./build/build-wasm.sh",
     "prepack": "npm run build:wasm",

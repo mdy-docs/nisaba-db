@@ -1701,6 +1701,26 @@ int dbs_open_count(const dbs *s) {
     return n;
 }
 
+int dbs_read_view(dbs *s, const char *name, size_t name_len, dc_collection **out) {
+    if (!s || !name || !out) return BJ_ERR_STATE;
+    /* Through dbs_collection rather than find_entry: a view of a
+     * collection this session happens not to have touched yet is the same
+     * view as one of a collection it has, and making the caller notice the
+     * difference would only invite it to guess. */
+    dc_collection *live = NULL;
+    int e = dbs_collection(s, name, name_len, &live);
+    if (e) return e;
+    return dc_collection_snapshot(live, out);
+}
+
+void dbs_read_view_close(dc_collection *view) {
+    /* dc_collection_free is what frees a view's handles (db.h): one free
+     * function for both kinds, so there is never a question about which to
+     * call. This wrapper exists so a caller holding a view need not know
+     * that a view is a dc_collection at all. */
+    dc_collection_free(view);
+}
+
 /* ---- applying a committed command --------------------------------------
  *
  * See db_session.h. Everything above this line is asked for by a client;

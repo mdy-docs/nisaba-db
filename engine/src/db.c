@@ -50,12 +50,17 @@ typedef struct {
 } dc_index;
 
 struct dc_collection {
-    bpt *primary;                /* not owned */
+    bpt *primary;                /* not owned -- unless is_view; see db.h */
     dc_index *indexes;           /* owned, dense array */
     uint32_t index_count;
     uint32_t index_cap;
     bj_io journal;                /* stored by value -- see dc_collection_recover */
     int has_journal;
+    /* A read view (dc_collection_snapshot): every structure it holds is a
+     * snapshot handle it minted, it owns them, and every mutation through
+     * it is refused. Never has a journal -- a view cannot commit, so there
+     * is nothing to make atomic across its files. */
+    int is_view;
 };
 
 static void free_index(dc_index *ix) {
@@ -76,11 +81,157 @@ dc_collection *dc_collection_open(bpt *primary) {
     return c;
 }
 
+/* The structures one index points at. Only a read view owns them (db.h), so
+ * only dc_collection_free on a view calls this. NULL-tolerant throughout,
+ * because it also unwinds a view that failed halfway through being built. */
+static void free_index_trees(dc_index *ix) {
+    if (ix->kind == DC_IDX_TEXT) {
+        bpt_free(ix->tix_index);
+        bpt_free(ix->tix_doc_terms);
+        bpt_free(ix->tix_doc_lengths);
+        ix->tix_index = ix->tix_doc_terms = ix->tix_doc_lengths = NULL;
+    } else {
+        /* Equality. Not geo: dc_collection_snapshot refuses a collection
+         * with one outright, so a view never holds an rtree to free. */
+        bpt_free(ix->tree);
+        ix->tree = NULL;
+    }
+}
+
 void dc_collection_free(dc_collection *c) {
     if (!c) return;
-    for (uint32_t i = 0; i < c->index_count; i++) free_index(&c->indexes[i]);
+    for (uint32_t i = 0; i < c->index_count; i++) {
+        if (c->is_view) free_index_trees(&c->indexes[i]);
+        free_index(&c->indexes[i]);
+    }
     free(c->indexes);
+    if (c->is_view) bpt_free(c->primary);
     free(c);
+}
+
+int dc_collection_is_view(const dc_collection *c) { return c && c->is_view; }
+
+/* ---- read views -------------------------------------------------------- */
+
+/*
+ * Deep-copy one index's DEFINITION -- everything except the structures it
+ * points at, which the caller replaces with snapshot handles.
+ *
+ * Copying the already-parsed dc_index, rather than re-reading the catalog
+ * entry that produced it, is the point. A view has to present exactly the
+ * index set the live collection presents, because the planner chooses from
+ * it: an index the view lacked, or described differently, would answer a
+ * different question from the same filter. Re-parsing would be a second
+ * reading of one definition, free to drift; this cannot drift, because
+ * there is only ever one reading.
+ *
+ * `dst` is zeroed first and left safe to hand to free_index on failure.
+ */
+static int clone_index_def(const dc_index *src, dc_index *dst) {
+    memset(dst, 0, sizeof(*dst));
+    dst->kind = src->kind;
+    dst->unique = src->unique;
+    dst->sparse = src->sparse;
+
+    dst->name = (char *)malloc(src->name_len ? (size_t)src->name_len : 1);
+    if (!dst->name) return BJ_ERR_OOM;
+    memcpy(dst->name, src->name, (size_t)src->name_len);
+    dst->name_len = src->name_len;
+
+    if (src->field_count) {
+        dst->field_names = (uint8_t **)calloc(src->field_count, sizeof(uint8_t *));
+        dst->field_name_lens = (uint32_t *)calloc(src->field_count, sizeof(uint32_t));
+        if (!dst->field_names || !dst->field_name_lens) return BJ_ERR_OOM;
+        /* Only now: free_index walks field_names[] `field_count` times, so
+         * a count set before the array exists is a NULL walk on the very
+         * unwinding path this function is trying to keep safe. */
+        dst->field_count = src->field_count;
+        for (uint32_t i = 0; i < src->field_count; i++) {
+            uint32_t n = src->field_name_lens[i];
+            dst->field_names[i] = (uint8_t *)malloc(n ? (size_t)n : 1);
+            if (!dst->field_names[i]) return BJ_ERR_OOM;
+            memcpy(dst->field_names[i], src->field_names[i], (size_t)n);
+            dst->field_name_lens[i] = n;
+        }
+    }
+
+    if (src->partial_filter && src->partial_filter_len) {
+        dst->partial_filter = (uint8_t *)malloc(src->partial_filter_len);
+        if (!dst->partial_filter) return BJ_ERR_OOM;
+        memcpy(dst->partial_filter, src->partial_filter, src->partial_filter_len);
+        dst->partial_filter_len = src->partial_filter_len;
+    }
+    if (src->text_field && src->text_field_len) {
+        dst->text_field = (char *)malloc(src->text_field_len);
+        if (!dst->text_field) return BJ_ERR_OOM;
+        memcpy(dst->text_field, src->text_field, src->text_field_len);
+        dst->text_field_len = src->text_field_len;
+    }
+    /* geo_field is deliberately not copied: dc_collection_snapshot refuses
+     * a collection holding a geo index, so this never sees one. If rtree
+     * ever grows a snapshot, that field and free_index_trees's geo case are
+     * the two places that have to learn it together. */
+    return BJ_OK;
+}
+
+int dc_collection_snapshot(const dc_collection *live, dc_collection **out) {
+    if (!live || !out) return BJ_ERR_STATE;
+    if (live->is_view) return DC_ERR_READ_ONLY; /* one hop only: see db.h */
+
+    /* Refused before anything is allocated. A geo index has no snapshot,
+     * and a view holding every index BUT that one is not this collection
+     * with a caveat -- it is a collection the planner reads differently.
+     * All of it or none of it. */
+    for (uint32_t i = 0; i < live->index_count; i++) {
+        if (live->indexes[i].kind == DC_IDX_GEO) return DC_ERR_NO_READ_VIEW;
+    }
+
+    dc_collection *v = (dc_collection *)calloc(1, sizeof(*v));
+    if (!v) return BJ_ERR_OOM;
+    v->is_view = 1;
+
+    /* The index array is sized up front so that nothing can fail AFTER a
+     * snapshot handle has been minted but BEFORE the view is holding it --
+     * which is the one shape where unwinding would have to free a handle
+     * that no structure points to yet. */
+    if (live->index_count) {
+        v->indexes = (dc_index *)calloc(live->index_count, sizeof(dc_index));
+        if (!v->indexes) { dc_collection_free(v); return BJ_ERR_OOM; }
+        v->index_cap = live->index_count;
+    }
+
+    v->primary = bpt_snapshot(live->primary);
+    if (!v->primary) { dc_collection_free(v); return BJ_ERR_OOM; }
+
+    for (uint32_t i = 0; i < live->index_count; i++) {
+        const dc_index *src = &live->indexes[i];
+        dc_index *ix = &v->indexes[v->index_count];
+        int e = clone_index_def(src, ix);
+        /* Counted before the handles exist, so the unwind below frees this
+         * half-built slot rather than stepping past it. Both free helpers
+         * tolerate the NULLs that leaves. */
+        v->index_count++;
+        if (e) { dc_collection_free(v); return e; }
+
+        if (src->kind == DC_IDX_TEXT) {
+            ix->tix_index = bpt_snapshot(src->tix_index);
+            ix->tix_doc_terms = bpt_snapshot(src->tix_doc_terms);
+            ix->tix_doc_lengths = bpt_snapshot(src->tix_doc_lengths);
+            if (!ix->tix_index || !ix->tix_doc_terms || !ix->tix_doc_lengths) {
+                dc_collection_free(v);
+                return BJ_ERR_OOM;
+            }
+        } else {
+            ix->tree = bpt_snapshot(src->tree);
+            if (!ix->tree) { dc_collection_free(v); return BJ_ERR_OOM; }
+        }
+    }
+
+    /* No journal, deliberately: the journal exists to make a multi-file
+     * WRITE atomic, and a view cannot write. dc_collection_recover is
+     * refused on one for the same reason. */
+    *out = v;
+    return BJ_OK;
 }
 
 static dc_index *find_index(dc_collection *c, const char *name, int name_len) {
@@ -288,6 +439,12 @@ static int commit_journal(dc_collection *c) {
  */
 static int mut_begin(dc_collection *c, uint64_t **lens) {
     *lens = NULL;
+    /* Every document mutation in this file begins here, which makes this
+     * the one place a read view has to be turned away. The trees would
+     * refuse it anyway -- bpt_add and bpt_delete both check read_only --
+     * but they refuse it four frames down, after the rollback capture, and
+     * with BJ_ERR_STATE rather than a name. */
+    if (c->is_view) return DC_ERR_READ_ONLY;
     if (c->index_count == 0) return BJ_OK;
     uint64_t *l = (uint64_t *)malloc(dctj_file_count(c) * sizeof(uint64_t));
     if (!l) return BJ_ERR_OOM;
@@ -309,6 +466,11 @@ static int mut_end(dc_collection *c, uint64_t *lens, int e) {
 }
 
 int dc_collection_recover(dc_collection *c, const bj_io *journal) {
+    /* A view has nothing to reconcile: the journal makes a multi-file
+     * WRITE atomic, and it cannot write. It also must not adopt one --
+     * recovery REWINDS files, which is the one thing a shared io must
+     * never suffer from a reader. */
+    if (c->is_view) return DC_ERR_READ_ONLY;
     if (!journal) { c->has_journal = 0; return BJ_OK; }
     c->journal = *journal;
     c->has_journal = 1;
@@ -374,6 +536,7 @@ static int stage_applied_all(dc_collection *c, uint64_t index, int stage) {
 }
 
 int dc_set_applied_index(dc_collection *c, uint64_t index) {
+    if (c->is_view) return DC_ERR_READ_ONLY;
     int e = stage_applied_all(c, index, 0);
     if (e) return e;
     return stage_applied_all(c, index, 1);
@@ -411,6 +574,7 @@ int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
                                const uint8_t *fields, uint32_t fields_len,
                                int unique, int sparse,
                                const uint8_t *partial_filter, uint32_t partial_filter_len) {
+    if (c->is_view) return DC_ERR_READ_ONLY;
     if (find_index(c, name, name_len)) return BJ_ERR_STATE;
 
     cur fc = { fields, fields_len, 0 };
@@ -456,6 +620,7 @@ int dc_collection_attach_index(dc_collection *c, const char *name, int name_len,
 int dc_collection_attach_text_index(dc_collection *c, const char *name, int name_len,
                                     bpt *tix_index, bpt *tix_doc_terms, bpt *tix_doc_lengths,
                                     const char *field, int field_len) {
+    if (c->is_view) return DC_ERR_READ_ONLY;
     if (find_index(c, name, name_len)) return BJ_ERR_STATE;
     if (field_len <= 0) return BJ_ERR_STATE;
     for (uint32_t i = 0; i < c->index_count; i++) {
@@ -496,6 +661,7 @@ int dc_collection_add_text_index(dc_collection *c, const char *name, int name_le
 
 int dc_collection_attach_geo_index(dc_collection *c, const char *name, int name_len,
                                    rtree *rt, const char *field, int field_len) {
+    if (c->is_view) return DC_ERR_READ_ONLY;
     if (find_index(c, name, name_len)) return BJ_ERR_STATE;
     if (field_len <= 0) return BJ_ERR_STATE;
 
@@ -527,6 +693,10 @@ int dc_collection_add_geo_index(dc_collection *c, const char *name, int name_len
 }
 
 int dc_collection_remove_index(dc_collection *c, const char *name, int name_len) {
+    /* Not because removing a registration would corrupt anything, but
+     * because a view whose index set can be edited is no longer a view of
+     * the collection it was captured from. */
+    if (c->is_view) return DC_ERR_READ_ONLY;
     for (uint32_t i = 0; i < c->index_count; i++) {
         if (c->indexes[i].name_len == (uint32_t)name_len &&
             memcmp(c->indexes[i].name, name, (size_t)name_len) == 0) {

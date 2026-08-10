@@ -130,6 +130,20 @@ extern "C" {
  * through a *filter* rather than a document, where JS's toObjectId gate
  * never runs and the caller therefore gets no earlier warning. */
 #define DC_ERR_UNSUPPORTED_ID (-35)
+/* dc_collection_snapshot was asked for a read view of a collection holding
+ * a structure that cannot produce one — today that means a geo index,
+ * whose rtree has no snapshot API (bplustree's append-only guarantee is
+ * what makes bpt_snapshot possible, and rtree has not been given the
+ * equivalent). Distinct from BJ_ERR_STATE because it is not a fault: the
+ * caller's remedy is to read the live collection instead, which is what
+ * every caller could already do. */
+#define DC_ERR_NO_READ_VIEW (-77)
+/* A mutation was attempted on a read view. Every underlying structure
+ * would refuse it anyway (bpt_add/bpt_delete return BJ_ERR_STATE on a
+ * snapshot handle), so this code buys no safety — it buys a name, so the
+ * failure reads as "a read did a writer thing" rather than as a generic
+ * state error from four frames down. */
+#define DC_ERR_READ_ONLY (-78)
 
 typedef struct dc_collection dc_collection;
 
@@ -138,7 +152,11 @@ typedef struct dc_collection dc_collection;
 dc_collection *dc_collection_open(bpt *primary);
 /* Free the collection's own bookkeeping (index registrations). Does not
  * close/free the primary tree or any attached index tree — those are owned
- * by the host. Safe on NULL. */
+ * by the host. Safe on NULL.
+ *
+ * The one exception is a read view (dc_collection_snapshot), which minted
+ * its own handles and therefore frees them here. It still closes no file:
+ * a view's handles share the live collection's ios. */
 void dc_collection_free(dc_collection *c);
 
 /*
@@ -205,6 +223,58 @@ int dc_collection_recover(dc_collection *c, const bj_io *journal);
  */
 uint64_t dc_applied_index(const dc_collection *c);
 int      dc_set_applied_index(dc_collection *c, uint64_t index);
+
+/* ---- Read views (MVCC) ------------------------------------------------- */
+
+/*
+ * A READ VIEW is a read-only dc_collection pinned at everything `live`
+ * holds right now: its primary tree and every attached index, each as a
+ * bpt_snapshot() handle. Reads run against it unchanged — the planner sees
+ * the same index set, so it picks the same plan — and it keeps answering
+ * the state it was captured at however far `live` moves on afterwards.
+ *
+ * This composes a COLLECTION-level snapshot out of the tree-level ones
+ * bplustree.h already guarantees. It invents no versioning: a bpt file is
+ * append-only, every commit boundary in it is a complete consistent state,
+ * and later appends never disturb an earlier root. All this adds is
+ * capturing every one of a collection's trees at the same instant, and
+ * carrying the index definitions across so a view is a whole collection
+ * rather than a bare tree.
+ *
+ * WHAT A VIEW OWNS, and it is the opposite of the live collection.
+ * dc_collection_open takes ownership of nothing (the host opened the trees
+ * and closes them). A view MINTED the handles it holds, so
+ * dc_collection_free frees them — the same call for both, because a second
+ * free function would be a second opinion about a lifetime.
+ *
+ * A VIEW OPENS NO FILES. bpt_snapshot shares the live handle's bj_io and
+ * allocates only its own buffers, which is what makes a view legal at all
+ * under the one-open-handle-per-file invariant (bjns.h, and
+ * test/db.exclusive-handles.test.js polices it) — a second open of a live
+ * file is a rule violation, not a tuning choice. It is also the view's one
+ * sharp edge: sharing the io means the view is valid only while that file
+ * is merely appended to. Truncating or replacing it — bpt_rewind, adopting
+ * a compaction, dropping the collection — invalidates every view over it,
+ * and reading one afterwards is a use-after-free rather than a stale
+ * answer. Whoever does those things must retire the views first.
+ *
+ * Capture it between operations, never mid-mutation: it copies each tree's
+ * current committed root, and a multi-index write is several trees'
+ * mutations that are only consistent with each other at the ends.
+ *
+ * DC_ERR_NO_READ_VIEW if any attached structure cannot be snapshotted (a
+ * geo index), BJ_ERR_OOM on allocation failure. *out is set only on BJ_OK.
+ *
+ * A view of a view is DC_ERR_READ_ONLY. Not because it is dangerous but
+ * because it is meaningless: a snapshot of a snapshot is pinned at the same
+ * instant, so it is the first view with an extra layer of borrowing under
+ * it. Ask the live collection for a second view instead.
+ */
+int dc_collection_snapshot(const dc_collection *live, dc_collection **out);
+
+/* 1 when `c` is a read view. Every mutation through it is refused with
+ * DC_ERR_READ_ONLY. Safe on NULL (0). */
+int dc_collection_is_view(const dc_collection *c);
 
 /*
  * Like dc_collection_attach_index, but also backfills `index_tree` (expected

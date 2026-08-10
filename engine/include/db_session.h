@@ -328,6 +328,41 @@ int dbs_collection(dbs *s, const char *name, size_t name_len,
  * server that wants to say so. */
 int dbs_open_count(const dbs *s);
 
+/*
+ * A READ VIEW of `name`: a read-only dc_collection pinned at what the
+ * collection holds right now (dc_collection_snapshot in db.h has the whole
+ * contract, and the caveats). Reads run against it exactly as they run
+ * against the live collection; every write through it is refused with
+ * DC_ERR_READ_ONLY.
+ *
+ * Opens the collection first if this session does not already hold it, so
+ * the caller need not sequence the two -- which means this call CAN open
+ * files, while the view it returns never does. The distinction matters to
+ * whoever calls it: the open is the session's, and a caller that must not
+ * open anything should ask for the view only after dbs_collection has
+ * already succeeded on that name.
+ *
+ * WHAT THIS IS FOR, and what it deliberately is not. A view lets a read be
+ * answered from a state that is not the session's current one -- which is
+ * what serving a read somewhere other than the middle of the apply loop
+ * needs. It is not a transaction: nothing is coordinated across two views,
+ * and a view of collection A and a view of collection B were captured at
+ * two instants, not one.
+ *
+ * The view is the CALLER's: free it with dbs_read_view_close, and free it
+ * before anything truncates or replaces the files under it -- dropping the
+ * collection, dropping the database, compacting, or adopting an installed
+ * snapshot. It shares the live handles' ios, so a view outliving its files
+ * is a use-after-free rather than a stale read.
+ *
+ * DC_ERR_NO_COLLECTION if the catalog has no such collection,
+ * DC_ERR_NO_READ_VIEW if it holds a structure that cannot be snapshotted
+ * (a geo index), or whatever opening it refused with. *out on BJ_OK only.
+ */
+int  dbs_read_view(dbs *s, const char *name, size_t name_len, dc_collection **out);
+/* Free a view from dbs_read_view. Closes no file. Safe on NULL. */
+void dbs_read_view_close(dc_collection *view);
+
 /* ---- creation and schema ------------------------------------------------
  *
  * The other half of a database: making one. Everything above this line

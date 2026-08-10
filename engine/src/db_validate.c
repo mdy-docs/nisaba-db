@@ -56,6 +56,14 @@ const char *dc_strerror(int code) {
         case DC_ERR_INDEX_ARITY:
             return "findByIndex needs one value per indexed field, "
                    "in the index's own order";
+        case DC_ERR_NO_READ_VIEW:
+            return "This collection cannot produce a read view: a geo index "
+                   "has no snapshot, and a view without one of the "
+                   "collection's indexes would answer a different question. "
+                   "Read the live collection instead";
+        case DC_ERR_READ_ONLY:
+            return "A read view cannot be written to; it is a fixed state, "
+                   "not a second copy of the collection";
         /* db_validate.h */
         case DC_ERR_INVALID_COLLECTION_NAME:
             return "Invalid collection name: must be a non-empty string containing "

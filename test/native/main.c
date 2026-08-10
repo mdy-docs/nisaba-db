@@ -549,6 +549,269 @@ TEST(distinct_reports_unique_values) {
     fx_close(&fx);
 }
 
+/* ---- read views (MVCC) -------------------------------------------------
+ *
+ * A read view is a read-only dc_collection pinned at everything the live
+ * collection held at one instant (db.h). The claim it rests on is
+ * bplustree's: the file is append-only, so an earlier root stays readable
+ * however far the tree moves on.
+ *
+ * That claim is testable with ONE THREAD, which is why these tests exist
+ * before anything concurrent does. A view that answers stale data under a
+ * single caller would answer stale data under a hundred, and finding it
+ * here means finding it as a plain bug rather than as a race.
+ */
+
+/* An equality index on `team`, created and backfilled through the real
+ * createIndex path. Returns the tree, which the caller frees. */
+static bpt *add_team_index(fixture *fx) {
+    bj_io idx_io;
+    if (memfs_open(fx->fs, "idx-people-team_1.bj", &idx_io) != BJ_OK) return NULL;
+    bpt *idx = bpt_create(&idx_io, ORDER);
+    if (!idx) return NULL;
+    const char *names[] = { "team" };
+    const uint8_t *fields; uint32_t fields_len;
+    bj_builder *fb = fields_of(names, 1, &fields, &fields_len);
+    int e = dc_collection_add_index(fx->coll, "team_1", 6, idx,
+                                   fields, fields_len, 0, 0, NULL, 0);
+    bj_builder_free(fb);
+    if (e) { bpt_free(idx); return NULL; }
+    return idx;
+}
+
+/* How many documents match `filter` in `c`. -1 if the count was refused. */
+static int64_t count_matching(dc_collection *c, const uint8_t *filter, uint32_t filter_len) {
+    int64_t n = -1;
+    return dc_count(c, filter, filter_len, &n) ? -1 : n;
+}
+
+TEST(a_read_view_answers_the_state_it_was_captured_at) {
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-people.bj") == 0);
+    bpt *idx = add_team_index(&fx);
+    CHECK_FATAL(idx != NULL);
+
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+    CHECK_OK(insert_person(fx.coll, 2, "Grace", "core", 45));
+    CHECK_OK(insert_person(fx.coll, 3, "Alan", "research", 41));
+    /* A log position too: a view carries the applied index it was captured
+     * at, which is what tells a reader how current its answer is. */
+    CHECK_OK(dc_set_applied_index(fx.coll, 7));
+
+    dc_collection *view = NULL;
+    CHECK_FATAL(dc_collection_snapshot(fx.coll, &view) == BJ_OK);
+    CHECK_I64(dc_collection_is_view(view), 1);
+    CHECK_I64(dc_collection_is_view(fx.coll), 0);
+    CHECK_I64((int64_t)dc_applied_index(view), 7);
+
+    /* Now move the live collection on, in every way that writes: an
+     * insert, a delete, and a write that FAILS partway and is rolled back
+     * by mut_end -- which rewinds the files the view is reading, and is
+     * therefore the one that would break a naive snapshot. */
+    CHECK_OK(dc_set_applied_index(fx.coll, 8));
+    CHECK_OK(insert_person(fx.coll, 4, "Edsger", "research", 40));
+    CHECK_OK(insert_person(fx.coll, 5, "Barbara", "core", 51));
+
+    doc *del = doc_new();
+    doc_str(del, "name", "Grace");
+    uint32_t dlen; const uint8_t *dbuf_ = doc_done(del, &dlen);
+    int deleted = 0;
+    CHECK_OK(dc_delete_one(fx.coll, dbuf_, dlen, &deleted));
+    CHECK_I64(deleted, 1);
+    doc_free(del);
+
+    /* The failing write: a duplicate _id is refused after the primary
+     * tree has already been asked to take it. */
+    CHECK_RC(insert_person(fx.coll, 1, "Ada again", "core", 36), DC_ERR_DUPLICATE);
+
+    const uint8_t *f; uint32_t flen;
+    bj_builder *fb = empty_filter(&f, &flen);
+
+    /* The live collection: 3 + 2 - 1. */
+    CHECK_I64(count_matching(fx.coll, f, flen), 4);
+    /* The view: exactly what it was captured at, and its applied index has
+     * not followed the live one either. */
+    CHECK_I64(count_matching(view, f, flen), 3);
+    CHECK_I64((int64_t)dc_applied_index(view), 7);
+
+    /* Grace was deleted from the live collection and is still in the
+     * view; Edsger was inserted into the live collection and is not. */
+    doc *q = doc_new();
+    doc_str(q, "name", "Grace");
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+    int found = 0; uint8_t *out = NULL; size_t out_len = 0;
+    CHECK_OK(dc_find_one(view, qbuf, qlen, NULL, 0, &found, &out, &out_len));
+    CHECK_I64(found, 1);
+    free(out); out = NULL;
+    found = 0;
+    CHECK_OK(dc_find_one(fx.coll, qbuf, qlen, NULL, 0, &found, &out, &out_len));
+    CHECK_I64(found, 0);
+    free(out); out = NULL;
+    doc_free(q);
+
+    q = doc_new();
+    doc_str(q, "name", "Edsger");
+    qbuf = doc_done(q, &qlen);
+    found = 0;
+    CHECK_OK(dc_find_one(view, qbuf, qlen, NULL, 0, &found, &out, &out_len));
+    CHECK_I64(found, 0);
+    free(out); out = NULL;
+    doc_free(q);
+
+    /*
+     * And through the INDEX, which is the half a primary-only snapshot
+     * would get wrong. `team: research` had one member when the view was
+     * captured and has two now. The view must say one -- and must say it
+     * having actually consulted its own index tree, which the explain
+     * asserts rather than assumes.
+     */
+    q = doc_new();
+    doc_str(q, "team", "research");
+    qbuf = doc_done(q, &qlen);
+
+    int kind = -1; uint8_t *iname = NULL; size_t iname_len = 0;
+    CHECK_OK(dc_explain(view, qbuf, qlen, &kind, &iname, &iname_len));
+    CHECK_I64(kind, 2);                       /* the equality index, not a scan */
+    CHECK_I64(iname_len, 6);
+    if (iname && iname_len == 6) CHECK(memcmp(iname, "team_1", 6) == 0);
+    free(iname);
+
+    CHECK_OK(dc_find(view, qbuf, qlen, NULL, &out, &out_len));
+    CHECK_I64(arr_count(out, out_len), 1);
+    free(out); out = NULL;
+    CHECK_OK(dc_find(fx.coll, qbuf, qlen, NULL, &out, &out_len));
+    CHECK_I64(arr_count(out, out_len), 2);
+    free(out); out = NULL;
+    doc_free(q);
+
+    /* A second view, taken now, sees the state as it now is: the mechanism
+     * pins an instant rather than pinning the first instant. */
+    dc_collection *later = NULL;
+    CHECK_FATAL(dc_collection_snapshot(fx.coll, &later) == BJ_OK);
+    CHECK_I64(count_matching(later, f, flen), 4);
+    CHECK_I64((int64_t)dc_applied_index(later), 8);
+    /* ...and the first view is unmoved by the second one existing. */
+    CHECK_I64(count_matching(view, f, flen), 3);
+    dbs_read_view_close(later);
+
+    dbs_read_view_close(view);
+    /* Freeing the view closed nothing: the live collection still reads. */
+    CHECK_I64(count_matching(fx.coll, f, flen), 4);
+
+    bj_builder_free(fb);
+    bpt_free(idx);
+    fx_close(&fx);
+}
+
+TEST(a_read_view_refuses_every_write_and_cannot_be_stacked) {
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-people.bj") == 0);
+    bpt *idx = add_team_index(&fx);
+    CHECK_FATAL(idx != NULL);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+
+    dc_collection *view = NULL;
+    CHECK_FATAL(dc_collection_snapshot(fx.coll, &view) == BJ_OK);
+
+    /*
+     * The backstop the design rests on, asserted directly on the
+     * structure rather than through db.c: a snapshot handle refuses a
+     * mutation itself. Everything below is a second line of defence, and
+     * this is what makes "a read did a writer thing" a loud error rather
+     * than silent corruption even if db.c forgets a guard.
+     */
+    bpt *snap = bpt_snapshot(fx.primary);
+    CHECK_FATAL(snap != NULL);
+    CHECK_I64(bpt_is_snapshot(snap), 1);
+    CHECK_I64(bpt_is_snapshot(fx.primary), 0);
+    bpt_key k = { .is_string = 1, .num = 0, .str = (const uint8_t *)"x", .str_len = 1 };
+    CHECK_RC(bpt_add(snap, &k, (const uint8_t *)"\x00", 1), BJ_ERR_STATE);
+    bpt_free(snap);
+
+    /* Documents. */
+    CHECK_RC(insert_person(view, 9, "Nobody", "core", 1), DC_ERR_READ_ONLY);
+    doc *q = doc_new();
+    doc_str(q, "name", "Ada");
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+    int n = 0;
+    CHECK_RC(dc_delete_one(view, qbuf, qlen, &n), DC_ERR_READ_ONLY);
+
+    doc *u = doc_new();
+    doc_begin_obj(u, "$set");
+    doc_int(u, "age", 99);
+    doc_end_obj(u);
+    uint32_t ulen; const uint8_t *ubuf = doc_done(u, &ulen);
+    uint8_t default_id[12];
+    mk_oid(default_id, 42);
+    int result = 0;
+    CHECK_RC(dc_update_one(view, qbuf, qlen, ubuf, ulen, default_id, 0, &result, NULL),
+             DC_ERR_READ_ONLY);
+    /* An UPSERT too: it is the one write that can create a document out of
+     * a filter, so it is the one that could plausibly slip past a guard
+     * placed on the update path alone. */
+    CHECK_RC(dc_update_one(view, qbuf, qlen, ubuf, ulen, default_id, 1, &result, NULL),
+             DC_ERR_READ_ONLY);
+    doc_free(u); doc_free(q);
+
+    /* The index set, and the log position. A view whose definitions can be
+     * edited is no longer a view of the collection it came from. */
+    CHECK_RC(dc_collection_remove_index(view, "team_1", 6), DC_ERR_READ_ONLY);
+    CHECK_RC(dc_set_applied_index(view, 99), DC_ERR_READ_ONLY);
+    CHECK_RC(dc_collection_recover(view, NULL), DC_ERR_READ_ONLY);
+
+    /* One hop only: a view of a view would share an io with a handle that
+     * is itself borrowing one, for no gain -- the second is identical to
+     * another view of the live collection. */
+    dc_collection *nested = NULL;
+    CHECK_RC(dc_collection_snapshot(view, &nested), DC_ERR_READ_ONLY);
+    CHECK(nested == NULL);
+
+    /* None of the refusals landed anything. */
+    const uint8_t *f; uint32_t flen;
+    bj_builder *fb = empty_filter(&f, &flen);
+    CHECK_I64(count_matching(view, f, flen), 1);
+    CHECK_I64(count_matching(fx.coll, f, flen), 1);
+    bj_builder_free(fb);
+
+    dbs_read_view_close(view);
+    bpt_free(idx);
+    fx_close(&fx);
+}
+
+TEST(a_geo_index_is_refused_a_read_view_rather_than_left_out_of_one) {
+    /*
+     * rtree has no snapshot API -- only cursors pin a root there -- so a
+     * collection with a geo index cannot have a whole view. It gets none
+     * rather than one missing that index, because the planner CHOOSES from
+     * the index set: a view without the geo index would answer a geo
+     * filter by scanning, quietly, and agree with the live collection
+     * about everything except the one query the index exists for.
+     */
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-places.bj") == 0);
+    CHECK_OK(insert_person(fx.coll, 1, "Ada", "core", 36));
+
+    /* Without the geo index, a view is available. */
+    dc_collection *before = NULL;
+    CHECK_FATAL(dc_collection_snapshot(fx.coll, &before) == BJ_OK);
+    dbs_read_view_close(before);
+
+    bj_io geo_io;
+    CHECK_FATAL(memfs_open(fx.fs, "geo-places-loc_2dsphere.bj", &geo_io) == BJ_OK);
+    rtree *rt = rtree_create(&geo_io, ORDER);
+    CHECK_FATAL(rt != NULL);
+    CHECK_OK(dc_collection_attach_geo_index(fx.coll, "loc_2dsphere", 12, rt, "loc", 3));
+
+    dc_collection *view = NULL;
+    CHECK_RC(dc_collection_snapshot(fx.coll, &view), DC_ERR_NO_READ_VIEW);
+    CHECK(view == NULL);
+    /* A refusal that names itself: "unknown error" would be untraceable. */
+    CHECK(strcmp(dc_strerror(DC_ERR_NO_READ_VIEW), "unknown error") != 0);
+
+    rtree_free(rt);
+    fx_close(&fx);
+}
+
 /* ---- keyenc ------------------------------------------------------------
  *
  * These vectors were generated by running the ORIGINAL pure-JavaScript
@@ -818,6 +1081,20 @@ TEST(strerror_covers_every_code_the_layer_can_raise) {
         DC_ERR_NOT_LEADER, DC_ERR_WRITE_LOST, DC_ERR_NOT_CURRENT,
         DC_ERR_CURSORS_OPEN, DC_ERR_FORMAT_NEWER, DC_ERR_INDEX_EXISTS,
         DC_ERR_NO_INDEX, DC_ERR_INDEX_KIND, DC_ERR_INDEX_ARITY,
+        DC_ERR_NO_READ_VIEW, DC_ERR_READ_ONLY,
+        /* Minted since this list was first written. The distinctness
+         * check below is only as good as what it is given, and it is the
+         * half that caught a real collision -- so a code kept out of the
+         * list is a code free to be somebody else's. */
+        DC_ERR_CATALOG_ENTRY, DC_ERR_INDEX_OPTION_UNSUPPORTED,
+        DC_ERR_TTL_NEEDS_SINGLE_FIELD,
+        DC_ERR_AGG_BAD_STAGE, DC_ERR_AGG_UNKNOWN_STAGE,
+        DC_ERR_AGG_BAD_ACCUMULATOR, DC_ERR_AGG_PROJECT_MIXED,
+        DC_ERR_BAD_CURRENT_DATE, DC_ERR_CURRENT_DATE_CONFLICT,
+        DC_ERR_RESUME_NO_LOG, DC_ERR_RESUME_COMPACTED, DC_ERR_RESUME_AHEAD,
+        DC_ERR_BATCH_TOO_LARGE, DC_ERR_DB_DROPPED,
+        DC_ERR_NO_SNAPSHOT_STORE, DC_ERR_SNAPSHOT_GONE,
+        DC_ERR_NOT_REPLICATED, DC_ERR_TRANSFER_FAILED, DC_ERR_BEHIND,
         /* The consensus layer's refusals reach a host the same way, and
          * one that prints "unknown error" is one nobody can act on. */
         RAFT_ERR_MEMBER, RAFT_ERR_MESSAGE, RAFT_ERR_PEER, RAFT_ERR_CAPACITY,
@@ -1709,6 +1986,94 @@ TEST(a_collection_that_cannot_be_opened_leaves_the_session_untouched) {
     CHECK_I64(nscheck_opens(k) - nscheck_closes(k), 0);   /* including the catalog */
     if (nscheck_violations(k))
         TAP_FAIL("session opened a name no plan declared: %s", nscheck_first_violation(k));
+    nscheck_end(k);
+    nscheck_free(k);
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
+TEST(a_read_view_opens_no_file_and_gives_back_every_handle) {
+    /*
+     * The invariant that makes read views legal at all: ONE OPEN HANDLE
+     * PER FILE. It comes from OPFS exclusivity, the Node suite polices it
+     * (test/db.exclusive-handles.test.js), and a view that opened its own
+     * copy of a collection's files would break it -- which is why
+     * dc_collection_snapshot shares the live handles' ios instead, and why
+     * its signature has no bj_ns in it to open anything with.
+     *
+     * Asserted here through the same checking namespace the session's own
+     * open path is held to, with NOTHING declared for the view: an open
+     * would be both a counted event and a violation. And the open/close
+     * counters make "the view gave back everything" an assertion rather
+     * than a hope -- freeing a view must close no file, because the files
+     * are the session's and it is still serving them.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-view-opens", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_users_db(&ns) == 0);
+
+    bj_ns counted;
+    nscheck *k = nscheck_new(&ns, &counted);
+    CHECK_FATAL(k != NULL);
+
+    /* Setup, with the four names a session legitimately opens declared:
+     * the catalog, the primary, the index, the journal. */
+    nscheck_begin(k);
+    CHECK_OK(nscheck_declare(k, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE)));
+    CHECK_OK(nscheck_declare(k, "coll-users.bj", 13));
+    CHECK_OK(nscheck_declare(k, "idx-users-team_1.bj", 19));
+    CHECK_OK(nscheck_declare(k, "coll-users-journal.bj", 21));
+
+    dbs *s = NULL;
+    CHECK_FATAL(dbs_open(&counted, ORDER, 0, &s) == BJ_OK);
+    dc_collection *live = NULL;
+    CHECK_FATAL(dbs_collection(s, "users", 5, &live) == BJ_OK);
+    /* Cumulative counters, so the assertions below are deltas across the
+     * views alone -- nscheck_begin forgets declarations, not history. */
+    uint32_t opened = nscheck_opens(k), closed = nscheck_closes(k);
+    CHECK_I64(opened - closed, 4);   /* catalog, primary, index, journal */
+
+    /* A fresh window: from here, every name is undeclared. */
+    nscheck_begin(k);
+
+    /* Ten views, taken and freed, plus reads through each -- because a
+     * handle leaked once is a bug found by inspection and a handle leaked
+     * per view is EMFILE in production weeks later. */
+    const uint8_t *f; uint32_t flen;
+    bj_builder *fb = empty_filter(&f, &flen);
+    for (int i = 0; i < 10; i++) {
+        dc_collection *view = NULL;
+        CHECK_FATAL(dbs_read_view(s, "users", 5, &view) == BJ_OK);
+        CHECK_I64(count_matching(view, f, flen), 3);
+        dbs_read_view_close(view);
+    }
+    bj_builder_free(fb);
+
+    CHECK_I64(nscheck_opens(k) - opened, 0);
+    CHECK_I64(nscheck_closes(k) - closed, 0);
+    if (nscheck_violations(k))
+        TAP_FAIL("a read view opened a file: %s", nscheck_first_violation(k));
+
+    /* The session is untouched by all of it and still holds exactly what
+     * it held: the view borrowed, it did not take. */
+    CHECK_I64(dbs_open_count(s), 1);
+    dc_collection *again = NULL;
+    CHECK_FATAL(dbs_collection(s, "users", 5, &again) == BJ_OK);
+    CHECK(again == live);
+
+    /* A view of a collection the catalog does not have is a refusal, not
+     * an empty view -- the open is attempted, so this one CAN open. */
+    nscheck_begin(k);
+    CHECK_OK(nscheck_declare(k, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE)));
+    dc_collection *missing = NULL;
+    CHECK_RC(dbs_read_view(s, "nope", 4, &missing), DC_ERR_NO_COLLECTION);
+    CHECK(missing == NULL);
+
+    dbs_close(s);
     nscheck_end(k);
     nscheck_free(k);
     bjns_posix_free(&ns);
@@ -11611,6 +11976,7 @@ int main(void) {
     RUN(posix_namespace_backs_a_real_database);
     RUN(a_session_resolves_a_collection_by_name_with_no_host_language);
     RUN(a_collection_that_cannot_be_opened_leaves_the_session_untouched);
+    RUN(a_read_view_opens_no_file_and_gives_back_every_handle);
     RUN(a_request_is_answered_in_binjson_with_no_transport);
     RUN(every_way_a_request_can_be_wrong_is_answered_not_thrown);
     RUN(memory_io_is_accepted_without_a_sync_callback);
@@ -11662,5 +12028,8 @@ int main(void) {
     RUN(cross_file_journal_stays_bounded);
     RUN(applied_index_advances_and_never_regresses);
     RUN(distinct_reports_unique_values);
+    RUN(a_read_view_answers_the_state_it_was_captured_at);
+    RUN(a_read_view_refuses_every_write_and_cannot_be_stacked);
+    RUN(a_geo_index_is_refused_a_read_view_rather_than_left_out_of_one);
     return tap_summary();
 }

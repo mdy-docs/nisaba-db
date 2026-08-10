@@ -215,6 +215,19 @@ extern "C" {
 #define DC_ERR_NOT_REPLICATED       (-74)
 #define DC_ERR_TRANSFER_FAILED      (-75)
 
+/*
+ * A stale-tolerant read asked for state at or past a log index this
+ * member has not applied yet (`after`, server/replica.c).
+ *
+ * Distinct from -63 and -66 because the remedy is different from
+ * either. Not "ask the leader" -- though the leader is one member that
+ * certainly satisfies it -- and not "there may be nobody to ask". It
+ * is "not yet, HERE": another member may already be past that index,
+ * and this one will be within about a heartbeat. Retryable anywhere,
+ * including on this same member.
+ */
+#define DC_ERR_BEHIND               (-76)
+
 #define DC_ERR_NO_CURSOR            (-46)
 #define DC_ERR_TOO_MANY_CURSORS     (-47)
 #define DC_ERR_CURSOR_SORTED        (-48)

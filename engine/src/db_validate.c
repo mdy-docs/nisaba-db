@@ -200,6 +200,10 @@ const char *dc_strerror(int code) {
             return "Leadership did not move before the deadline (the target "
                    "is down, unreachable, or refused to stand); this member "
                    "still leads and it is safe to retry";
+        case DC_ERR_BEHIND:
+            return "This member has not applied far enough to serve a read "
+                   "asked for `after` that index; try another member, or this "
+                   "one again in a moment";
         case DC_ERR_CURSORS_OPEN:
             return "Cannot compact a collection while a cursor is scanning it: "
                    "compaction rewrites the files the cursor is positioned in";

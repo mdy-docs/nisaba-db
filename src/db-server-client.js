@@ -265,6 +265,11 @@ class Connection {
     this._buf = Buffer.alloc(0);
     this._dead = null;      // the Error every later call fails with
     this._closing = false;  // our own close(), so EOF is not a surprise
+    /* The highest log index a write over THIS connection has been told
+     * about (see call()). Read-your-writes for stale reads is built on
+     * it; 0 means nothing has been written here yet, which is no floor
+     * at all. */
+    this.lastCommit = 0;
     this._streams = new Map();   // stream id -> RemoteChangeStream
     /* Frames for a stream id nobody has claimed YET. A resumed watch's
      * replayed events can share a TCP segment with the subscribe answer
@@ -448,6 +453,20 @@ class Connection {
       if (res.leader && typeof res.leader === 'object') err.leader = res.leader;
       throw err;
     }
+    /*
+     * The log index a write reached, remembered as a high-water mark.
+     *
+     * A replicated server stamps every finished write with `commit`,
+     * and this is the whole client-side of read-your-writes: a stale
+     * read sent afterwards carries the mark as `after`, so no member
+     * may answer it from state older than the write this connection
+     * has already been told about. Monotonic, never decreasing --
+     * answers can arrive out of order on a pipelined connection, and a
+     * floor that could fall is not a floor.
+     */
+    if (typeof res.commit === 'number' && res.commit > this.lastCommit) {
+      this.lastCommit = res.commit;
+    }
     return res;
   }
 
@@ -542,16 +561,28 @@ function materialized(docs, extras = {}) {
 /**
  * The stale-tolerance waiver, as a top-level request field.
  *
- * `{ stale: true }` on a READ says the caller will take this member's
- * own applied state, whatever its role -- which is what lets a FOLLOWER
- * serve it instead of refusing toward the leader, and lets any member
- * keep answering through an election. The staleness is bounded by
- * replication lag; there is no read-your-writes. Absent means what it
- * has always meant: linearizable, from the leader, behind a quorum
- * barrier.
+ * `{ stale: true }` on a READ says the caller will take the answering
+ * member's own applied state, whatever its role -- which is what lets a
+ * FOLLOWER serve it instead of refusing toward the leader, and lets any
+ * member keep answering through an election. Absent means what it has
+ * always meant: linearizable, from the leader, behind a quorum barrier.
+ *
+ * ...but not older than what this connection has already been told.
+ * `after` carries the connection's write high-water mark, so a member
+ * that has not applied that far refuses (-76) instead of serving state
+ * in which the caller's own write has not happened yet. That is
+ * read-your-writes, and it costs one number on the wire.
+ *
+ * `{ stale: true, after: n }` states the floor explicitly, which is
+ * what a caller ACROSS connections needs: the number came back on the
+ * write's answer as `commit`, and whoever holds it can hand it to a
+ * different connection -- or a different process -- than the one that
+ * wrote. `after: 0` waives the floor entirely.
  */
-function staleOf(options) {
-  return options?.stale === true ? { stale: true } : {};
+function staleOf(options, conn) {
+  if (options?.stale !== true) return {};
+  const after = options.after ?? conn?.lastCommit ?? 0;
+  return after > 0 ? { stale: true, after } : { stale: true };
 }
 
 /** find's options, as db_request.c's read_opts reads them: absent is none. */
@@ -588,7 +619,7 @@ function collection(conn, name) {
      */
     find(filter = {}, options = undefined) {
       const opts = findOpts(options);
-      const stale = staleOf(options);
+      const stale = staleOf(options, conn);
       const batchSize = options?.batchSize > 0 ? options.batchSize : 0;
 
       if (!batchSize) {
@@ -658,7 +689,7 @@ function collection(conn, name) {
     },
 
     async findOne(filter = {}, options = undefined) {
-      const res = await call({ op: 'findOne', filter, ...staleOf(options) });
+      const res = await call({ op: 'findOne', filter, ...staleOf(options, conn) });
       return res.found ? res.doc : null;
     },
 
@@ -674,7 +705,7 @@ function collection(conn, name) {
     aggregate(pipeline = [], options = undefined) {
       if (!Array.isArray(pipeline)) throw new Error('aggregate requires a pipeline array');
       return materialized(
-        call({ op: 'aggregate', stages: pipeline, ...staleOf(options) })
+        call({ op: 'aggregate', stages: pipeline, ...staleOf(options, conn) })
           .then((res) => res.docs || [])
           .catch((err) => { throw atStage(err, pipeline); })
       );
@@ -688,11 +719,11 @@ function collection(conn, name) {
     },
 
     async countDocuments(filter = {}, options = undefined) {
-      return (await call({ op: 'count', filter, ...staleOf(options) })).n;
+      return (await call({ op: 'count', filter, ...staleOf(options, conn) })).n;
     },
 
     async distinct(field, filter = {}, options = undefined) {
-      return (await call({ op: 'distinct', field, filter, ...staleOf(options) })).values || [];
+      return (await call({ op: 'distinct', field, filter, ...staleOf(options, conn) })).values || [];
     },
 
     /* The id is this side's, and it is also the answer: an insert's
@@ -1147,6 +1178,18 @@ export async function connectServer(address, { keepAliveMs = DEFAULT_KEEPALIVE_M
   const impl = {
     isOpen: true,
     address: `${host}:${port}`,
+    /**
+     * The highest log index a write over this connection has been told
+     * about, or 0 — the `commit` a replicated server stamps every
+     * finished write with.
+     *
+     * Stale reads on this connection carry it automatically. It is
+     * readable because a caller that spreads reads over OTHER
+     * connections — a gateway routing to followers is the case this
+     * exists for — has to move the floor across itself, by passing it
+     * as `after`.
+     */
+    get lastCommit() { return conn.lastCommit; },
     /** A database on this connection. Sends nothing; the same name
      * returns the same handle, as `Client.db(name)` does in process. */
     db(name) {

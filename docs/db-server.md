@@ -285,9 +285,8 @@ with the read.
 What the flag means, precisely: the answer reflects everything this
 member has applied, which on a healthy cluster trails the leader by at
 most about a heartbeat — and by more when the member is catching up,
-with no bound the member can state. There is no read-your-writes: a
-write acknowledged by the leader may not be visible to a flagged read
-on a follower yet. The flag changes routing for reads only —
+with no bound the member can state. The flag changes routing for reads
+only —
 classification is untouched, so a write carrying it is refused exactly
 as before, and it travels per request, never per connection. Cursor
 continuations (`getMore`) must carry it too, since the cursor lives on
@@ -300,6 +299,41 @@ across the WAN. It is the asynchronous read tier the
 [`replicaton-roadmap.md`](replicaton-roadmap.md) step 6 decision
 deferred — built inside consensus rather than beside it, because the
 followers were already applying the same log.
+
+**And a floor under it, so you can read your own writes.** Eventual
+consistency alone is unusable for the commonest shape there is —
+write, then read what you wrote — so every finished write on a
+replicated server answers with **`commit`**, the log index its entries
+reached, and a stale read may carry that index back as **`after`**. A
+member that has not applied that far **refuses with `-76`** instead of
+answering from before it.
+
+```
+  → { op: 'insert',  … }                  ← { ok: true, …, commit: 118 }
+  → { op: 'findOne', …, stale: true, after: 118 }
+                                          ← { ok: false, code: -76 }   (this member is behind)
+                                          ← { ok: true, found: true, … } (once it is not)
+```
+
+So the guarantee is not "the follower is fast" — it is that a flagged
+read can never show *less* than the client has already been told,
+whichever member answers. `-76` is its own code because the remedy is
+neither `-63`'s ("ask the leader") nor `-66`'s ("there may be nobody to
+ask"): it is *not yet, here* — another member may already be past that
+index, and this one will be within about a heartbeat. Retry anywhere,
+including the same member. The leader always satisfies it.
+
+Expect the immediate read after a write to refuse: the leader answers
+once a *quorum* holds the entry, and a follower learns the new commit
+index on the next AppendEntries. That is the floor doing its job.
+
+`src/db-server-client.js` tracks `commit` per connection as
+`client.lastCommit` and sends it automatically on that connection's
+stale reads, so read-your-writes needs nothing from a caller using one
+connection. Spreading reads over *other* connections — a gateway
+routing to followers — means carrying the number across: pass it
+explicitly as `{ stale: true, after: n }`, and `after: 0` waives the
+floor.
 
 **Without `--raft` nothing changes**, including the file layout: a
 directory served by a single process today can be joined to a cluster

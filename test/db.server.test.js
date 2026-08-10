@@ -993,6 +993,106 @@ for (const engine of ENGINES) {
     });
 
     /*
+     * READ-YOUR-WRITES ON TOP OF IT. `{ stale: true }` alone is
+     * eventually consistent, which is unusable for the ordinary shape
+     * "write, then read what I wrote": a follower a heartbeat behind
+     * would answer from a world where the write had not happened.
+     *
+     * `after: <n>` is the floor. A write's answer carries the log index
+     * it reached (`commit`); a read carrying that index back is refused
+     * (-76) by any member that has not applied it, rather than served
+     * from before it. So the guarantee is not "the follower is fast" --
+     * it is that a read can never show LESS than the client already
+     * knows, whichever member happens to answer.
+     *
+     * The assertion is that invariant rather than a timing: every
+     * attempt must either see the write or refuse. Seeing the state
+     * BEFORE it, on any of these rounds, is the bug this exists to
+     * catch -- and each round races the write against replication, so
+     * the race is exercised rather than waited out.
+     */
+    it('never serves a stale read from before a write the client was told about', async () => {
+      await agree(['alpha', 'beta', 'contested', 'redirected']);
+      const stats = await Promise.all(
+        nodes.filter((n) => n.alive).map(async (m) => [m, await statusOf(m)]));
+      const leader = stats.find(([, s]) => s.role === 'leader')[0];
+      const follower = stats.find(([, s]) => s.role !== 'leader')[0];
+
+      const lc = await connectServer(leader.port);
+      const fc = await connectServer(follower.port);
+      let refusals = 0, served = 0;
+      try {
+        /* Its own collection: `agree` -- which every test after this one
+         * leans on -- counts `users`, and 25 more documents there would
+         * be this test rewriting the suite's shared expectation. */
+        const writes = lc.db(DB).collection('ryw');
+        const reads = fc.db(DB).collection('ryw');
+        for (let i = 0; i < 25; i++) {
+          const name = `ryw-${i}`;
+          await writes.insertOne({ name });
+          // The floor the leader's answer put under everything after it.
+          const after = lc.lastCommit;
+          expect(after).toBeGreaterThan(0);
+          try {
+            const found = await reads.findOne({ name }, { stale: true, after });
+            /* Served means the follower claimed to be at or past that
+             * index -- so the document MUST be there. A hit here with
+             * `found` null would be the floor failing to hold. */
+            expect(found?.name).toBe(name);
+            served++;
+          } catch (err) {
+            expect(err.code).toBe(-76);
+            refusals++;
+          }
+        }
+        /*
+         * Both outcomes are legal and the refusals are the EXPECTED
+         * ones: the leader answers a write as soon as a quorum has it,
+         * and a follower learns the new commit index on the next
+         * AppendEntries -- so a read issued in the same breath is
+         * genuinely behind, and says so. That is the floor working, not
+         * the follower being slow. What must never happen is the third
+         * outcome, and the loop above is what would have caught it.
+         */
+        expect(served + refusals).toBe(25);
+        expect(refusals).toBeGreaterThan(0);
+
+        // And the floor lifts on its own: the follower catches up, so
+        // the same read stops refusing without anybody retrying a write.
+        const settled = await (async () => {
+          const until = Date.now() + 10000;
+          while (Date.now() < until) {
+            try {
+              return await reads.countDocuments({}, { stale: true, after: lc.lastCommit });
+            } catch (err) {
+              if (err.code !== -76) throw err;
+              await new Promise((r) => setTimeout(r, 50));
+            }
+          }
+          throw new Error('the follower never caught up to the floor');
+        })();
+        expect(settled).toBe(25);
+
+        /*
+         * ...and now the SERVED path, with a real floor rather than a
+         * lucky one: the follower is known to be caught up, so a read
+         * carrying the same high-water must be answered -- by the
+         * follower, from its own state -- and must contain the last
+         * write. This is the pair the guarantee is made of: refused
+         * while behind, correct once not.
+         */
+        const last = await reads.findOne({ name: 'ryw-24' }, { stale: true, after: lc.lastCommit });
+        expect(last?.name).toBe('ryw-24');
+        expect((await statusOf(follower)).role).not.toBe('leader');
+      } finally {
+        await lc.close();
+        await fc.close();
+      }
+      // The suite's own collection is untouched by any of it.
+      await agree(['alpha', 'beta', 'contested', 'redirected']);
+    }, 60000);
+
+    /*
      * ...and the other half of linearizable: a LEADER that cannot prove
      * it still leads refuses too.
      *

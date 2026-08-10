@@ -1824,6 +1824,20 @@ static int req_reads_stale(const uint8_t *req, size_t len) {
 }
 
 /*
+ * The floor the client put under this read: `after: <n>`, a log index
+ * it has already been told about (the `commit` a write answered with).
+ * 0 -- absent, unreadable, or genuinely zero -- is no floor at all.
+ */
+static uint64_t req_read_after(const uint8_t *req, size_t len) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(req, len, (const uint8_t *)"after", 5, &v, &vlen, &found)) return 0;
+    if (!found) return 0;
+    cur c = { v, vlen, 0 };
+    uint64_t at = 0;
+    return read_u64(&c, &at) == BJ_OK ? at : 0;
+}
+
+/*
  * A read the client declared stale-tolerant, served from this member's
  * own applied state, whatever its role.
  *
@@ -1845,11 +1859,28 @@ static int req_reads_stale(const uint8_t *req, size_t len) {
  *
  * The pump still runs first: "stale" means behind the cluster, never
  * behind this member's own committed log.
+ *
+ * READ-YOUR-WRITES, when the client asks for it. `after: <n>` is a log
+ * index the client has already been told about -- the `commit` some
+ * write answered with -- and this member refuses (-76) rather than
+ * serve state older than it. That turns "eventually consistent" into
+ * "monotonic, from a floor the client chose": a client that writes and
+ * then reads never sees its own write vanish, wherever the read lands.
+ * The refusal is cheap to act on -- another member may already be past
+ * that index, and this one will be within about a heartbeat -- which is
+ * why it is its own code rather than -63 or -66.
  */
 static int submit_read_stale(replica *r, uint64_t client,
                              const uint8_t *req, size_t len, dbuf *out) {
     int e = apply_committed(r);
     if (e) return e;
+    /* After the pump, so the floor is tested against everything this
+     * member has actually got -- not against a number that was already
+     * stale when the request arrived. */
+    if (r->applied < req_read_after(req, len)) {
+        e = refuse(r, DC_ERR_BEHIND, out);
+        return e ? e : 0;
+    }
     dbuf cmds = {0};
     uint64_t token = 0;
     e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
@@ -2375,6 +2406,60 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
  * log -- a bulkWrite planning its next operation against what this one
  * just did -- or its answer is ready.
  */
+/*
+ * Stamp a finished write's answer with the log index its entries
+ * reached: `commit: <n>`, spliced in beside whatever the operation
+ * itself answered.
+ *
+ * THIS IS THE HALF OF READ-YOUR-WRITES THE SERVER OWES. A follower
+ * serving a stale read has no way to know which writes the asking
+ * client has already been told about -- so the client is told, in the
+ * one place it cannot miss, and hands the number back on the reads
+ * that must not appear to go backwards (`after`, submit_read_stale).
+ *
+ * Rebuilt rather than appended to: a binjson object carries its field
+ * count in its header, so a field cannot be bolted onto the end of an
+ * encoded one. Every field is copied through by raw bytes, which
+ * neither parses nor re-encodes the values the operation produced --
+ * an answer holding a document must come back byte-identical.
+ *
+ * Only the replicated path reaches here. An unreplicated server has no
+ * log index to report and no follower that could be behind one, so its
+ * answers keep exactly the shape they always had.
+ */
+static int stamp_commit(dbuf *answer, uint64_t at) {
+    cur c = { answer->data, answer->len, 0 };
+    uint32_t count = 0;
+    if (object_begin(&c, &count) != BJ_OK) return BJ_OK;   /* not an object: leave it */
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    for (uint32_t i = 0; i < count && !e; i++) {
+        const uint8_t *kp; uint32_t klen;
+        if (take_key(&c, &kp, &klen) != BJ_OK) { e = BJ_ERR_STATE; break; }
+        size_t vstart = c.pos;
+        if (skip_value(&c) != BJ_OK) { e = BJ_ERR_STATE; break; }
+        /* An answer that already says `commit` is not overwritten twice:
+         * the first stamp is the one that is true. */
+        if (klen == 6 && memcmp(kp, "commit", 6) == 0) { bj_builder_free(b); return BJ_OK; }
+        e = bj_put_key(b, kp, klen);
+        if (!e) e = bj_put_raw(b, c.d + vstart, (uint32_t)(c.pos - vstart));
+    }
+    if (!e) e = bj_put_key(b, (const uint8_t *)"commit", 6);
+    if (!e) e = bj_put_int(b, (int64_t)at);
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *d = bj_builder_data(b, &len);
+        if (!d) e = BJ_ERR_STATE;
+        else { answer->len = 0; e = dbuf_put(answer, d, len); }
+    }
+    bj_builder_free(b);
+    return e;
+}
+
 static int advance(replica *r, pending *p) {
     dbuf cmds = {0};
     uint64_t next = 0;
@@ -2385,7 +2470,16 @@ static int advance(replica *r, pending *p) {
     }
     int e = dbi_step(r->inst, p->token, p->indices, p->view, p->n, &next, &cmds, &p->answer);
     if (e) { dbuf_free(&cmds); return e; }
-    if (!next) { dbuf_free(&cmds); p->done = 1; return BJ_OK; }
+    if (!next) {
+        dbuf_free(&cmds);
+        /* Stamped even when the operation itself REFUSED (a duplicate
+         * key, say): the entries were proposed and the log did move, so
+         * a later read that must not go backwards has to clear this
+         * index too. */
+        e = stamp_commit(&p->answer, p->last);
+        p->done = 1;
+        return e;
+    }
 
     p->token = next;
     e = propose_batch(r, p, &cmds);

@@ -215,6 +215,67 @@ describe.skipIf(!enabled)('a busy server: many clients, deep pipelines', () => {
     }
   }, 120000);
 
+  it('compiles a fresh $regex on every connection at once', async () => {
+    /*
+     * The one read path that touches process-lifetime state outside the
+     * collection: compiling a pattern. engine/src/regex.c caches compiled
+     * patterns PER THREAD and serializes the compile itself, because
+     * regex-engine keeps statics only its compiler touches and documents
+     * that an embedder must serialize it (RX_COMPILE_LOCK says which
+     * statics, and which is one flag away from mattering).
+     *
+     * Every other test here reads with a plain filter, which compiles
+     * nothing -- so without this one the whole compile path is
+     * unreachable from the suite built to find concurrency bugs, and a
+     * TSan run over it would come back green having never entered the
+     * code at risk.
+     *
+     * The patterns must all DIFFER, or the per-thread cache answers from
+     * the second read onward and nothing compiles. `(?:[0-9]+|zzz<k>)`
+     * cannot match a `v<n>` tag through its second branch, so every
+     * pattern selects every document however k varies, and the count is
+     * still exact.
+     */
+    const w = await connectServer(PORT);
+    const readers = await Promise.all(
+      Array.from({ length: 8 }, () => connectServer(PORT)));
+    try {
+      const N = 60;
+      const writes = w.db(DB).collection('patterns');
+      for (let i = 0; i < N; i++) {
+        await writes.insertOne({ n: i, echo: i, tag: `v${i}` });
+      }
+
+      /* 8 connections × 12 distinct patterns = 96 compiles, well past the
+       * 8-entry cache, so eviction and re-compilation both happen. */
+      const counts = await Promise.all(readers.map(async (rc, r) => {
+        const coll = rc.db(DB).collection('patterns');
+        const got = [];
+        for (let k = 0; k < 12; k++) {
+          const docs = await coll
+            .find({ tag: { $regex: `^v(?:[0-9]+|zzz${r}_${k})$` } })
+            .toArray();
+          for (const d of docs) expect(d.tag).toBe(`v${d.n}`);
+          got.push(docs.length);
+        }
+        return got;
+      }));
+
+      // Every one of the 96 reads saw the whole collection.
+      for (const perReader of counts) {
+        for (const n of perReader) expect(n).toBe(N);
+      }
+      // And a pattern that matches nothing still answers, rather than
+      // matching everything because a stale compiled handle was reused.
+      const none = await w.db(DB).collection('patterns')
+        .find({ tag: { $regex: '^nothing-matches-this$' } }).toArray();
+      expect(none).toHaveLength(0);
+    } finally {
+      await w.close();
+      await Promise.all(readers.map((c) => c.close()));
+    }
+  }, 120000);
+
   it('pages a cursor while the collection is being written to', async () => {
     /* A cursor pins the tree's root at open, so it iterates a consistent
      * snapshot and simply does not see later appends (bplustree.h's

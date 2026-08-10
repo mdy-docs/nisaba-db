@@ -120,6 +120,26 @@ async function startServer(dir, port) {
 /** The self-describing document, and the check that reads it back. */
 const docFor = (coll, n) => ({ n, echo: n, tag: `v${n}`, coll });
 
+/*
+ * A $regex filter whose pattern is DIFFERENT EVERY TIME, matching exactly
+ * the same documents.
+ *
+ * Reads here were all `find({})` until now, which never compiles a regex,
+ * so the whole compile path -- and the process-lifetime state
+ * regex-engine keeps inside it (engine/src/regex.c's RX_COMPILE_LOCK
+ * says which) -- was unreachable from the one harness built to find
+ * concurrency bugs. That is a hole exactly where reads leaving the
+ * serving thread are sharpest.
+ *
+ * Varying `k` is the whole point: engine/src/regex.c caches 8 compiled
+ * patterns per thread, so a fixed pattern compiles once and every later
+ * read is a cache hit that proves nothing. `(?:[0-9]+|zzz<k>)` can never
+ * match a tag through its second branch -- tags are `v<n>` -- so the
+ * result set is every document in the collection whatever k is, and the
+ * content check below stays exact.
+ */
+const regexFor = (k) => ({ tag: { $regex: `^v(?:[0-9]+|zzz${k})$` } });
+
 function checkBatch(coll, docs) {
   const ns = [];
   for (const d of docs) {
@@ -143,7 +163,7 @@ const main = async () => {
   const rand = rng(opts.seed);
   const COLLS = ['alpha', 'beta', 'gamma'];
   const counts = new Map(COLLS.map((c) => [c, 0]));
-  const stats = { writes: 0, reads: 0, compacts: 0, drops: 0, indexes: 0 };
+  const stats = { writes: 0, reads: 0, regexReads: 0, compacts: 0, drops: 0, indexes: 0 };
 
   say(`soak: ${opts.seconds}s, ${opts.readers} readers, seed ${opts.seed}, ` +
       `port ${opts.port}, ${NATIVE}`);
@@ -191,14 +211,20 @@ const main = async () => {
     }
   })();
 
+  let pattern = 0;   /* only the readers touch it, and only to differ */
   const reading = readers.map(async (rc) => {
     const db = rc.db(DB);
     while (Date.now() < deadline && !violations.length) {
       const coll = COLLS[(rand() * COLLS.length) | 0];
+      /* A quarter of reads compile a fresh pattern; the rest stay on the
+       * plain scan, which is still the shape most reads have. */
+      const useRegex = rand() < 0.25;
       try {
-        const docs = await db.collection(coll).find({}).toArray();
+        const filter = useRegex ? regexFor(pattern++) : {};
+        const docs = await db.collection(coll).find(filter).toArray();
         checkBatch(coll, docs);
         stats.reads++;
+        if (useRegex) stats.regexReads++;
       } catch (err) {
         if (!expected(err)) note(`reader: [${err?.code}] ${err.message}`);
       }
@@ -217,8 +243,12 @@ const main = async () => {
   }
 
   fs.rmSync(dir, { recursive: true, force: true });
-  say(`done: ${stats.writes} writes, ${stats.reads} reads, ${stats.compacts} compacts, ` +
+  say(`done: ${stats.writes} writes, ${stats.reads} reads ` +
+      `(${stats.regexReads} compiling a fresh $regex), ${stats.compacts} compacts, ` +
       `${stats.indexes} index ops, ${stats.drops} drops`);
+  /* A run that compiled nothing did not exercise the compile path, and
+   * would pass vacuously for the hazard that path carries. */
+  if (!stats.regexReads) note('no read compiled a $regex -- the compile path went untested');
 
   if (violations.length) {
     console.error(`\n${violations.length} violation(s) -- replay with --seed ${opts.seed}`);

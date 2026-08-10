@@ -5,11 +5,18 @@
  * anywhere" only, never capture groups, so this never touches
  * regex_captures_ptr()/regex_group_count().
  *
- * The compile cache has per-thread storage on any target where more than
- * one thread is possible (see REGEX_CACHE_TLS below), so a native server
- * handling concurrent requests gets a cache per thread rather than a data
- * race. On the single-threaded browser build it stays a plain global at
- * zero cost, which is what it always was.
+ * Two things make this safe for a native server that reads on more than
+ * one thread, and they cover different halves of it:
+ *
+ *   - the compile cache has PER-THREAD storage wherever a second thread
+ *     is possible (REGEX_CACHE_TLS below), so every handle this file
+ *     hands out is private to one thread and MATCHING races on nothing;
+ *   - COMPILING is serialized by one mutex (RX_COMPILE_LOCK below),
+ *     because regex-engine keeps process-lifetime statics that only its
+ *     compiler touches and documents that an embedder must serialize it.
+ *
+ * On the single-threaded browser build both resolve away -- plain
+ * statics, no lock -- and the generated code is what it always was.
  */
 #include "regex.h"
 #include "binjson.h"
@@ -156,6 +163,61 @@ typedef struct {
 static REGEX_CACHE_TLS regex_cache_entry g_regex_cache[REGEX_CACHE_CAPACITY];
 static REGEX_CACHE_TLS unsigned long g_regex_cache_clock = 0;
 
+/*
+ * ---- Serialized COMPILATION (not matching) -----------------------------
+ *
+ * The per-thread cache above makes every handle this file hands out
+ * private to one thread, so matching races on nothing. Compiling does,
+ * and not because of anything here: regex-engine keeps process-lifetime
+ * statics that only its compiler touches, and its own
+ * docs/ARCHITECTURE.md states the consequence outright -- "NOT
+ * thread-safe: a multi-threaded native embedder must serialize
+ * compilation."
+ *
+ * Two of them, and they are not equally close:
+ *
+ *   - `regex_wasm.c`'s g_last_error[256] is written by EVERY compile,
+ *     failure or success (the success path ends in set_last_error(NULL)).
+ *     That is the live one, on the ordinary path, and this file never
+ *     even reads it -- rx_match returns a boolean and lets the detail go.
+ *   - `re_lexer.c`'s prop_cache[64] is unreachable from here TODAY, and
+ *     only because rx_match passes no REGEX_FLAG_UNICODE: without it the
+ *     lexer treats `\p` as a literal 'p' rather than a property escape
+ *     (re_lexer.c's `if (lexer->prog->unicode)`). One flag, one line,
+ *     and a `$regex` implementation that grows a `u` option reaches it.
+ *
+ * We are that embedder, so we serialize it here rather than making the
+ * library thread-safe from the outside. Three reasons, in order:
+ *
+ *   - it honors a documented contract instead of quietly widening one,
+ *     and the submodule stays a shared dependency rather than a fork;
+ *   - it is closed by CONSTRUCTION rather than by enumeration -- which is
+ *     what the prop_cache case argues for. A lock around the compile
+ *     covers the static that is reachable, the one that is one flag away
+ *     from being reachable, and any added later that no audit would see;
+ *   - it costs nothing measurable. Compilation happens on a cache MISS,
+ *     which during the scan this exists to speed up is once per pattern,
+ *     against millions of matches that take no lock at all.
+ *
+ * Matching deliberately stays outside it: serializing regex_exec would
+ * put every $regex evaluation in the process behind one mutex, which is
+ * the cost the per-thread cache was built to avoid.
+ *
+ * No lock where no second thread can exist. On wasm both targets are
+ * single-threaded by construction and pthreads may not be there at all;
+ * the only native targets are Linux and macOS (Windows ships the wasip2
+ * build under wasmtime), where pthread_mutex_* is in libc.
+ */
+#if defined(__EMSCRIPTEN__) || defined(__wasi__)
+#define RX_COMPILE_LOCK()    ((void)0)
+#define RX_COMPILE_UNLOCK()  ((void)0)
+#else
+#include <pthread.h>
+static pthread_mutex_t g_compile_lock = PTHREAD_MUTEX_INITIALIZER;
+#define RX_COMPILE_LOCK()    ((void)pthread_mutex_lock(&g_compile_lock))
+#define RX_COMPILE_UNLOCK()  ((void)pthread_mutex_unlock(&g_compile_lock))
+#endif
+
 static uintptr_t regex_cache_lookup(const uint8_t *pattern, uint32_t pattern_len, int flags) {
     for (int i = 0; i < REGEX_CACHE_CAPACITY; i++) {
         regex_cache_entry *e = &g_regex_cache[i];
@@ -207,7 +269,9 @@ int rx_match(const char *pattern, int pattern_len, int ignorecase,
         uint16_t *pat16; size_t pat16_units;
         int e = utf8_to_utf16((const uint8_t *)pattern, (size_t)pattern_len, 1, &pat16, &pat16_units);
         if (e) return e;
+        RX_COMPILE_LOCK();
         handle = regex_compile(pat16, (int)pat16_units, flags);
+        RX_COMPILE_UNLOCK();
         free(pat16);
         if (!handle) return BJ_ERR_STATE; /* invalid pattern syntax; regex_last_error() has detail this boolean API doesn't surface */
         int e2 = regex_cache_insert((const uint8_t *)pattern, (uint32_t)pattern_len, flags, handle);

@@ -864,6 +864,25 @@ int dbs_read(dc_collection *coll, const uint8_t *req, size_t req_len, dbuf *out)
  * (dbs_read) -- so this is a scheduling hint and nothing more.
  */
 int dbs_read_is_long(dbs *s, const uint8_t *req, size_t req_len, int64_t min_docs);
+
+/*
+ * DOES PERFORMING THIS REQUEST TRUNCATE, REPLACE OR REMOVE A FILE?
+ *
+ * The question a caller holding read views has to ask before it performs
+ * anything. A view (db.h's dc_collection_snapshot) shares the live handle's
+ * io and stays valid exactly as long as its files are only APPENDED to --
+ * so a document write is safe under one, including a failed one, while
+ * making and unmaking files is not, and whoever holds views must retire
+ * them first.
+ *
+ * Read off the op table, where every op states its answer, so an op added
+ * later cannot become destructive without saying so. Conservative in both
+ * directions that matter: a request it cannot read at all answers 1, and
+ * createIndex answers 1 although it only adds a file -- the cost of a wrong
+ * 0 is a use-after-free, and the cost of a wrong 1 is a pause on something
+ * that happens once.
+ */
+int dbs_request_wrecks_files(const uint8_t *req, size_t req_len);
 /* How many ops the table holds. Exposed so a test can assert the table has
  * an opinion about every one of them rather than about a subset it happens
  * to have listed -- an op added with no `bare` decision is exactly the gap

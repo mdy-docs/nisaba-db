@@ -119,6 +119,7 @@
 #include "db_session.h"
 #include "db_instance.h"
 #include "replica.h"
+#include "readers.h"   /* SERVER_HAS_READ_THREADS */
 #include "root.h"
 #include "peers.h"
 #include "join.h"
@@ -626,7 +627,10 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
      * have watched -- its own listener and one socket per direction per
      * member (server/peers.h bounds it, which is what makes this one
      * allocation rather than a growing array). */
-    struct pollfd *pf = (struct pollfd *)calloc((size_t)max_clients + 1 + PEERS_MAX_FDS,
+    /* ...plus one for the reader pool's wake pipe (server/readers.h), which
+     * is how a read finished on another thread interrupts a poll() that is
+     * otherwise blocked with no timeout at all. */
+    struct pollfd *pf = (struct pollfd *)calloc((size_t)max_clients + 1 + PEERS_MAX_FDS + 1,
                                                 sizeof *pf);
     if (!cs || !pf) { free(cs); free(pf); return -1; }
     for (int i = 0; i < max_clients; i++) cs[i].fd = -1;
@@ -665,6 +669,17 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
             pf[pbase + i].events = (short)(POLLIN | (want_write ? POLLOUT : 0));
             pf[pbase + i].revents = 0;
         }
+        /*
+         * The reader pool's wake pipe, last. Its slot moves with the
+         * connection count like the peers' do, and -1 is a slot poll()
+         * ignores -- so a server with no reader threads watches exactly
+         * what it watched before.
+         */
+        const int wbase = pbase + (int)pn;
+        const int wake_fd = replica_read_wake_fd(rep);
+        pf[wbase].fd = wake_fd;
+        pf[wbase].events = POLLIN;
+        pf[wbase].revents = 0;
 
         /* Sleep until something happens or the earliest deadline, rather
          * than waking on a tick to find nothing to do. No timer, no
@@ -698,7 +713,7 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
             if (wait_ms < 0 || tick < wait_ms) wait_ms = tick;
         }
 
-        int r = poll(pf, (nfds_t)(n + 1 + (int)pn), wait_ms);
+        int r = poll(pf, (nfds_t)(n + 1 + (int)pn + (wake_fd >= 0 ? 1 : 0)), wait_ms);
         if (r < 0) {
             if (errno == EINTR) continue;
             perror("poll");
@@ -743,6 +758,18 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
              * anyway.
              */
             if (replica_adopt_pending(rep)) {
+                /* Adoption closes the whole instance and puts different
+                 * files where the database looks. Every read view any
+                 * worker holds points into the files being replaced, so
+                 * they have to be finished with before this runs -- the
+                 * same rule as a dropped collection, at the largest scale
+                 * it comes in. */
+                int rde = replica_wait_reads_idle(rep);
+                if (rde != 0) {
+                    fprintf(stderr, "replica: readers would not finish before an"
+                                    " install (%d: %s)\n", rde, dc_strerror(rde));
+                    break;
+                }
                 int ae = adopt_install(&inst, rep, rootops, order, rst);
                 *inst_p = inst;
                 if (ae != 0) {
@@ -758,6 +785,19 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
         if (idle_ms) {
             uint64_t now = now_ms();
             for (int i = n - 1; i >= 0; i--) {
+                /*
+                 * NOT A CONNECTION THAT IS WAITING ON US. `owed` means its
+                 * answer is being worked on -- a write in the log, or a long
+                 * read on a reader thread -- and the pollset stops asking it
+                 * for POLLIN meanwhile, so `quiet_since` cannot advance
+                 * however busy the client is being on our behalf. The timer
+                 * exists to take back a slot held by a client that is not
+                 * there; a client owed an answer is the opposite of that.
+                 *
+                 * A socket that has actually gone is still noticed:
+                 * POLLHUP and POLLERR arrive whatever is asked for.
+                 */
+                if (cs[i].owed) continue;
                 if (now - cs[i].quiet_since < idle_ms) continue;
                 int fd = cs[i].fd;
                 cs[i].fd = -1;              /* conn_gone must not close it first */
@@ -845,6 +885,22 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
          * bytes nobody has just read.
          */
         if (rep) {
+            /*
+             * Reads that finished on a reader thread, moved into the
+             * requests waiting for them -- so the loop below delivers them
+             * by exactly the path a write's answer takes.
+             *
+             * Not gated on the pipe's POLLIN. A completion queued between
+             * the drain and here has spent its wake byte already, and one
+             * whose byte arrives after this pass wakes the next one; asking
+             * the queue unconditionally costs a mutex and cannot miss.
+             */
+            int re = replica_reap_reads(rep);
+            if (re != 0) {
+                fprintf(stderr, "replica: a finished read could not be delivered"
+                                " (%d: %s)\n", re, dc_strerror(re));
+                break;
+            }
             for (;;) {
                 uint64_t owner = 0;
                 int have = 0;
@@ -858,6 +914,11 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                  * still applied -- that is what committed means. */
                 if (found >= 0) {
                     cs[found].owed = 0;      /* it can be asked things again */
+                    /* Its silence starts NOW. It has been waiting on us,
+                     * possibly for longer than the idle timeout, and the
+                     * timer must not take its slot back the instant it is
+                     * free to speak again. */
+                    cs[found].quiet_since = now_ms();
                     /* The answer, and then whatever was pipelined behind
                      * it and has been waiting for exactly this. */
                     int dead = dbuf_put(&cs[found].out, answer.data, answer.len) != 0;
@@ -1252,6 +1313,17 @@ int main(int argc, char **argv) {
      * rather than accepted-and-ignored, which is the failure that looks
      * like a tuning flag that does nothing.
      */
+    /*
+     * A build with no threads at all -- both wasm targets -- says so rather
+     * than starting and quietly answering every read inline. A fleet driver
+     * that passes this flag to a wasip2 tenant needs to find out from the
+     * flag, not from a latency graph.
+     */
+    if (read_threads > 0 && !SERVER_HAS_READ_THREADS) {
+        fprintf(stderr, "--read-threads is not available in this build: wasm has no"
+                        " threads, so every read is answered on the serving thread\n");
+        return 2;
+    }
     if (read_threads > 0 && node_id <= 0) {
         fprintf(stderr, "--read-threads needs --raft NODE_ID: a read is moved by being"
                         " deferred, and only a replicated server can defer one\n");
@@ -1464,8 +1536,19 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (max_batch) replica_set_max_batch(rep, (uint32_t)max_batch);
-        if (read_threads >= 0 || read_min_docs >= 0)
-            replica_set_read_offload(rep, (int)read_threads, (int64_t)read_min_docs);
+        if (read_threads >= 0 || read_min_docs >= 0) {
+            int rte = replica_set_read_offload(rep, (int)read_threads,
+                                               (int64_t)read_min_docs);
+            if (rte != 0) {
+                fprintf(stderr, "cannot start %ld reader thread(s): %s\n",
+                        read_threads, dc_strerror(rte));
+                replica_close(rep);
+                dbi_close(inst);
+                root_free(rst);
+                instns_free(&ns);
+                return 1;
+            }
+        }
         /* What the LOG says, which is not necessarily what argv said: a
          * restarted member's cluster comes from its own CONFIG entries,
          * and a --peer list that disagrees has already lost. */

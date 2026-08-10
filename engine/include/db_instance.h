@@ -179,6 +179,38 @@ void dbi_request_kind(const uint8_t *req, size_t req_len, int *kind);
 int dbi_read_is_long(dbi *i, const uint8_t *req, size_t req_len, int64_t min_docs);
 
 /*
+ * A READ VIEW of the collection this request names (db_session.h's
+ * dbs_read_view, with the instance's routing in front) -- so a read can be
+ * performed against a fixed state somewhere other than here.
+ *
+ * The view is the CALLER's: free it with dbs_read_view_close, and free it
+ * before anything truncates or replaces the files under it. Creates no
+ * database. Refuses with DC_ERR_REQ_MISSING_FIELD if the request names no
+ * database or no collection, and otherwise with whatever opening it or
+ * snapshotting it refused (DC_ERR_NO_COLLECTION, DC_ERR_NO_READ_VIEW).
+ */
+int dbi_read_view(dbi *i, const uint8_t *req, size_t req_len, dc_collection **out);
+
+/*
+ * db_session.h's dbs_request_wrecks_files plus the instance's own ops --
+ * dropDatabase removes a whole directory, which is every file in it.
+ */
+int dbi_request_wrecks_files(const uint8_t *req, size_t req_len);
+
+/*
+ * The same question about a COMMITTED ENTRY rather than a request, for the
+ * replicated path: a follower's destructive work arrives through the log,
+ * not through a client.
+ *
+ * Answers 1 for the instance-level dropDatabase form, for any DDL command
+ * (asked of db_wal.h's dc_wal_is_document, so this and the apply path
+ * cannot disagree about what a command does), and for anything it cannot
+ * parse -- a log this build does not understand is the worst case, not the
+ * best.
+ */
+int dbi_entry_wrecks_files(const uint8_t *payload, uint32_t len);
+
+/*
  * The replicated fork (db_session.h's dbs_propose / dbs_step), with one
  * addition: every command comes back WRAPPED.
  *
@@ -222,10 +254,11 @@ int dbi_apply(dbi *i, uint64_t index, const uint8_t *payload, uint32_t len,
 
 /* Unwrap one entry's envelope WITHOUT applying it: the command it
  * carries for database `db`, or NULL when the entry is another
- * database's, is not an envelope, or carries no command. The envelope's
- * shape has one owner and this is its reader -- a resumed change stream
- * replays the log through it (db_session.h's dbs_log). The pointers
- * alias `payload`. */
+ * database's, is not an envelope, or carries no command. `db` of NULL
+ * matches ANY database, for a caller classifying what an entry DOES rather
+ * than replaying one database's history. The envelope's shape has one owner
+ * and this is its reader -- a resumed change stream replays the log through
+ * it (db_session.h's dbs_log). The pointers alias `payload`. */
 int dbi_entry_cmd(const uint8_t *payload, uint32_t len,
                   const char *db, size_t db_len,
                   const uint8_t **cmd, size_t *cmd_len);

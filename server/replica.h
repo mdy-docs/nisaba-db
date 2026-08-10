@@ -160,7 +160,44 @@ void replica_set_max_batch(replica *r, uint32_t bytes);
  * even asked, so it costs nothing. Negative in either argument leaves that
  * one alone.
  */
-void replica_set_read_offload(replica *r, int threads, int64_t min_docs);
+int replica_set_read_offload(replica *r, int threads, int64_t min_docs);
+
+/*
+ * ---- offloaded reads (server/readers.h) ----------------------------------
+ *
+ * The read end of the reader pool's wake pipe, or -1 when there is no pool.
+ * It belongs in the serving thread's pollset: poll() blocks with no timeout
+ * and a finished read could not otherwise wake it.
+ */
+int replica_read_wake_fd(const replica *r);
+
+/*
+ * Move every finished read into the request that is waiting for it. Call it
+ * once a pass, before replica_ready -- which is what then delivers the
+ * answers, exactly as it delivers a write's.
+ *
+ * Cheap and safe to call when nothing has finished, and a no-op with no
+ * pool at all.
+ */
+int replica_reap_reads(replica *r);
+
+/*
+ * Reads handed to a reader thread and not yet reaped. Non-zero means some
+ * thread is inside a read view right now, which is what anything about to
+ * truncate or replace a file has to wait out.
+ */
+int  replica_reads_in_flight(const replica *r);
+/*
+ * Wait until no reader thread is inside a read view, DELIVERING every answer
+ * that lands rather than discarding it -- a read already performed against
+ * the state as it was is a good answer, and dropping it would hold its
+ * client's connection owed forever.
+ *
+ * Call it before anything that truncates, replaces or removes a file. Only
+ * from the serving thread: reads are submitted there, so only there is the
+ * count certain to fall.
+ */
+int replica_wait_reads_idle(replica *r);
 
 /*
  * Open the log in `ns` and put a node over it.

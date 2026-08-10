@@ -47,11 +47,22 @@ const DB = 'soak';
 function usage(msg) {
   if (msg) console.error(`error: ${msg}`);
   console.error(
-    'usage: node test/soak.js [--seconds N] [--readers N] [--seed N] [--port N] [--quiet]');
+    'usage: node test/soak.js [--seconds N] [--readers N] [--seed N] [--port N]\n' +
+    '                            [--readThreads N] [--quiet]');
   process.exit(2);
 }
 
-const opts = { seconds: 30, readers: 8, seed: 1, port: 34000 + (process.pid % 900), quiet: false };
+/*
+ * `readThreads` is the server's --read-threads, and asking for any turns on
+ * --raft 1 as well: a read is moved off the serving thread by being
+ * DEFERRED, and only the replicated transport can defer one (server/main.c
+ * refuses the flag without it). So 0 -- the default -- soaks exactly the
+ * unreplicated server this file always soaked, and anything above it soaks
+ * a replicated one with reader threads. Both are worth running; they are
+ * different servers.
+ */
+const opts = { seconds: 30, readers: 8, seed: 1, port: 34000 + (process.pid % 900),
+               readThreads: 0, quiet: false };
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (a === '--quiet') { opts.quiet = true; continue; }
@@ -95,7 +106,19 @@ const note = (what) => {
 };
 
 async function startServer(dir, port) {
-  const proc = spawn(path.resolve(NATIVE), ['--port', String(port), '--max-clients', '64'], {
+  const args = ['--port', String(port), '--max-clients', '64'];
+  if (opts.readThreads > 0) {
+    /* A floor of 0 so every scanning read goes to a worker: the reads here
+     * are over small collections, and a soak that never reached the worker
+     * path would be soaking the wrong server. */
+    args.push('--raft', '1',
+              '--read-threads', String(opts.readThreads),
+              /* A floor of 0 so every scanning read goes to a worker: the
+               * collections here are small, and a soak that never reached
+               * the worker path would be soaking the wrong server. */
+              '--read-offload-min', '0');
+  }
+  const proc = spawn(path.resolve(NATIVE), args, {
     cwd: dir, stdio: ['ignore', 'pipe', 'pipe']
   });
   let err = '';
@@ -166,7 +189,8 @@ const main = async () => {
   const stats = { writes: 0, reads: 0, regexReads: 0, compacts: 0, drops: 0, indexes: 0 };
 
   say(`soak: ${opts.seconds}s, ${opts.readers} readers, seed ${opts.seed}, ` +
-      `port ${opts.port}, ${NATIVE}`);
+      `port ${opts.port}, ${opts.readThreads} reader thread(s)` +
+      `${opts.readThreads > 0 ? ' (+--raft 1)' : ''}, ${NATIVE}`);
 
   const writer = await connectServer(opts.port);
   const readers = await Promise.all(

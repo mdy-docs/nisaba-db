@@ -104,74 +104,95 @@ typedef enum {
  * `aggregate` reads a collection but answers a failure by naming the stage
  * that failed, which is a response shape run_read does not build.
  */
-#define OP(name, code, kind, bare) \
-    { name, (uint32_t)(sizeof(name) - 1), code, kind, bare }
+/*
+ * The fifth column is whether performing the op TRUNCATES, REPLACES OR
+ * REMOVES A FILE -- as opposed to appending to one.
+ *
+ * It matters because a read view (db.h) shares the live handle's io: it is
+ * valid exactly as long as its files are only appended to. An ordinary
+ * document write is safe under one, including a failed one -- mut_end
+ * rewinds only to the length captured when the write began, which is at or
+ * above any earlier view's root. Making and unmaking files is not, and
+ * anything holding views has to retire them first.
+ *
+ * WRECKS is stated by every op for the same reason `bare` is, and
+ * conservatively: createIndex is here although it only ADDS a file and
+ * resets a journal, because the cost of being wrong is a use-after-free and
+ * the cost of being cautious is a pause on an operation that happens once.
+ */
+#define OP(name, code, kind, bare, wrecks) \
+    { name, (uint32_t)(sizeof(name) - 1), code, kind, bare, wrecks }
 #define BARE   1    /* run_read can perform it against any dc_collection */
 #define OWNED  0    /* needs the session, or writes, or both */
+#define WRECKS 1    /* unmakes or rewrites a file a read view may hold */
+#define KEEPS  0    /* appends, or touches no file at all */
 
 static const struct {
-    const char *name; uint32_t len; dbs_op op; uint8_t kind; uint8_t bare;
+    const char *name; uint32_t len; dbs_op op;
+    uint8_t kind; uint8_t bare; uint8_t wrecks;
 } OP_NAMES[] = {
-    OP("ping",        OP_PING,        DBS_REQ_STATUS, OWNED),
+    OP("ping",        OP_PING,        DBS_REQ_STATUS, OWNED, KEEPS),
     /* BARE only WITHOUT batchSize. A batched find opens a cursor, and a
      * cursor is the session's: it holds a slot in a bounded table, belongs
      * to a client id, and pins the tree it scans. run_read refuses one
      * rather than trusting a caller to have checked. */
-    OP("find",        OP_FIND,        DBS_REQ_READ, BARE),
-    OP("findOne",     OP_FIND_ONE,    DBS_REQ_READ, BARE),
-    OP("count",       OP_COUNT,       DBS_REQ_READ, BARE),
-    OP("distinct",    OP_DISTINCT,    DBS_REQ_READ, BARE),
-    OP("insert",      OP_INSERT,      DBS_REQ_WRITE, OWNED),
-    OP("update",      OP_UPDATE,      DBS_REQ_WRITE, OWNED),
-    OP("updateMany",  OP_UPDATE_MANY, DBS_REQ_WRITE, OWNED),
-    OP("replace",     OP_REPLACE,     DBS_REQ_WRITE, OWNED),
-    OP("delete",      OP_DELETE,      DBS_REQ_WRITE, OWNED),
-    OP("deleteMany",  OP_DELETE_MANY, DBS_REQ_WRITE, OWNED),
+    OP("find",        OP_FIND,        DBS_REQ_READ, BARE, KEEPS),
+    OP("findOne",     OP_FIND_ONE,    DBS_REQ_READ, BARE, KEEPS),
+    OP("count",       OP_COUNT,       DBS_REQ_READ, BARE, KEEPS),
+    OP("distinct",    OP_DISTINCT,    DBS_REQ_READ, BARE, KEEPS),
+    OP("insert",      OP_INSERT,      DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("update",      OP_UPDATE,      DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("updateMany",  OP_UPDATE_MANY, DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("replace",     OP_REPLACE,     DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("delete",      OP_DELETE,      DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("deleteMany",  OP_DELETE_MANY, DBS_REQ_WRITE, OWNED, KEEPS),
     /* A cursor batch is a READ like any other: the rule is applied
      * uniformly rather than weakened for paging, so a page sees
      * everything committed when it was asked for and not merely
      * everything committed when the cursor was opened. */
-    OP("getMore",     OP_GET_MORE,    DBS_REQ_READ, OWNED),
-    OP("closeCursor", OP_CLOSE_CURSOR, DBS_REQ_NONE, OWNED),
+    OP("getMore",     OP_GET_MORE,    DBS_REQ_READ, OWNED, KEEPS),
+    OP("closeCursor", OP_CLOSE_CURSOR, DBS_REQ_NONE, OWNED, KEEPS),
     /* Compaction rewrites this member's own files. It changes nothing a
      * reader can observe and nothing another replica has to agree with,
      * but it is not a read either -- and a member that cannot take a
      * write has no business rewriting its files underneath the log. */
-    OP("compact",     OP_COMPACT,     DBS_REQ_WRITE, OWNED),
-    OP("createCollection", OP_CREATE_COLLECTION, DBS_REQ_WRITE, OWNED),
-    OP("dropCollection",   OP_DROP_COLLECTION,   DBS_REQ_WRITE, OWNED),
-    OP("createIndex",      OP_CREATE_INDEX,      DBS_REQ_WRITE, OWNED),
-    OP("dropIndex",        OP_DROP_INDEX,        DBS_REQ_WRITE, OWNED),
-    OP("listIndexes",      OP_LIST_INDEXES,      DBS_REQ_READ, OWNED),
-    OP("listCollections",  OP_LIST_COLLECTIONS,  DBS_REQ_READ, OWNED),
-    OP("insertMany",       OP_INSERT_MANY,       DBS_REQ_WRITE, OWNED),
-    OP("bulkWrite",        OP_BULK_WRITE,        DBS_REQ_WRITE, OWNED),
-    OP("aggregate",        OP_AGGREGATE,         DBS_REQ_READ, OWNED),
-    OP("explain",          OP_EXPLAIN,           DBS_REQ_READ, OWNED),
-    OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE,  DBS_REQ_WRITE, OWNED),
-    OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE, DBS_REQ_WRITE, OWNED),
-    OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE,  DBS_REQ_WRITE, OWNED),
-    OP("findByIndex",       OP_FIND_BY_INDEX,        DBS_REQ_READ, OWNED),
+    OP("compact",     OP_COMPACT,     DBS_REQ_WRITE, OWNED, WRECKS),
+    OP("createCollection", OP_CREATE_COLLECTION, DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("dropCollection",   OP_DROP_COLLECTION,   DBS_REQ_WRITE, OWNED, WRECKS),
+    OP("createIndex",      OP_CREATE_INDEX,      DBS_REQ_WRITE, OWNED, WRECKS),
+    OP("dropIndex",        OP_DROP_INDEX,        DBS_REQ_WRITE, OWNED, WRECKS),
+    OP("listIndexes",      OP_LIST_INDEXES,      DBS_REQ_READ, OWNED, KEEPS),
+    OP("listCollections",  OP_LIST_COLLECTIONS,  DBS_REQ_READ, OWNED, KEEPS),
+    OP("insertMany",       OP_INSERT_MANY,       DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("bulkWrite",        OP_BULK_WRITE,        DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("aggregate",        OP_AGGREGATE,         DBS_REQ_READ, OWNED, KEEPS),
+    OP("explain",          OP_EXPLAIN,           DBS_REQ_READ, OWNED, KEEPS),
+    OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE,  DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE, DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("findOneAndDelete",  OP_FIND_ONE_AND_DELETE,  DBS_REQ_WRITE, OWNED, KEEPS),
+    OP("findByIndex",       OP_FIND_BY_INDEX,        DBS_REQ_READ, OWNED, KEEPS),
     /* It deletes what a TTL index says is over. */
-    OP("pruneExpired",      OP_PRUNE_EXPIRED,        DBS_REQ_WRITE, OWNED),
+    OP("pruneExpired",      OP_PRUNE_EXPIRED,        DBS_REQ_WRITE, OWNED, KEEPS),
     /* Opening a stream is a read: what it goes on to deliver is this
      * member's view of what changed, and a member that cannot show its
      * data is current cannot show that either. */
-    OP("watch",             OP_WATCH,                DBS_REQ_READ, OWNED),
-    OP("closeStream",       OP_CLOSE_STREAM,         DBS_REQ_NONE, OWNED),
+    OP("watch",             OP_WATCH,                DBS_REQ_READ, OWNED, KEEPS),
+    OP("closeStream",       OP_CLOSE_STREAM,         DBS_REQ_NONE, OWNED, KEEPS),
     /* The snapshot ops (docs/s3-backup.md): answered by the replicated
      * transport (server/replica.c), which routes on the kind before the
      * leader check -- a snapshot is PER-MEMBER. Spelled here because
      * every op is, so the engine's answer below is "no store here"
      * rather than an unknown-op refusal masquerading as "not built". */
-    OP("snapshot",          OP_SNAPSHOT,             DBS_REQ_SNAPSHOT, OWNED),
-    OP("latestSnapshot",    OP_LATEST_SNAPSHOT,      DBS_REQ_SNAPSHOT, OWNED),
-    OP("readSnapshotFile",  OP_READ_SNAPSHOT_FILE,   DBS_REQ_SNAPSHOT, OWNED),
+    OP("snapshot",          OP_SNAPSHOT,             DBS_REQ_SNAPSHOT, OWNED, KEEPS),
+    OP("latestSnapshot",    OP_LATEST_SNAPSHOT,      DBS_REQ_SNAPSHOT, OWNED, KEEPS),
+    OP("readSnapshotFile",  OP_READ_SNAPSHOT_FILE,   DBS_REQ_SNAPSHOT, OWNED, KEEPS),
 };
 
 #undef OP
 #undef BARE
 #undef OWNED
+#undef WRECKS
+#undef KEEPS
 
 /* ---- reading the request ----------------------------------------------- */
 
@@ -614,6 +635,31 @@ static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
         *out = dbs_repl_resuming(s);
         if (*out) return BJ_OK;
     }
+    /*
+     * DOES THE COLLECTION EXIST? Asked here, for the index DDL only, and
+     * only because a `NULL` collection is how DDL is planned: what files an
+     * index is made of is the namespace owner's business rather than a
+     * collection's, so dc_wal_plan_build is handed no collection and cannot
+     * notice that there is none.
+     *
+     * Unchecked, a `dropIndex` naming a collection that does not exist
+     * plans cleanly, reaches the log, and fails at APPLY with
+     * DC_ERR_NO_COLLECTION -- which dc_is_deterministic deliberately
+     * classifies as possible divergence, so the member HALTS. A client's
+     * typo took a replica down, and every other member replaying that entry
+     * went down with it. Found by the soak once its server was replicated.
+     *
+     * An unreplicated server has always answered -37 here (there is no log,
+     * so dbs_apply's refusal simply goes back to the client). This is what
+     * makes the two hosts agree again, which is the property that matters
+     * more than either behaviour on its own.
+     */
+    if (!c && (wreq == DC_WREQ_CREATE_INDEX || wreq == DC_WREQ_DROP_INDEX)) {
+        dc_collection *have = NULL;
+        int ce = dbs_collection(s, coll, coll_len, &have);
+        if (ce) return ce;
+    }
+
     int e = dc_wal_plan_build(c, coll, coll_len, wreq, a, a_len, b, b_len,
                               upsert, id, out);
     if (e) return e;
@@ -1390,6 +1436,15 @@ int dbs_request_is_bare(const uint8_t *req, size_t req_len) {
         return 1;
     }
     return 0;
+}
+
+int dbs_request_wrecks_files(const uint8_t *req, size_t req_len) {
+    if (!req) return 1;   /* unreadable: assume the worst */
+    int op = op_of(req, req_len);
+    if (op < 0) return 0; /* refused before anything is performed */
+    for (size_t i = 0; i < sizeof(OP_NAMES) / sizeof(OP_NAMES[0]); i++)
+        if ((int)OP_NAMES[i].op == op) return OP_NAMES[i].wrecks;
+    return 1;
 }
 
 int dbs_read_is_long(dbs *s, const uint8_t *req, size_t req_len, int64_t min_docs) {

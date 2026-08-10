@@ -371,6 +371,60 @@ int dbi_read_is_long(dbi *i, const uint8_t *req, size_t req_len, int64_t min_doc
     return dbs_read_is_long(s, req, req_len, min_docs);
 }
 
+int dbi_request_wrecks_files(const uint8_t *req, size_t req_len) {
+    if (!req) return 1;
+    /* The instance's own three: dropDatabase removes a whole directory,
+     * which is every file under it. The other two touch none. */
+    if (op_is(req, req_len, "dropDatabase")) return 1;
+    if (op_is(req, req_len, "ping") || op_is(req, req_len, "listDatabases") ||
+        op_is(req, req_len, "transferLeadership")) return 0;
+    return dbs_request_wrecks_files(req, req_len);
+}
+
+int dbi_entry_wrecks_files(const uint8_t *payload, uint32_t len) {
+    if (!payload) return 1;
+    /*
+     * An entry with no command is the instance-level dropDatabase form
+     * ({d, i:"drop"}), which removes the database's whole directory.
+     * dbi_entry_cmd returns no command for it -- and for an entry that is
+     * not an envelope at all, which is a log this build cannot read and is
+     * treated as the worst case rather than the best.
+     */
+    const uint8_t *cmd = NULL; size_t cmd_len = 0;
+    if (dbi_entry_cmd(payload, len, NULL, 0, &cmd, &cmd_len)) return 1;
+    if (!cmd) return 1;
+
+    int op = 0;
+    const uint8_t *coll = NULL; uint32_t coll_len = 0;
+    if (dc_wal_parse(cmd, (uint32_t)cmd_len, &op, &coll, &coll_len)) return 1;
+    /*
+     * The four document ops append; the DDL three make and unmake files.
+     * Asked of db_wal.h rather than answered here, so the two cannot come
+     * to different conclusions about what a command does -- and so an
+     * opcode added later is DDL until db_wal.h says otherwise.
+     */
+    return !dc_wal_is_document(op);
+}
+
+int dbi_read_view(dbi *i, const uint8_t *req, size_t req_len, dc_collection **out) {
+    if (!i || !req || !out) return BJ_ERR_STATE;
+    *out = NULL;
+    const uint8_t *db; uint32_t db_len; int found = 0;
+    if (req_str(req, req_len, "db", &db, &db_len, &found) || !found)
+        return DC_ERR_REQ_MISSING_FIELD;
+    const uint8_t *coll; uint32_t coll_len; found = 0;
+    if (req_str(req, req_len, "coll", &coll, &coll_len, &found) || !found)
+        return DC_ERR_REQ_MISSING_FIELD;
+
+    dbs *s = NULL;
+    /* create = 0, for the same reason dbi_read_is_long uses 0: taking a
+     * view is preparation for answering a read, and a read of a database
+     * that is not there must refuse rather than make one. */
+    int e = dbi_database(i, (const char *)db, db_len, 0, &s);
+    if (e) return e;
+    return dbs_read_view(s, (const char *)coll, coll_len, out);
+}
+
 int dbi_handle(dbi *i, uint64_t client, const uint8_t *req, size_t req_len,
                dbuf *out) {
     if (!i || !req || !out) return BJ_ERR_STATE;
@@ -616,7 +670,11 @@ int dbi_entry_cmd(const uint8_t *payload, uint32_t len,
      * an entry with no events in it. */
     const uint8_t *name; uint32_t nlen; int found = 0;
     if (req_str(payload, len, "d", &name, &nlen, &found) || !found) return BJ_OK;
-    if (nlen != db_len || memcmp(name, db, db_len) != 0) return BJ_OK;
+    /* db == NULL asks for ANY database's command: a caller classifying what
+     * an entry does -- rather than replaying one database's history -- does
+     * not know or care whose it is. Kept here rather than given a second
+     * reader, because the envelope's shape has one owner. */
+    if (db && (nlen != db_len || memcmp(name, db, db_len) != 0)) return BJ_OK;
     const uint8_t *c; size_t clen;
     if (obj_get_field(payload, len, (const uint8_t *)"c", 1, &c, &clen, &found) || !found)
         return BJ_OK;

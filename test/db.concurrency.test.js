@@ -47,7 +47,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { connectServer } from '../src/db-server-client.js';
+import { connectServer, ObjectId } from '../src/db-server-client.js';
 
 const NATIVE = process.env.NISABA_SERVER_BIN || 'build/lib/nisaba-server';
 const have = (p) => fs.existsSync(p);
@@ -310,6 +310,283 @@ describe.skipIf(!enabled)('a busy server: many clients, deep pipelines', () => {
       await r.close();
     }
   }, 120000);
+
+/*
+ * ---- reader threads (--read-threads, server/readers.h) --------------------
+ *
+ * Its own server, because the flag is per-process and the whole point is to
+ * compare a server that has reader threads against the one above that does
+ * not.
+ *
+ * Native only, like the rest of this file: wasm has no threads on either
+ * target and refuses the flag outright.
+ */
+describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
+  /* Small, and forced through a worker by a floor of 0: correctness does
+   * not need a big collection, and every second of seeding is a second of
+   * CI. The measurement further down needs a big one and says so. */
+  const TINY_PORT = PORT + 40;
+
+  it('answers an offloaded read exactly as an inline one, whatever the shape', async () => {
+    /*
+     * --read-offload-min 0 sends EVERY scanning read to a worker, however
+     * small the collection. That is not how a server would be run -- it is
+     * how the worker path gets exercised by a test that takes a second
+     * rather than a minute, and `movedReads` proves each read really went.
+     *
+     * The answers are compared against a second server running with no
+     * reader threads at all, over the same requests in the same order. Not
+     * against hand-written expectations: those would encode what I believe
+     * the engine answers, and the property under test is that moving a read
+     * changes nothing about it.
+     */
+    const a = await startServer(TINY_PORT, ['--raft', '1', '--read-threads', '2',
+                                            '--read-offload-min', '0']);
+    const b = await startServer(TINY_PORT + 1, ['--raft', '1']);
+    try {
+      /*
+       * DETERMINISTIC _ids, so the two collections are identical down to
+       * the bytes. Ordinary ObjectIds are minted client-side and carry a
+       * random component, so two independently seeded servers would differ
+       * in every document's id -- and, because the primary tree is keyed by
+       * id, in the ORDER an unsorted find returns them. That would leave
+       * this comparison unable to check ordering at all, which is one of
+       * the things most worth checking about a read that moved threads.
+       */
+      const idOf = (i) => new ObjectId(String(i).padStart(24, '0'));
+      const seed = async (port) => {
+        const c = await connectServer(port);
+        const coll = c.db(DB).collection('shapes');
+        const ids = [];
+        for (let n = 0; n < 300; n += 100) {
+          const batch = Array.from({ length: 100 }, (_, k) => ({
+            _id: idOf(n + k),
+            n: n + k, tag: `v${n + k}`, team: (n + k) % 3 === 0 ? 'core' : 'other',
+          }));
+          await coll.insertMany(batch);
+          ids.push(...batch.map((d) => d._id));
+        }
+        await coll.createIndex({ team: 1 });
+        return { c, coll, ids };
+      };
+      const A = await seed(TINY_PORT), B = await seed(TINY_PORT + 1);
+
+      /* Every read shape that can be offloaded, plus ones that cannot --
+       * so a difference in EITHER direction shows up. */
+      const shapes = [
+        (k) => k.coll.countDocuments({}),
+        (k) => k.coll.countDocuments({ tag: 'v7' }),
+        (k) => k.coll.countDocuments({ nope: 'zz' }),
+        (k) => k.coll.find({ tag: 'v7' }).toArray(),
+        (k) => k.coll.find({}).toArray(),
+        (k) => k.coll.find({ n: { $gt: 290 } }).toArray(),
+        (k) => k.coll.find({ tag: { $regex: '^v29[0-9]$' } }).toArray(),
+        (k) => k.coll.findOne({ tag: 'v42' }),
+        (k) => k.coll.findOne({ nope: 'zz' }),
+        (k) => k.coll.findOne({ _id: k.ids[3] }),          // ids plan: never moved
+        (k) => k.coll.countDocuments({ team: 'core' }),    // equality index: not moved
+        (k) => k.coll.distinct('team'),
+        (k) => k.coll.distinct('tag'),
+        (k) => k.coll.find({}, { sort: { n: -1 }, limit: 3 }).toArray(),
+        (k) => k.coll.find({}, { projection: { tag: 1 } , limit: 2 }).toArray(),
+      ];
+      /* Everything compared, ids and order included. */
+      for (let i = 0; i < shapes.length; i++) {
+        const [ra, rb] = [await shapes[i](A), await shapes[i](B)];
+        expect(JSON.stringify(ra), `shape ${i} differs on a reader thread`)
+          .toBe(JSON.stringify(rb));
+      }
+
+      /* And they really did go to a worker -- most of them. A test that
+       * exercised the inline path by accident would pass everything above. */
+      const p = await A.c.ping();
+      expect(p.movedReads).toBeGreaterThan(8);
+      expect(p.movedReads).toBe(p.longReads);   // nothing judged long fell back
+
+      /* A refusal travels the same way: distinct with no field is missing a
+       * required one, and it must come back as a refusal rather than as a
+       * dead connection. */
+      await expect(A.coll.distinct('')).rejects.toThrow();
+      expect((await A.c.ping()).pong).toBe(true);
+
+      await A.c.close(); await B.c.close();
+    } finally {
+      a.proc.kill(); b.proc.kill();
+      fs.rmSync(a.dir, { recursive: true, force: true });
+      fs.rmSync(b.dir, { recursive: true, force: true });
+    }
+  }, 120000);
+
+  it('survives a client hanging up in the middle of its own long read', async () => {
+    /*
+     * The socket goes while a worker is inside the scan. The answer has
+     * nowhere to go -- which is fine, and is exactly what happens to a
+     * write whose client leaves while it is in the log -- but the pending
+     * that was waiting for it is released and its slot reused, so a
+     * completion matched by pointer or by slot index would land on somebody
+     * else's request. It is matched by a never-reused seq instead.
+     *
+     * Fifty of them, so a leak or a misdelivery has fifty chances rather
+     * than one, and the server must still be serving at the end.
+     */
+    const port = TINY_PORT + 2;
+    const { proc, dir } = await startServer(port, ['--raft', '1',
+      '--read-threads', '2', '--read-offload-min', '0']);
+    try {
+      const seeder = await connectServer(port);
+      const coll = seeder.db(DB).collection('hangup');
+      for (let n = 0; n < 2000; n += 100) {
+        await coll.insertMany(Array.from({ length: 100 }, (_, k) => ({ n: n + k })));
+      }
+
+      for (let i = 0; i < 50; i++) {
+        const c = await connectServer(port);
+        /* Issued and NOT awaited: the close lands while it is in flight. */
+        c.db(DB).collection('hangup').countDocuments({ nope: 'zz' }).catch(() => {});
+        await c.close().catch(() => {});
+      }
+
+      /* Still serving, still correct, and the reads that were abandoned
+       * did not take anybody else's answers with them. */
+      expect(await coll.countDocuments({})).toBe(2000);
+      expect(await coll.findOne({ n: 1999 })).toMatchObject({ n: 1999 });
+      await seeder.close();
+    } finally {
+      proc.kill();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120000);
+
+  it('does not reap a connection while it is waiting for its own read', async () => {
+    /*
+     * The idle timer takes back a slot held by a client that is not there.
+     * A client owed an answer is the opposite of that -- and while it is
+     * owed one, the pollset stops asking its socket for POLLIN, so the
+     * quiet clock cannot advance however busy the server is on its behalf.
+     * Without an exemption a read that outlives --idle-timeout gets its own
+     * connection closed underneath it.
+     *
+     * One second of timeout, and a scan of a collection large enough to
+     * take a while, repeated so the connection is owed across several
+     * timeouts' worth of wall time.
+     */
+    const port = TINY_PORT + 6;
+    const { proc, dir } = await startServer(port, ['--raft', '1',
+      '--read-threads', '2', '--read-offload-min', '0', '--idle-timeout', '1']);
+    try {
+      const c = await connectServer(port);
+      const coll = c.db(DB).collection('patient');
+      /*
+       * ONE read has to outlive the timeout -- many quick ones would not
+       * test this, because the quiet clock is refreshed between them. A
+       * plain scan of this collection takes ~30ms, so the length comes from
+       * the FILTER: `^x*y$` against 2,000 x's per document walks every
+       * character of every one and takes seconds, where the same scan
+       * without a regex takes milliseconds.
+       */
+      /* The cost is documents x characters, and the SEEDING cost is bytes.
+       * Fewer, wider documents buy the same scan length for less inserting
+       * -- which matters because this file runs beside suites holding
+       * three-member clusters on default election timeouts, and a heavy
+       * neighbour is how those start losing leaders mid-test. */
+      const N = 6000;
+      const PAD = 'x'.repeat(4000);
+      for (let n = 0; n < N; n += 100) {
+        await coll.insertMany(Array.from({ length: 100 }, (_, k) => ({ n: n + k, pad: PAD })));
+      }
+
+      const started = Date.now();
+      const matched = await coll.countDocuments({ pad: { $regex: '^x*y$' } });
+      const took = Date.now() - started;
+      expect(matched).toBe(0);               // no document ends in y
+      /* The read really did outlive the timeout -- otherwise this asserts
+       * nothing at all about the exemption. */
+      expect(took, `the read took ${took}ms, which is inside the 1s timeout`)
+        .toBeGreaterThan(1200);
+
+      /* THE POINT: the connection that asked is still there and still
+       * usable. Without the exemption the sweep closed it mid-read and this
+       * is where it fails. */
+      expect((await c.ping()).pong).toBe(true);
+      expect(await coll.countDocuments({ n: { $lt: 5 } })).toBe(5);
+      await c.close();
+    } finally {
+      proc.kill();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120000);
+
+  it('keeps small reads fast while another client scans', async () => {
+    /*
+     * THE MEASUREMENT THIS WHOLE MILESTONE EXISTS FOR.
+     *
+     * Measured at 50,000 documents: with no reader threads, one connection
+     * running a scanning count took eight connections of point lookups from
+     * 53,152 reads in three seconds to 2,160 -- FOUR PERCENT -- and their
+     * median from 0.35ms to 11.08ms, which is one scan exactly. With one
+     * reader thread the same eight held 91% and a median of 0.35ms, and
+     * scan throughput did not fall.
+     *
+     * Asserted here at a smaller size and with a wide bound, because this
+     * runs on whatever CI is given: 8,000 documents (a ~1.8ms scan against
+     * a ~0.35ms lookup), and the requirement is HALF of idle throughput
+     * where the unthreaded server manages a twentieth. Both margins are
+     * large; the effect is 20x, and the bound is 10x off the failure.
+     */
+    const port = TINY_PORT + 4;
+    const N = 8000;
+    const { proc, dir } = await startServer(port,
+      ['--raft', '1', '--read-threads', '2', '--max-clients', '32']);
+    try {
+      const seeder = await connectServer(port);
+      const items = seeder.db(DB).collection('isolated');
+      const ids = [];
+      while (ids.length < N) {
+        const r = await items.insertMany(Array.from({ length: 100 },
+          (_, k) => ({ n: ids.length + k, pad: 'x'.repeat(60) })));
+        ids.push(...Object.values(r.insertedIds));
+      }
+      const pick = () => ids[(Math.random() * ids.length) | 0];
+
+      const readers = await Promise.all(Array.from({ length: 8 }, () => connectServer(port)));
+      const round = async (ms) => {
+        const stop = Date.now() + ms;
+        let n = 0;
+        await Promise.all(readers.map(async (c) => {
+          const coll = c.db(DB).collection('isolated');
+          while (Date.now() < stop) { await coll.findOne({ _id: pick() }); n++; }
+        }));
+        return n;
+      };
+
+      await round(300);                       // warm
+      const idle = await round(1000);
+
+      let go = true, scans = 0;
+      const scanner = await connectServer(port);
+      const scanning = (async () => {
+        const coll = scanner.db(DB).collection('isolated');
+        while (go) { await coll.countDocuments({ pad: 'zzzzzz' }); scans++; }
+      })();
+      const busy = await round(1000);
+      go = false; await scanning;
+
+      const held = busy / idle;
+      /* The scanner was really scanning -- otherwise this asserts nothing. */
+      expect(scans, 'no scan ran, so nothing was competing').toBeGreaterThan(2);
+      expect((await scanner.ping()).movedReads,
+        'the scans were not offloaded').toBeGreaterThan(2);
+      expect(held, `held ${(held * 100).toFixed(0)}% of idle throughput` +
+                   ` (${busy} vs ${idle}) while one client scanned`)
+        .toBeGreaterThan(0.5);
+
+      await Promise.all([...readers, scanner, seeder].map((c) => c.close().catch(() => {})));
+    } finally {
+      proc.kill();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 180000);
+});
 
   it('says nothing alarming on stderr through all of it', () => {
     /* A sanitized build reports on stderr and keeps going for anything

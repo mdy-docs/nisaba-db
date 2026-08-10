@@ -438,6 +438,19 @@ describe.skipIf(!(REQUIRED || have(NATIVE)))('http front end: a three-member clu
   const engine = ENGINES[0];
   const argsFor = (m) => [
     '--raft', String(m.id), '--raft-port', String(m.raftPort),
+    /*
+     * A WIDER CLOCK THAN THE LAN DEFAULT, for the reason
+     * test/bench-server.js already states about itself: a busy machine
+     * makes 150:300 too tight, the cluster elects mid-test, and what gets
+     * measured is the election rather than the thing under test. These
+     * suites are about replication; election timing on a loaded CI box is
+     * not what they are asserting, and it is what they were failing on.
+     *
+     * 600:1200 with a 150ms heartbeat keeps the ratio the default has (a
+     * leader beats four times inside the shortest patience) and gives
+     * four times the tolerance for a scheduler that is busy elsewhere.
+     */
+    '--election-timeout', '600:1200', '--heartbeat', '150',
     ...MEMBERS.filter((o) => o.id !== m.id)
       .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
   ];

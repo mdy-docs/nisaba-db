@@ -1,5 +1,6 @@
 /* server/replica.c — see replica.h. */
 #include "replica.h"
+#include "readers.h"   /* the threads that perform long reads */
 
 #include "raft_node.h"
 #include "raft_msg.h"      /* the member-record grammar; this file reads it */
@@ -91,6 +92,32 @@ typedef struct {
     uint64_t last;
     int      done;              /* the answer is built and waiting */
     dbuf     answer;
+
+    /*
+     * AN OFFLOADED READ (readers.h): a reader thread is performing it, or
+     * has. Such a read has TWO conditions before it can be answered, not
+     * one, and `done` is set when both hold:
+     *
+     *   answered   the reader thread came back and its bytes are in
+     *              `answer`
+     *   barrier==0 the quorum settled the barrier (or there was nothing
+     *              left to prove when it was parked)
+     *
+     * `read_seq` is how a completion finds its way back here, and it is a
+     * number rather than a pointer or a slot index on purpose: a client
+     * that hangs up mid-read has its pending released and the slot reused,
+     * so both of those would land an answer on somebody else's request.
+     * A seq that matches nothing means the client left.
+     *
+     * `stale` records that the barrier failed and `answer` already holds
+     * the refusal, so the reader thread's answer -- which is correct, and
+     * simply cannot be shown to be current -- is dropped when it arrives
+     * rather than overwriting it.
+     */
+    int      offloaded;
+    int      answered;
+    int      stale;
+    uint64_t read_seq;
 } pending;
 
 /*
@@ -163,6 +190,12 @@ struct replica {
     int64_t    read_min_docs;
     uint64_t   reads_long;      /* judged worth moving off this thread */
     uint64_t   reads_short;     /* judged cheaper to answer here */
+    /* The threads themselves, and the ids that pair a completion with the
+     * request that is waiting for it. NULL when none were asked for, or
+     * when this target has no threads at all. */
+    rdpool    *readers;
+    uint64_t   next_read_seq;   /* 1, 2, 3, ... never reused */
+    uint64_t   reads_moved;     /* actually handed to a reader thread */
 };
 
 static conversation *conv_open(replica *r, uint64_t theirs, uint64_t from) {
@@ -1198,10 +1231,30 @@ static int tick_for(int64_t heartbeat_ms) {
     return half > INT32_MAX ? INT32_MAX : (int)half;
 }
 
-void replica_set_read_offload(replica *r, int threads, int64_t min_docs) {
-    if (!r) return;
-    if (threads >= 0) r->read_threads = threads;
+int replica_set_read_offload(replica *r, int threads, int64_t min_docs) {
+    if (!r) return BJ_ERR_STATE;
     if (min_docs >= 0) r->read_min_docs = min_docs;
+    if (threads < 0) return BJ_OK;
+
+    /* Replacing a pool would orphan whatever it is running, and nothing
+     * needs to: this is called once, from argv. */
+    if (r->readers) return BJ_ERR_STATE;
+    r->read_threads = threads;
+    if (threads == 0) return BJ_OK;
+
+    /*
+     * No more in flight than there are pendings, because a pending is what
+     * an answer comes back to: one deferred answer per connection means the
+     * two bounds are the same bound seen from either end.
+     */
+    r->readers = rdpool_open(threads, REPLICA_MAX_PENDING);
+    if (!r->readers) {
+        /* Said, not swallowed: a server asked for reader threads and
+         * running without them is a different server. */
+        r->read_threads = 0;
+        return BJ_ERR_STATE;
+    }
+    return BJ_OK;
 }
 
 void replica_set_max_batch(replica *r, uint32_t bytes) {
@@ -1411,6 +1464,14 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
 
 void replica_close(replica *r) {
     if (!r) return;
+    /*
+     * THE READER THREADS FIRST, before anything else here is touched.
+     * Every one of them may be inside a read view, and a view points into
+     * files the instance owns -- rdpool_close joins them and frees the
+     * views of jobs that never ran. Nothing below this line is safe while
+     * another thread is still reading.
+     */
+    if (r->readers) { rdpool_close(r->readers); r->readers = NULL; }
     /* The instance outlives this call in some teardowns, and a reader
      * whose ctx has been freed must not be reachable from it. */
     if (r->inst) dbi_set_log(r->inst, NULL);
@@ -1596,6 +1657,27 @@ static int apply_committed(replica *r) {
         }
 
         if (type == EL_NORMAL) {
+            /*
+             * READERS OUT OF THE WAY FIRST, if this entry unmakes a file.
+             *
+             * A read view shares its live handles' ios, so it is valid
+             * exactly as long as its files are only appended to. Dropping a
+             * collection or a database, or any other DDL, leaves a worker's
+             * pread aiming at a descriptor that has been closed and very
+             * possibly reused -- which returns another file's bytes with no
+             * error at all. This drain is not an optimisation to be tuned;
+             * it is the correctness argument for the whole design.
+             *
+             * Only for the destructive ones. An ordinary document write
+             * proceeds with reads in flight, which is what keeps a write's
+             * latency what it was -- quiescing the whole pump would make
+             * every write wait out the longest scan.
+             */
+            if (r->readers && dbi_entry_wrecks_files(payload.data, (uint32_t)payload.len)) {
+                e = replica_wait_reads_idle(r);
+                if (e) break;
+            }
+
             /* Into whoever proposed it, if that was a client of this
              * process -- because the response is built from exactly what
              * applying produced, and this is the only place it happens.
@@ -1995,6 +2077,77 @@ static int submit_read_stale(replica *r, uint64_t client,
     return 0;
 }
 
+/*
+ * An offloaded read is answerable only when BOTH have happened: the reader
+ * thread came back, and the barrier settled. Called from each side, so
+ * neither has to know whether it is the second.
+ */
+static void read_maybe_done(pending *p) {
+    if (p->offloaded && p->answered && !p->barrier) p->done = 1;
+}
+
+/*
+ * Hand this read to a reader thread.
+ *
+ *   1   handed over; the answer will arrive through replica_reap_reads
+ *   <0  not handed over, and nothing was consumed -- the caller performs
+ *       it here instead
+ *
+ * EVERY refusal here falls back rather than failing the request. There is
+ * no such thing as a read that cannot be answered because it could not be
+ * moved: no view (a geo index has none), no free pending slot, a full
+ * queue, OOM -- each means "answer it on this thread", which is what the
+ * server did for its whole life before this existed. That is why the
+ * failure return is negative and distinct from the deferral's 1.
+ *
+ * The view is minted HERE, on the serving thread, between applies -- never
+ * mid-mutation, because a view copies each tree's current committed root
+ * and a multi-index write is several trees that agree only at the ends.
+ */
+static int offload_read(replica *r, pending *p, uint64_t client,
+                        const uint8_t *req, size_t len,
+                        uint64_t barrier, dbuf *out, size_t mark) {
+    if (!r->readers) return -1;
+    dc_collection *view = NULL;
+    if (dbi_read_view(r->inst, req, len, &view) || !view) return -1;
+
+    uint64_t seq = ++r->next_read_seq;
+    if (rdpool_submit(r->readers, client, seq, view, req, len)) {
+        /* Not taken: still ours to free. `p` was never marked used, so
+         * there is nothing to give back. */
+        dbs_read_view_close(view);
+        return -1;
+    }
+
+    p->used = 1;
+    p->client = client;
+    p->barrier = barrier;
+    p->offloaded = 1;
+    p->read_seq = seq;
+    p->done = 0;
+    r->reads_moved++;
+
+    /*
+     * Nothing left to prove? Then the only thing this read is waiting for
+     * is the reader thread. Checked here rather than left to the tick, so
+     * a barrier that was already satisfied does not hold an answer for a
+     * round it does not need.
+     */
+    if (rn_read_state(r->node, barrier) > 0) {
+        rn_read_release(r->node, barrier);
+        p->barrier = 0;
+    }
+
+    /* This request contributes no bytes now. Anything before `mark`
+     * belongs to earlier pipelined requests and still goes out in order. */
+    out->len = mark;
+    /* The heartbeats the barrier queued go NOW, for the same reason the
+     * inline path flushes them: a read that waited a tick for its own
+     * proof to start would add the tick interval to every read. */
+    int e = flush_out(r);
+    return e ? e : 1;
+}
+
 static int submit_read(replica *r, pending *p, uint64_t client,
                        const uint8_t *req, size_t len, dbuf *out) {
     /*
@@ -2028,7 +2181,15 @@ static int submit_read(replica *r, pending *p, uint64_t client,
         return e ? e : 0;
     }
 
-    (void)read_is_long(r, req, len);
+    /*
+     * Long enough to be worth moving? Then move it, and if that cannot be
+     * arranged for any reason, fall through and perform it here -- which is
+     * what this server did for its whole life before reader threads.
+     */
+    if (read_is_long(r, req, len)) {
+        int off = offload_read(r, p, client, req, len, barrier, out, mark);
+        if (off >= 0) return off;
+    }
 
     dbuf cmds = {0};
     uint64_t token = 0;
@@ -2118,6 +2279,12 @@ static int replica_status(const replica *r, dbuf *out) {
     if (!e) e = bj_put_int(b, (int64_t)r->reads_long);
     if (!e) e = bj_put_key(b, (const uint8_t *)"shortReads", 10);
     if (!e) e = bj_put_int(b, (int64_t)r->reads_short);
+    /* Judged long is not the same as MOVED: a read with no view available
+     * (a geo index has none) or one that arrived with the queue full falls
+     * back to this thread, and a gap between these two numbers is exactly
+     * how an operator sees that happening. */
+    if (!e) e = bj_put_key(b, (const uint8_t *)"movedReads", 10);
+    if (!e) e = bj_put_int(b, (int64_t)r->reads_moved);
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {
@@ -2478,6 +2645,19 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
     }
     if (kind == DBS_REQ_READ) return submit_read(r, p, client, req, len, out);
 
+    /*
+     * A request that unmakes files, performed rather than logged: `compact`
+     * rewrites a collection into fresh files and deletes the old ones
+     * without ever reaching the log, so the apply-side drain never sees it.
+     * The logged ones are drained again there -- once here for this
+     * member's own client, once there for every member replaying it -- and
+     * draining twice costs a comparison against zero.
+     */
+    if (r->readers && dbi_request_wrecks_files(req, len)) {
+        int de = replica_wait_reads_idle(r);
+        if (de) return de;
+    }
+
     dbuf cmds = {0};
     uint64_t token = 0;
     int e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
@@ -2743,10 +2923,18 @@ int replica_tick(replica *r, uint64_t now) {
             p->answer.len = 0;
             e = refuse(r, DC_ERR_NOT_CURRENT, &p->answer);
             if (e) return e;
+            /* An offloaded read may not have its answer yet. Recording
+             * that the refusal is the final one is what stops the reader
+             * thread's answer -- perfectly correct, merely unprovable --
+             * overwriting it when it lands. */
+            p->stale = 1;
         }
         rn_read_release(r->node, p->barrier);
         p->barrier = 0;
-        p->done = 1;
+        /* An offloaded read has a second condition; every other pending
+         * here is finished by this settlement alone. */
+        if (p->offloaded) read_maybe_done(p);
+        else p->done = 1;
     }
 
     /*
@@ -2756,6 +2944,82 @@ int replica_tick(replica *r, uint64_t now) {
      * (raft_node.h's rn_effects_lost says exactly this).
      */
     return rn_effects_lost(r->node) ? BJ_ERR_STATE : BJ_OK;
+}
+
+static pending *pending_by_read_seq(replica *r, uint64_t seq) {
+    for (int i = 0; i < REPLICA_MAX_PENDING; i++) {
+        pending *p = &r->waiting[i];
+        if (p->used && p->offloaded && p->read_seq == seq) return p;
+    }
+    return NULL;
+}
+
+int replica_reap_reads(replica *r) {
+    if (!r || !r->readers) return BJ_OK;
+    rdpool_drain_wake(r->readers);
+    for (;;) {
+        uint64_t client = 0, seq = 0;
+        int rc = 0, have = 0;
+        dbuf answer = {0};
+        int e = rdpool_reap(r->readers, &client, &seq, &rc, &answer, &have);
+        if (e) { dbuf_free(&answer); return e; }
+        if (!have) return BJ_OK;
+
+        pending *p = pending_by_read_seq(r, seq);
+        if (!p) {
+            /* The client hung up while its read was running, and
+             * replica_drop_client gave the slot back. The scan still
+             * happened -- there is simply nobody to tell. */
+            dbuf_free(&answer);
+            continue;
+        }
+        if (!p->stale) {
+            p->answer.len = 0;
+            if (answer.len) e = dbuf_put(&p->answer, answer.data, answer.len);
+            else {
+                /*
+                 * dbs_read could not build a response at all (OOM, or a
+                 * request it should never have been handed). Rendered
+                 * HERE rather than on the worker, so every refusal this
+                 * server sends is built by the same code on the same
+                 * thread as every other.
+                 */
+                e = refuse(r, rc ? rc : BJ_ERR_STATE, &p->answer);
+            }
+        }
+        dbuf_free(&answer);
+        if (e) return e;
+        p->answered = 1;
+        read_maybe_done(p);
+    }
+}
+
+int replica_read_wake_fd(const replica *r) {
+    return r ? rdpool_wake_fd(r->readers) : -1;
+}
+
+int replica_reads_in_flight(const replica *r) {
+    return r ? rdpool_inflight(r->readers) : 0;
+}
+
+int replica_wait_reads_idle(replica *r) {
+    if (!r || !r->readers) return BJ_OK;
+    /*
+     * Every outstanding read is WAITED FOR AND DELIVERED, not abandoned.
+     * The drain exists so a file can be unmade safely, and a read already
+     * performed against the state as it was is a perfectly good answer --
+     * throwing it away would leave its client waiting on a reply that was
+     * built and dropped, with its connection held owed forever.
+     *
+     * Terminates because reads are only submitted from this thread, which is
+     * inside this loop: the count can fall and cannot rise.
+     */
+    while (rdpool_inflight(r->readers) > 0) {
+        rdpool_wait_completion(r->readers);
+        int e = replica_reap_reads(r);
+        if (e) return e;
+    }
+    return BJ_OK;
 }
 
 int replica_ready(replica *r, uint64_t *client, dbuf *out, int *have) {

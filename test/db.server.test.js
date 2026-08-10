@@ -429,14 +429,22 @@ describe.skipIf(!have(WASIP2) || !wasmtime)('nisaba-server: frames over TCP (was
  * CLI subprocesses in the listen backlog. That is what the last suite
  * below now tests is over.)
  */
+/*
+ * `threads` is whether the target can run reader threads at all. wasm has
+ * none on either target -- the server refuses --read-threads outright there
+ * -- so a suite that needs them says so with this rather than by matching on
+ * a display name.
+ */
 const ENGINES = [
   {
     name: 'native',
+    threads: true,
     ready: () => have(NATIVE),
     argv: (dir, port, extra) => [path.resolve(NATIVE), ['--port', String(port), ...extra], { cwd: dir }]
   },
   {
     name: 'wasm32-wasip2 under wasmtime',
+    threads: false,
     ready: () => have(WASIP2) && !!wasmtime,
     argv: (dir, port, extra) => [wasmtime, [
       'run', '-S', 'inherit-network', '--dir', `${dir}::.`,
@@ -706,6 +714,19 @@ for (const engine of ENGINES) {
     }));
     const argsFor = (m) => [
       '--raft', String(m.id), '--raft-port', String(m.raftPort),
+      /*
+       * A WIDER CLOCK THAN THE LAN DEFAULT, for the reason
+       * test/bench-server.js already states about itself: a busy machine
+       * makes 150:300 too tight, the cluster elects mid-test, and what gets
+       * measured is the election rather than the thing under test. These
+       * suites are about replication; election timing on a loaded CI box is
+       * not what they are asserting, and it is what they were failing on.
+       *
+       * 600:1200 with a 150ms heartbeat keeps the ratio the default has (a
+       * leader beats four times inside the shortest patience) and gives
+       * four times the tolerance for a scheduler that is busy elsewhere.
+       */
+      '--election-timeout', '600:1200', '--heartbeat', '150',
       ...MEMBERS.filter((o) => o.id !== m.id)
         .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
     ];
@@ -1559,6 +1580,87 @@ for (const engine of ENGINES) {
     }, 60000);
   });
 
+  describe.skipIf(!enabled)(`nisaba-server: asking for reader threads (${engine.name})`, () => {
+    it(engine.threads ? 'starts with them' : 'refuses them, saying this build has none', async () => {
+      /*
+       * wasm has no threads on either target, and a fleet driver that
+       * passes --read-threads to a wasip2 tenant has to find out from the
+       * flag rather than from a latency graph later. So the threadless
+       * build refuses and says why, instead of starting and quietly
+       * answering every read on the serving thread.
+       */
+      const port = nextPort();
+      if (!engine.threads) {
+        const [cmd, argv, opts] = engine.argv(os.tmpdir(), port,
+          ['--raft', '1', '--read-threads', '2']);
+        const err = await new Promise((resolve) => {
+          const proc = spawn(cmd, argv, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+          let text = '';
+          proc.stderr.on('data', (d) => { text += String(d); });
+          proc.once('exit', () => resolve(text));
+        });
+        expect(err).toMatch(/--read-threads is not available in this build/);
+        return;
+      }
+      const { proc } = await startServer(engine, port,
+        ['--raft', '1', '--read-threads', '2'], -1);
+      try {
+        const c = await connectServer(port);
+        expect((await c.ping()).readThreads).toBe(2);
+        await c.close();
+      } finally { proc.kill(); }
+    }, 60000);
+  });
+
+  describe.skipIf(!enabled)(`nisaba-server: index DDL on a collection that is gone (${engine.name})`, () => {
+    it('refuses it rather than halting the member on apply', async () => {
+      /*
+       * A CLIENT'S TYPO COULD TAKE A REPLICA DOWN.
+       *
+       * DDL is planned with no collection at all -- what files an index is
+       * made of belongs to whoever owns the namespace, not to a collection
+       * -- so dc_wal_plan_build was never in a position to notice that the
+       * collection named did not exist. A `dropIndex` for a missing one
+       * therefore planned cleanly, reached the LOG, and failed at apply with
+       * DC_ERR_NO_COLLECTION, which dc_is_deterministic deliberately treats
+       * as possible divergence: the member halts, and so does every other
+       * member that replays the entry.
+       *
+       * An unreplicated server has always answered -37 here, because there
+       * is no log and the refusal simply goes back to the client. So this is
+       * two hosts disagreeing about the same request, which matters more
+       * than either answer alone.
+       *
+       * Found by test/soak.js once its server was given --raft, and
+       * reproducible in five calls with no threads involved at all.
+       */
+      const port = nextPort();
+      const { proc } = await startServer(engine, port, ['--raft', '1'], -1);
+      try {
+        const c = await connectServer(port);
+        const db = c.db(DB);
+        await db.collection('doomed').insertOne({ n: 1 });
+        await db.collection('doomed').createIndex({ n: 1 });
+        expect(await db.dropCollection('doomed')).toBe(true);
+
+        for (const [what, run] of [
+          ['dropIndex', () => db.collection('doomed').dropIndex('n_1')],
+          ['createIndex', () => db.collection('doomed').createIndex({ n: 1 })],
+          ['dropIndex on a name that never existed', () => db.collection('nope').dropIndex('x_1')],
+        ]) {
+          await expect(run(), `${what} should refuse`).rejects.toMatchObject({ code: -37 });
+        }
+
+        /* THE POINT: still serving, still leading, still able to take a
+         * write. A halted member answers nothing at all. */
+        expect((await c.ping()).pong).toBe(true);
+        await db.collection('after').insertOne({ n: 2 });
+        expect(await db.collection('after').countDocuments({})).toBe(1);
+        await c.close();
+      } finally { proc.kill(); }
+    }, 60000);
+  });
+
   /*
    * ---- routing a long read ------------------------------------------------
    *
@@ -1576,7 +1678,8 @@ for (const engine of ENGINES) {
    * load-dependent and would pass on a fast machine whatever the router
    * did.
    */
-  describe.skipIf(!enabled)(`nisaba-server: which reads are long (${engine.name})`, () => {
+  describe.skipIf(!enabled || !engine.threads)(
+    `nisaba-server: which reads are long (${engine.name})`, () => {
     /* Above the 1000-document default floor, so a scan of it is long. */
     const BIG = 1200;
 

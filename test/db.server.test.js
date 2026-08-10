@@ -1560,6 +1560,141 @@ for (const engine of ENGINES) {
   });
 
   /*
+   * ---- routing a long read ------------------------------------------------
+   *
+   * A read that scans a large collection costs every other client on the
+   * process the whole scan: measured at 50k documents, one connection
+   * scanning took 8 connections of point reads from 52,389 in three
+   * seconds to 1,992 -- four percent -- and their median from 0.37ms to
+   * 11.57ms, which is one scan exactly. That is what moving long reads off
+   * the serving thread is for.
+   *
+   * The DECISION is separable from the moving, and is tested here on its
+   * own, by COUNTERS rather than by clock: `ping` reports longReads and
+   * shortReads, so what the router concluded is a fact rather than an
+   * inference from a duration. Timing tests for this would be
+   * load-dependent and would pass on a fast machine whatever the router
+   * did.
+   */
+  describe.skipIf(!enabled)(`nisaba-server: which reads are long (${engine.name})`, () => {
+    /* Above the 1000-document default floor, so a scan of it is long. */
+    const BIG = 1200;
+
+    const routing = async (client) => {
+      const r = await client.ping();
+      return { threads: r.readThreads, long: r.longReads, short: r.shortReads };
+    };
+
+    it('counts a scan as long and a point lookup as short', async () => {
+      const port = nextPort();
+      const { proc } = await startServer(engine, port,
+        ['--raft', '1', '--read-threads', '2'], -1);
+      try {
+        const c = await connectServer(port);
+        const coll = c.db(DB).collection('routed');
+        const ids = [];
+        for (let n = 0; n < BIG; n += 100) {
+          const r = await coll.insertMany(Array.from({ length: 100 }, (_, k) => ({ n: n + k })));
+          ids.push(...Object.values(r.insertedIds));
+        }
+        /* The flag arrived, and writes counted as neither. */
+        const seeded = await routing(c);
+        expect(seeded.threads).toBe(2);
+        expect(seeded.long).toBe(0);
+
+        /* A filter no index serves, over 1200 documents: a scan. */
+        await coll.countDocuments({ nope: 'zzz' });
+        const afterScan = await routing(c);
+        expect(afterScan.long).toBe(seeded.long + 1);
+        expect(afterScan.short).toBe(seeded.short);
+
+        /* By _id: O(log n), and must never be moved however big the
+         * collection is. */
+        await coll.findOne({ _id: ids[5] });
+        const afterPoint = await routing(c);
+        expect(afterPoint.long).toBe(afterScan.long);
+        expect(afterPoint.short).toBe(afterScan.short + 1);
+
+        /* An indexed equality is short too -- not because it is always
+         * cheap, but because its cost is not knowable in advance and this
+         * router refuses to guess (db_session.h says why). */
+        await coll.createIndex({ n: 1 });
+        await coll.countDocuments({ n: 7 });
+        const afterIndexed = await routing(c);
+        expect(afterIndexed.long).toBe(afterPoint.long);
+        expect(afterIndexed.short).toBe(afterPoint.short + 1);
+
+        /* ...and the same filter with the index dropped becomes long: the
+         * decision follows the PLAN, not the shape of the request. */
+        await coll.dropIndex('n_1');
+        await coll.countDocuments({ n: 7 });
+        const afterDrop = await routing(c);
+        expect(afterDrop.long).toBe(afterIndexed.long + 1);
+
+        /* A batched find is not offloadable at all -- a cursor belongs to
+         * the session -- so it counts as neither. */
+        const before = await routing(c);
+        const cur = coll.find({ nope: 'zzz' }, { batchSize: 10 });
+        await cur.next();
+        await cur.close?.();
+        const afterCursor = await routing(c);
+        expect(afterCursor.long).toBe(before.long);
+        expect(afterCursor.short).toBe(before.short);
+
+        await c.close();
+      } finally { proc.kill(); }
+    }, 90000);
+
+    it('leaves a small collection alone however it is queried', async () => {
+      /* The floor exists because a scan of a few documents is cheaper
+       * answered here than queued. Raised to 5000 so 1200 documents are
+       * below it, which also proves the flag is read rather than ignored. */
+      const port = nextPort();
+      const { proc } = await startServer(engine, port,
+        ['--raft', '1', '--read-threads', '2', '--read-offload-min', '5000'], -1);
+      try {
+        const c = await connectServer(port);
+        const coll = c.db(DB).collection('small');
+        for (let n = 0; n < BIG; n += 100) {
+          await coll.insertMany(Array.from({ length: 100 }, (_, k) => ({ n: n + k })));
+        }
+        await coll.countDocuments({ nope: 'zzz' });
+        await coll.find({ nope: 'zzz' }).toArray();
+        const r = await routing(c);
+        expect(r.long).toBe(0);
+        expect(r.short).toBe(2);
+        await c.close();
+      } finally { proc.kill(); }
+    }, 90000);
+
+    it('asks nothing at all when no reader threads were asked for', async () => {
+      /* The default has to cost exactly what it cost before, and sizing a
+       * read is not free: it resolves the collection and runs the planner.
+       * Both counters staying at zero through a scan is how "the question
+       * is not even asked" is asserted rather than assumed. */
+      const port = nextPort();
+      const { proc } = await startServer(engine, port, ['--raft', '1'], -1);
+      try {
+        const c = await connectServer(port);
+        const coll = c.db(DB).collection('unasked');
+        for (let n = 0; n < BIG; n += 100) {
+          await coll.insertMany(Array.from({ length: 100 }, (_, k) => ({ n: n + k })));
+        }
+        await coll.countDocuments({ nope: 'zzz' });
+        await coll.findOne({ nope: 'zzz' });
+        const r = await routing(c);
+        expect(r.threads).toBe(0);
+        expect(r.long).toBe(0);
+        expect(r.short).toBe(0);
+        /* And the reads still answered correctly, which is the point of
+         * the default: nothing about them changed. */
+        expect(await coll.countDocuments({})).toBe(BIG);
+        await c.close();
+      } finally { proc.kill(); }
+    }, 90000);
+  });
+
+  /*
    * ONE CLUSTER, TWO HOSTS: two C members and one member running in
    * Node.
    *

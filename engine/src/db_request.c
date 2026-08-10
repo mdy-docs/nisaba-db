@@ -1392,6 +1392,47 @@ int dbs_request_is_bare(const uint8_t *req, size_t req_len) {
     return 0;
 }
 
+int dbs_read_is_long(dbs *s, const uint8_t *req, size_t req_len, int64_t min_docs) {
+    if (!s || !req) return 0;
+    /* Only a read that CAN be performed elsewhere is worth asking about. */
+    if (!dbs_request_is_bare(req, req_len)) return 0;
+
+    const uint8_t *coll; uint32_t coll_len; int found = 0;
+    if (field_str(req, req_len, "coll", &coll, &coll_len, &found) || !found) return 0;
+
+    /* Resolving opens the collection if this session does not hold it,
+     * which the read itself is about to do anyway. A name with no
+     * collection answers 0 and lets the read raise the real refusal --
+     * this function's job is to size work, not to reject requests. */
+    dc_collection *c = NULL;
+    if (dbs_collection(s, (const char *)coll, coll_len, &c)) return 0;
+
+    /* Cheap test first: O(1), and it is the one that rules out the whole
+     * class of small collections where no plan is expensive. */
+    if (dc_collection_doc_count(c) <= min_docs) return 0;
+
+    const uint8_t *filter; size_t filter_len;
+    if (read_filter(req, req_len, &filter, &filter_len)) return 0;
+
+    int kind = DC_EXPLAIN_SCAN;
+    uint8_t *name = NULL; size_t name_len = 0;
+    if (dc_explain(c, filter, (uint32_t)filter_len, &kind, &name, &name_len)) return 0;
+    free(name);
+
+    /*
+     * Only a full scan, and that is a deliberate under-reach.
+     *
+     * SCAN is the one plan whose cost is proportional to the COLLECTION
+     * rather than to the answer, so it is the only one this can size
+     * without running it. An equality index matching most of a large
+     * collection is expensive too, and stays here -- a known gap, not an
+     * oversight: how many entries a range covers is not knowable from the
+     * filter, and guessing it would be a second, weaker planner beside the
+     * real one. IDS is O(log n) and must never be moved anywhere.
+     */
+    return kind == DC_EXPLAIN_SCAN;
+}
+
 int dbs_read(dc_collection *coll, const uint8_t *req, size_t req_len, dbuf *out) {
     if (!coll || !req || !out) return BJ_ERR_STATE;
     if (!dbs_request_is_bare(req, req_len)) return BJ_ERR_STATE;

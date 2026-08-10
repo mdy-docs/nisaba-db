@@ -353,6 +353,24 @@ static int resolve(dbi *i, const uint8_t *req, size_t len, dbs **out, dbuf *res)
     return 0;
 }
 
+int dbi_read_is_long(dbi *i, const uint8_t *req, size_t req_len, int64_t min_docs) {
+    if (!i || !req) return 0;
+    /* The instance's own three ops name no collection, so none of them can
+     * be a long read; asking a session about them would mean resolving a
+     * database that is not named. */
+    if (op_is(req, req_len, "ping") || op_is(req, req_len, "listDatabases") ||
+        op_is(req, req_len, "dropDatabase") || op_is(req, req_len, "transferLeadership"))
+        return 0;
+
+    const uint8_t *name; uint32_t nlen; int found = 0;
+    if (req_str(req, req_len, "db", &name, &nlen, &found) || !found) return 0;
+    dbs *s = NULL;
+    /* create = 0: sizing a read must not bring a database into existence.
+     * dbi_handle will make one if the request deserves it. */
+    if (dbi_database(i, (const char *)name, nlen, 0, &s)) return 0;
+    return dbs_read_is_long(s, req, req_len, min_docs);
+}
+
 int dbi_handle(dbi *i, uint64_t client, const uint8_t *req, size_t req_len,
                dbuf *out) {
     if (!i || !req || !out) return BJ_ERR_STATE;

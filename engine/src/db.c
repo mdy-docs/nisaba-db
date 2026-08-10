@@ -1745,22 +1745,26 @@ static int resolve_special_source(dc_collection *c, const uint8_t *filter, size_
  */
 const char *dc_explain_source(int kind) {
     switch (kind) {
-        case 1:  return "ids";
-        case 2:  return "equality";
-        case 3:  return "text";
-        case 4:  return "geo";
-        default: return "scan";
+        case DC_EXPLAIN_IDS:      return "ids";
+        case DC_EXPLAIN_EQUALITY: return "equality";
+        case DC_EXPLAIN_TEXT:     return "text";
+        case DC_EXPLAIN_GEO:      return "geo";
+        default:                  return "scan";
     }
+}
+
+int64_t dc_collection_doc_count(const dc_collection *c) {
+    return c ? bpt_size(c->primary) : 0;
 }
 
 int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                int *kind_out, uint8_t **name_out, size_t *name_len_out) {
-    *kind_out = 0; *name_out = NULL; *name_len_out = 0;
+    *kind_out = DC_EXPLAIN_SCAN; *name_out = NULL; *name_len_out = 0;
 
     uint8_t id[12]; int is_id = 0;
     int e = filter_is_id_only(filter, filter_len, id, &is_id);
     if (e) return e;
-    if (is_id) { *kind_out = 1; return BJ_OK; }
+    if (is_id) { *kind_out = DC_EXPLAIN_IDS; return BJ_OK; }
 
     int found = 0, is_text = 0;
     const uint8_t *skey; uint32_t skey_len; const uint8_t *sval; size_t sval_len;
@@ -1769,7 +1773,7 @@ int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                               &skey, &skey_len, &sval, &sval_len, &ix);
     if (e) return e;
     if (found) {
-        *kind_out = is_text ? 3 : 4;
+        *kind_out = is_text ? DC_EXPLAIN_TEXT : DC_EXPLAIN_GEO;
         return dbuf_dup((const uint8_t *)ix->name, ix->name_len, name_out, name_len_out);
     }
 
@@ -1778,7 +1782,7 @@ int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     if (e) return e;
     free(values);
     if (planned) {
-        *kind_out = 2;
+        *kind_out = DC_EXPLAIN_EQUALITY;
         return dbuf_dup((const uint8_t *)ix->name, ix->name_len, name_out, name_len_out);
     }
     return BJ_OK;

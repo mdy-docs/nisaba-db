@@ -835,6 +835,35 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
  */
 int dbs_request_is_bare(const uint8_t *req, size_t req_len);
 int dbs_read(dc_collection *coll, const uint8_t *req, size_t req_len, dbuf *out);
+
+/*
+ * IS THIS READ LONG ENOUGH TO BE WORTH MOVING? 1 when it is bare, its
+ * collection holds more than `min_docs` documents, and the planner would
+ * serve it by scanning all of them. Performs nothing.
+ *
+ * The question exists because moving a read is not free: it costs a queue
+ * hop, and -- since a deferred answer stops a connection being read from
+ * until it goes out -- it costs that connection its pipelining. Against a
+ * 0.4ms point read that is a loss; against an 11ms scan it is noise. So the
+ * criterion is COST, not op, and the two are not the same: `findOne` and
+ * `find` can both be either, depending on the filter and the collection.
+ *
+ * Cost is knowable in advance here only for one plan. DC_EXPLAIN_SCAN's
+ * work is proportional to the collection, which dc_collection_doc_count
+ * reports in O(1). Every other plan's is proportional to its answer, which
+ * is not knowable without producing it -- so an equality index matching
+ * most of a large collection is expensive and still answers 0. That is a
+ * known gap rather than an oversight: estimating it would mean a second,
+ * weaker planner beside the one that actually runs, and the two would
+ * disagree exactly when it mattered. DC_EXPLAIN_IDS is O(log n) and must
+ * never be moved at all.
+ *
+ * A HEURISTIC, and the failure modes are deliberately mild: a wrong "yes"
+ * costs one queue hop, a wrong "no" leaves one read uninsulated. Neither
+ * can change an answer -- the read runs the same code either way
+ * (dbs_read) -- so this is a scheduling hint and nothing more.
+ */
+int dbs_read_is_long(dbs *s, const uint8_t *req, size_t req_len, int64_t min_docs);
 /* How many ops the table holds. Exposed so a test can assert the table has
  * an opinion about every one of them rather than about a subset it happens
  * to have listed -- an op added with no `bare` decision is exactly the gap

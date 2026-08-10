@@ -155,6 +155,19 @@
  * largest frame in flight. */
 #define MAX_CLIENTS 64
 
+/*
+ * The most reader threads --read-threads will run.
+ *
+ * A ceiling rather than a guess at the right number: each thread carries
+ * its own read buffers per tree it is scanning and its own compiled-regex
+ * cache (engine/src/regex.c), so asking for more than the machine has
+ * cores buys queueing and pays memory. Sized against MAX_CLIENTS too --
+ * one deferred answer per connection means no more reads can be in flight
+ * than there are connections, so threads past that number can never all
+ * be busy at once.
+ */
+#define SERVER_MAX_READ_THREADS 16
+
 /* Seconds of silence before a connection's slot is taken back; 0 turns
  * the timer off. Sixty is short enough that a dead peer does not hold a
  * slot for long and long enough that a warm client pinging on any sane
@@ -895,6 +908,7 @@ static void usage(const char *me) {
             "           [--snapshot-entries N]\n"
             "           [--election-timeout MIN[:MAX]] [--heartbeat MS]\n"
             "           [--max-batch BYTES]\n"
+            "           [--read-threads N] [--read-offload-min DOCS]\n"
             "  serves the instance in the preopened directory \".\"\n"
             "  --bind: where the client wire listens (default 127.0.0.1;\n"
             "         widen it consciously -- there is no auth on this wire)\n"
@@ -922,7 +936,17 @@ static void usage(const char *me) {
             "  --max-batch: the replication window in bytes (default 65536).\n"
             "         One AppendEntries is in flight per follower, so catch-up\n"
             "         throughput is window/RTT: widen it for members a WAN\n"
-            "         separates\n", me);
+            "         separates\n"
+            "  --read-threads: how many threads answer LONG reads, so that one\n"
+            "         client's scan stops delaying everybody else's (default 0,\n"
+            "         which is every read on the serving thread as before).\n"
+            "         Routing is live and reported by `ping` as longReads /\n"
+            "         shortReads; the threads themselves are not built yet, so\n"
+            "         today this decides and counts without moving anything\n"
+            "  --read-offload-min: how many documents a collection must hold\n"
+            "         before a scanning read of it is worth moving (default\n"
+            "         %d). Below it a read is cheaper answered inline than\n"
+            "         queued\n", me, REPLICA_READ_MIN_DOCS);
 }
 
 /*
@@ -1055,6 +1079,12 @@ int main(int argc, char **argv) {
     replica_timing timing = {0};
     /* 0 is the engine's default window (64 KB). */
     long max_batch = 0;
+    /* -1 means "not given", so an explicit --read-threads 0 is
+     * distinguishable from silence -- it is not, in effect, but a flag
+     * whose absence and whose zero are the same value is one that cannot
+     * later grow a different default without breaking somebody. */
+    long read_threads = -1;
+    long read_min_docs = -1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdio") == 0) use_stdio = 1;
@@ -1107,6 +1137,28 @@ int main(int argc, char **argv) {
             if (max_batch > 32L * 1024 * 1024) {
                 fprintf(stderr, "--max-batch %ld is larger than the peer wire can promise"
                                 " to carry (max %ld)\n", max_batch, 32L * 1024 * 1024);
+                return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--read-threads") == 0 && i + 1 < argc) {
+            read_threads = atol(argv[++i]);
+            if (read_threads < 0) {
+                fprintf(stderr, "--read-threads cannot be negative\n");
+                return 2;
+            }
+            /* A ceiling, because every thread costs its own read buffers
+             * and its own compiled-pattern cache, and a number larger than
+             * the machine has cores is a number that only adds those. */
+            if (read_threads > SERVER_MAX_READ_THREADS) {
+                fprintf(stderr, "--read-threads %ld is more than this build will run"
+                                " (max %d)\n", read_threads, SERVER_MAX_READ_THREADS);
+                return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--read-offload-min") == 0 && i + 1 < argc) {
+            read_min_docs = atol(argv[++i]);
+            if (read_min_docs < 0) {
+                fprintf(stderr, "--read-offload-min cannot be negative (documents)\n");
                 return 2;
             }
         }
@@ -1191,6 +1243,23 @@ int main(int argc, char **argv) {
     if (max_batch && node_id <= 0) {
         fprintf(stderr, "--max-batch needs --raft NODE_ID: it sizes the replication"
                         " window\n");
+        return 2;
+    }
+    /*
+     * Reads move off the serving thread through the deferral path, and
+     * that path is the replicated transport's: an unreplicated server
+     * answers every request inline and has nowhere to park one. Refused
+     * rather than accepted-and-ignored, which is the failure that looks
+     * like a tuning flag that does nothing.
+     */
+    if (read_threads > 0 && node_id <= 0) {
+        fprintf(stderr, "--read-threads needs --raft NODE_ID: a read is moved by being"
+                        " deferred, and only a replicated server can defer one\n");
+        return 2;
+    }
+    if (read_min_docs >= 0 && node_id <= 0) {
+        fprintf(stderr, "--read-offload-min needs --raft NODE_ID: it sizes reads for"
+                        " --read-threads\n");
         return 2;
     }
     /*
@@ -1395,6 +1464,8 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (max_batch) replica_set_max_batch(rep, (uint32_t)max_batch);
+        if (read_threads >= 0 || read_min_docs >= 0)
+            replica_set_read_offload(rep, (int)read_threads, (int64_t)read_min_docs);
         /* What the LOG says, which is not necessarily what argv said: a
          * restarted member's cluster comes from its own CONFIG entries,
          * and a --peer list that disagrees has already lost. */

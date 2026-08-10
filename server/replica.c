@@ -142,6 +142,27 @@ struct replica {
      * case leadership moves anyway and the answer has nowhere to go,
      * exactly like a proposer's (replica_drop_client). */
     pending   *transfer_waiter;
+
+    /*
+     * READ ROUTING. `read_threads` is how many reader threads were asked
+     * for; `read_min_docs` is the collection size below which no read is
+     * long enough to be worth moving (db_session.h's dbs_read_is_long).
+     *
+     * The two counters are how a test -- and an operator -- sees the
+     * routing decision without measuring time. Reported by `ping`, beside
+     * the log's bounds and for the same reason: a decision nobody can
+     * observe is a decision nobody can check.
+     *
+     * The decision is only ASKED when read_threads > 0. Sizing a read
+     * costs a collection resolve and a dc_explain, and a server that was
+     * never asked for reader threads must pay exactly what it paid
+     * before -- so with the default of 0, this whole mechanism is a
+     * comparison against zero.
+     */
+    int        read_threads;
+    int64_t    read_min_docs;
+    uint64_t   reads_long;      /* judged worth moving off this thread */
+    uint64_t   reads_short;     /* judged cheaper to answer here */
 };
 
 static conversation *conv_open(replica *r, uint64_t theirs, uint64_t from) {
@@ -1177,6 +1198,12 @@ static int tick_for(int64_t heartbeat_ms) {
     return half > INT32_MAX ? INT32_MAX : (int)half;
 }
 
+void replica_set_read_offload(replica *r, int threads, int64_t min_docs) {
+    if (!r) return;
+    if (threads >= 0) r->read_threads = threads;
+    if (min_docs >= 0) r->read_min_docs = min_docs;
+}
+
 void replica_set_max_batch(replica *r, uint32_t bytes) {
     /* rn_set_limits keeps its default on 0, so this needs no policy of
      * its own -- one place decides what 0 means. */
@@ -1212,6 +1239,12 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
     r->rt = rt;
     r->snap_every = snapshot_entries;
     r->self_id = self_id;
+    /* No reader threads unless asked for, and a floor that puts the
+     * smallest moved read at roughly a quarter of a millisecond of
+     * scanning -- measured at ~0.22us per document, so a thousand of them
+     * is about the point where a queue hop stops being the bigger cost. */
+    r->read_threads = 0;
+    r->read_min_docs = REPLICA_READ_MIN_DOCS;
     /* Non-zero, or xorshift stays at zero forever and every member draws
      * the same nothing -- which is the bug this exists to avoid. */
     r->rnd = (self_id * 0x9E3779B97F4A7C15ULL) ^ (now + 0x100000001B3ULL);
@@ -1899,6 +1932,44 @@ static uint64_t req_read_after(const uint8_t *req, size_t len) {
  * that index, and this one will be within about a heartbeat -- which is
  * why it is its own code rather than -63 or -66.
  */
+/*
+ * Would this read be better performed somewhere other than here?
+ *
+ * Asked in ONE place so the two read paths -- linearizable and stale --
+ * cannot come to different conclusions about the same request, and so the
+ * counters mean one thing. Only asked when reader threads were asked for:
+ * sizing a read costs a collection resolve and a dc_explain, which a
+ * server running the default of none must not pay.
+ *
+ * Nothing acts on the answer yet. It is recorded so the decision can be
+ * checked -- by a test, and by an operator through `ping` -- while the
+ * server is still answering every read on this thread, which is the only
+ * moment at which the routing can be judged apart from the threading.
+ */
+static int read_is_long(replica *r, const uint8_t *req, size_t len) {
+    if (!r || r->read_threads <= 0) return 0;
+
+    /*
+     * Counted only if the router had a CHOICE about it, so that
+     * longReads + shortReads is the number of decisions rather than the
+     * number of read requests. `getMore`, `watch`, `listCollections` and a
+     * batched `find` can go nowhere at all -- a cursor and a stream belong
+     * to the session -- and recording those as "short" would report a read
+     * that was never in question as one judged cheap. Two different facts,
+     * and an operator watching these numbers to decide whether reader
+     * threads are earning their keep needs them apart.
+     *
+     * dbs_read_is_long asks this again for its own reasons (it will not
+     * perform what it cannot). The check is cheap and the two have
+     * different jobs: this one gates counting, that one gates answering.
+     */
+    if (!dbs_request_is_bare(req, len)) return 0;
+
+    int lng = dbi_read_is_long(r->inst, req, len, r->read_min_docs);
+    if (lng) r->reads_long++; else r->reads_short++;
+    return lng;
+}
+
 static int submit_read_stale(replica *r, uint64_t client,
                              const uint8_t *req, size_t len, dbuf *out) {
     int e = apply_committed(r);
@@ -1910,6 +1981,8 @@ static int submit_read_stale(replica *r, uint64_t client,
         e = refuse(r, DC_ERR_BEHIND, out);
         return e ? e : 0;
     }
+    (void)read_is_long(r, req, len);
+
     dbuf cmds = {0};
     uint64_t token = 0;
     e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
@@ -1954,6 +2027,8 @@ static int submit_read(replica *r, pending *p, uint64_t client,
         e = refuse(r, DC_ERR_NOT_CURRENT, out);
         return e ? e : 0;
     }
+
+    (void)read_is_long(r, req, len);
 
     dbuf cmds = {0};
     uint64_t token = 0;
@@ -2032,6 +2107,17 @@ static int replica_status(const replica *r, dbuf *out) {
     if (!e) e = bj_put_int(b, (int64_t)elog_base_index(r->log));
     if (!e) e = bj_put_key(b, (const uint8_t *)"last", 4);
     if (!e) e = bj_put_int(b, (int64_t)elog_last_index(r->log));
+    /* Read routing, for the same reason as the log's bounds above: a
+     * decision nobody can observe is a decision nobody can check. Both are
+     * 0 on a server that was not asked for reader threads, because it does
+     * not ask the question -- and they count DECISIONS, so a read that
+     * could never be moved anywhere is in neither. */
+    if (!e) e = bj_put_key(b, (const uint8_t *)"readThreads", 11);
+    if (!e) e = bj_put_int(b, (int64_t)r->read_threads);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"longReads", 9);
+    if (!e) e = bj_put_int(b, (int64_t)r->reads_long);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"shortReads", 10);
+    if (!e) e = bj_put_int(b, (int64_t)r->reads_short);
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
     if (!e) {

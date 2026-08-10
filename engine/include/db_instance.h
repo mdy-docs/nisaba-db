@@ -167,6 +167,18 @@ int dbi_handle(dbi *i, uint64_t client, const uint8_t *req, size_t req_len,
 void dbi_request_kind(const uint8_t *req, size_t req_len, int *kind);
 
 /*
+ * db_session.h's dbs_read_is_long with the instance's routing in front:
+ * resolves the request's `db` and asks that session. 0 for the instance's
+ * own ops, which name no collection.
+ *
+ * It does NOT create the database. Sizing a read is a question, and a
+ * question must not make a directory -- dbi_handle still creates one when a
+ * request deserves it, which keeps "using a database makes it" in the one
+ * place that performs requests.
+ */
+int dbi_read_is_long(dbi *i, const uint8_t *req, size_t req_len, int64_t min_docs);
+
+/*
  * The replicated fork (db_session.h's dbs_propose / dbs_step), with one
  * addition: every command comes back WRAPPED.
  *

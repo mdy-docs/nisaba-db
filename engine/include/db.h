@@ -224,6 +224,12 @@ int dc_collection_recover(dc_collection *c, const bj_io *journal);
 uint64_t dc_applied_index(const dc_collection *c);
 int      dc_set_applied_index(dc_collection *c, uint64_t index);
 
+/* How many documents the collection holds, in O(1) -- the primary tree
+ * keeps the count, so this reads it rather than counting. Distinct from
+ * dc_count, which applies a filter and therefore scans. For a caller
+ * deciding how much work a query is about to be, before doing any. */
+int64_t dc_collection_doc_count(const dc_collection *c);
+
 /* ---- Read views (MVCC) ------------------------------------------------- */
 
 /*
@@ -456,12 +462,27 @@ int dc_find(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             const qry_options *opts, uint8_t **out, size_t *out_len);
 
 /*
+ * Which candidate source the shared query dispatch would use for `filter`.
+ * Named rather than left as the bare integers they were, because a caller
+ * that ROUTES on the answer -- rather than printing it -- should not be
+ * comparing against a literal 0, and because the difference between SCAN
+ * and the rest is the difference between work proportional to the
+ * collection and work proportional to the answer.
+ */
+typedef enum {
+    DC_EXPLAIN_SCAN     = 0,  /* every document, in primary order */
+    DC_EXPLAIN_IDS      = 1,  /* {_id: <oid>}: one O(log n) bpt_search */
+    DC_EXPLAIN_EQUALITY = 2,
+    DC_EXPLAIN_TEXT     = 3,
+    DC_EXPLAIN_GEO      = 4
+} dc_explain_kind;
+
+/*
  * Report which candidate source the shared query dispatch would use for
  * `filter`, without executing anything -- consults the same planners the
- * queries run, so it cannot drift. *kind_out: 0 full scan, 1 {_id} point
- * lookup, 2 equality index, 3 text index, 4 geo index. For kinds 2-4 the
- * serving index's name is written through *name_out / *name_len_out
- * (malloc'd; caller frees); NULL otherwise.
+ * queries run, so it cannot drift. *kind_out is a dc_explain_kind. For
+ * EQUALITY/TEXT/GEO the serving index's name is written through *name_out /
+ * *name_len_out (malloc'd; caller frees); NULL otherwise.
  */
 int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                int *kind_out, uint8_t **name_out, size_t *name_len_out);

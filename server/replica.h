@@ -143,6 +143,25 @@ void replica_timing_resolve(replica_timing *tm);
  */
 void replica_set_max_batch(replica *r, uint32_t bytes);
 
+/* Collection size below which no read is long enough to be worth moving
+ * off the serving thread. Chosen from measurement rather than taste: a
+ * scan costs ~0.22us per document on this hardware, so a thousand is
+ * ~0.22ms -- about where the cost of a queue hop and a lost pipeline stops
+ * dominating the cost of the scan. */
+#define REPLICA_READ_MIN_DOCS 1000
+
+/*
+ * How many reader threads to run, and the size floor above which a
+ * scanning read is judged worth giving to one (db_session.h's
+ * dbs_read_is_long has the criterion and its limits).
+ *
+ * `threads` of 0 -- the default -- means every read is answered on the
+ * serving thread exactly as it always was, and the sizing question is not
+ * even asked, so it costs nothing. Negative in either argument leaves that
+ * one alone.
+ */
+void replica_set_read_offload(replica *r, int threads, int64_t min_docs);
+
 /*
  * Open the log in `ns` and put a node over it.
  *

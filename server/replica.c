@@ -1727,7 +1727,38 @@ static int apply_committed(replica *r) {
             int rc = dbi_apply(r->inst, index, payload.data, (uint32_t)payload.len, into);
             if (p) p->view[p->at].rc = rc;
             dbuf_free(&scratch);
-            if (rc && !dc_is_deterministic(rc)) { e = rc; break; }
+            if (rc && !dc_is_deterministic(rc)) {
+                /*
+                 * WHICH ENTRY, and what it was. A halt is the strongest
+                 * thing this member does -- it stops serving entirely,
+                 * because the alternative is diverging quietly -- and
+                 * "halted (-37)" tells whoever has to diagnose it nothing
+                 * about where to look. The index is what to fetch from the
+                 * log; the opcode and collection are what to reason about.
+                 *
+                 * Written here rather than left to the caller: by the time
+                 * this returns, the index is gone and the payload is freed.
+                 */
+                const uint8_t *cmd = NULL;
+                size_t cmd_len = 0;
+                int op = -1;
+                const uint8_t *coll = NULL;
+                uint32_t coll_len = 0;
+                if (dbi_entry_cmd(payload.data, (uint32_t)payload.len, NULL, 0,
+                                  &cmd, &cmd_len) == BJ_OK && cmd) {
+                    if (dc_wal_parse(cmd, (uint32_t)cmd_len, &op, &coll, &coll_len)) {
+                        op = -1;
+                    }
+                }
+                fprintf(stderr, "replica: entry %llu (opcode %d, collection"
+                                " '%.*s') would not apply: %s\n",
+                        (unsigned long long)index, op,
+                        (int)(coll ? coll_len : 0), coll ? (const char *)coll : "",
+                        dc_strerror(rc));
+                fflush(stderr);
+                e = rc;
+                break;
+            }
         }
         r->applied = index;
         rn_applied(r->node, index);

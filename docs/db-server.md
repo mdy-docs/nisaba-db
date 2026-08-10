@@ -1135,6 +1135,39 @@ is what makes the serial engine a property that can be handed back.
 
 Stated here rather than discovered later.
 
+- **OPEN BUG, and the worst one written down here: a replicated member
+  killed during a `dropCollection` never starts again.** Reproduce it in
+  seconds with `npm run repro:halt-on-drop` — on the first kill, typically:
+
+  ```
+  replica: entry 42 (opcode 4, collection 'c') would not apply:
+           No collection of that name in this database's catalog
+  replica: halted (-37: ...)
+  ```
+
+  Opcode 4 is `DC_WAL_CREATE_INDEX`. The entry replayed is a `createIndex`
+  whose collection the *next* entry dropped: the drop's effect on the files
+  became durable while the recorded applied index stayed below it, so replay
+  restarts at an index whose state no longer exists. The halt is correct —
+  `-37` on apply is either a log this member cannot apply or a state that has
+  drifted, and the ambiguity resolves toward stopping. But replay is
+  deterministic, so **every later boot fails identically**: measured at four
+  consecutive boots, all halted. The database cannot be opened again.
+
+  Needs no cluster, no snapshot install, no reader threads and no sanitizer —
+  only `--raft` and an unlucky moment. On a deployment running one replicated
+  server per tenant, that is a tenant's data unavailable after one badly
+  timed crash, OOM or reboot.
+
+  The invariant broken is that a destructive file operation must not become
+  durable before the record of the entries preceding it. Which end to fix —
+  the durability ordering, or letting a replayed DDL whose collection a later
+  entry removed count as convergence the way a re-applied `createIndex`
+  (`-56`) and `dropIndex` (`-57`) already do — is a decision about the
+  durability contract and has deliberately not been taken on a hypothesis.
+  Found by `npm run soak:install`; the halt now names the entry it choked on,
+  which is what identified it.
+
 - **Cursors are bounded and not timed out on their own.** Sixteen at
   once across all clients (`DBS_MAX_CURSORS`); the seventeenth is `-47`.
   An abandoned cursor is held until its connection ends, which the idle

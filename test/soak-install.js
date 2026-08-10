@@ -86,7 +86,15 @@ function usage(msg) {
  * without testing what it is named for. A padded document makes a scan tens
  * of milliseconds, which is wide enough to hit repeatedly.
  */
-const opts = { seconds: 60, readers: 8, seed: 1, port: 35000 + (process.pid % 600),
+/*
+ * A STRIDE, not an offset. Three members need six ports (client + peer
+ * each), and `35000 + pid % 600` put consecutive runs 1 apart -- so two of
+ * these at once collided and the second died with "Address already in use".
+ * Catching an intermittent failure means running several at once, which is
+ * exactly when that bites. Twenty apart leaves room for a member count to
+ * grow, too.
+ */
+const opts = { seconds: 60, readers: 8, seed: 1, port: 35000 + (process.pid % 140) * 20,
                readThreads: 4, churnMs: 6000, pad: 400, cap: 4000, quiet: false };
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
@@ -262,7 +270,14 @@ async function startMember(m, freshDir) {
       note(`member ${m.id} sanitizer: ${text.trim().split('\n')[0]}`);
     }
     if (/halted|adoption failed|readers would not finish/.test(text)) {
-      note(`member ${m.id}: ${text.trim().split('\n').find((l) => /halted|failed|finish/.test(l))}`);
+      /*
+       * With the member's own last words, not just the line that matched.
+       * A halt prints WHICH entry it choked on (index, opcode, collection)
+       * on the line before -- and reporting only the match threw exactly
+       * that away, which cost one reproduction of twelve minutes.
+       */
+      const tail = m.log.trim().split('\n').slice(-14).join('\n      ');
+      note(`member ${m.id} halted; its last words:\n      ${tail}`);
     }
   });
   const until = Date.now() + 30000;

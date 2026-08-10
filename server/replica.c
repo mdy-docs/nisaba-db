@@ -1809,6 +1809,59 @@ static int refuse(const replica *r, int code, dbuf *out) {
  * above `read_index`, and serving something NEWER than the barrier
  * requires is allowed. Only serving something older is not.
  */
+/*
+ * Did the client declare this read stale-tolerant? A top-level
+ * `stale: true` on a read request. Anything else -- absent, false,
+ * unreadable -- is the default, which is the strong one.
+ */
+static int req_reads_stale(const uint8_t *req, size_t len) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(req, len, (const uint8_t *)"stale", 5, &v, &vlen, &found)) return 0;
+    if (!found) return 0;
+    cur c = { v, vlen, 0 };
+    int b = 0;
+    return read_bool(&c, &b) == BJ_OK && b;
+}
+
+/*
+ * A read the client declared stale-tolerant, served from this member's
+ * own applied state, whatever its role.
+ *
+ * The refusal below ("staleness presented as authority") is about a
+ * follower answering as if it were current when nobody asked it to be.
+ * This is the other case: the CLIENT signed the waiver, in the request,
+ * where it travels with the read -- so what is served is exactly what
+ * was asked for. The staleness is bounded by replication lag (the next
+ * heartbeat, on a healthy cluster), and nothing here promises tighter:
+ * no barrier, no proof, no read-your-writes.
+ *
+ * What this buys is the two things a leader-only read path cannot have:
+ * every member's CPU serves reads instead of one in three, and a read
+ * near a far follower streams its documents locally instead of across
+ * the WAN. It is also why there is no role check at all -- a leader
+ * serving a stale read just skips the barrier, and a member mid-election
+ * keeps answering, which makes flagged reads AVAILABLE through the very
+ * window where linearizable ones wait.
+ *
+ * The pump still runs first: "stale" means behind the cluster, never
+ * behind this member's own committed log.
+ */
+static int submit_read_stale(replica *r, uint64_t client,
+                             const uint8_t *req, size_t len, dbuf *out) {
+    int e = apply_committed(r);
+    if (e) return e;
+    dbuf cmds = {0};
+    uint64_t token = 0;
+    e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
+    dbuf_free(&cmds);
+    if (e || token) {
+        /* A read plans nothing; see submit_read. */
+        if (token) dbi_abandon(r->inst, token);
+        return e ? e : BJ_ERR_STATE;
+    }
+    return 0;
+}
+
 static int submit_read(replica *r, pending *p, uint64_t client,
                        const uint8_t *req, size_t len, dbuf *out) {
     /*
@@ -1886,7 +1939,7 @@ static int submit_read(replica *r, pending *p, uint64_t client,
  * nobody can watch replicate is one nobody can operate. It reports and
  * promises nothing: `applied` is this member's own floor at the moment
  * it was asked, which is exactly the number that must not be used to
- * serve a read.
+ * serve a read nobody declared stale-tolerant.
  *
  * A server without --raft never reaches here and answers the plain
  * { ok, pong } it always did.
@@ -2241,6 +2294,15 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
 
     if (kind == DBS_REQ_TRANSFER) return transfer_submit(r, p, client, req, len, out);
 
+    /*
+     * Before the role check AND the transfer fence: a stale read takes
+     * no barrier and proposes nothing, so neither gate protects
+     * anything on its path -- and staying open through elections and
+     * transfers is half of what the flag is for.
+     */
+    if (kind == DBS_REQ_READ && req_reads_stale(req, len))
+        return submit_read_stale(r, client, req, len, out);
+
     if (kind == DBS_REQ_READ || kind == DBS_REQ_WRITE) {
         if (!replica_is_leader(r)) {
             /*
@@ -2248,6 +2310,8 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
              * a round trip and cannot tell by how much, so an answer
              * from it is staleness presented as authority
              * (docs/replicaton-roadmap.md, the step 6 decision).
+             * `stale: true` is the client waiving exactly that, and it
+             * was routed above before this check.
              */
             int e = refuse(r, DC_ERR_NOT_LEADER, out);
             return e ? e : 0;

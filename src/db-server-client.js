@@ -539,6 +539,21 @@ function materialized(docs, extras = {}) {
   }, 'cursor');
 }
 
+/**
+ * The stale-tolerance waiver, as a top-level request field.
+ *
+ * `{ stale: true }` on a READ says the caller will take this member's
+ * own applied state, whatever its role -- which is what lets a FOLLOWER
+ * serve it instead of refusing toward the leader, and lets any member
+ * keep answering through an election. The staleness is bounded by
+ * replication lag; there is no read-your-writes. Absent means what it
+ * has always meant: linearizable, from the leader, behind a quorum
+ * barrier.
+ */
+function staleOf(options) {
+  return options?.stale === true ? { stale: true } : {};
+}
+
 /** find's options, as db_request.c's read_opts reads them: absent is none. */
 function findOpts(options) {
   const out = {};
@@ -573,10 +588,11 @@ function collection(conn, name) {
      */
     find(filter = {}, options = undefined) {
       const opts = findOpts(options);
+      const stale = staleOf(options);
       const batchSize = options?.batchSize > 0 ? options.batchSize : 0;
 
       if (!batchSize) {
-        return materialized(call({ op: 'find', filter, ...(opts ? { opts } : {}) })
+        return materialized(call({ op: 'find', filter, ...(opts ? { opts } : {}), ...stale })
           .then((res) => res.docs || []),
           { explain: () => impl.explain(filter) });
       }
@@ -587,9 +603,13 @@ function collection(conn, name) {
 
       const take = async () => {
         if (done) return [];
+        /* The getMore carries the waiver too: the cursor lives on the
+         * member that opened it, and if that member is a follower an
+         * unflagged continuation would be refused toward the leader --
+         * who has never heard of this cursor. */
         const res = started
-          ? await call({ op: 'getMore', cursor: id })
-          : await call({ op: 'find', filter, ...(opts ? { opts } : {}) });
+          ? await call({ op: 'getMore', cursor: id, ...stale })
+          : await call({ op: 'find', filter, ...(opts ? { opts } : {}), ...stale });
         started = true;
         id = res.cursor ?? null;
         if (id === null) done = true;
@@ -637,8 +657,8 @@ function collection(conn, name) {
       return guard(cursor, 'cursor');
     },
 
-    async findOne(filter = {}) {
-      const res = await call({ op: 'findOne', filter });
+    async findOne(filter = {}, options = undefined) {
+      const res = await call({ op: 'findOne', filter, ...staleOf(options) });
       return res.found ? res.doc : null;
     },
 
@@ -651,10 +671,10 @@ function collection(conn, name) {
      * One frame, no server cursor: $sort and $group need every match
      * before the first result exists, so there is no scan left to resume.
      */
-    aggregate(pipeline = []) {
+    aggregate(pipeline = [], options = undefined) {
       if (!Array.isArray(pipeline)) throw new Error('aggregate requires a pipeline array');
       return materialized(
-        call({ op: 'aggregate', stages: pipeline })
+        call({ op: 'aggregate', stages: pipeline, ...staleOf(options) })
           .then((res) => res.docs || [])
           .catch((err) => { throw atStage(err, pipeline); })
       );
@@ -667,12 +687,12 @@ function collection(conn, name) {
       return (await call({ op: 'explain', filter })).plan;
     },
 
-    async countDocuments(filter = {}) {
-      return (await call({ op: 'count', filter })).n;
+    async countDocuments(filter = {}, options = undefined) {
+      return (await call({ op: 'count', filter, ...staleOf(options) })).n;
     },
 
-    async distinct(field, filter = {}) {
-      return (await call({ op: 'distinct', field, filter })).values || [];
+    async distinct(field, filter = {}, options = undefined) {
+      return (await call({ op: 'distinct', field, filter, ...staleOf(options) })).values || [];
     },
 
     /* The id is this side's, and it is also the answer: an insert's

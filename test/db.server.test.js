@@ -933,6 +933,66 @@ for (const engine of ENGINES) {
     });
 
     /*
+     * ...unless the client waives it. `{ stale: true }` on a read is
+     * the client saying it will take this member's own applied state --
+     * so a follower serves it instead of refusing toward the leader,
+     * and every member's CPU serves reads instead of one in three. The
+     * refusal above is about staleness presented as authority; this is
+     * staleness asked for by name, which is a different thing.
+     */
+    it('serves a stale-tolerant read on a follower, and stays a read', async () => {
+      await agree(['alpha', 'beta', 'contested', 'redirected']);
+      const live = nodes.filter((n) => n.alive);
+      const stats = await Promise.all(live.map(async (m) => [m, await statusOf(m)]));
+      const followers = stats.filter(([, s]) => s.role !== 'leader');
+      expect(followers.length).toBe(2);
+
+      for (const [m] of followers) {
+        const c = await connectServer(m.port);
+        try {
+          const users = c.db(DB).collection('users');
+
+          // Every read shape, from the follower's own applied state --
+          // which `agree` just proved matches the leader's.
+          const names = (await users.find({}, { stale: true }).toArray())
+            .map((d) => d.name).sort();
+          expect(names).toEqual(['alpha', 'beta', 'contested', 'redirected']);
+          expect(await users.countDocuments({}, { stale: true })).toBe(4);
+          expect((await users.findOne({ name: 'alpha' }, { stale: true })).name).toBe('alpha');
+          expect((await users.distinct('name', {}, { stale: true })).sort())
+            .toEqual(['alpha', 'beta', 'contested', 'redirected']);
+          expect((await users.aggregate([{ $count: 'n' }], { stale: true }).toArray())[0])
+            .toMatchObject({ n: 4 });
+
+          /*
+           * A batched find opens a CURSOR on this follower, and the
+           * getMore must carry the waiver too -- an unflagged
+           * continuation would be refused toward a leader that has
+           * never heard of the cursor.
+           */
+          const paged = [];
+          for await (const doc of users.find({}, { stale: true, batchSize: 2 })) paged.push(doc.name);
+          expect(paged.sort()).toEqual(['alpha', 'beta', 'contested', 'redirected']);
+
+          // The flag waives the barrier, not the classification: a
+          // WRITE carrying it is still a write, and still refused.
+          await expect(c.db(DB).request({ op: 'createCollection', coll: 'sneak', stale: true }))
+            .rejects.toMatchObject({ code: -63 });
+          // And an unflagged read on this same connection still
+          // refuses: the waiver travels per request, not per socket.
+          await expect(users.countDocuments({})).rejects.toMatchObject({ code: -63 });
+        } finally { await c.close(); }
+      }
+
+      // On the leader the flag simply skips the barrier: same answer.
+      const leader = stats.find(([, s]) => s.role === 'leader')[0];
+      const lc = await connectServer(leader.port);
+      try {
+        expect(await lc.db(DB).collection('users').countDocuments({}, { stale: true })).toBe(4);
+      } finally { await lc.close(); }
+    });
+
+    /*
      * ...and the other half of linearizable: a LEADER that cannot prove
      * it still leads refuses too.
      *
@@ -964,6 +1024,13 @@ for (const engine of ENGINES) {
         try {
           await expect(db.collection('users').countDocuments({}))
             .rejects.toMatchObject({ code: -66 });
+          /* The stale-tolerant read is the other side of that coin: it
+           * asked for this member's own applied state and nothing about
+           * the cluster, so a quorum going quiet is not its problem --
+           * flagged reads stay AVAILABLE through the exact window where
+           * linearizable ones refuse. */
+          expect(await db.collection('users').countDocuments({}, { stale: true }))
+            .toBe(4);
         } finally { await db.close(); }
       } finally {
         for (const m of others) if (!m.alive) await boot(m);

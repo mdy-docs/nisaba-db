@@ -273,11 +273,33 @@ Those numbers report and promise nothing — `applied` is that member's
 own floor when it was asked, which is precisely the number that may not
 be used to serve a read.
 
-Reads that scale by adding members are a different thing: an
-asynchronous replica tier outside consensus, explicitly not
-linearizable, deferred until a workload wants it
-([`replicaton-roadmap.md`](replicaton-roadmap.md)'s step 6 decision
-records why and what was rejected).
+**Unless the client waives it.** A read carrying a top-level
+`stale: true` is served from the answering member's own applied state,
+whatever its role — a follower serves it instead of refusing, a leader
+serves it without the barrier round, and a member mid-election keeps
+answering through the exact window where linearizable reads wait. The
+step-6 refusal is about staleness *presented as authority*; this is
+staleness asked for by name, in the request, where the waiver travels
+with the read.
+
+What the flag means, precisely: the answer reflects everything this
+member has applied, which on a healthy cluster trails the leader by at
+most about a heartbeat — and by more when the member is catching up,
+with no bound the member can state. There is no read-your-writes: a
+write acknowledged by the leader may not be visible to a flagged read
+on a follower yet. The flag changes routing for reads only —
+classification is untouched, so a write carrying it is refused exactly
+as before, and it travels per request, never per connection. Cursor
+continuations (`getMore`) must carry it too, since the cursor lives on
+the member that opened it; `src/db-server-client.js` does this when a
+read is given `{ stale: true }` in its options.
+
+What it buys: every member's CPU serves reads instead of one in three,
+and a client near a far follower streams documents locally instead of
+across the WAN. It is the asynchronous read tier the
+[`replicaton-roadmap.md`](replicaton-roadmap.md) step 6 decision
+deferred — built inside consensus rather than beside it, because the
+followers were already applying the same log.
 
 **Without `--raft` nothing changes**, including the file layout: a
 directory served by a single process today can be joined to a cluster

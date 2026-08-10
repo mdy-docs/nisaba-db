@@ -1709,6 +1709,96 @@ for (const engine of ENGINES) {
     }, 60000);
   });
 
+  describe.skipIf(!enabled)(`nisaba-server: a drop the log has outrun (${engine.name})`, () => {
+    it('restarts instead of halting for ever', async () => {
+      /*
+       * A DROPPED COLLECTION TOOK THE RECORD OF WHAT HAD BEEN APPLIED WITH
+       * IT, AND THE DATABASE COULD NEVER BE OPENED AGAIN.
+       *
+       * Every structure records the last log index applied to it in its own
+       * metadata, staged before the mutation so the mutation's commit
+       * persists both atomically. That is exactly right until the mutation
+       * IS the deletion of the structure holding the record: the replay
+       * floor is a MAX over the collections that still exist, so dropping
+       * the one carrying the highest index makes the floor go BACKWARDS.
+       *
+       * Harmless while the log still holds the entries in between -- replay
+       * is idempotent under each collection's own guard. Fatal once the log
+       * has been compacted past them: replay resumes at the log's base,
+       * which is AHEAD of what the live files contain, and the first entry
+       * naming the dropped collection cannot apply. -37 is deliberately not
+       * deterministic, so the member halts; replay being deterministic, it
+       * halts on every later boot too. Four consecutive boots measured, all
+       * halted. No crash needed -- a completed drop and a polite restart did
+       * it, and `npm run repro:halt-on-drop` still does it in one go against
+       * a build without the fix.
+       *
+       * The fix gives the index a home a drop cannot delete: the catalog,
+       * which is the one structure a drop both keeps and writes.
+       *
+       * THE PRECONDITION IS FORCED, NOT WAITED FOR. This only bites when the
+       * log's base sits between the entries that made the collection and the
+       * DDL naming it -- so the snapshot is taken explicitly, at exactly
+       * that point, rather than hoping --snapshot-entries lands there. The
+       * assertion below proves it landed: without `base < applied` this test
+       * passes while testing nothing.
+       */
+      const port = nextPort();
+      const first = await startServer(engine, port,
+        ['--raft', '1', '--snapshot-entries', '8'], -1);
+      let second = null;
+      /* Whatever goes wrong, the server's own words go with it: a bare
+       * "write EPIPE" from the client says only that the far end went. */
+      const withLog = (err) => {
+        const tail = [first.stderr?.(), second?.stderr?.()]
+          .filter(Boolean).join('\n--\n').trim().split('\n').slice(-8).join('\n    ');
+        err.message += `\n  server said:\n    ${tail}`;
+        return err;
+      };
+      try {
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        const db = c.db(DB);
+        await db.collection('doomed').insertMany(
+          Array.from({ length: 20 }, (_, k) => ({ n: k })));
+
+        /* Compact the log HERE: its base is now the last insert, so the
+         * entries that made 'doomed' are gone from it. */
+        const gen = await c.snapshot();
+        const base = gen.lastIncludedIndex;
+        expect(base, 'the snapshot included nothing').toBeGreaterThan(1);
+
+        /* The entry that will be replayed into a collection that is gone. */
+        await db.collection('doomed').createIndex({ n: 1 });
+        expect(await db.dropCollection('doomed')).toBe(true);
+
+        const before = await c.ping();
+        expect(before.base, 'the log did not compact').toBeGreaterThanOrEqual(base);
+        expect(before.base, 'the log outran the DDL, so replay would skip it' +
+          ' and this proves nothing').toBeLessThan(before.applied);
+        await c.close();
+
+        first.proc.kill();
+        await new Promise((r) => first.proc.once('exit', r));
+
+        /* THE POINT: it serves again, over its own files. */
+        second = await startServer(engine, port, ['--raft', '1',
+          '--snapshot-entries', '8'], 0, first.dir);
+        const back = await connectServer(port, { keepAliveMs: 0 });
+        expect((await back.ping()).pong).toBe(true);
+        /* And it is a working database, not merely a listening socket. */
+        await back.db(DB).collection('after').insertOne({ n: 1 });
+        expect(await back.db(DB).collection('after').countDocuments({})).toBe(1);
+        expect(await back.db(DB).listCollections()).not.toContain('doomed');
+        await back.close();
+      } catch (err) {
+        throw withLog(err);
+      } finally {
+        first.proc.kill();
+        second?.proc.kill();
+      }
+    }, 60000);
+  });
+
   /*
    * ---- routing a long read ------------------------------------------------
    *

@@ -1128,6 +1128,30 @@ is what makes the serial engine a property that can be handed back.
   loses a tenth of a second of accounting.
 - **The transport frames, it does not interpret.** `server/main.c` never
   reads a field of a request or a response.
+- **The replay floor cannot go backwards, even when a drop deletes the
+  files that recorded it.** Every structure records the last log index
+  applied to it in its own metadata, staged before the mutation so the
+  mutation's commit persists both atomically — which is exactly right until
+  the mutation *is* the deletion of the structure holding the record. The
+  floor is a max over surviving collections, so dropping the collection that
+  carried the highest index used to make it regress; with a compacted log,
+  replay then resumed at the log's base, *ahead* of what the live files
+  contained, and the first entry naming the dropped collection could not
+  apply. `-37` is deliberately not deterministic, so the member halted — and
+  replay being deterministic, it halted again on every later boot. **The
+  database could not be opened again**, after nothing worse than a drop and a
+  restart.
+
+  So the **catalog** carries an applied index too: it is the one structure a
+  drop both keeps and writes, and all three DDL ops make its commit their
+  decisive durable act (`createIndex` writes it last, having built and
+  attached; `dropIndex` and `dropCollection` write it first and then remove
+  files, so a crash leaves an orphan nothing references). Only those three
+  stage onto it — recording an index the catalog's next commit would carry
+  *without* that commit containing the entry's mutation would let the floor
+  claim an entry whose effects are not durable, which is a lost write, worse
+  than the halt. `test/repro-halt-on-drop.js` reproduces the old failure
+  against a build without this in one go.
 - **Nothing is dropped in silence.** Every refusal is a distinct code
   with `dc_strerror` text.
 
@@ -1135,39 +1159,28 @@ is what makes the serial engine a property that can be handed back.
 
 Stated here rather than discovered later.
 
-- **OPEN BUG, and the worst one written down here: a replicated member
-  killed during a `dropCollection` never starts again.** Reproduce it in
-  seconds with `npm run repro:halt-on-drop` — on the first kill, typically:
+- **OPEN: `dropDatabase` has the same shape the catalog fix closed for
+  `dropCollection`.** A dropped database takes its whole directory, catalog
+  included, so the INSTANCE-level floor — a max over databases — regresses
+  exactly as the per-database one used to. With a compacted log the member
+  then halts on restart, on every boot, and the database cannot be opened
+  again. `npm run repro:halt-on-drop -- --via database` does it on the first
+  try; `--via collection` is the fixed case and stays clean.
 
-  ```
-  replica: entry 42 (opcode 4, collection 'c') would not apply:
-           No collection of that name in this database's catalog
-  replica: halted (-37: ...)
-  ```
-
-  Opcode 4 is `DC_WAL_CREATE_INDEX`. The entry replayed is a `createIndex`
-  whose collection the *next* entry dropped: the drop's effect on the files
-  became durable while the recorded applied index stayed below it, so replay
-  restarts at an index whose state no longer exists. The halt is correct —
-  `-37` on apply is either a log this member cannot apply or a state that has
-  drifted, and the ambiguity resolves toward stopping. But replay is
-  deterministic, so **every later boot fails identically**: measured at four
-  consecutive boots, all halted. The database cannot be opened again.
-
-  Needs no cluster, no snapshot install, no reader threads and no sanitizer —
-  only `--raft` and an unlucky moment. On a deployment running one replicated
-  server per tenant, that is a tenant's data unavailable after one badly
-  timed crash, OOM or reboot.
-
-  The invariant broken is that a destructive file operation must not become
-  durable before the record of the entries preceding it. Which end to fix —
-  the durability ordering, or letting a replayed DDL whose collection a later
-  entry removed count as convergence the way a re-applied `createIndex`
-  (`-56`) and `dropIndex` (`-57`) already do — is a decision about the
-  durability contract and has deliberately not been taken on a hypothesis.
-  Found by `npm run soak:install`; the halt now names the entry it choked on,
-  which is what identified it.
-
+  There is nowhere left *inside* the instance for the record to survive, so
+  the fix is not another catalog. Two candidates: a small root-level record
+  written atomically with the directory's removal (a format addition), or —
+  better, because it covers this and any future cause — restoring the
+  committed generation when the floor sits below the log's base. That
+  condition means replay *cannot* reach consistency (the entries in between
+  no longer exist), while a generation holding a consistent state at exactly
+  that boundary is usually right there on disk; `restore_if_stale()` already
+  performs that restore and only declines because its trigger is a boundary
+  *past* the base rather than equal to it. Putting the index in the log's own
+  hard state would be the neatest analogue of the catalog fix, but `elog`
+  lives in the `binjson-structures` submodule, and forking a shared
+  dependency is the thing this repo went out of its way not to do for
+  regex-engine.
 - **Cursors are bounded and not timed out on their own.** Sixteen at
   once across all clients (`DBS_MAX_CURSORS`); the seventeenth is `-47`.
   An abandoned cursor is held until its connection ends, which the idle

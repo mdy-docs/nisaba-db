@@ -631,6 +631,51 @@ static int catalog_put(dbs *s, const char *name, size_t name_len,
     return bpt_add(s->catalog, &key, entry, (uint32_t)entry_len);
 }
 
+/*
+ * THE CATALOG CARRIES AN APPLIED INDEX OF ITS OWN, and a dropped collection
+ * is the whole reason it has to.
+ *
+ * Every other structure here records the last log index applied to it in its
+ * own metadata, staged before the mutation so the mutation's commit persists
+ * both atomically (db.h's dc_set_applied_index, bplustree.h's setter). That
+ * is exactly right until the mutation IS the deletion of the structure
+ * holding the record. `dbs_applied_floor` is a MAX over the collections that
+ * still exist, so dropping the collection carrying the highest index makes
+ * the floor go BACKWARDS -- by however far that collection was ahead.
+ *
+ * Harmless while the log still holds the entries between the regressed floor
+ * and the truth, because replay is idempotent under each collection's own
+ * guard. Fatal once the log has been COMPACTED past them: replay then resumes
+ * at the log's base, which is ahead of what the live files contain, and the
+ * first entry naming the dropped collection cannot apply. That is -37, which
+ * dc_is_deterministic deliberately treats as possible divergence, so the
+ * member halts -- and replay being deterministic, it halts again on every
+ * later boot. Measured: a drop followed by a restart with nothing written
+ * after it leaves a database that cannot be opened again, no crash required.
+ * test/repro-halt-on-drop.js does it in one go.
+ *
+ * The catalog is the one structure a drop cannot delete AND does write, so
+ * the record belongs here. All three DDL ops make the catalog's commit their
+ * decisive durable act -- createIndex writes it last, having built and
+ * attached; dropIndex and dropCollection write it FIRST and then remove
+ * files, so what a crash leaves behind is an orphan nothing references. In
+ * every case, a catalog commit means the entry was applied, which is exactly
+ * what may be recorded in it.
+ *
+ * ONLY for those three. Staging an index the catalog's next commit would
+ * carry without that commit containing the entry's mutation would let the
+ * floor claim an entry whose effects are not durable -- a lost write, which
+ * is worse than the halt this fixes.
+ */
+static int catalog_note_applied(dbs *s, uint64_t index) {
+    if (!s || !s->catalog || !index) return BJ_OK;
+    /* The setter refuses a decrease (BJ_ERR_STATE) and the value is sticky.
+     * A replay that re-offers an index at or below what is already recorded
+     * is the guard working, not an error to fail the apply with. */
+    if (index <= bpt_applied_index(s->catalog)) return BJ_OK;
+    return bpt_set_applied_index(s->catalog, index);
+}
+
 /* Create one file, empty, replacing anything already there: a leftover
  * from an interrupted attempt is garbage, and building on top of it
  * would be building on an unknown. */
@@ -1512,10 +1557,17 @@ int dbs_close_stream(dbs *s, uint64_t client, uint64_t id) {
 uint64_t dbs_applied_floor(dbs *s) {
     if (!s) return 0;
     dbuf names = {0};
-    if (dbs_list_collections(s, &names) != BJ_OK) { dbuf_free(&names); return 0; }
+    /*
+     * THE CATALOG COUNTS TOO, and it is the only term here that a
+     * dropCollection cannot take away with it. Without it this max is over
+     * surviving collections alone, so a drop makes the floor regress and a
+     * compacted log leaves nothing to bridge the gap -- see
+     * catalog_note_applied for what that costs.
+     */
+    uint64_t floor = s->catalog ? bpt_applied_index(s->catalog) : 0;
+    if (dbs_list_collections(s, &names) != BJ_OK) { dbuf_free(&names); return floor; }
     cur c = { names.data, names.len, 0 };
     uint32_t count = 0;
-    uint64_t floor = 0;
     if (array_begin(&c, &count) == BJ_OK) {
         for (uint32_t i = 0; i < count; i++) {
             const uint8_t *name; uint32_t nlen;
@@ -1778,6 +1830,18 @@ int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
     const uint8_t *coll = NULL; uint32_t coll_len = 0;
     int e = dc_wal_parse(cmd, len, &op, &coll, &coll_len);
     if (e) return e;
+
+    /*
+     * The DDL three record their index on the CATALOG, before the mutation,
+     * exactly as a document op records its own on the collection. See
+     * catalog_note_applied: this is the only record that survives the drop
+     * whose files carry every other one, and without it the replay floor
+     * regresses and a compacted log cannot bridge the gap.
+     */
+    if (op == DC_WAL_DROP_COLLECTION || op == DC_WAL_CREATE_INDEX ||
+        op == DC_WAL_DROP_INDEX) {
+        if ((e = catalog_note_applied(s, index))) return e;
+    }
 
     if (op == DC_WAL_DROP_COLLECTION) {
         int dropped = 0;

@@ -1,7 +1,10 @@
 /**
  * test/repro-halt-on-drop.js — a REPLICATED MEMBER KILLED DURING A
- * dropCollection NEVER STARTS AGAIN. Open bug; this reproduces it in
- * seconds, and exits 1 when it does.
+ * dropCollection NEVER STARTS AGAIN. FIXED (the catalog now carries an
+ * applied index a drop cannot delete -- db_session.c's
+ * catalog_note_applied); this is kept because it is the sharpest statement
+ * of what the fix is for, it reproduces the failure in one go against any
+ * build without it, and it exits 1 if it ever comes back.
  *
  *   node test/repro-halt-on-drop.js
  *   node test/repro-halt-on-drop.js --tries 200 --maxDelay 40
@@ -33,13 +36,18 @@
  * FOUND by test/soak-install.js, which kills a member every few seconds,
  * but it predates every part of that milestone.
  *
- * THE INVARIANT BROKEN. A destructive file operation must not become
- * durable before the record of the entries that precede it. Which of the
- * two ends to fix -- the ordering, or making a replayed DDL whose
- * collection a later entry removed count as convergence the way a
- * re-applied createIndex (-56) and dropIndex (-57) already do -- is a
- * decision about the durability contract, and is deliberately not taken
- * here.
+ * THE INVARIANT BROKEN, and where it was repaired. The replay floor is a
+ * MAX over surviving collections, so a drop could make it regress: the
+ * record of what had been applied lived in the very files the drop
+ * deleted. It now also lives in the CATALOG, which is the one structure a
+ * drop both keeps and writes -- so the floor cannot go backwards, and
+ * replay never resumes below the state the live files are in.
+ *
+ * The alternative considered and rejected was to let a replayed DDL whose
+ * collection a later entry removed count as convergence, the way a
+ * re-applied createIndex (-56) and dropIndex (-57) already do. It is
+ * smaller, but it treats the symptom: the floor would still be wrong, and
+ * -37 on apply would stop meaning "this member's state has drifted".
  *
  * Exit 0 = did not reproduce (say so, loudly, rather than passing
  * quietly), 1 = reproduced, 2 = the harness itself failed.
@@ -54,7 +62,22 @@ import { connectServer } from '../src/db-server-client.js';
 const NATIVE = process.env.NISABA_SERVER_BIN || 'build/lib/nisaba-server';
 const DB = 'reproduced';
 
-const opts = { tries: 60, maxDelay: 25, boots: 4,
+/*
+ * `via` chooses WHICH drop deletes the record:
+ *
+ *   collection  FIXED. A dropCollection deletes the collection's files, and
+ *               with them the applied index they carried; the catalog now
+ *               carries one too, and a drop keeps the catalog.
+ *   database    STILL OPEN. A dropDatabase removes the whole directory, the
+ *               catalog included, so the INSTANCE-level floor (a max over
+ *               databases) regresses exactly as the database-level one did.
+ *               Reproduces on the first try; there is nowhere left inside
+ *               the instance for the record to survive, so the fix is not
+ *               another catalog but either a root-level record or restoring
+ *               the committed generation when the floor sits below the log's
+ *               base. See docs/db-server.md.
+ */
+const opts = { tries: 60, maxDelay: 25, boots: 4, via: 'collection',
                port: 38600 + (process.pid % 120) * 4 };
 for (let i = 2; i < process.argv.length; i++) {
   const key = process.argv[i].replace(/^--/, '');
@@ -63,7 +86,12 @@ for (let i = 2; i < process.argv.length; i++) {
                   ' [--maxDelay MS] [--boots N] [--port N]');
     process.exit(2);
   }
-  opts[key] = Number(process.argv[++i]);
+  const raw = process.argv[++i];
+  opts[key] = key === 'via' ? raw : Number(raw);
+}
+if (opts.via !== 'collection' && opts.via !== 'database') {
+  console.error("--via must be 'collection' or 'database'");
+  process.exit(2);
 }
 
 const say = (...a) => writeSync(1, a.join(' ') + '\n');
@@ -106,8 +134,8 @@ const main = async () => {
     say(`no server at ${NATIVE} -- ./build/build-server.sh --native`);
     process.exit(2);
   }
-  say(`repro-halt-on-drop: up to ${opts.tries} kills, ${opts.maxDelay}ms window,` +
-      ` ${opts.boots} boots each, ${NATIVE}`);
+  say(`repro-halt-on-drop: drop a ${opts.via}, up to ${opts.tries} kills,` +
+      ` ${opts.maxDelay}ms window, ${opts.boots} boots each, ${NATIVE}`);
 
   for (let attempt = 0; attempt < opts.tries; attempt++) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-repro-'));
@@ -125,7 +153,8 @@ const main = async () => {
       /* The entry that will be replayed into a collection that is gone. */
       await db.collection('c').createIndex({ n: 1 });
       /* Issued and NOT awaited, so the kill lands inside it. */
-      db.dropCollection('c').catch(() => {});
+      if (opts.via === 'database') c.dropDatabase(DB).catch(() => {});
+      else db.dropCollection('c').catch(() => {});
       await new Promise((r) => setTimeout(r, Math.floor(rand() * opts.maxDelay)));
       await stop(h);
       await c.close().catch(() => {});
@@ -153,7 +182,8 @@ const main = async () => {
       process.exit(1);
     }
   }
-  say(`did not reproduce in ${opts.tries} kills -- which is not the same as` +
-      ' fixed; widen --maxDelay or raise --tries');
+  say(`no halt in ${opts.tries} kills dropping a ${opts.via}: the fix holds.` +
+      ' A REPRODUCED line here means it is back -- widen --maxDelay or raise' +
+      ' --tries to push harder.');
 };
 main().catch((e) => { console.error(e); process.exit(2); });

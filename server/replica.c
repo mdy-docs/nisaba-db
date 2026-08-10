@@ -1477,7 +1477,36 @@ uint32_t replica_peer_count(const replica *r) {
 
 int replica_wait_ms(const replica *r, uint64_t now) {
     (void)now;
-    return r ? r->tick_ms : REPLICA_TICK_MS;
+    if (!r) return REPLICA_TICK_MS;
+    /*
+     * WORK THAT IS READY NOW IS NOT WORK TO SLEEP ON.
+     *
+     * Committed entries this member has not applied yet are the answer
+     * to somebody's write, sitting one apply away. The transport learns
+     * about them by ticking -- so if the loop sleeps first, that write
+     * waits a whole tick interval for nothing.
+     *
+     * On a cluster it never showed: the acks that MOVED the commit index
+     * are themselves peer traffic, so poll() is already awake and the
+     * next pass applies immediately. A GROUP OF ONE has no peers and no
+     * traffic. It commits inside rn_propose -- there is nobody to hear
+     * from -- and then the loop, with nothing to wake it, sleeps the
+     * full tick before noticing. Every write on a single-member cluster
+     * cost one tick: 27ms at the default heartbeat, measured, and it
+     * tracked the tick exactly when the heartbeat was changed (a 400ms
+     * heartbeat made writes 202ms). That is ~37 writes/s where the same
+     * member unlogged does thousands.
+     *
+     * `dbi_stream_pending` right above this in server/main.c's wait
+     * computation is the same rule for change events, for the same
+     * reason: something is deliverable because state changed rather than
+     * because a socket did.
+     *
+     * It cannot spin: apply_committed either advances `applied` or
+     * halts the replica outright.
+     */
+    if (r->applied < rn_commit_index(r->node)) return 0;
+    return r->tick_ms;
 }
 
 /* ---- the apply pump ----------------------------------------------------- */

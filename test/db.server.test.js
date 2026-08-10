@@ -1516,6 +1516,47 @@ for (const engine of ENGINES) {
         for (const p of procs) p.kill();
       }
     }, 90000);
+
+    /*
+     * A COMMIT THAT HAS ALREADY HAPPENED MUST NOT WAIT FOR A TICK.
+     *
+     * A group of one commits inside rn_propose -- there is nobody to
+     * hear from -- but the transport learns that by ticking, and with no
+     * peers there is no traffic to wake its poll(). So every write on a
+     * single-member cluster used to sleep the full tick interval before
+     * being answered: 27ms at the default heartbeat, ~37 writes/s, where
+     * the same member with no log did thousands. A cluster never showed
+     * it, because the acks that move the commit index are themselves the
+     * traffic that wakes the loop.
+     *
+     * Asserted against a DELIBERATELY HUGE tick, which is what makes
+     * this sharp rather than a timing guess: an 800ms heartbeat derives
+     * a 400ms tick, so the old behaviour is ~400ms per write. The bound
+     * is 120ms -- comfortably above what it actually costs even under
+     * wasmtime, whose syscall overhead makes this ~20ms where native is
+     * under 1ms, and comfortably below the ~400ms that a reintroduced
+     * bug would produce. Both margins are better than 3x.
+     */
+    it('answers a solo member\'s write without waiting for the next tick', async () => {
+      const port = nextPort();
+      const { proc } = await startServer(engine, port, [
+        '--raft', '1', '--election-timeout', '1600:3200', '--heartbeat', '800'
+      ], -1);
+      try {
+        const db = (await connectServer(port)).db(DB);
+        const coll = db.collection('ticked');
+        await coll.insertOne({ warm: true });          // pay any first-write cost
+        const started = Date.now();
+        for (let i = 0; i < 10; i++) await coll.insertOne({ i });
+        const each = (Date.now() - started) / 10;
+        expect(await coll.countDocuments({})).toBe(11);
+        await db.close();
+        /* The tick is 400ms here (half the heartbeat). Anything near it
+         * means the loop is sleeping on work it already has. */
+        expect(each, `${each.toFixed(1)}ms per write -- a 400ms tick is being waited on`)
+          .toBeLessThan(120);
+      } finally { proc.kill(); }
+    }, 60000);
   });
 
   /*

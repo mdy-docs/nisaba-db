@@ -1132,6 +1132,13 @@ has to beat it *while keeping the pipelining*, because a read moved to
 another thread can no longer be answered inline, and a deferred read
 pays its own barrier round instead of sharing one.
 
+**A group of one is now the fastest logged shape**, as it should be:
+~0.5 ms per sequential write against ~0.7 ms for a cluster, which is a
+log sync and an apply with no network in the way. It was 27 ms — one
+write per tick — until `replica_wait_ms` stopped sleeping on a commit
+that had already happened; see the note there, and the regression test
+that pins it against a deliberately 400 ms tick.
+
 ### Concurrency
 
 `test/db.concurrency.test.js` is the busy-server suite: deep pipelines,

@@ -164,8 +164,15 @@ describe.skipIf(!enabled)('a busy server: many clients, deep pipelines', () => {
       const N = 150;
       let stop = false;
 
+      /* Document 0 BEFORE the readers start, so the collection exists
+       * when they first look. Without it a reader can arrive before the
+       * writer has created it and get -37 -- a real refusal, but the
+       * test's own race rather than the server's, and tolerating it here
+       * would blunt the same code's ability to report a genuine one. */
+      await writes.insertOne({ n: 0, echo: 0, tag: 'v0' });
+
       const writing = (async () => {
-        for (let i = 0; i < N; i++) {
+        for (let i = 1; i < N; i++) {
           await writes.insertOne({ n: i, echo: i, tag: `v${i}` });
         }
         stop = true;

@@ -2408,8 +2408,13 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
  */
 /*
  * Stamp a finished write's answer with the log index its entries
- * reached: `commit: <n>`, spliced in beside whatever the operation
- * itself answered.
+ * reached: `at: <n>`, spliced in beside whatever the operation itself
+ * answered.
+ *
+ * NOT `commit`, which `ping` already uses for a different fact -- that
+ * member's own commit index. One name for two quantities is how a
+ * client ends up putting a floor under a read because it once said
+ * hello.
  *
  * THIS IS THE HALF OF READ-YOUR-WRITES THE SERVER OWES. A follower
  * serving a stale read has no way to know which writes the asking
@@ -2427,7 +2432,7 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
  * log index to report and no follower that could be behind one, so its
  * answers keep exactly the shape they always had.
  */
-static int stamp_commit(dbuf *answer, uint64_t at) {
+static int stamp_at(dbuf *answer, uint64_t at) {
     cur c = { answer->data, answer->len, 0 };
     uint32_t count = 0;
     if (object_begin(&c, &count) != BJ_OK) return BJ_OK;   /* not an object: leave it */
@@ -2440,13 +2445,13 @@ static int stamp_commit(dbuf *answer, uint64_t at) {
         if (take_key(&c, &kp, &klen) != BJ_OK) { e = BJ_ERR_STATE; break; }
         size_t vstart = c.pos;
         if (skip_value(&c) != BJ_OK) { e = BJ_ERR_STATE; break; }
-        /* An answer that already says `commit` is not overwritten twice:
+        /* An answer that already says `at` is not overwritten twice:
          * the first stamp is the one that is true. */
-        if (klen == 6 && memcmp(kp, "commit", 6) == 0) { bj_builder_free(b); return BJ_OK; }
+        if (klen == 2 && memcmp(kp, "at", 2) == 0) { bj_builder_free(b); return BJ_OK; }
         e = bj_put_key(b, kp, klen);
         if (!e) e = bj_put_raw(b, c.d + vstart, (uint32_t)(c.pos - vstart));
     }
-    if (!e) e = bj_put_key(b, (const uint8_t *)"commit", 6);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"at", 2);
     if (!e) e = bj_put_int(b, (int64_t)at);
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
@@ -2476,7 +2481,7 @@ static int advance(replica *r, pending *p) {
          * key, say): the entries were proposed and the log did move, so
          * a later read that must not go backwards has to clear this
          * index too. */
-        e = stamp_commit(&p->answer, p->last);
+        e = stamp_at(&p->answer, p->last);
         p->done = 1;
         return e;
     }

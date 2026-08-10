@@ -999,7 +999,7 @@ for (const engine of ENGINES) {
      * would answer from a world where the write had not happened.
      *
      * `after: <n>` is the floor. A write's answer carries the log index
-     * it reached (`commit`); a read carrying that index back is refused
+     * it reached (`at`); a read carrying that index back is refused
      * (-76) by any member that has not applied it, rather than served
      * from before it. So the guarantee is not "the follower is fast" --
      * it is that a read can never show LESS than the client already

@@ -303,13 +303,13 @@ followers were already applying the same log.
 **And a floor under it, so you can read your own writes.** Eventual
 consistency alone is unusable for the commonest shape there is —
 write, then read what you wrote — so every finished write on a
-replicated server answers with **`commit`**, the log index its entries
+replicated server answers with **`at`**, the log index its entries
 reached, and a stale read may carry that index back as **`after`**. A
 member that has not applied that far **refuses with `-76`** instead of
 answering from before it.
 
 ```
-  → { op: 'insert',  … }                  ← { ok: true, …, commit: 118 }
+  → { op: 'insert',  … }                  ← { ok: true, …, at: 118 }
   → { op: 'findOne', …, stale: true, after: 118 }
                                           ← { ok: false, code: -76 }   (this member is behind)
                                           ← { ok: true, found: true, … } (once it is not)
@@ -327,7 +327,12 @@ Expect the immediate read after a write to refuse: the leader answers
 once a *quorum* holds the entry, and a follower learns the new commit
 index on the next AppendEntries. That is the floor doing its job.
 
-`src/db-server-client.js` tracks `commit` per connection as
+`at` rather than `commit`, which `ping` already uses for a different
+fact — the answering member's own commit index. Harvesting that as a
+floor would push every later read onto the leader on the strength of
+having said hello.
+
+`src/db-server-client.js` tracks `at` per connection as
 `client.lastCommit` and sends it automatically on that connection's
 stale reads, so read-your-writes needs nothing from a caller using one
 connection. Spreading reads over *other* connections — a gateway

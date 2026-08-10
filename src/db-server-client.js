@@ -456,16 +456,23 @@ class Connection {
     /*
      * The log index a write reached, remembered as a high-water mark.
      *
-     * A replicated server stamps every finished write with `commit`,
-     * and this is the whole client-side of read-your-writes: a stale
-     * read sent afterwards carries the mark as `after`, so no member
-     * may answer it from state older than the write this connection
-     * has already been told about. Monotonic, never decreasing --
-     * answers can arrive out of order on a pipelined connection, and a
-     * floor that could fall is not a floor.
+     * A replicated server stamps every finished write with `at`, and
+     * this is the whole client-side of read-your-writes: a stale read
+     * sent afterwards carries the mark as `after`, so no member may
+     * answer it from state older than the write this connection has
+     * already been told about. Monotonic, never decreasing -- answers
+     * can arrive out of order on a pipelined connection, and a floor
+     * that could fall is not a floor.
+     *
+     * `at` rather than ping's `commit`, and the distinction is not
+     * cosmetic: ping reports the answering MEMBER's commit index, which
+     * is a real log index but not one this client was promised
+     * anything about. Harvesting it would put a floor under every
+     * later read on the strength of having said hello -- pushing them
+     * all onto the leader and undoing the point of follower reads.
      */
-    if (typeof res.commit === 'number' && res.commit > this.lastCommit) {
-      this.lastCommit = res.commit;
+    if (typeof res.at === 'number' && res.at > this.lastCommit) {
+      this.lastCommit = res.at;
     }
     return res;
   }

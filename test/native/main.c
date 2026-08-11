@@ -1436,6 +1436,153 @@ static int run_pipeline(dc_collection *c, bj_builder *stages,
     return dc_aggregate(c, p, len, bad, out, out_len);
 }
 
+/*
+ * AGGREGATE AGAINST A READ VIEW -- the one op M3's verification list named
+ * and nothing exercised.
+ *
+ * `dc_aggregate` takes a plain `dc_collection *`, and a read view IS one:
+ * pinned, read-only, opening no files. So this should work, and "should"
+ * is the word a verification list exists to remove. Nothing routes an
+ * aggregate to a view today -- the server keeps it on the serving thread,
+ * because it answers a failure by naming the stage that failed and that is
+ * a response shape run_read does not build (engine/src/db_request.c) --
+ * which is exactly why this is worth pinning now rather than later: the
+ * only thing between aggregate and a reader thread is that response shape,
+ * and whoever adds it should find the read path already proven.
+ *
+ * Both halves of the pipeline are covered, because a view changes what the
+ * collection READS and the two halves read differently: a leading $match
+ * is pushed into the scan, and everything after it runs over materialized
+ * documents.
+ */
+TEST(an_aggregate_against_a_read_view_answers_the_state_it_was_captured_at) {
+    fixture fx;
+    CHECK_FATAL(fx_open(&fx, "coll-agg-view.bj") == 0);
+    bpt *idx = add_team_index(&fx);
+    CHECK_FATAL(idx != NULL);
+
+    CHECK_OK(insert_person(fx.coll, 1, "Ada",   "core",     36));
+    CHECK_OK(insert_person(fx.coll, 2, "Grace", "core",     45));
+    CHECK_OK(insert_person(fx.coll, 3, "Alan",  "research", 41));
+
+    dc_collection *view = NULL;
+    CHECK_FATAL(dc_collection_snapshot(fx.coll, &view) == BJ_OK);
+
+    /* The live collection moves on in both directions: two more people and
+     * one gone. Research goes from one to two; the names from three to
+     * four. */
+    CHECK_OK(insert_person(fx.coll, 4, "Edsger", "research", 40));
+    CHECK_OK(insert_person(fx.coll, 5, "Barbara", "core", 51));
+    {
+        doc *del = doc_new();
+        doc_str(del, "name", "Grace");
+        uint32_t dlen; const uint8_t *dbytes = doc_done(del, &dlen);
+        int deleted = 0;
+        CHECK_OK(dc_delete_one(fx.coll, dbytes, dlen, &deleted));
+        CHECK_I64(deleted, 1);
+        doc_free(del);
+    }
+
+    /* [{$match: {team: "research"}}] -- pushed into the scan, so this is the
+     * half that reads through the collection's own trees. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"$match", 6);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"team", 4);
+        bj_put_string(b, (const uint8_t *)"research", 8);
+        bj_end_object(b);
+        bj_end_object(b);
+        bj_end_array(b);
+
+        uint8_t *out = NULL; size_t out_len = 0; int bad = -2;
+        CHECK_OK(run_pipeline(view, b, &out, &out_len, &bad));
+        CHECK_I64(bad, -1);
+        CHECK_I64(arr_count(out, out_len), 1);       /* as captured */
+        free(out); out = NULL;
+
+        CHECK_OK(run_pipeline(fx.coll, b, &out, &out_len, &bad));
+        CHECK_I64(arr_count(out, out_len), 2);       /* as it is now */
+        free(out);
+        bj_builder_free(b);
+    }
+
+    /* [{$group: {_id: "$name", n: {$sum: 1}}}] -- no leading $match, so the
+     * whole collection is scanned and materialized. Three names when the
+     * view was taken, four now. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"$group", 6);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"_id", 3);
+        bj_put_string(b, (const uint8_t *)"$name", 5);
+        bj_put_key(b, (const uint8_t *)"n", 1);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"$sum", 4);
+        bj_put_int(b, 1);
+        bj_end_object(b);
+        bj_end_object(b);
+        bj_end_object(b);
+        bj_end_array(b);
+
+        uint8_t *out = NULL; size_t out_len = 0; int bad = -2;
+        CHECK_OK(run_pipeline(view, b, &out, &out_len, &bad));
+        CHECK_I64(bad, -1);
+        CHECK_I64(arr_count(out, out_len), 3);
+        free(out); out = NULL;
+
+        CHECK_OK(run_pipeline(fx.coll, b, &out, &out_len, &bad));
+        CHECK_I64(arr_count(out, out_len), 4);
+        free(out);
+        bj_builder_free(b);
+    }
+
+    /* A stage error still names its stage through a view -- the response
+     * shape that keeps aggregate off the reader threads is not damaged by
+     * being asked from one. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"$nonesuch", 9);
+        bj_begin_object(b); bj_end_object(b);
+        bj_end_object(b);
+        bj_end_array(b);
+
+        uint8_t *out = NULL; size_t out_len = 0; int bad = -2;
+        CHECK_RC(run_pipeline(view, b, &out, &out_len, &bad),
+                 DC_ERR_AGG_UNKNOWN_STAGE);
+        CHECK_I64(bad, 0);
+        free(out);
+        bj_builder_free(b);
+    }
+
+    dbs_read_view_close(view);
+    /* Closing the view closed nothing the live collection was using. */
+    {
+        bj_builder *b = bj_builder_new();
+        bj_begin_array(b);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"$match", 6);
+        bj_begin_object(b);
+        bj_put_key(b, (const uint8_t *)"team", 4);
+        bj_put_string(b, (const uint8_t *)"research", 8);
+        bj_end_object(b);
+        bj_end_object(b);
+        bj_end_array(b);
+        uint8_t *out = NULL; size_t out_len = 0; int bad = -2;
+        CHECK_OK(run_pipeline(fx.coll, b, &out, &out_len, &bad));
+        CHECK_I64(arr_count(out, out_len), 2);
+        free(out);
+        bj_builder_free(b);
+    }
+    fx_close(&fx);
+}
+
 TEST(aggregate_group_uses_encoded_bytes_for_identity) {
     fixture fx;
     CHECK_FATAL(fx_open(&fx, "coll-sales.bj") == 0);
@@ -12180,6 +12327,7 @@ int main(void) {
     RUN(current_date_is_idempotent_and_passes_others_through);
     RUN(current_date_refuses_bad_specs_and_collisions);
     RUN(aggregate_group_uses_encoded_bytes_for_identity);
+    RUN(an_aggregate_against_a_read_view_answers_the_state_it_was_captured_at);
     RUN(aggregate_reports_the_stage_that_failed);
     RUN(aggregate_later_match_has_the_full_engine_grammar);
     RUN(bulk_grammar_accepts_every_operation_and_orders_the_codes);

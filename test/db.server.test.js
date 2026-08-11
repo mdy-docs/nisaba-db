@@ -1618,6 +1618,52 @@ for (const engine of ENGINES) {
       } finally { proc.kill(); }
     }, 60000);
 
+    it.skipIf(!engine.threads)('runs a pool by DEFAULT, sized to this machine',
+       async () => {
+      /*
+       * THE DEFAULT IS ON, and this is what it comes out as. Off was right
+       * while the path was new; it is wrong once the path is proven, because
+       * shipping a fix off means nobody gets it -- and what it fixes is
+       * severe: one client's unindexed scan took eight connections of point
+       * reads to FOUR PERCENT of idle throughput, and their median from
+       * 0.37ms to 11.57ms, which is one whole scan.
+       *
+       * Computed here the way the server computes it rather than hard-coded,
+       * so this asserts the RULE on whatever machine runs it -- a two-core
+       * CI box included, where the answer is one worker and not none.
+       */
+      const cpus = os.cpus().length;
+      const room = cpus > 2 ? cpus - 2 : 1;
+      const want = Math.min(4, room);
+      const port = nextPort();
+      const { proc, stderr } = await startServer(engine, port, ['--raft', '1'], -1);
+      try {
+        const c = await connectServer(port);
+        expect((await c.ping()).readThreads,
+          `${cpus} cpus should give ${want} worker(s) by default`).toBe(want);
+        /* And it says where the number came from: a pool that appears after
+         * an upgrade has to be explicable from the log alone. */
+        expect(stderr()).toMatch(/reader thread\(s\) \(auto, from this machine's cpus\)/);
+        await c.close();
+      } finally { proc.kill(); }
+    }, 60000);
+
+    it.skipIf(!engine.threads)('takes `auto` as a word, meaning what it defaults to',
+       async () => {
+      /* A deployment template should be able to state the intent rather
+       * than a number that is wrong on the next machine size. */
+      const cpus = os.cpus().length;
+      const want = Math.min(4, cpus > 2 ? cpus - 2 : 1);
+      const port = nextPort();
+      const { proc } = await startServer(engine, port,
+        ['--raft', '1', '--read-threads', 'auto'], -1);
+      try {
+        const c = await connectServer(port);
+        expect((await c.ping()).readThreads).toBe(want);
+        await c.close();
+      } finally { proc.kill(); }
+    }, 60000);
+
     it.skipIf(!engine.threads)('runs no more of them than the machine can spare', async () => {
       /*
        * MORE WORKERS THAN CORES IS MEASURABLY WORSE, not merely wasteful.
@@ -2788,13 +2834,19 @@ for (const engine of ENGINES) {
       } finally { proc.kill(); }
     }, 90000);
 
-    it('asks nothing at all when no reader threads were asked for', async () => {
-      /* The default has to cost exactly what it cost before, and sizing a
-       * read is not free: it resolves the collection and runs the planner.
-       * Both counters staying at zero through a scan is how "the question
-       * is not even asked" is asserted rather than assumed. */
+    it('asks nothing at all when reader threads are turned off', async () => {
+      /* `--read-threads 0` has to cost exactly what it cost before there
+       * were reader threads at all, and sizing a read is not free: it
+       * resolves the collection and runs the planner. Both counters staying
+       * at zero through a scan is how "the question is not even asked" is
+       * asserted rather than assumed.
+       *
+       * Asked for EXPLICITLY, because the default is now `auto` -- this test
+       * used to pass no flag and rely on that, and the day the default
+       * flipped it would have been testing the opposite of its own name. */
       const port = nextPort();
-      const { proc } = await startServer(engine, port, ['--raft', '1'], -1);
+      const { proc } = await startServer(engine, port,
+        ['--raft', '1', '--read-threads', '0'], -1);
       try {
         const c = await connectServer(port);
         const coll = c.db(DB).collection('unasked');

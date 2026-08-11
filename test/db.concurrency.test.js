@@ -544,14 +544,26 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
      *
      * Reproduced here in a second rather than a minute by making the long
      * work a read: one `^x*y$` scan of this collection walks every character
-     * of every document and takes several seconds, on the serving thread
-     * because no reader threads are asked for. What is being tested is not
-     * about reader threads -- it predates them -- but they sharpen it: more
-     * threads on a busy machine means more passes that run long.
+     * of every document and takes several seconds on the serving thread.
+     *
+     * WHICH IS WHY --read-threads 0 IS NOW STATED. It used to be the
+     * default, and the day the default became `auto` this test broke -- the
+     * scan was offloaded, the loop was never blocked, and the bystander was
+     * genuinely silent for the whole --idle-timeout 1, so the -45 it got was
+     * the timer working correctly. The property under test is the sweep's,
+     * not the read path's: a pass that runs long for ANY reason must not be
+     * charged to the clients that waited through it. Turning offloading off
+     * is how that pass is made long cheaply and reliably.
+     *
+     * What still blocks the loop for seconds with the default on is a WRITE
+     * -- updateMany, or a createIndex backfill, both out of scope for the
+     * milestone that moved reads -- and they reach the same forgiveness in
+     * the same sweep. That is the shape to reach for if this vehicle ever
+     * stops being long enough.
      */
     const port = TINY_PORT + 40;
     const { proc, dir } = await startServer(port,
-      ['--raft', '1', '--idle-timeout', '1']);
+      ['--raft', '1', '--idle-timeout', '1', '--read-threads', '0']);
     try {
       const busy = await connectServer(port);
       const coll = busy.db(DB).collection('unheard');

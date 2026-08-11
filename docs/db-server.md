@@ -73,7 +73,7 @@ data and reporting nothing wrong.
 | `--heartbeat MS` | the leader's idle interval (default 50). Must be at most half `--election-timeout`'s minimum, or the flag is refused |
 | `--max-batch BYTES` | the replication window (default 65536). One AppendEntries is in flight per follower, so catch-up throughput is window/RTT — widen it for members a WAN separates. Refused above half the peer wire's frame cap |
 | `--leave ID` | ask that cluster to remove member `ID`, then exit without serving; needs `--join` to say who to ask |
-| `--read-threads N` | threads that answer LONG reads, so one client's scan stops delaying every other client (default 0 — every read on the serving thread, exactly as before). Needs `--raft`; native only. Lowered to the cpus the machine can spare, loudly |
+| `--read-threads N\|auto` | threads that answer LONG reads, so one client's scan stops delaying every other client. **Default `auto`** — `min(4, the cpus the machine can spare)` — for any replicated server; `0` is byte-for-byte the serving-thread path this predates. Needs `--raft`; native only. Lowered to the cpus the machine can spare, loudly, and `ping` reports what is actually running |
 | `--read-offload-min DOCS` | how many documents a collection must hold before a scanning read of it is worth moving (default 1000). Below it, a read is cheaper answered inline than queued |
 
 **`--order` is a creation parameter, not something a reader has to be
@@ -1046,8 +1046,33 @@ to 28.5 over 36,000 compiles, flat from 45 s on. Both halves of that — the
 per-worker bound and the ceiling — are asserted, because a per-worker cost
 without a ceiling is a leak that every other test here would pass.
 
-**Off by default.** `--read-threads 0` is byte-for-byte the old path, which
-is what makes the serial engine a property that can be handed back.
+**On by default, and this is what that took.** `auto` — `min(4, cpus - 2)`,
+one worker at minimum on a machine too small to spare two — for any
+replicated server that does not say otherwise. Off was the right default
+while the path was new; it is the wrong one once the path is proven, because
+shipping a fix off means nobody gets the fix, and this one is worth 4% → 100%
+of idle throughput for every client sharing a process with a scan.
+
+The gate was stated before the work started, and met after it: **four
+consecutive hours of sanitized soaking** — two under ThreadSanitizer, two
+under AddressSanitizer and LeakSanitizer, an hour each — with drops,
+compaction, index churn and snapshot installs interleaved, a member killed
+every four seconds, and **half of those kills taking the leader**. Across
+them: **8.3 million reads answered on worker threads**, every one compiling a
+fresh `$regex`; 710,104 writes; 10,970 compacts and 2,239 drops; 1,360
+snapshot installs adopted, **658 of which had to drain a worker out of a read
+view**; 31,168 drain events in total. No violation, no sanitizer report, no
+halt. The drain is the correctness argument for this whole design and
+`bpt_pinned` does not cover views, so there is nothing behind it — 658
+install drains and 31,168 total is the number that made a default
+defensible.
+
+`--read-threads 0` remains byte-for-byte the old path, which is what keeps
+the serial engine a property that can be handed back. It is also what two
+tests now state explicitly rather than rely on: the day this default flipped,
+a test named *"asks nothing at all when no reader threads were asked for"*
+and one reproducing a sweep bug through a long inline scan were both testing
+the opposite of what they said.
 
 ## Invariants
 

@@ -1223,7 +1223,7 @@ static void usage(const char *me) {
             "           [--snapshot-entries N] [--group N]\n"
             "           [--election-timeout MIN[:MAX]] [--heartbeat MS]\n"
             "           [--max-batch BYTES]\n"
-            "           [--read-threads N] [--read-offload-min DOCS]\n"
+            "           [--read-threads N|auto] [--read-offload-min DOCS]\n"
             "  serves the instance in the preopened directory \".\"\n"
             "  --bind: where the client wire listens (default 127.0.0.1;\n"
             "         widen it consciously -- there is no auth on this wire)\n"
@@ -1259,9 +1259,11 @@ static void usage(const char *me) {
             "         throughput is window/RTT: widen it for members a WAN\n"
             "         separates\n"
             "  --read-threads: how many threads answer LONG reads, so that one\n"
-            "         client's scan stops delaying everybody else's (default 0,\n"
-            "         which is every read on the serving thread as before).\n"
-            "         Lowered to the cpus this machine can spare, and reported\n"
+            "         client's scan stops delaying everybody else's. DEFAULT\n"
+            "         `auto`: min(4, the cpus this machine can spare), for any\n"
+            "         replicated server. 0 turns it off -- every read on the\n"
+            "         serving thread, byte for byte as it was before this\n"
+            "         existed. Lowered to the cpus this machine can spare, and reported\n"
             "         by `ping` as readThreads with the routing it did as\n"
             "         longReads / shortReads / movedReads. More than one also\n"
             "         scales SCAN throughput, to about the core count: on six\n"
@@ -1411,6 +1413,11 @@ int main(int argc, char **argv) {
      * whose absence and whose zero are the same value is one that cannot
      * later grow a different default without breaking somebody. */
     long read_threads = -1;
+    /* Whether the number came from the machine rather than from argv, so
+     * the announcement can say which -- threads appearing after an upgrade
+     * should be explicable from the log alone. Always zero on a build with
+     * no threads, where the announcement it feeds cannot be reached. */
+    int auto_threads = 0;
     long read_min_docs = -1;
 
     for (int i = 1; i < argc; i++) {
@@ -1476,7 +1483,11 @@ int main(int argc, char **argv) {
             }
         }
         else if (strcmp(argv[i], "--read-threads") == 0 && i + 1 < argc) {
-            read_threads = atol(argv[++i]);
+            /* `auto` is what the default already does, said out loud -- so a
+             * deployment template can state the intent rather than a number
+             * that would be wrong on the next machine size. */
+            if (strcmp(argv[++i], "auto") == 0) { read_threads = -1; continue; }
+            read_threads = atol(argv[i]);
             if (read_threads < 0) {
                 fprintf(stderr, "--read-threads cannot be negative\n");
                 return 2;
@@ -1609,6 +1620,48 @@ int main(int argc, char **argv) {
         return 2;
     }
 #if SERVER_HAS_READ_THREADS
+    /*
+     * ---- THE DEFAULT IS NOW ON -------------------------------------------
+     *
+     * `auto` -- min(4, what the machine can spare) -- for any replicated
+     * server that did not say otherwise. Off was the right default while
+     * this was new; it is the wrong one now, because shipping it off means
+     * nobody gets the fix. What the fix is worth, measured: one client
+     * running an unindexed scan took eight connections of point reads from
+     * 52,389 in three seconds to 1,992 -- FOUR PERCENT -- and their median
+     * from 0.37ms to 11.57ms, which is one whole scan. With workers the same
+     * eight hold 100-104% of idle throughput and scan throughput does not
+     * fall; more than one also scales scanning about to the core count (4.4x
+     * with eight workers on six cores).
+     *
+     * FOUR, not the whole machine: the measurements above flatten near the
+     * core count and each worker costs ~2.3MB, so four is where the curve
+     * stops paying and the clamp below takes it lower on a smaller box.
+     *
+     * WHAT THE GATE FOR THIS WAS, since a default is a promise: four
+     * consecutive hours of sanitized soaking (2x TSan, 2x ASan) with drops,
+     * compaction, index churn and snapshot installs interleaved, a member
+     * killed every four seconds and half of those kills taking the leader --
+     * 8.3 million offloaded reads, 1,360 installs adopted, 658 of which had
+     * to drain a worker out of a read view, 31,168 drains in total, and not
+     * one violation, sanitizer report or halt.
+     *
+     * ONLY WHERE IT CAN WORK. A read is offloaded by being DEFERRED, and
+     * only a replicated server can defer one -- so an unreplicated server
+     * stays serial, as does --stdio, which has no poll loop to wake. Those
+     * are not silent: asking for threads there is already a refusal above,
+     * and this only ever turns them on where they are available.
+     */
+    if (read_threads < 0) {
+        read_threads = 0;
+        if (node_id > 0 && !use_stdio) {
+            long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+            long room = cpus > 2 ? cpus - 2 : 1;
+            read_threads = room < 4 ? room : 4;
+            auto_threads = 1;
+        }
+    }
+
     /*
      * SIZED TO THE MACHINE, and lowered rather than refused.
      *
@@ -1933,12 +1986,14 @@ int main(int argc, char **argv) {
          * listening, not merely started. */
         fprintf(stderr, "nisaba: serving %s:%d (max %d clients, idle timeout %ds)\n",
                 bind_host, port, max_clients, idle_seconds);
-        /* Said only when asked for, so the default line stays the line
-         * every test and every log reader already knows -- and said at
-         * all because the number may have been LOWERED to the machine. */
+        /* Always said now that it is the default, and it says WHERE the
+         * number came from: threads that appear after an upgrade have to be
+         * explicable from the log alone, and so does a number the machine
+         * lowered. */
         if (read_threads > 0) {
-            fprintf(stderr, "nisaba: %ld reader thread(s) for scans of more than"
+            fprintf(stderr, "nisaba: %ld reader thread(s)%s for scans of more than"
                             " %lld documents\n", read_threads,
+                    auto_threads ? " (auto, from this machine's cpus)" : "",
                     (long long)(read_min_docs >= 0 ? read_min_docs
                                                    : REPLICA_READ_MIN_DOCS));
         }
@@ -1951,6 +2006,7 @@ int main(int argc, char **argv) {
         (void)bind_host;
         (void)max_clients;
         (void)idle_seconds;
+        (void)auto_threads;
         fprintf(stderr,
                 "this build has no sockets (wasm32-wasip1 has none at all);"
                 " use --stdio\n");

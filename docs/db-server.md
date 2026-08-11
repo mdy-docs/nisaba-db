@@ -1172,6 +1172,20 @@ is what makes the serial engine a property that can be handed back.
   the live files) remains only as the backstop for an instance with no
   generation at the base at all.
 
+  **A committed entry is not necessarily a present one.** The commit index is
+  knowledge about the cluster; the log is what has physically arrived. They
+  agree on a member whose log only grows, and an install makes them differ —
+  adoption replaces the log with one based at the generation's boundary, which
+  can sit below a commit index the member has already learned. The entries in
+  between are committed and on their way from the leader, so the apply pump
+  stops at the log's last entry rather than treating a missing one as
+  divergence. Measured in a soak that kills leaders: a member that had applied
+  23231 adopted an install at 23174, applied the three entries that had
+  arrived since, and **halted for good over the fourth** (`-9`, with
+  `commit 23232` against `last 23177`). An index below the log's *base* is a
+  different matter and still halts: that is state the member needs and nothing
+  can supply.
+
   **The restore is not atomic, and does not clear its own trigger.** It
   removes every live file and then copies the generation's back, so a crash
   inside it leaves a directory that is neither state; the next boot reads the
@@ -1391,16 +1405,63 @@ drain exists for, and what `drainWaits` now makes assertable.
 A single member can only be asked to unmake one collection's files;
 **adopting a snapshot install** replaces every file in the instance at once,
 and arrives as a committed entry with no client request behind it. So this
-one runs three members with `--snapshot-entries 4`, kills a non-leader every
-few seconds and brings it back — sometimes onto an empty directory — while
-stale scanning reads are aimed at all three. A member whose log is behind
-the leader's base cannot be caught up by AppendEntries, so it must be
-installed into, and the reads in flight must survive it.
+one runs three members with `--snapshot-entries 4`, kills a member every few
+seconds and brings it back — sometimes onto an empty directory — while stale
+scanning reads are aimed at all three. A member whose log is behind the
+leader's base cannot be caught up by AppendEntries, so it must be installed
+into, and the reads in flight must survive it.
 
 ```sh
 npm run soak:install -- --seconds 3600 --readThreads 4
+npm run soak:install -- --leaderShare 0        # the follower-only churn
 NISABA_SERVER_BIN=build/lib/nisaba-server-asan npm run soak:install
 ```
+
+**About a third of those kills take the leader** (`--leaderShare`). It spared
+leaders at first, on the reasoning that killing one measures elections and
+that a leader receives no installs — true of a member while it leads, and
+false of it a moment later. A former leader comes back *behind* the new one,
+whose base has moved on, so it is installed into like any other lagging
+member — arriving there as the member that had held the clients, the pending
+writes and the outstanding proposals. The run counts how many leader kills
+were actually installed back in and fails if none were, because a leader kill
+that produced no install tested Raft and not this.
+
+It found a real halt on the first long run, on all three builds: a member that
+adopts an install whose boundary sits **below a commit index it already
+learned** used to stop serving for good, because the apply pump treated a
+committed entry that had not arrived yet as divergence. The invariant it
+broke is listed above.
+
+It also found two things about the harness, and the sharper one is worth
+stating as an operating rule: **emptying a member's directory is not a crash
+Raft tolerates.** A crash keeps the log, the term and the vote; a wipe takes
+all three and brings the member back wearing the same id with no memory of
+what it promised — so it can vote twice in one term, and vote for a candidate
+whose log is missing entries its own acknowledgement helped commit. Measured
+both ways: two wiped members are a quorum of blanks who elect each other and
+tell the member holding the history to adopt theirs (7,319 committed entries
+gone), and *one* wipe is enough — a leader answered a linearizable read with
+768 of the 784 documents it had just acknowledged, its co-committer having
+been wiped and then voted for the shorter log. Wiping is now off by default
+(`--wipeShare`), which costs nothing: a member killed *with* its files is
+installed into anyway, because the base moves past it in a fraction of a
+second. **The way to replace a member that has lost its disk is to join a new
+one under a new id**, never to restart the old id on an empty directory.
+
+The other was the writer's model: **a lost answer is genuinely ambiguous, and
+no amount of asking afterwards resolves it.** A batch proposed to a member that then died can still commit later,
+under the next leader, out of the log it had already replicated — so a
+retry may write those documents a second time, and the content oracle
+reported a duplicate as if it were a torn read. Two documents describing the
+same `n` with distinct `_id`s is at-least-once delivery, which is what a
+client gets; *the same document twice in one read* is a bug, and the oracle
+now separates them by `_id` rather than tolerating both. A **drop** whose
+answer was lost is the one case that had to be settled rather than
+characterised — left ambiguous it would leave the writer's count above what
+the collection holds, and every earlier id missing for good — so it is
+retried until it succeeds, which is sound because dropping an absent
+collection is a no-op.
 
 Two things about it are worth copying into any harness of this kind.
 

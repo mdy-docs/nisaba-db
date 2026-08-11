@@ -1755,12 +1755,62 @@ static int apply_committed(replica *r) {
     int e = BJ_OK;
     while (r->applied < rn_commit_index(r->node)) {
         uint64_t index = r->applied + 1;
+        /*
+         * COMMITTED IS NOT THE SAME AS PRESENT.
+         *
+         * The commit index is knowledge about the CLUSTER -- an entry a
+         * quorum has stored -- and the log is what has physically arrived
+         * here. They are the same thing on a member whose log only ever
+         * grows, and an install makes them differ: adoption replaces this
+         * member's log with one based at the generation's boundary, which
+         * can sit BELOW a commit index it had already learned. The entries
+         * in between are committed and on their way from the leader; they
+         * are not divergence, and asking the log for one gets -9.
+         *
+         * Without this line that -9 became a HALT, because the pump treats
+         * anything non-deterministic as "this member has diverged" -- the
+         * strongest thing it does. Measured in a soak that kills leaders:
+         *
+         *   snapshot install adopted at index 23174
+         *   committed entry 23178 is not in the log
+         *       (base 23174, last 23177, commit 23232)
+         *   halted (-9: Argument out of range)
+         *
+         * -- a member that had applied 23231 and compacted its own log
+         * there, then adopted an install at 23174, applied the three
+         * entries that had arrived since, and stopped serving for good over
+         * the fourth. Stopping the sweep is all that is needed: the pump
+         * runs again on every message and tick, so the rest applies as it
+         * lands. The fprintf below still fires for the case that IS a
+         * fault -- an index below the log's base, which is state this
+         * member needs and nothing can supply.
+         */
+        if (index > elog_last_index(r->log)) break;
         uint64_t term = 0;
         int type = 0;
         const uint8_t *p = NULL;
         size_t plen = 0;
         e = elog_get(r->log, index, &term, &type, &p, &plen);
-        if (e) break;
+        if (e) {
+            /*
+             * WHY THE LOG COULD NOT PRODUCE A COMMITTED ENTRY, because the
+             * caller turns this into a halt and "-9: Argument out of range"
+             * says nothing about which range. The interesting case is an
+             * index ABOVE the last entry: a commit index is knowledge about
+             * the cluster and an install replaces this member's log with one
+             * based at the generation's boundary, so the entries in between
+             * are committed, not yet here, and on their way from the leader.
+             */
+            fprintf(stderr, "replica: committed entry %llu is not in the log"
+                            " (base %llu, last %llu, commit %llu): %s\n",
+                    (unsigned long long)index,
+                    (unsigned long long)elog_base_index(r->log),
+                    (unsigned long long)elog_last_index(r->log),
+                    (unsigned long long)rn_commit_index(r->node),
+                    dc_strerror(e));
+            fflush(stderr);
+            break;
+        }
         /* The log owns that pointer and it dies on the next operation on
          * this log -- and dbs_apply can be one. */
         payload.len = 0;

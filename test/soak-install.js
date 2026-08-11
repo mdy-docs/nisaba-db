@@ -25,12 +25,20 @@
  * holding read views, because stale reads are the only reads it serves.
  *
  * HOW IT FORCES ONE. Three members with `--snapshot-entries 4`, so a
- * leader's log base advances almost continuously. Every few seconds a
- * NON-LEADER is killed and restarted, occasionally onto a wiped directory:
- * a member whose log is behind the leader's base cannot be caught up by
+ * leader's log base advances almost continuously. Every few seconds a member
+ * is killed and restarted, occasionally onto a wiped directory: a member
+ * whose log is behind the leader's base cannot be caught up by
  * AppendEntries, so the leader sends it an install.
  * Meanwhile every reader is running stale scanning reads against all three
  * members, which `--read-offload-min 0` puts on worker threads.
+ *
+ * ABOUT A THIRD OF THOSE KILLS TAKE THE LEADER (`--leaderShare`, 0 for the
+ * follower-only churn this started as). A leader receives no installs while
+ * it leads, which is why it was spared at first -- but a former leader comes
+ * back behind the new one and is installed into like anything else, having
+ * been the member that held the clients and the proposals. The run counts
+ * how many leader kills were actually installed back in, and fails if none
+ * of them were.
  *
  * WHAT IT ASSERTS, and it is content rather than liveness, for the same
  * reason soak.js is: a view whose files were unlinked under it means a
@@ -71,7 +79,8 @@ function usage(msg) {
   console.error(
     'usage: node test/soak-install.js [--seconds N] [--readers N] [--seed N]\n' +
     '                                 [--port N] [--readThreads N] [--churnMs N]\n' +
-    '                                 [--pad BYTES] [--cap DOCS] [--quiet]');
+    '                                 [--pad BYTES] [--cap DOCS] [--leaderShare P]\n' +
+    '                                 [--wipeShare P] [--quiet]');
   process.exit(2);
 }
 
@@ -95,15 +104,22 @@ function usage(msg) {
  * grow, too.
  */
 const opts = { seconds: 60, readers: 8, seed: 1, port: 35000 + (process.pid % 140) * 20,
-               readThreads: 4, churnMs: 6000, pad: 400, cap: 4000, quiet: false };
+               readThreads: 4, churnMs: 6000, pad: 400, cap: 4000, leaderShare: 0.34,
+               wipeShare: 0, quiet: false };
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (a === '--quiet') { opts.quiet = true; continue; }
   const key = a.replace(/^--/, '');
   if (!(key in opts) || a[0] !== '-') usage(`unknown option ${a}`);
   const v = Number(process.argv[++i]);
-  const floor = key === 'readThreads' ? 0 : 1;
+  /* Zero is a MEANING for both of these, not a missing value: no reader
+   * threads is the control run, and no leader kills is the follower-only
+   * churn this soak had until leaders were added to it. */
+  const floor = (key === 'readThreads' || key === 'leaderShare' ||
+                 key === 'wipeShare') ? 0 : 1;
   if (!Number.isFinite(v) || v < floor) usage(`${a} needs a number of at least ${floor}`);
+  if ((key === 'leaderShare' || key === 'wipeShare') && v > 1)
+    usage(`--${key} is a probability, 0 to 1`);
   opts[key] = v;
 }
 
@@ -201,25 +217,69 @@ const regexFor = (k) => ({ tag: { $regex: `^v(?:[0-9]+|zzz${k})$` } });
  * further. Not a count -- a follower legitimately holds less than the
  * leader, and after a drop it may briefly hold a whole earlier generation.
  */
-function checkStale(coll, docs) {
-  const ns = [];
-  for (const d of docs) {
-    if (d.coll !== coll) { note(`${coll}: a document from collection "${d.coll}" -- wrong file`); return; }
-    if (d.echo !== d.n) { note(`${coll}: torn document, n=${d.n} echo=${d.echo}`); return; }
-    if (d.tag !== `v${d.n}`) { note(`${coll}: torn document, n=${d.n} tag=${d.tag}`); return; }
-    ns.push(d.n);
+/* Contiguous runs, so a violation shows the SHAPE of what came back --
+ * "0..232, 264..391" is a different fault from "0..232" and the message has
+ * to be able to say which. */
+const runsOf = (ns) => {
+  const out = [];
+  for (let i = 0; i < ns.length; i++) {
+    const from = ns[i];
+    while (i + 1 < ns.length && ns[i + 1] === ns[i] + 1) i++;
+    out.push(from === ns[i] ? `${from}` : `${from}..${ns[i]}`);
   }
-  ns.sort((a, b) => a - b);
+  return out.join(', ');
+};
+
+function checkStale(coll, docs, where) {
+  const ids = new Map();          /* n -> the _id that carried it */
+  for (const d of docs) {
+    if (d.coll !== coll) return `${where} ${coll}: a document from collection "${d.coll}" -- wrong file`;
+    if (d.echo !== d.n) return `${where} ${coll}: torn document, n=${d.n} echo=${d.echo}`;
+    if (d.tag !== `v${d.n}`) return `${where} ${coll}: torn document, n=${d.n} tag=${d.tag}`;
+    const seen = ids.get(d.n);
+    if (seen === undefined) { ids.set(d.n, String(d._id)); continue; }
+    /*
+     * TWO DOCUMENTS WITH THE SAME n IS THE WRITER'S DOING; THE SAME DOCUMENT
+     * TWICE IS NOT.
+     *
+     * Killing the leader makes a lost write genuinely ambiguous: a batch
+     * proposed to a member that then died may commit afterwards, under the
+     * next leader, out of the log it had already replicated -- so no amount
+     * of asking after the fact tells the writer whether to retry, and a
+     * retry that was not needed inserts those documents a second time. That
+     * is at-least-once, which is what a client gets, and it shows up as two
+     * DISTINCT documents (distinct _id) describing the same n.
+     *
+     * A scan that emitted one document twice is a different animal and the
+     * kind of thing this soak exists to catch, so the two are separated by
+     * _id rather than folded together. Measured the first time this soak
+     * killed leaders: "beta: stale read skipped id 217 but returned 216",
+     * which was a duplicate 216 and not a gap at all.
+     */
+    if (seen === String(d._id)) {
+      return `${where} ${coll}: the same document (_id ${seen}, n=${d.n}) twice in one read`;
+    }
+  }
+  const ns = [...ids.keys()].sort((a, b) => a - b);
   /* A PREFIX, because the writer appends n only after n-1. Behind is fine;
    * a hole is a read that skipped an id it held. */
   for (let i = 0; i < ns.length; i++) {
-    if (ns[i] !== i) { note(`${coll}: stale read skipped id ${i} but returned ${ns[i]}`); return; }
+    if (ns[i] !== i) {
+      return `${where} ${coll}: ${docs.length} document(s), ids ${runsOf(ns)}` +
+             ` -- a hole at ${i}, and ${ns[ns.length - 1]} is the highest`;
+    }
   }
+  return null;
 }
+
+/* Ids of a second look, deduped and sorted -- the shape without the verdict. */
+const idsOf = (docs) => [...new Set(docs.map((d) => d.n))].sort((a, b) => a - b);
 
 const MEMBERS = [1, 2, 3].map((id) => ({
   id, port: opts.port + id, raftPort: opts.port + 10 + id,
   proc: null, dir: null, log: '', installs: 0,
+  /* For crediting an install to the kill that made it necessary. */
+  installsAtRestart: 0, killedAsLeader: false,
   /* Counters survive a restart by being banked before the kill: the server
    * they came from is about to be a different process. */
   banked: { drainWaits: 0, drainedReads: 0, installDrains: 0, installDrainedReads: 0,
@@ -285,6 +345,17 @@ async function startMember(m, freshDir) {
   if (!ready) throw new Error(`member ${m.id} did not start: ${m.log.slice(-400)}`);
 }
 
+/** One ping, or null if it did not answer. */
+async function pingOf(m) {
+  if (!m.proc) return null;
+  try {
+    const c = await connectServer(m.port, { keepAliveMs: 0 });
+    const p = await c.ping();
+    await c.close();
+    return p;
+  } catch { return null; }
+}
+
 /** Bank what this incarnation counted, before it stops existing. */
 async function bank(m) {
   try {
@@ -303,7 +374,28 @@ const main = async () => {
   const rand = rng(opts.seed);
   const counts = new Map(COLLS.map((c) => [c, 0]));
   const stats = { writes: 0, reads: 0, regexReads: 0, compacts: 0, drops: 0,
-                  indexes: 0, cycles: 0, wipes: 0, reconnects: 0 };
+                  indexes: 0, cycles: 0, wipes: 0, reconnects: 0,
+                  leaderKills: 0, leaderKillsKept: 0,
+                  installsAfterLeaderKill: 0, skipped: 0, wipeWaits: 0 };
+
+  /*
+   * An install that landed on a member killed WHILE IT WAS LEADING, counted
+   * once per kill. Attributed rather than assumed: `m.installs` accumulates
+   * over every boot of that member, so the only way to say a particular
+   * install followed a particular kill is to remember the count at the
+   * restart and look again later. Checked at the top of each cycle and once
+   * at the end, so nothing is waited for and the churn's cadence is
+   * unchanged.
+   */
+  const creditLeaderInstalls = () => {
+    for (const m of MEMBERS) {
+      if (!m.killedAsLeader) continue;
+      if (m.installs > m.installsAtRestart) {
+        stats.installsAfterLeaderKill++;
+        m.killedAsLeader = false;
+      }
+    }
+  };
 
   for (const m of MEMBERS) await startMember(m, true);
 
@@ -357,6 +449,40 @@ const main = async () => {
    * on purpose.
    */
   const wslot = newSlot('writer');
+  /*
+   * A LOST ANSWER IS AMBIGUOUS AND MOSTLY HARMLESS -- EXCEPT FOR A DROP.
+   *
+   * `counts` advances only when a write returns, so an insert whose answer
+   * was lost is simply retried, and the worst that happens is the batch
+   * lands twice (checkStale says why that is legal and how it is told apart
+   * from a bug). Asking the cluster instead does not help: a batch proposed
+   * to a member that then died can still commit afterwards, out of the log
+   * it had already replicated, so nothing counted before that moment is an
+   * answer -- an earlier version of this file re-counted and duplicated
+   * anyway.
+   *
+   * A DROP is the exception, and it is the one case that can produce a GAP
+   * rather than a duplicate: if the drop landed and the writer does not know
+   * it, `counts` still says N, the next insert starts at N, and ids 0..N-1
+   * are missing for good. So a drop whose answer was lost is not guessed at
+   * -- it is FINISHED. Dropping an absent collection is a no-op, which is
+   * what makes retrying it until it succeeds the whole of the fix.
+   */
+  const unresolvedDrops = new Set();
+  const settleDrops = async (db) => {
+    for (const coll of [...unresolvedDrops]) {
+      wslot.what = `settling an unfinished drop of ${coll}`;
+      wslot.at = Date.now();
+      try {
+        await db.dropCollection(coll);
+      } catch (err) {
+        if (err?.code !== -37) throw err;   /* already gone is done */
+      }
+      counts.set(coll, 0);
+      unresolvedDrops.delete(coll);
+    }
+    wslot.what = null;
+  };
   const writing = (async () => {
     while (!stop()) {
       if (!lead) {
@@ -366,8 +492,21 @@ const main = async () => {
         wslot.what = null;
         if (!lead) { await new Promise((r) => setTimeout(r, 200)); continue; }
       }
+      if (unresolvedDrops.size) {
+        try {
+          await settleDrops(lead.c.db(DB));
+        } catch (err) {
+          /* The member answering this is being churned too. Let go and ask
+           * whoever leads next; nothing is written until this succeeds. */
+          await lead.c.close().catch(() => {});
+          lead = null;
+          refused(err);
+          continue;
+        }
+      }
       const coll = COLLS[(rand() * COLLS.length) | 0];
       const roll = rand();
+      let dropping = false;
       wslot.at = Date.now();
       try {
         const db = lead.c.db(DB);
@@ -390,6 +529,27 @@ const main = async () => {
           await db.collection(coll).insertMany(batch);
           counts.set(coll, at + batch.length);
           stats.writes += batch.length;
+          /*
+           * A WRITE-SIDE ORACLE, occasionally, because the read-side one
+           * cannot say WHEN what it found went missing. A linearizable count
+           * on the leader is the authoritative answer to "how many are
+           * there", and comparing it to what the writer was told landed
+           * separates a write that was acknowledged and lost from a read
+           * that went looking in the wrong place.
+           */
+          if (rand() < 0.05) {
+            wslot.what = `verifying ${coll} on member ${lead.m.id}`;
+            const held = await db.collection(coll).countDocuments({});
+            if (held < counts.get(coll)) {
+              const ns = idsOf(await db.collection(coll).find({}).toArray());
+              const hole = ns.findIndex((v, i) => v !== i);
+              note(`the leader lost an acknowledged write: ${coll} should hold` +
+                   ` ${counts.get(coll)} and holds ${held}` +
+                   ` (ids ${runsOf(ns)}${hole < 0 ? '' : `, hole at ${hole}`})` +
+                   ` -- last insert was ${at}..${at + batch.length - 1} to` +
+                   ` member ${lead.m.id}`);
+            }
+          }
         } else if (roll < 0.90) {
           wslot.what = `compact ${coll} -> member ${lead.m.id}`;
           await db.collection(coll).compact();
@@ -404,6 +564,7 @@ const main = async () => {
           stats.indexes++;
         } else {
           wslot.what = `dropCollection ${coll} -> member ${lead.m.id}`;
+          dropping = true;
           await db.dropCollection(coll);
           counts.set(coll, 0);
           stats.drops++;
@@ -413,9 +574,16 @@ const main = async () => {
         if (err?.code === -63 || err?.code === -64 || typeof err?.code !== 'number') {
           /* Leadership moved, or the socket to it did -- which this soak
            * arranges. Let go and look again rather than treating a correct
-           * refusal, or a deliberate kill, as a fault. */
+           * refusal, or a deliberate kill, as a fault.
+           *
+           * And ask what landed before writing again. -63/-64 are refusals
+           * that precede the proposal, so they change nothing; a lost socket
+           * says nothing either way, and telling them apart here would be
+           * guessing. Counting is cheap and happens once per interruption. */
           await lead.c.close().catch(() => {});
           lead = null;
+          /* Only a drop leaves something that has to be finished. */
+          if (dropping) unresolvedDrops.add(coll);
           refused(err);
         } else if (!expected(err)) {
           note(`writer: [${err?.code}] ${err.message}`);
@@ -466,7 +634,55 @@ const main = async () => {
         if (rand() < 0.25) {
           slot.what = `stale find ${coll} on member ${m.id}`;
           const docs = await cl.find(regexFor(pat++), stale).toArray();
-          checkStale(coll, docs);
+          const fault = checkStale(coll, docs, `member ${m.id}`);
+          /*
+           * BAD BYTES OR BAD STATE, asked immediately rather than argued
+           * about afterwards. A hole that is STILL THERE on the next read
+           * means this member really holds a collection with a gap in it --
+           * a state that got there by applying something. A hole that is
+           * GONE means the first read saw bytes that were never a state:
+           * a file replaced under a view, which is what the drain exists to
+           * prevent and the worst thing this soak can find.
+           *
+           * Two very different faults with one symptom, and one extra read
+           * separates them. Both come with the member's own position and
+           * last words, because "which install had just adopted" is the
+           * first thing anyone will ask.
+           */
+          if (fault) {
+            let again = 'could not ask again';
+            try {
+              const ns = idsOf(await cl.find(regexFor(pat++), stale).toArray());
+              const hole = ns.findIndex((v, i) => v !== i);
+              again = hole < 0
+                ? `ASKED AGAIN: a clean prefix of ${ns.length} -- so the first` +
+                  ' read returned bytes that were never a state'
+                : `ASKED AGAIN: still a hole at ${hole} (ids ${runsOf(ns)})` +
+                  ' -- so this member really holds that';
+            } catch (err) { again = `ASKED AGAIN: [${err?.code}] ${err.message}`; }
+            /* EVERY member, not just the one that answered: a state that
+             * went backwards is a statement about the cluster, and "who
+             * thinks it leads" cannot be read off one of them. */
+            const where = [];
+            for (const o of MEMBERS) {
+              let stood = o.proc ? 'did not answer' : 'not running';
+              if (o.proc) {
+                try {
+                  const c2 = await connectServer(o.port, { keepAliveMs: 0 });
+                  const p = await c2.ping();
+                  await c2.close();
+                  stood = `role ${p.role}, follows ${p.leaderId},` +
+                          ` applied ${p.applied}, commit ${p.commit},` +
+                          ` base ${p.base}, last ${p.last}`;
+                } catch { /* it may have just been killed */ }
+              }
+              where.push(`      member ${o.id}${o === m ? ' (read here)' : ''}:` +
+                         ` ${stood}\n        ${o.log.trim().split('\n').slice(-4).join('\n        ')}`);
+            }
+            note(`${fault}\n      ${again}\n      writer thinks ${coll} holds` +
+                 ` ${counts.get(coll)}, and is writing to member` +
+                 ` ${lead ? lead.m.id : '(none)'}\n${where.join('\n')}`);
+          }
         } else {
           slot.what = `stale count ${coll} on member ${m.id}`;
           const n = await cl.countDocuments(regexFor(pat++), stale);
@@ -512,14 +728,33 @@ const main = async () => {
   })());
 
   /*
-   * THE CHURN. Kill a member that is not leading, then bring it back --
-   * half the time onto an empty directory, which cannot be caught up by
-   * AppendEntries at all and so must be installed into. Never the leader:
-   * killing that measures elections, and a leader receives no installs.
+   * THE CHURN. Kill a member, then bring it back -- sometimes onto an empty
+   * directory, which cannot be caught up by AppendEntries at all and so must
+   * be installed into.
+   *
+   * MOSTLY A FOLLOWER, AND SOMETIMES THE LEADER (--leaderShare). This file
+   * used to say "never the leader: killing that measures elections, and a
+   * leader receives no installs". The second half is true of the member
+   * while it leads and false of it a moment later: a former leader comes
+   * back BEHIND the new one, whose base has moved on, so it is installed
+   * into like any other lagging member -- and it arrives there having been
+   * the member with the clients, the pending writes and the outstanding
+   * proposals, which the follower-only churn never produced. The first half
+   * is the cost, accepted deliberately: an election runs before the cluster
+   * takes another write, so a leader kill spends a second or so of the run
+   * on Raft rather than on the barrier under test. That is why it is a
+   * SHARE rather than the whole thing, and why the attribution below counts
+   * the installs it actually produced instead of assuming they happened.
    */
   const churning = (async () => {
     while (!stop()) {
-      await new Promise((r) => setTimeout(r, opts.churnMs));
+      /* IN SLICES, so the deadline is visible through the wait. A single
+       * setTimeout(churnMs) holds the run open for its whole length after
+       * everything else has finished -- `--churnMs 999999`, asking for a
+       * workload with no kills in it at all, hung a 150s run for sixteen
+       * minutes and looked exactly like the bug this file hunts. */
+      for (let waited = 0; waited < opts.churnMs && !stop(); waited += 100)
+        await new Promise((r) => setTimeout(r, Math.min(100, opts.churnMs - waited)));
       if (stop()) break;
       const live = [];
       for (const m of MEMBERS) {
@@ -531,9 +766,18 @@ const main = async () => {
           live.push({ m, role });
         } catch { /* not answering */ }
       }
-      const victims = live.filter((x) => x.role !== 'leader');
-      if (!victims.length || live.length < 3) continue;   // keep quorum
-      const victim = victims[(rand() * victims.length) | 0].m;
+      creditLeaderInstalls();
+      /* Counted, because a churn that mostly skips is a soak that mostly
+       * does not churn, and the run should say so rather than look calm. */
+      if (live.length < 3) { stats.skipped++; continue; }   // keep quorum
+      const leading = live.filter((x) => x.role === 'leader');
+      const following = live.filter((x) => x.role !== 'leader');
+      /* The leader only when the dice say so AND there is one to take. */
+      const takeLeader = leading.length && rand() < opts.leaderShare;
+      const pool = takeLeader ? leading : following;
+      if (!pool.length) { stats.skipped++; continue; }
+      const victim = pool[(rand() * pool.length) | 0].m;
+      if (takeLeader) stats.leaderKills++;
 
       await bank(victim);
       victim.proc.kill();
@@ -552,18 +796,93 @@ const main = async () => {
       await new Promise((r) => setTimeout(r, 250 + Math.floor(rand() * 350)));
       if (stop()) break;
       /*
-       * Mostly NOT wiped, which is the opposite of what looks aggressive.
-       * A wiped member comes back empty, so every stale read against it is
-       * refused -37 until the install lands -- 54% of all read attempts, in
-       * the run that taught this -- and an empty member has no view worth
-       * draining. A member that kept its files still needs an install (the
-       * base moved past it) and still holds thousands of documents to be
-       * reading when the install arrives. Some wipes stay, because a full
-       * install from nothing is a different amount of work to adopt.
+       * WIPING IS OFF BY DEFAULT (--wipeShare 0) BECAUSE IT IS NOT A FAULT
+       * RAFT TOLERATES, AND THE RUNS THAT DID IT WERE LOSING DATA ON PURPOSE
+       * WITHOUT MEANING TO.
+       *
+       * Emptying a member's directory does not simulate a crash. A crash
+       * keeps the log, the term and the vote; a wipe takes all three and
+       * brings the member back wearing the same id with no memory of what it
+       * had promised. That member can then vote a second time in a term it
+       * already voted in, and can vote for a candidate whose log is missing
+       * entries its own ack had helped commit -- so entries a quorum stored
+       * are lost, exactly as the algorithm allows once a member's disk
+       * silently rejoins the vote.
+       *
+       * Both halves of that were measured here. Two wiped members are a
+       * quorum of blanks who elect each other and tell the one member
+       * holding the history to adopt theirs (7,319 committed entries gone).
+       * ONE is enough as well, which is why "one wipe at a time" was not the
+       * fix: the write-side oracle caught a LEADER answering a linearizable
+       * read with 768 of the 784 documents it had just acknowledged, and the
+       * member that had acked them held commit 5237 against that leader's
+       * last 5157 -- its co-committer having been wiped and voted for the
+       * shorter log.
+       *
+       * None of this is needed to reach the barrier this soak is named for.
+       * A member killed WITH ITS FILES is still installed into, because the
+       * leader's base moves past it in a fraction of a second at
+       * --snapshot-entries 4 -- a run with no kills at all still adopted 185
+       * installs. So the wipes bought a variation of the receiving side and
+       * cost the property the content oracle rests on.
+       *
+       * `--wipeShare 0.25` restores the old behaviour for anyone studying
+       * that failure deliberately. The right way to replace a member that
+       * has lost its disk is to JOIN A NEW ONE, under a new id, which is
+       * what the server's join path is for.
        */
-      const wipe = rand() < 0.25;
+      const wipe = rand() < opts.wipeShare;
       if (wipe) stats.wipes++;
       await startMember(victim, wipe);
+      /*
+       * A WIPE IS A MEMBER REPLACEMENT, NOT A RESTART, AND ONLY ONE AT A
+       * TIME IS SOUND.
+       *
+       * An emptied directory takes the member's log, its term and its vote
+       * with it, so what comes back is a blank member wearing the same id.
+       * One of those is harmless: it cannot win an election (its log is not
+       * up to date) and the leader installs it back. TWO of them are a
+       * QUORUM OF BLANKS -- they have equally empty logs, so they vote for
+       * each other, and the one member still holding the cluster's history
+       * is outvoted and told to adopt theirs.
+       *
+       * Measured here, before this wait existed, with leaders being killed
+       * often enough to make elections common:
+       *
+       *   member 1: follower, follows 2, applied 7319, commit 7319
+       *   member 2: LEADER, applied 17, commit 17, base 0     <- wiped
+       *   member 3: follower, follows 2, applied 18, base 17  <- wiped
+       *
+       * -- 7,319 committed entries discarded by a cluster doing exactly what
+       * Raft says to do with the majority it was given. Not a fault in the
+       * server, and not something a soak should do to itself: re-provisioning
+       * a member means joining a new one, not blanking an old one in place.
+       * So a wipe is followed to completion before the next churn, and a
+       * wiped member that never comes back is itself a violation.
+       */
+      if (wipe) {
+        const at = Date.now();
+        let caught = false;
+        for (let i = 0; i < 200 && !stop(); i++) {
+          const p = await pingOf(victim);
+          /* Its own base moving proves an install landed; applied past the
+           * boundary proves it is following again. */
+          if (p && p.base > 0 && p.applied >= p.base) { caught = true; break; }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        stats.wipeWaits += Date.now() - at;
+        if (!caught && !stop()) {
+          note(`member ${victim.id} was wiped and never caught back up` +
+               ` (${((Date.now() - at) / 1000).toFixed(1)}s): ` +
+               (await pingOf(victim) ? 'still behind' : 'not answering'));
+        }
+      }
+      /* Before anything can be credited to this boot, and only meaningful
+       * for a leader kill -- a wiped member's install proves nothing about
+       * having been the leader, since an empty directory forces one anyway. */
+      victim.installsAtRestart = victim.installs;
+      victim.killedAsLeader = takeLeader && !wipe;
+      if (victim.killedAsLeader) stats.leaderKillsKept++;
       stats.cycles++;
     }
   })();
@@ -613,6 +932,7 @@ const main = async () => {
   if (heartbeat) clearInterval(heartbeat);
   for (const m of MEMBERS) if (m.proc) await bank(m);
 
+  creditLeaderInstalls();
   const total = (k) => MEMBERS.reduce((n, m) => n + m.banked[k], 0);
   const installs = MEMBERS.reduce((n, m) => n + m.installs, 0);
 
@@ -626,6 +946,12 @@ const main = async () => {
       ` ${stats.indexes} index ops, ${stats.drops} drops`);
   say(`      ${stats.cycles} churn cycles (${stats.wipes} onto an empty directory),` +
       ` ${installs} installs adopted, ${stats.reconnects} reconnects`);
+  say(`      ${stats.leaderKills} of those took the LEADER` +
+      ` (${stats.leaderKillsKept} keeping their files,` +
+      ` ${stats.installsAfterLeaderKill} of them installed back in),` +
+      ` ${stats.skipped} cycles skipped for want of a quorum`);
+  say(`      ${(stats.wipeWaits / 1000).toFixed(1)}s spent following a wiped` +
+      ' member back to the cluster, one at a time');
   say(`      correct refusals by code: ${refusalLine() || 'none'}`);
   say(`      ${total('movedReads')} reads moved to a worker,` +
       ` ${total('drainWaits')} drains (${total('drainedReads')} reads),` +
@@ -648,6 +974,25 @@ const main = async () => {
   }
   if (!stats.regexReads) {
     note('no read compiled a $regex -- the compile path went untested');
+  }
+  if (opts.leaderShare > 0 && !stats.leaderKills) {
+    note('no leader was ever killed -- raise --churnMs or --seconds, or say' +
+         ' --leaderShare 0 to ask for the follower-only churn on purpose');
+  }
+  /*
+   * A leader kill that never produced an install tested the election and not
+   * this file's subject. It should not be possible for every one of them to
+   * miss: a former leader cannot win the next election while it is behind
+   * (Raft will not elect a log that is not up to date), so it comes back as
+   * a follower whose base the new leader has already passed.
+   */
+  /* Only the ones that KEPT their files can be credited: a wiped member is
+   * installed into whatever it used to be, so it proves nothing about
+   * having led. */
+  if (stats.leaderKillsKept && !stats.installsAfterLeaderKill) {
+    note(`${stats.leaderKillsKept} leader kill(s) kept their files and not` +
+         ' one was installed back in -- a former leader is being caught up' +
+         ' some other way, or is never getting far enough behind');
   }
 
   if (violations.length) {

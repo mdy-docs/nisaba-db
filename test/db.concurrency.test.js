@@ -904,25 +904,46 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
         }
         return out;
       };
-      let seen = [];
-      for (let i = 0; i < 100; i++) {
-        seen = await roles();
-        if (seen.some((x) => x.role === 'leader') && seen.length === 3) break;
-        await new Promise((r) => setTimeout(r, 200));
+      /*
+       * WHO LEADS IS ASKED EVERY TIME, never remembered. Not the cause of
+       * anything measured -- that is below -- but a held connection to
+       * yesterday's leader is a way for this test to fail while finding
+       * nothing wrong with the server: under load an election can happen
+       * between two goes, and then the writes below are refused, or
+       * redirected to whichever member the test has just killed, so the
+       * leader's base never passes the follower and no install is ever
+       * necessary. Cheap to rule out, and this file's own scan-scaling
+       * tests load the machine hard enough to make it worth ruling out.
+       */
+      const leaderNow = async () => {
+        for (let i = 0; i < 150; i++) {
+          const who = (await roles()).find((x) => x.role === 'leader');
+          if (who) return who.m;
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        return null;
+      };
+      const first = await leaderNow();
+      expect(first, 'no leader emerged').toBeTruthy();
+      let up = 0;
+      for (let i = 0; i < 50 && up < 3; i++) {
+        up = (await roles()).length;
+        if (up < 3) await new Promise((r) => setTimeout(r, 200));
       }
-      const leaderOf = seen.find((x) => x.role === 'leader');
-      expect(leaderOf, 'no leader emerged').toBeTruthy();
+      expect(up, 'not every member came up').toBe(3);
 
       const N = 4000;
       const PAD = 'x'.repeat(600);
-      const lead = await connectServer(leaderOf.m.port);
-      const coll = lead.db(DB).collection('installed');
-      for (let n = 0; n < N; n += 200) {
-        await coll.insertMany(Array.from({ length: 200 },
-          (_, k) => ({ n: n + k, pad: PAD })));
+      {
+        const lead = await connectServer(first.port);
+        const coll = lead.db(DB).collection('installed');
+        for (let n = 0; n < N; n += 200) {
+          await coll.insertMany(Array.from({ length: 200 },
+            (_, k) => ({ n: n + k, pad: PAD })));
+        }
+        await lead.close();
       }
 
-      const victim = seen.find((x) => x.role !== 'leader').m;
       const stale = { stale: true };
       /* Matches nothing and walks every character of every document, which
        * is what makes a read long enough to still be running when the
@@ -930,48 +951,121 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
       const SLOW = { pad: { $regex: '^x*y$' } };
 
       /*
-       * Up to six goes at the overlap, because it IS a race -- the read has
-       * to be in flight at the moment adoption is ready. Each go: take the
-       * follower away, write past its log base, bring it back, and put four
-       * slow stale reads on it at once. The loop ends as soon as an install
-       * has drained a reader, and the assertion afterwards is that it did.
+       * Up to six goes, each one: take a follower away, write until an
+       * install is the only way it can catch up, bring it back, and keep
+       * four slow stale reads running on it until the install has actually
+       * been adopted. The loop ends as soon as one of those installs
+       * drained a reader, and the assertions afterwards are that it did.
+       *
+       * THE READS LOOP RATHER THAN FIRING ONCE, and the window ends on the
+       * adoption rather than on a sleep. Four reads issued once take a few
+       * hundred milliseconds; an install of this collection takes about the
+       * same, so a go that fired once and moved on was a coin toss on an
+       * idle machine and a lost cause on a loaded one -- and losing it
+       * killed the follower again mid-transfer, so its `last` never moved
+       * and six goes in a row could produce no install at all. THAT is what
+       * the suite was failing on, one run in five, having found nothing
+       * wrong with the server: a follower stuck 2,500 entries behind a base
+       * of 4,001, identical in all six goes. It is not slowness in the
+       * server -- a follower left down for 3,200 entries and then brought
+       * back is installed in half a second, measured -- it was this test
+       * never letting one finish.
        */
       let installDrains = 0, answered = 0, installs = 0;
+      let victim = null;
       for (let go = 0; go < 6 && !installDrains; go++) {
+        const leaderM = await leaderNow();
+        expect(leaderM, `go ${go}: nobody is leading`).toBeTruthy();
+        victim = MEMBERS.find((m) => m !== leaderM && m.proc);
+        expect(victim, `go ${go}: no follower to take away`).toBeTruthy();
+
+        /* What the follower has, from the follower, before it goes: an
+         * install is necessary exactly when the leader's base passes THIS,
+         * because a leader cannot send entries at or below its own base. */
+        const at = await connectServer(victim.port, { keepAliveMs: 0 });
+        const behind = (await at.ping()).last;
+        await at.close();
+
         victim.proc.kill();
         await new Promise((r) => victim.proc.once('exit', r));
         victim.proc = null;
 
-        /* Enough entries that the leader's base passes the follower's last. */
-        for (let i = 0; i < 8; i++) {
-          await lead.db(DB).collection('churn').insertMany(
-            Array.from({ length: 50 }, (_, k) => ({ n: i * 50 + k })));
+        /*
+         * Write until that is true, rather than writing a fixed amount and
+         * hoping. --snapshot-entries 4 means a handful of entries does it;
+         * the loop is what makes "a handful" a fact instead of an estimate,
+         * and it re-resolves the leader if one of these writes is refused
+         * because leadership moved mid-churn.
+         */
+        let lead = await connectServer(leaderM.port, { keepAliveMs: 0 });
+        let base = 0;
+        for (let i = 0; i < 60; i++) {
+          base = (await lead.ping()).base;
+          if (base > behind) break;
+          try {
+            await lead.db(DB).collection('churn').insertMany(
+              Array.from({ length: 50 }, (_, k) => ({ n: i * 50 + k })));
+          } catch (e) {
+            /* Leadership moved: find it again rather than failing on a
+             * refusal that says nothing about the barrier under test. */
+            await lead.close().catch(() => {});
+            const now = await leaderNow();
+            expect(now, `go ${go}: leadership went nowhere`).toBeTruthy();
+            lead = await connectServer(now.port, { keepAliveMs: 0 });
+          }
         }
+        await lead.close().catch(() => {});
+        expect(base, `go ${go}: the leader's base (${base}) never passed the` +
+          ` follower's last entry (${behind}), so an install was never` +
+          ' necessary and this go tested nothing').toBeGreaterThan(behind);
 
         await bring(victim);
+        const adopted = () =>
+          (victim.stderr().match(/snapshot install adopted/g) || []).length;
         const readers = await Promise.all(Array.from({ length: 4 },
           () => connectServer(victim.port, { keepAliveMs: 0 })));
-        /* Issued and not awaited: they are on workers by the time the
-         * install lands. Every one must come back, and with 0 -- the answer
-         * to SLOW against a collection of x's, whichever state it is read
-         * from. A hang here is the bug. */
-        const reads = readers.map((c) =>
-          c.db(DB).collection('installed').countDocuments(SLOW, stale)
-            .then((v) => { answered++; return v; })
-            .catch((e) => e?.code ?? e?.message));
 
         /*
-         * Bounded, so the failure SAYS what happened. The bug is a read
-         * that never comes back, and awaiting it plainly turns that into
-         * "the test timed out after four minutes" -- true, unhelpful, and
-         * four minutes long. Thirty seconds is many times the scan and many
-         * times an adoption; nothing legitimate is still going then.
+         * Every answer bounded, so a failure SAYS what happened. The bug is
+         * a read that never comes back, and awaiting one plainly turns that
+         * into "the test timed out after four minutes" -- true, unhelpful,
+         * and four minutes long. Thirty seconds is many times the scan and
+         * many times an adoption; nothing legitimate is still going then.
          */
         const NEVER = Symbol('never answered');
-        const got = await Promise.all(reads.map((p) => Promise.race([
-          p, new Promise((r) => { const t = setTimeout(() => r(NEVER), 30000); t.unref?.(); })
-        ])));
-        for (const v of got) {
+        const bounded = (p) => Promise.race([p, new Promise((r) => {
+          const t = setTimeout(() => r(NEVER), 30000); t.unref?.();
+        })]);
+
+        /* Each reader keeps asking until the window closes, so one of them
+         * is inside a view whenever adoption becomes ready. Every answer is
+         * kept: 0 -- the answer to SLOW against a collection of x's,
+         * whichever state it is read from -- or a refusal that is correct
+         * while the state machine moves. A read that stops answering ends
+         * that reader's loop rather than spinning on a dead socket. */
+        let stop = false;
+        const outcomes = [];
+        const loops = readers.map(async (c) => {
+          while (!stop) {
+            const v = await bounded(
+              c.db(DB).collection('installed').countDocuments(SLOW, stale)
+                .then((x) => { answered++; return x; })
+                .catch((e) => e?.code ?? e?.message));
+            outcomes.push(v);
+            if (v === NEVER || typeof v === 'string') break;
+          }
+        });
+
+        /* The window: until the install has been adopted, plus a moment for
+         * whichever read was inside the drain to come back with it. */
+        for (let i = 0; i < 200 && !adopted(); i++) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        await new Promise((r) => setTimeout(r, 300));
+        stop = true;
+        await Promise.all(loops);
+
+        for (const v of outcomes) {
           expect(v, 'a stale read across an install was never answered:' +
                     ' its worker finished and the answer was dropped').not.toBe(NEVER);
           /* -66 while the state machine is moving, or -37 if the install
@@ -985,7 +1079,7 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
         const p = await after.ping();
         installDrains = p.installDrains ?? 0;
         await after.close();
-        installs += (victim.stderr().match(/snapshot install adopted/g) || []).length;
+        installs += adopted();
         await Promise.all(readers.map((c) => c.close().catch(() => {})));
       }
 
@@ -999,8 +1093,6 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
        * which is the bug. */
       expect(answered, 'a stale read was never answered at all')
         .toBeGreaterThan(0);
-
-      await lead.close();
     } finally {
       for (const m of MEMBERS) {
         m.proc?.kill();

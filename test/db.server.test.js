@@ -1879,6 +1879,432 @@ for (const engine of ENGINES) {
   });
 
   /*
+   * ---- the reconciliation itself, and being interrupted inside it ----------
+   *
+   * The test above proves the restore happens and converges. What it does
+   * not touch is everything AROUND that restore, and two of those things
+   * were claimed in comments rather than run:
+   *
+   *   - a generation OLDER than the log's base must be left alone. It
+   *     would restore a state the log can no longer carry forward, which
+   *     silently discards every entry in between -- so that case halts,
+   *     with its files intact, and an operator gets to decide.
+   *   - the restore is not atomic. It removes every live file and then
+   *     copies the generation's back, so a crash inside it leaves a
+   *     directory that is neither state. That must be recoverable, and
+   *     recoverable REPEATEDLY, because the recovery is the same
+   *     non-atomic copy.
+   *
+   * Both are properties of a recovery path, which is exactly the kind of
+   * code that is written once, reasoned about, and then never executed
+   * until the day it matters.
+   */
+  describe.skipIf(!enabled)(
+      `nisaba-server: reconciling a generation (${engine.name})`, () => {
+    /* No AUTOMATIC snapshots: this suite builds its generations by hand
+     * and needs to know that the two it took are the two on disk. */
+    const RAFT = ['--raft', '1', '--snapshot-entries', '0'];
+    const DOOMED = 'outrun';
+    const SAFE = 'kept';
+    /* Enough bytes that removing and copying the generation's files takes
+     * milliseconds rather than microseconds -- the window the interrupted
+     * case has to land inside -- in batches small enough that one request
+     * does not plan more entries than the node can track in flight. */
+    const KEPT = 600;
+    const BATCH = 50;
+    const rows = (from, n) => Array.from({ length: n },
+      (_, k) => ({ n: from + k, pad: 'y'.repeat(1000) }));
+    const seed = async (coll, n) => {
+      for (let at = 0; at < n; at += BATCH)
+        await coll.insertMany(rows(at, Math.min(BATCH, n - at)));
+    };
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const waitExit = (p) => new Promise((r) => {
+      if (p.exitCode !== null || p.signalCode !== null) r();
+      else p.once('exit', r);
+    });
+    const tail = (b) => b.stderr().trim().split('\n').slice(-6).join('\n    ');
+    const scratch = (tag) =>
+      fs.mkdtempSync(path.join(os.tmpdir(), `nisaba-${tag}-`));
+
+    /* Every file under every database directory, with its size: the
+     * subject of "with its files intact". Store files are excluded on
+     * purpose -- the startup sweep is entitled to tidy those, and does. */
+    const dbFiles = (dir) => {
+      const out = {};
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (!e.isDirectory()) continue;
+        for (const f of fs.readdirSync(path.join(dir, e.name)))
+          out[`${e.name}/${f}`] = fs.statSync(path.join(dir, e.name, f)).size;
+      }
+      return out;
+    };
+    const storeFiles = (dir) =>
+      fs.readdirSync(dir).filter((f) => f.startsWith('__snap__'));
+    /* One generation, whole: its data files AND the manifest that makes
+     * them a committed generation rather than a pile of bytes. Data is
+     * `__snap__-<gen>-<role>.bj` and the manifest `__snap__-<gen>.manifest.bj`
+     * -- taking only the first spelling leaves a generation nothing will
+     * adopt, which is a different test from the one this suite means. */
+    const genFiles = (dir, gen) => fs.readdirSync(dir).filter((f) =>
+      f.startsWith(`__snap__-${gen}-`) || f === `__snap__-${gen}.manifest.bj`);
+    const moveAll = (names, from, to) => {
+      for (const f of names) fs.renameSync(path.join(from, f), path.join(to, f));
+    };
+    const copyAll = (names, from, to) => {
+      for (const f of names) fs.copyFileSync(path.join(from, f), path.join(to, f));
+    };
+
+    /*
+     * startServer resolves on "serving", which a halted member never
+     * says: a halt ENDS the serve loop, so the process exits on its own.
+     * This waits for whichever comes first and reports which it was --
+     * and, with `killAfterRestore` set, kills the member that many
+     * milliseconds after it announces a restore, which is the only place
+     * a test can stand INSIDE one.
+     */
+    async function boot(port, dir, killAfterRestore = -1) {
+      const [cmd, args, opts] = engine.argv(dir, port, RAFT);
+      const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+      let text = '';
+      let gone = false;
+      proc.stderr.on('data', (d) => { text += String(d); });
+      proc.once('exit', () => { gone = true; });
+      let killed = false;
+      for (let i = 0; i < 40000 && !gone; i++) {
+        if (killAfterRestore >= 0 && /restoring snapshot/.test(text)) {
+          await sleep(killAfterRestore);
+          killed = true;
+          proc.kill('SIGKILL');
+          break;
+        }
+        if (/serving/.test(text) || /halted/.test(text)) break;
+        await sleep(1);
+      }
+      if (killed) await waitExit(proc);
+      else await sleep(200);   /* a halt's last words finish printing */
+      return {
+        proc,
+        stderr: () => text,
+        serving: /serving/.test(text),
+        halted: /halted/.test(text),
+        restored: /restoring snapshot at index \d+/.test(text),
+        /* Killed before it ever served: whatever it was doing, it did not
+         * finish. Both possibilities -- inside the copy, or inside the
+         * replay after it -- have to come back. */
+        interrupted: killed && !/serving/.test(text)
+      };
+    }
+
+    /*
+     * THE STATE, BUILT RATHER THAN WAITED FOR. A dropDatabase takes the
+     * record of what had been applied with the directory, so the replay
+     * floor regresses; two snapshots put the log's base above the entries
+     * that would have replayed it, and keep an OLDER generation on hand.
+     *
+     * SAFE is written before the first snapshot and never again, on
+     * purpose: it is the surviving data whose files must be intact, and
+     * its own applied index stays below the base, so it cannot mask the
+     * floor regression the drop causes.
+     */
+    async function outrun(port) {
+      const s = await startServer(engine, port, RAFT, -1);
+      const older = scratch('gen1');
+      let g1, g2;
+      try {
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        await seed(c.db(SAFE).collection('keep'), KEPT);
+        await seed(c.db(DOOMED).collection('x'), KEPT);
+
+        g1 = await c.snapshot();
+        expect(g1.lastIncludedIndex, 'the first snapshot included nothing')
+          .toBeGreaterThan(1);
+        /* Aside BEFORE the second snapshot sweeps it: a crash between a
+         * compaction and its sweep leaves exactly this on disk. */
+        copyAll(genFiles(s.dir, g1.gen), s.dir, older);
+        expect(fs.readdirSync(older).length,
+          'the first generation had no data files to keep').toBeGreaterThan(0);
+
+        await seed(c.db(DOOMED).collection('x'), KEPT);
+        g2 = await c.snapshot();
+        expect(g2.lastIncludedIndex, 'the second snapshot included nothing new')
+          .toBeGreaterThan(g1.lastIncludedIndex);
+
+        /* The entry that cannot be replayed into a database that is gone. */
+        await c.db(DOOMED).collection('x').createIndex({ n: 1 });
+        expect(await c.dropDatabase(DOOMED)).toBe(true);
+
+        const p = await c.ping();
+        expect(p.base, 'the log did not compact to the second snapshot')
+          .toBeGreaterThanOrEqual(g2.lastIncludedIndex);
+        expect(p.base, 'the log outran the DDL, so replay would skip it and' +
+          ' this proves nothing').toBeLessThan(p.applied);
+        await c.close();
+      } finally {
+        s.proc.kill();
+        await waitExit(s.proc);
+      }
+      return { dir: s.dir, older, g1, g2 };
+    }
+
+    /*
+     * Built ONCE per engine and copied per test. Seeding it is the
+     * expensive part -- under wasmtime it is most of a minute, and three
+     * tests paying that separately is two minutes of the suite spent
+     * writing the same 1800 documents -- and every test starts from a
+     * byte-identical copy, which is stronger isolation than sharing a
+     * directory each of them performs surgery on.
+     */
+    let fixture = null;
+    beforeAll(async () => {
+      if (!enabled) return;
+      fixture = await outrun(nextPort());
+    }, 180000);
+    const unusable = () => {
+      const dir = scratch('unusable');
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.cpSync(fixture.dir, dir, { recursive: true });
+      return { ...fixture, dir };
+    };
+
+    it('leaves a generation older than the log alone, with the files intact',
+       async () => {
+      const port = nextPort();
+      const st = unusable();
+      /* Every store file as the last boot left it, so the repair at the
+       * end of this test puts back exactly what the surgery took. */
+      const pristine = scratch('store');
+      copyAll(storeFiles(st.dir), st.dir, pristine);
+
+      /*
+       * THE FAULT: the newest generation's DATA is lost -- a torn write, a
+       * bad sector, a copy that never finished -- while its manifest,
+       * which IS the commit, survives. The store confirms candidates
+       * newest-first, so it falls back to the generation it can still
+       * check, whose boundary now sits BELOW the log's base.
+       */
+      const lost = scratch('lost');
+      const newest = genFiles(st.dir, st.g2.gen);
+      expect(newest.length, 'the newest generation has no data files')
+        .toBeGreaterThan(0);
+      moveAll(newest, st.dir, lost);
+      copyAll(fs.readdirSync(st.older), st.older, st.dir);
+
+      const before = dbFiles(st.dir);
+      expect(Object.keys(before).length,
+        'no database files survived the drop, so "intact" says nothing')
+        .toBeGreaterThan(0);
+
+      const first = await boot(port, st.dir);
+      try {
+        expect(first.restored, 'it restored a generation older than the log\'s' +
+          ' base, which throws away every entry in between:\n    ' + tail(first))
+          .toBe(false);
+        expect(first.halted, 'it neither restored nor halted, so it is serving' +
+          ' a state it cannot account for:\n    ' + tail(first)).toBe(true);
+        const after = dbFiles(st.dir);
+        for (const [f, size] of Object.entries(before))
+          expect(after[f], `${f} did not survive the halt intact`).toBe(size);
+        /* One thing it may ADD, and nothing else: replay makes the
+         * directory and catalog for the database an entry names before it
+         * discovers the collection is not in it, so a stub of the dropped
+         * database is left behind. Harmless -- the reconciliation below
+         * clears every live file before it copies -- but it is why this
+         * checks that what was there survived rather than that nothing
+         * changed. */
+        for (const f of Object.keys(after))
+          if (!(f in before))
+            expect(f.startsWith(`${DOOMED}/`), `it also left ${f} behind`).toBe(true);
+      } finally {
+        first.proc.kill();
+        await waitExit(first.proc);
+      }
+
+      /*
+       * AND NOTHING WAS DISCARDED. Give the newest generation back -- the
+       * fault repaired, the database files untouched since -- and the same
+       * directory comes up, reconciles, and converges. Without this the
+       * test above would pass just as well against a member that had
+       * corrupted everything and then halted for an unrelated reason.
+       */
+      for (const f of storeFiles(st.dir)) fs.rmSync(path.join(st.dir, f));
+      copyAll(fs.readdirSync(pristine), pristine, st.dir);
+
+      const second = await boot(port, st.dir);
+      try {
+        expect(second.serving, 'the fault was repaired and it still did not' +
+          ' start:\n    ' + tail(second)).toBe(true);
+        expect(second.restored, 'it came up without reconciling, so the halt' +
+          ' above was not the branch this names:\n    ' + tail(second)).toBe(true);
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        expect(await c.listDatabases(),
+          'the drop did not survive the restore').not.toContain(DOOMED);
+        expect(await c.db(SAFE).collection('keep').countDocuments({}),
+          'the data that was supposed to be intact is not').toBe(KEPT);
+        await c.close();
+      } finally {
+        second.proc.kill();
+        await waitExit(second.proc);
+      }
+    }, 120000);
+
+    it('reconciles again after a reconciliation that was interrupted',
+       async () => {
+      /*
+       * The restore removes every live file and then copies the
+       * generation's back, so there is a window in which the directory
+       * holds neither state. A kill in that window is not exotic: the
+       * restore only runs on a member that has just crashed, and a
+       * machine that crashed once will crash again.
+       *
+       * Killed at a spread of offsets from the moment it says it is
+       * restoring -- 0ms is inside the removals, later ones inside the
+       * copy, where a partly restored file already carries an applied
+       * index and could talk the next boot out of finishing the job.
+       */
+      const port = nextPort();
+      const st = unusable();
+      const pristine = fixture.dir;
+
+      let interrupted = 0, insideRestore = 0;
+      const notes = [];
+      for (const delay of [0, 1, 2, 4, 8, 16]) {
+        fs.rmSync(st.dir, { recursive: true, force: true });
+        fs.cpSync(pristine, st.dir, { recursive: true });
+
+        const hit = await boot(port, st.dir, delay);
+        if (!hit.interrupted) {
+          hit.proc.kill();
+          await waitExit(hit.proc);
+          notes.push(`+${delay}ms: finished before the kill landed`);
+          continue;
+        }
+        interrupted++;
+        /* Whether the copy had actually started is READ OFF THE DISK, not
+         * inferred from the next boot's behaviour: the restore leaves its
+         * own trigger standing (see the test below), so "it restored
+         * again" says nothing about whether this one was half done. */
+        const midway = JSON.stringify(dbFiles(st.dir)) !==
+                       JSON.stringify(dbFiles(pristine));
+        if (midway) insideRestore++;
+
+        const again = await boot(port, st.dir);
+        try {
+          expect(again.serving, `killed +${delay}ms into a restore, it never` +
+            ' started again:\n    ' + tail(again)).toBe(true);
+          const c = await connectServer(port, { keepAliveMs: 0 });
+          expect(await c.listDatabases(), `killed +${delay}ms into a restore,` +
+            ' the dropped database came back').not.toContain(DOOMED);
+          expect(await c.db(SAFE).collection('keep').countDocuments({}),
+            `killed +${delay}ms into a restore, the surviving data did not`)
+            .toBe(KEPT);
+          /* A working database, not just a listening socket. */
+          await c.db('after').collection('c').insertOne({ n: 1 });
+          expect(await c.db('after').collection('c').countDocuments({})).toBe(1);
+          await c.close();
+        } finally {
+          again.proc.kill();
+          await waitExit(again.proc);
+        }
+        notes.push(`+${delay}ms: interrupted${midway ? ' mid-copy' : ''}, recovered`);
+      }
+
+      /* Racing is how this test can be wrong, so it says whether it
+       * raced. Nothing interrupted = nothing tested. */
+      expect(interrupted, 'no kill landed before the member finished starting,' +
+        ` so this passed without testing anything: ${notes.join('; ')}`)
+        .toBeGreaterThan(0);
+      expect(insideRestore, 'every kill landed with the directory untouched, so' +
+        ' the half-restored files this test is named for were never on disk:' +
+        ` ${notes.join('; ')}`).toBeGreaterThan(0);
+    }, 180000);
+
+    it('reconciles on EVERY boot until one write catches the floor up',
+       async () => {
+      /*
+       * A COST THIS PAYS, MEASURED RATHER THAN ASSUMED -- and the reason
+       * the restore is not the end of the story.
+       *
+       * The restore does not clear its own trigger. The trigger is "the
+       * live files account for less than the log's base", and what made
+       * that true was a drop with nowhere to record what it had applied;
+       * restoring the generation and replaying the drop again reaches the
+       * same state, which is still a state nothing records. So the next
+       * boot reads the same floor, draws the same conclusion, and rewrites
+       * every live file from the generation once more.
+       *
+       * That is not merely wasteful. It is what keeps the instance
+       * BOOTABLE: replay resumes at the base every time, and the entries
+       * above it name a database the drop removed -- so a boot that
+       * skipped the restore would halt exactly as it did before the fix.
+       * Correctness is not at risk (each boot converges, asserted below);
+       * startup time proportional to the whole dataset is.
+       *
+       * ONE ORDINARY WRITE ends it, because a write records its index in
+       * the collection it touches, and that is above the base -- no
+       * snapshot required. A busy instance therefore heals itself within
+       * a request; an idle one restores on every boot until somebody
+       * writes to it. Both halves are asserted here so that a change to
+       * either is visible: if a later fix records the applied index at
+       * instance level, the SECOND expectation below is the one that
+       * turns red, and it should.
+       */
+      const port = nextPort();
+      const st = unusable();
+
+      const first = await boot(port, st.dir);
+      try {
+        expect(first.serving, 'it did not start:\n    ' + tail(first)).toBe(true);
+        expect(first.restored, 'nothing was reconciled, so the boots below' +
+          ' prove nothing:\n    ' + tail(first)).toBe(true);
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        expect(await c.listDatabases()).not.toContain(DOOMED);
+        await c.close();
+      } finally {
+        first.proc.kill();
+        await waitExit(first.proc);
+      }
+
+      /* Again, over files that were just reconciled and converged. */
+      const second = await boot(port, st.dir);
+      try {
+        expect(second.serving, 'it did not start again:\n    ' + tail(second))
+          .toBe(true);
+        expect(second.restored, 'THE COST IS GONE: it did not reconcile a' +
+          ' second time. If that is deliberate -- an applied index the whole' +
+          ' instance records, rather than one per surviving collection -- this' +
+          ' expectation is the one to delete:\n    ' + tail(second)).toBe(true);
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        expect(await c.listDatabases(),
+          'it reconciled twice and diverged the second time').not.toContain(DOOMED);
+        expect(await c.db(SAFE).collection('keep').countDocuments({})).toBe(KEPT);
+        /* The write that ends it. */
+        await c.db(SAFE).collection('keep').insertOne({ n: -1, pad: 'z' });
+        await c.close();
+      } finally {
+        second.proc.kill();
+        await waitExit(second.proc);
+      }
+
+      const third = await boot(port, st.dir);
+      try {
+        expect(third.serving, 'it did not start after the write:\n    ' +
+          tail(third)).toBe(true);
+        expect(third.restored, 'one write above the base did not stop it' +
+          ' reconciling, so nothing ends this:\n    ' + tail(third)).toBe(false);
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        expect(await c.db(SAFE).collection('keep').countDocuments({}))
+          .toBe(KEPT + 1);
+        expect(await c.listDatabases()).not.toContain(DOOMED);
+        await c.close();
+      } finally {
+        third.proc.kill();
+        await waitExit(third.proc);
+      }
+    }, 180000);
+  });
+
+  /*
    * ---- routing a long read ------------------------------------------------
    *
    * A read that scans a large collection costs every other client on the

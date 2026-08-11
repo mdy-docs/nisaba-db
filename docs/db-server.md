@@ -1171,6 +1171,25 @@ is what makes the serial engine a property that can be handed back.
   snapshot *is* the state at the base — true of the snapshot, and asserted of
   the live files) remains only as the backstop for an instance with no
   generation at the base at all.
+
+  **The restore is not atomic, and does not clear its own trigger.** It
+  removes every live file and then copies the generation's back, so a crash
+  inside it leaves a directory that is neither state; the next boot reads the
+  same floor, reaches the same conclusion, and does it again, which is what
+  makes an interrupted restore recoverable rather than fatal — asserted at a
+  spread of kill offsets across the copy in `db.server.test.js`'s
+  *reconciling a generation*. The same property has a cost in the ordinary
+  case: converging by restore-then-replay reaches a state that *still* has
+  nothing recording the applied index, so the member reconciles on **every**
+  boot — rewriting its whole dataset each time — and, because replay would
+  otherwise resume at the base and meet the same unapplyable entry, that
+  repetition is what keeps it bootable rather than mere waste. **One ordinary
+  write ends it**, since a write records its index in the collection it
+  touches and that is above the base; no snapshot needed. A busy instance
+  therefore heals itself within a request, an idle one restores until somebody
+  writes to it. Recording an applied index for the whole instance would fix it
+  properly and is not done: the honest place for it is the one thing a
+  `dropDatabase` cannot delete, and an instance has no catalog of its own.
 - **Nothing is dropped in silence.** Every refusal is a distinct code
   with `dc_strerror` text.
 

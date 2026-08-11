@@ -65,7 +65,21 @@ typedef enum {
      * host has to route by decoding the message itself, which is the
      * split this header exists to remove. C classifies it; the election
      * it triggers is still the host's, until phase 7c. */
-    RAFT_MSG_TIMEOUT_NOW      = 5
+    RAFT_MSG_TIMEOUT_NOW      = 5,
+    /*
+     * "Who are you, and do you already exist?" -- the one message here
+     * that changes nothing and needs no leader.
+     *
+     * A process holding a --peer list and an EMPTY directory cannot tell
+     * from its own disk whether it is a founding member of a new cluster
+     * or a member of an old one whose disk is gone; the evidence a wipe
+     * destroys is exactly the evidence it would need. The distinguishing
+     * fact lives on the OTHER members: whether any of them has history.
+     * That is durable, so it is answerable by any member out of its own
+     * files, leader or follower, mid-election or not -- which is the
+     * whole reason this is not a join and not a vote.
+     */
+    RAFT_MSG_IDENTITY         = 6
 } raft_msg_kind;
 
 /* Which kind is this? RAFT_ERR_MESSAGE if it is none of them. Lets a
@@ -194,6 +208,42 @@ int rmsg_build_leave(uint64_t id, dbuf *out);
  * `leader_id` is the sender, which is the transferring leader.
  */
 int rmsg_build_timeout_now(uint64_t term, uint64_t leader_id, dbuf *out);
+
+/*
+ * An identity question, and the answer to one. `asking_id` is the id the
+ * caller intends to be, so the answer can say whether the group already
+ * has it -- the caller cannot check that itself, having no member set.
+ *
+ * The reply is every durable fact that bears on "does this group already
+ * exist": `baseIndex`/`lastIndex` are the log's own bounds, `group` is
+ * the cluster's identity (0 when it has none -- an older member, or one
+ * that has never been given one), and `isMember` says whether the asking
+ * id is in the member set this node has adopted. `members` is that set,
+ * spliced in as the node normalized it, so a refusal can print who the
+ * cluster thinks it is made of.
+ *
+ * Nothing here is a decision. What to do about an established group is
+ * the host's to make and server/replica.c makes it.
+ */
+int rmsg_build_identity(uint64_t asking_id, dbuf *out);
+/* The id the asker intends to be; 0 when it named none. */
+int rmsg_identity_asking(const uint8_t *msg, uint32_t len, uint64_t *out);
+int rmsg_build_identity_reply(uint64_t group, uint64_t base_index,
+                              uint64_t last_index, uint64_t term, int is_member,
+                              const uint8_t *members, uint32_t members_len,
+                              dbuf *out);
+
+/* The answer, read back. `members` points into `msg` and dies with it. */
+typedef struct {
+    uint64_t group;
+    uint64_t base_index;
+    uint64_t last_index;
+    uint64_t term;
+    int      is_member;
+    const uint8_t *members;
+    uint32_t members_len;
+} rmsg_identity;
+int rmsg_identity_read(const uint8_t *msg, uint32_t len, rmsg_identity *out);
 
 /*
  * ...and that answer, read back. Every span points into `msg` and dies

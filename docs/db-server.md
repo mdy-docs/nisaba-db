@@ -1204,6 +1204,49 @@ is what makes the serial engine a property that can be handed back.
   writes to it. Recording an applied index for the whole instance would fix it
   properly and is not done: the honest place for it is the one thing a
   `dropDatabase` cannot delete, and an instance has no catalog of its own.
+- **A member with no history does not found a cluster that already
+  exists.** Emptying a member's directory is not a crash Raft tolerates: a
+  crash keeps the log, the term and the vote, and a wipe takes all three and
+  brings the member back wearing the same id with no memory of what it
+  promised — so it can vote twice in one term, and vote for a candidate whose
+  log is missing entries its own acknowledgement helped commit. Measured both
+  ways by `soak:install` once it began killing leaders: two wiped members
+  electing each other and telling the member that held 7,319 committed
+  entries to adopt theirs, and — with a *single* wipe — a leader answering a
+  linearizable read with 768 of the 784 documents it had just acknowledged.
+
+  A member cannot tell the two cases apart from its own disk, because a wipe
+  destroys exactly the evidence it would need. So it **asks**: the peer wire
+  carries a read-only `identity` message that any member answers out of its
+  own files, in any role, mid-election or not — which is why it is neither a
+  join nor a vote, both of which need a leader, and a leaderless moment is
+  when this matters most. `--peer` with an empty directory is a claim to be
+  founding a cluster; a peer with a log falsifies it, and the member
+  **refuses to start** rather than voting its way into somebody's data loss.
+  Two of three is still a quorum, so the cluster is unharmed by the refusal.
+  The remedy is in the message: replace a member that has lost its disk by
+  **joining a new one under a new id**, never by restarting the old id on an
+  empty directory. Only the bootstrap path refuses — `--join` is how a
+  genuinely new member legitimately arrives with an empty log.
+
+  Silence is not an answer, and that is the check's honest limit: a peer that
+  does not reply proves nothing, so a cold boot, where nobody is up yet,
+  proceeds exactly as it always did. Refusing on silence would mean no
+  cluster could ever be started.
+- **`--group N` says which cluster a directory belongs to**, and a member
+  refuses to start if a peer reports a different one, or if this directory
+  was written under a different one. It is **given, not derived**: the first
+  attempt derived a fingerprint from the member set, on the reasoning that
+  every founding member would compute the same value from the same argv with
+  no consensus needed — and the suite caught two members of *one* cluster
+  refusing each other. Addresses differ in spelling between a member's own
+  record and the `--peer` entry another member was given, and an id set of
+  `{1,2,3}` is not unique across clusters anyway, so a derived value can be
+  identical across members or unique across clusters and never both. Whoever
+  places the cluster is the only party that knows, which for one cluster per
+  tenant is a number the control plane already has. Omit it and there is no
+  identity to check — which is what every existing deployment upgrades into,
+  and the history check above needs no identity at all.
 - **Nothing is dropped in silence.** Every refusal is a distinct code
   with `dc_strerror` text.
 

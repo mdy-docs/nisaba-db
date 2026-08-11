@@ -1,5 +1,7 @@
 /* server/replica.c — see replica.h. */
 #include "replica.h"
+
+#include "group.h"
 #include "readers.h"   /* the threads that perform long reads */
 
 #include "raft_node.h"
@@ -1390,10 +1392,184 @@ void replica_timing_resolve(replica_timing *tm) {
     if (tm->heartbeat_ms <= 0) tm->heartbeat_ms = RN_DEFAULT_HEARTBEAT;
 }
 
+/*
+ * ---- WHOSE CLUSTER IS THIS -----------------------------------------------
+ *
+ * Two questions, asked once, at startup, over the peer wire's read-only
+ * identity message (raft_msg.h's RAFT_MSG_IDENTITY). Both have to be
+ * answered before this member votes, because a vote is a promise and the
+ * whole problem is a member making one it has no business making.
+ *
+ *   DOES THIS CLUSTER ALREADY EXIST?  A member with a --peer list and an
+ *   EMPTY log is claiming to be founding one. That claim is falsifiable:
+ *   if any listed peer has history, the cluster is already here and this
+ *   directory is not a founder's. Emptying a member's directory is not a
+ *   crash Raft tolerates -- a crash keeps the log, the term and the vote;
+ *   a wipe takes all three and brings the member back wearing the same id
+ *   with no memory of what it promised, so it votes twice in one term and
+ *   can vote for a candidate whose log is missing entries its own
+ *   acknowledgement helped commit. Measured, before this existed: two
+ *   wiped members electing each other and telling the member that held
+ *   7,319 committed entries to adopt theirs, and -- with a single wipe --
+ *   a leader answering a linearizable read with 768 of the 784 documents
+ *   it had just acknowledged. So it refuses to start and says what to do
+ *   instead, which is to join a NEW id rather than resurrect an old one.
+ *
+ *   AND IS IT THE ONE I BELONG TO?  Group ids that both exist and differ
+ *   mean a directory has been carried to the wrong deployment, or a
+ *   --peer list points at somebody else's cluster. Also a refusal: the
+ *   alternative is one cluster's entries replicated over another's files.
+ *
+ * WHY NOT A JOIN, AND WHY NOT A VOTE. Both need a leader, and a
+ * leaderless moment is not an answer to "are you there" -- it is the
+ * moment this check matters most. The identity message is answered by any
+ * member in any role out of its own files, so an election in progress
+ * changes nothing about it.
+ *
+ * ONLY THE BOOTSTRAP PATH. A --join is a different claim ("let me in"),
+ * and it is the legitimate way for a genuinely new member to arrive with
+ * an empty log; refusing that would make joining impossible. A joiner
+ * that reuses a dead member's id is a separate footgun, and the message
+ * below names the remedy for it.
+ *
+ * UNREACHABLE IS NOT AN ANSWER, and that is this check's honest limit. A
+ * peer that does not reply, or that is too old to know the message,
+ * proves nothing -- so a cold boot, where nobody is up yet, proceeds
+ * exactly as it always did. That is the direction the ambiguity has to
+ * fall: refusing on silence would mean no cluster could ever be started.
+ */
+#define GROUP_ASK_MS 1500
+
+/* replica.h defines REPLICA_REFUSED; this is only where it is produced. */
+
+typedef struct {
+    int      any_history;    /* a peer has entries: the cluster is here   */
+    int      claims_us;      /* ...and our id is in its member set        */
+    uint64_t theirs;         /* the first non-zero group id seen          */
+    uint64_t from;           /* the peer that reported `theirs`           */
+    uint64_t history_from;   /* the peer that reported history            */
+} group_survey;
+
+static void ask_identity(replica *r, group_survey *s) {
+    dbuf q = {0};
+    if (rmsg_build_identity(r->self_id, &q)) { dbuf_free(&q); return; }
+    for (uint32_t i = 0; i < peers_count(r->px); i++) {
+        dbuf reply = {0};
+        char err[160];
+        err[0] = '\0';
+        int rc = peers_call(peers_host_at(r->px, i), peers_port_at(r->px, i),
+                            q.data, (uint32_t)q.len, GROUP_ASK_MS, &reply,
+                            err, sizeof err);
+        if (rc == 0) {
+            rmsg_identity id;
+            if (rmsg_identity_read(reply.data, (uint32_t)reply.len, &id) == BJ_OK) {
+                if (id.last_index > 0 || id.base_index > 0) {
+                    if (!s->any_history) s->history_from = peers_id_at(r->px, i);
+                    s->any_history = 1;
+                    if (id.is_member) s->claims_us = 1;
+                }
+                if (id.group && !s->theirs) {
+                    s->theirs = id.group;
+                    s->from = peers_id_at(r->px, i);
+                }
+            }
+        }
+        dbuf_free(&reply);
+        /* Enough. One peer with history falsifies a claim to be founding
+         * this cluster, and one group id is enough to compare against --
+         * so the common case is a single round trip, and the timeout is
+         * only paid for peers that are genuinely unreachable. */
+        if (s->any_history || s->theirs) break;
+    }
+    dbuf_free(&q);
+}
+
+static int settle_group(replica *r, int joined, uint64_t given) {
+    uint64_t onfile = 0;
+    int e = group_load(r->ns, &onfile);
+    if (e) return e;
+
+    /*
+     * A directory told it belongs to a cluster it does not. Caught before
+     * anything is asked of anybody: the operator has changed the answer
+     * to a question this directory already answered, and one of the two is
+     * a mistake nobody else can adjudicate.
+     */
+    if (given && onfile && given != onfile) {
+        fprintf(stderr,
+            "nisaba: refusing to start: --group says %llu and this directory"
+            " was written by cluster %llu.\n"
+            "  A directory reused between clusters, or the wrong --group."
+            " Neither is safe to guess at.\n",
+            (unsigned long long)given, (unsigned long long)onfile);
+        fflush(stderr);
+        return REPLICA_REFUSED;
+    }
+    const uint64_t mine = given ? given : onfile;
+
+    const int blank = elog_last_index(r->log) == 0 && elog_base_index(r->log) == 0;
+    const int have_peers = r->px && peers_count(r->px) > 0;
+
+    /*
+     * ASKED WHENEVER THERE IS ANYBODY TO ASK, including when this
+     * directory already knows which cluster it belongs to -- that is the
+     * case the mismatch check exists for, and an earlier version skipped
+     * it precisely then, so a directory pointed at another cluster sailed
+     * through. The cost is one round trip, since the survey stops at the
+     * first decisive answer.
+     */
+    group_survey s = {0};
+    if (have_peers) ask_identity(r, &s);
+
+    if (blank && !joined && s.any_history) {
+        fprintf(stderr,
+            "nisaba: refusing to start: this directory is empty, but member %llu"
+            " already has a log -- so this cluster exists and this is not the"
+            " member that founded it.\n"
+            "  --peer with an empty directory says \"I am founding a new"
+            " cluster\", and starting anyway would let this node vote in terms it"
+            " has already voted in, and elect a log that is missing committed"
+            " entries.\n"
+            "  %s\n"
+            "  To replace a member that has lost its disk, JOIN A NEW ONE:"
+            " --raft <a fresh id> --join HOST:PORT. To start a new cluster here,"
+            " point --peer at members whose directories are all empty.\n",
+            (unsigned long long)s.history_from,
+            s.claims_us
+                ? "That member's set already contains this node's id, so this is"
+                  " a member whose directory was emptied."
+                : "That member's set does not contain this node's id.");
+        fflush(stderr);
+        return REPLICA_REFUSED;
+    }
+
+    if (mine && s.theirs && mine != s.theirs) {
+        fprintf(stderr,
+            "nisaba: refusing to start: this directory belongs to cluster %llu"
+            " and member %llu belongs to cluster %llu.\n"
+            "  A --peer list pointing at somebody else's cluster, or a directory"
+            " carried to the wrong deployment. Nothing is replicated over"
+            " either of them.\n",
+            (unsigned long long)mine, (unsigned long long)s.from,
+            (unsigned long long)s.theirs);
+        fflush(stderr);
+        return REPLICA_REFUSED;
+    }
+
+    /* Written down on the first boot that was given one, so that a later
+     * boot with the wrong --group is caught rather than believed. */
+    if (given && !onfile) {
+        e = group_store(r->ns, given);
+        if (e) return e;
+    }
+    rn_set_group(r->node, mine);
+    return BJ_OK;
+}
+
 int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
                  const uint8_t *members, uint32_t members_len,
                  uint64_t now, root_state *rt, uint64_t snapshot_entries,
-                 const replica_timing *tm, replica **out) {
+                 uint64_t group, const replica_timing *tm, replica **out) {
     if (!ns || !inst || !out || !self_id) return BJ_ERR_STATE;
     if (px && peers_count(px) > rn_max_peers()) return RAFT_ERR_CAPACITY;
     *out = NULL;
@@ -1500,6 +1676,11 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
      */
     e = adopt_from_log(r);
     if (!e) e = sync_peers(r);      /* the bootstrap set's addresses, if the log had none */
+    if (e) { replica_close(r); return e; }
+
+    /* Whose cluster this is, and whether it already exists somewhere
+     * else. Before anything is served, and before a vote can be cast. */
+    e = settle_group(r, members != NULL, group);
     if (e) { replica_close(r); return e; }
 
     /*

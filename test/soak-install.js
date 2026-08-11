@@ -826,10 +826,16 @@ const main = async () => {
        * installs. So the wipes bought a variation of the receiving side and
        * cost the property the content oracle rests on.
        *
-       * `--wipeShare 0.25` restores the old behaviour for anyone studying
-       * that failure deliberately. The right way to replace a member that
-       * has lost its disk is to JOIN A NEW ONE, under a new id, which is
-       * what the server's join path is for.
+       * AND THE SERVER NOW REFUSES ONE. A member with a --peer list and an
+       * empty directory asks its peers whether the cluster already exists
+       * and declines to start if it does (server/replica.c's settle_group,
+       * covered end to end in db.server.test.js's "whose cluster is
+       * this"), so `--wipeShare` above zero no longer reproduces the data
+       * loss -- it reproduces the refusal, which takes that member out of
+       * the cluster and fails the run. Kept as a way to watch that happen.
+       * The right way to replace a member that has lost its disk is to
+       * JOIN A NEW ONE, under a new id, which is what the server's join
+       * path is for.
        */
       const wipe = rand() < opts.wipeShare;
       if (wipe) stats.wipes++;

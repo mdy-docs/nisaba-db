@@ -244,10 +244,22 @@ int replica_wait_reads_idle(replica *r, replica_drain_why why);
  * of however long the machine has been up -- which elects it instantly
  * and hides the fact that the timer was never running.
  */
+/*
+ * replica_open refused to start this member and has already said why, at
+ * length, on stderr: the caller must not print a diagnosis of its own
+ * over it. Every other failure is an ordinary error code.
+ *
+ * The refusals are both about IDENTITY rather than about files: a
+ * directory with no history claiming to found a cluster that already
+ * exists, and a directory whose group id differs from the one its peers
+ * report. See the block comment on settle_group.
+ */
+#define REPLICA_REFUSED (-1000)
+
 int  replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
                   const uint8_t *members, uint32_t members_len,
                   uint64_t now, root_state *rt, uint64_t snapshot_entries,
-                  const replica_timing *tm, replica **out);
+                  uint64_t group, const replica_timing *tm, replica **out);
 void replica_close(replica *r);
 
 /*

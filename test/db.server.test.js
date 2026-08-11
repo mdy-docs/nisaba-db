@@ -2304,6 +2304,287 @@ for (const engine of ENGINES) {
     }, 180000);
   });
 
+
+  /*
+   * ---- whose cluster is this ----------------------------------------------
+   *
+   * EMPTYING A MEMBER'S DIRECTORY IS NOT A CRASH RAFT TOLERATES, and until
+   * the check these tests cover, nothing said so.
+   *
+   * A crash keeps the log, the term and the vote. A wipe takes all three
+   * and brings the member back wearing the same id with no memory of what
+   * it promised -- so it can vote twice in one term, and vote for a
+   * candidate whose log is missing entries its own acknowledgement helped
+   * commit. Both halves were measured by test/soak-install.js once it
+   * started killing leaders: two wiped members electing each other and
+   * telling the member that held 7,319 committed entries to adopt theirs,
+   * and -- with a SINGLE wipe -- a leader answering a linearizable read
+   * with 768 of the 784 documents it had just acknowledged.
+   *
+   * A member cannot tell which case it is in from its own disk, because a
+   * wipe destroys exactly the evidence it would need. So it asks: the peer
+   * wire carries a read-only identity message that any member answers out
+   * of its own files, in any role, mid-election or not -- which is the
+   * whole reason it is not a join and not a vote.
+   */
+  describe.skipIf(!enabled)(
+      `nisaba-server: whose cluster is this (${engine.name})`, () => {
+    const CLOCK = ['--election-timeout', '600:1200', '--heartbeat', '150'];
+    /*
+     * ONE SLOT, ALLOCATED AT DECLARATION, like every other suite here --
+     * and the six clusters below packed into it 80 apart. nextPort() is a
+     * global counter with a hard end, so calling it per TEST rather than
+     * per suite walks off that end and the failure lands on whichever
+     * suite happens to be declared last: "port slots exhausted (65520)",
+     * which is what this did until it did not.
+     */
+    const SLOT = nextPort();
+    const at = (k) => SLOT + k * 80;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const waitExit = (p) => new Promise((r) => {
+      if (p.exitCode !== null || p.signalCode !== null) r();
+      else p.once('exit', r);
+    });
+
+    /** Three members that know each other by argv -- a bootstrap set. */
+    const trio = (base, group) => [1, 2, 3].map((id) => ({
+      id, group, port: base + id - 1, raftPort: base + 10 + id - 1,
+      dir: null, proc: null
+    }));
+    const argsFor = (m, all) => [
+      '--raft', String(m.id), '--raft-port', String(m.raftPort), ...CLOCK,
+      ...(m.group ? ['--group', String(m.group)] : []),
+      ...all.filter((o) => o.id !== m.id)
+        .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+    ];
+    const boot = async (m, all) => {
+      const s = await startServer(engine, m.port, argsFor(m, all), -1, m.dir);
+      m.proc = s.proc;
+      m.dir = s.dir;
+      return m;
+    };
+    const stop = async (m) => {
+      if (!m.proc) return;
+      m.proc.kill();
+      await waitExit(m.proc);
+      m.proc = null;
+    };
+    const leaderOf = async (all) => {
+      for (let i = 0; i < 120; i++) {
+        for (const m of all) {
+          if (!m.proc) continue;
+          try {
+            const c = await connectServer(m.port, { keepAliveMs: 0 });
+            const role = (await c.ping()).role;
+            await c.close();
+            if (role === 'leader') return m;
+          } catch { /* not up yet */ }
+        }
+        await sleep(100);
+      }
+      return null;
+    };
+    /* The group file, as the member wrote it. Read with the JS decoder --
+     * a third implementation looking at C's bytes, which is the property
+     * this repository rests on. */
+    const groupOf = (m) => {
+      const at = path.join(m.dir, '__group__.bj');
+      if (!fs.existsSync(at)) return null;
+      return Number(decode(fs.readFileSync(at)).group);
+    };
+    /* Start and wait for whichever comes first: serving, or an exit. A
+     * refused member never says "serving" -- it explains and leaves. */
+    const tryBoot = async (m, all) => {
+      const [cmd, args, opts] = engine.argv(m.dir, m.port, argsFor(m, all));
+      const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+      let text = '';
+      let gone = false;
+      proc.stderr.on('data', (d) => { text += String(d); });
+      proc.once('exit', () => { gone = true; });
+      for (let i = 0; i < 30000 && !gone; i++) {
+        if (/serving/.test(text)) break;
+        await sleep(1);
+      }
+      await sleep(150);
+      return { proc, said: () => text, serving: /serving/.test(text), gone };
+    };
+
+    it('writes down the group it was given, and starts without one', async () => {
+      /*
+       * GIVEN, NOT DERIVED, and the first version of this test asserted the
+       * opposite: that three members handed the same --peer list would each
+       * fingerprint the member set and arrive at the same number. They do
+       * not, and the suite caught it -- two members of ONE cluster refused
+       * each other. Addresses differ in spelling between a member's own
+       * record and the --peer entry another member was given, and an id set
+       * of {1,2,3} is not unique across clusters anyway, so a derived value
+       * can be identical across members or unique across clusters and never
+       * both. Whoever places the cluster is the only party that knows.
+       *
+       * So: it is written down on the first boot that was given one, and it
+       * survives a restart -- which is what makes a later boot with the
+       * wrong --group a refusal rather than a silent overwrite.
+       */
+      const GROUP = 20260811;
+      const all = trio(at(0), GROUP);
+      try {
+        for (const m of all) await boot(m, all);
+        expect(await leaderOf(all), 'no leader emerged').toBeTruthy();
+        expect(all.map(groupOf),
+          'every member should have written down the group it was given')
+          .toEqual([GROUP, GROUP, GROUP]);
+
+        await stop(all[2]);
+        await boot(all[2], all);
+        expect(groupOf(all[2]), 'the group id did not survive a restart')
+          .toBe(GROUP);
+      } finally {
+        for (const m of all) await stop(m);
+      }
+
+      /* And a cluster given none still runs: there is nothing to check,
+       * which is the state every existing deployment upgrades into. */
+      const plain = trio(at(1), 0);
+      try {
+        for (const m of plain) await boot(m, plain);
+        expect(await leaderOf(plain), 'a cluster with no --group did not elect')
+          .toBeTruthy();
+        expect(plain.map(groupOf),
+          'a member given no --group wrote one anyway').toEqual([null, null, null]);
+      } finally {
+        for (const m of plain) await stop(m);
+      }
+    }, 180000);
+
+    it('refuses a --group that contradicts the one this directory was given',
+       async () => {
+      /* No peers involved: the directory itself is the other party, and it
+       * has already answered this question. */
+      const all = trio(at(2), 4242);
+      try {
+        for (const m of all) await boot(m, all);
+        expect(await leaderOf(all), 'no leader emerged').toBeTruthy();
+        const victim = all[2];
+        await stop(victim);
+        const said = await tryBoot({ ...victim, group: 9999 }, all);
+        try {
+          expect(said.serving, 'it started under a different group:\n    ' +
+            said.said()).toBe(false);
+          expect(said.said()).toMatch(/--group says 9999/);
+          expect(said.said()).toMatch(/written by cluster 4242/);
+        } finally {
+          said.proc.kill();
+          await waitExit(said.proc);
+        }
+      } finally {
+        for (const m of all) await stop(m);
+      }
+    }, 180000);
+
+    it('refuses to start on an emptied directory, and says what to do instead',
+       async () => {
+      /*
+       * THE MEASURED FAILURE, PREVENTED. --peer with an empty directory is
+       * a claim: "I am founding a new cluster". It is falsifiable, and a
+       * peer with a log falsifies it. The member that would have voted its
+       * way into losing somebody's committed entries now refuses to start
+       * at all, which is the only safe answer -- a member that does not
+       * run cannot vote, and two of three is still a quorum.
+       */
+      const all = trio(at(3), 777);
+      try {
+        for (const m of all) await boot(m, all);
+        const lead = await leaderOf(all);
+        expect(lead, 'no leader emerged').toBeTruthy();
+
+        /* Something committed, so the survivors have history to report. */
+        const c = await connectServer(lead.port, { keepAliveMs: 0 });
+        await c.db(DB).collection('kept').insertMany(
+          Array.from({ length: 20 }, (_, k) => ({ n: k })));
+        expect(await c.db(DB).collection('kept').countDocuments({})).toBe(20);
+        await c.close();
+
+        /* The re-provisioning mistake: same id, same argv, empty disk. */
+        const victim = all.find((m) => m !== lead);
+        await stop(victim);
+        fs.rmSync(victim.dir, { recursive: true, force: true });
+        fs.mkdirSync(victim.dir, { recursive: true });
+
+        const again = await tryBoot(victim, all);
+        try {
+          expect(again.serving, 'it started anyway, on an empty directory,' +
+            ' beside a cluster that already exists:\n    ' + again.said())
+            .toBe(false);
+          /* It has to say WHICH member falsified the claim, that this looks
+           * like a wiped member rather than a new one, and the remedy. A
+           * refusal nobody can act on is a hang with extra steps. */
+          expect(again.said()).toMatch(/refusing to start/);
+          expect(again.said()).toMatch(/already has a log/);
+          expect(again.said()).toMatch(/contains this node's id/);
+          expect(again.said()).toMatch(/--join/);
+        } finally {
+          again.proc.kill();
+          await waitExit(again.proc);
+        }
+
+        /* AND THE CLUSTER IS UNHARMED, which is the whole point: the two
+         * members that still have the data keep serving it. */
+        const back = await leaderOf(all.filter((m) => m !== victim));
+        expect(back, 'the survivors lost their leader').toBeTruthy();
+        const c2 = await connectServer(back.port, { keepAliveMs: 0 });
+        expect(await c2.db(DB).collection('kept').countDocuments({}),
+          'the data the refusal was protecting is gone').toBe(20);
+        await c2.db(DB).collection('kept').insertOne({ n: 99 });
+        await c2.close();
+      } finally {
+        for (const m of all) await stop(m);
+      }
+    }, 180000);
+
+    it('refuses a directory that belongs to another cluster', async () => {
+      /*
+       * THE OTHER WAY ROUND: a directory with plenty of history, pointed at
+       * peers who have never heard of it. Not a wipe -- a --peer list
+       * naming somebody else's cluster, or a directory carried to the wrong
+       * deployment. Starting would replicate one cluster's entries over
+       * another's files, so this refuses too, and the group id is what
+       * makes it detectable rather than merely suspicious.
+       */
+      const one = trio(at(4), 1001);
+      const two = trio(at(5), 2002);
+      try {
+        for (const m of one) await boot(m, one);
+        const leadOne = await leaderOf(one);
+        expect(leadOne, 'cluster one elected nobody').toBeTruthy();
+        const c = await connectServer(leadOne.port, { keepAliveMs: 0 });
+        await c.db(DB).collection('mine').insertOne({ n: 1 });
+        await c.close();
+
+        for (const m of two) await boot(m, two);
+        expect(await leaderOf(two), 'cluster two elected nobody').toBeTruthy();
+
+        expect(groupOf(one[0]), 'cluster one did not write its group id').toBe(1001);
+        expect(groupOf(two[0]), 'cluster two did not write its group id').toBe(2002);
+
+        /* Cluster one's member 1, told that cluster two is its group. */
+        const stray = one[0];
+        await stop(stray);
+        const impostor = { ...stray, port: stray.port, dir: stray.dir };
+        const said = await tryBoot(impostor, [impostor, two[1], two[2]]);
+        try {
+          expect(said.serving, 'it joined a cluster it does not belong to:\n    ' +
+            said.said()).toBe(false);
+          expect(said.said()).toMatch(/refusing to start/);
+          expect(said.said()).toMatch(/belongs to cluster/);
+        } finally {
+          said.proc.kill();
+          await waitExit(said.proc);
+        }
+      } finally {
+        for (const m of [...one, ...two]) await stop(m);
+      }
+    }, 240000);
+  });
   /*
    * ---- routing a long read ------------------------------------------------
    *

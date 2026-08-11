@@ -121,6 +121,10 @@ typedef struct {
 
 struct raft_node {
     uint64_t self_id;
+    /* The cluster's durable identity, or 0 for a node that has never been
+     * given one. Reported, never interpreted here: what a mismatch means
+     * is the host's business (server/replica.c). */
+    uint64_t group;
     elog    *log;
 
     /*
@@ -809,6 +813,9 @@ static int start_election(raft_node *n, int pre_vote, double random01) {
 }
 
 /* ---- serving a snapshot ------------------------------------------------- */
+
+void rn_set_group(raft_node *n, uint64_t group) { if (n) n->group = group; }
+uint64_t rn_group(const raft_node *n) { return n ? n->group : 0; }
 
 void rn_set_ns(raft_node *n, bj_ns *ns)          { if (n) n->ns = ns; }
 bj_ns *rn_ns(const raft_node *n)                 { return n ? n->ns : NULL; }
@@ -2024,6 +2031,42 @@ static int defer(raft_node *n, uint64_t peer, uint64_t corr) {
 }
 
 /*
+ * An identity question: every durable fact that bears on "does this
+ * cluster already exist", and nothing else.
+ *
+ * ANSWERED BY ANY MEMBER, IN ANY ROLE, AT ANY TIME. That is the point of
+ * it, and the reason it is not a join and not a vote: what the asker
+ * needs to know is whether a group is already here, and a leaderless
+ * moment is not an answer to that question. Every field below comes from
+ * this node's own log or its adopted set, so an election in progress
+ * changes none of them.
+ *
+ * It touches nothing -- no term, no vote, no timer. A node being asked
+ * who it is has not been contacted by a leader and must not act as
+ * though it had.
+ */
+static int handle_identity(raft_node *n, uint64_t corr, const uint8_t *msg,
+                           uint32_t len) {
+    uint64_t asking = 0;
+    if (rmsg_identity_asking(msg, len, &asking)) return RAFT_ERR_MESSAGE;
+    /* Self counts: a member set of one is still a member set, and a node
+     * asking about its own id wants to know if the cluster has it. */
+    const int is_member = asking != 0 &&
+                          (asking == n->self_id || peer_of(n, asking) != NULL);
+    uint32_t mlen = 0;
+    const uint8_t *members = members_span(n, &mlen);
+    dbuf r = {0};
+    int e = rmsg_build_identity_reply(n->group, elog_base_index(n->log),
+                                      elog_last_index(n->log),
+                                      elog_current_term(n->log), is_member,
+                                      members, mlen, &r);
+    if (e) { dbuf_free(&r); return e; }
+    /* On the correlation id alone, like a join: whoever is asking may
+     * have no id in this cluster at all. */
+    return reply_with(n, 0, corr, &r);
+}
+
+/*
  * A join: the applicant's record, upserted into the member set.
  *
  * A NEW member always enters as a learner, whatever it asked for --
@@ -2190,6 +2233,9 @@ int rn_handle(raft_node *n, uint64_t corr,
      */
     if (kind == RAFT_MSG_JOIN)  return handle_join(n, corr, msg, len);
     if (kind == RAFT_MSG_LEAVE) return handle_leave(n, corr, msg, len);
+    /* Also from outside, and from a process that may never become a
+     * member at all: it is asking whether it should even start. */
+    if (kind == RAFT_MSG_IDENTITY) return handle_identity(n, corr, msg, len);
 
     uint64_t from = 0;
     e = rmsg_sender(msg, len, &from);

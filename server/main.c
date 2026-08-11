@@ -125,6 +125,7 @@
 
 #include "db_session.h"
 #include "db_instance.h"
+#include "group.h"
 #include "replica.h"
 #include "readers.h"   /* SERVER_HAS_READ_THREADS */
 #include "root.h"
@@ -1219,7 +1220,7 @@ static void usage(const char *me) {
             "           [--raft-port N] [--raft-bind HOST] [--raft-advertise HOST]\n"
             "           [--peer ID@HOST:PORT ...]\n"
             "           [--join HOST:PORT ...] [--leave NODE_ID]\n"
-            "           [--snapshot-entries N]\n"
+            "           [--snapshot-entries N] [--group N]\n"
             "           [--election-timeout MIN[:MAX]] [--heartbeat MS]\n"
             "           [--max-batch BYTES]\n"
             "           [--read-threads N] [--read-offload-min DOCS]\n"
@@ -1227,6 +1228,12 @@ static void usage(const char *me) {
             "  --bind: where the client wire listens (default 127.0.0.1;\n"
             "         widen it consciously -- there is no auth on this wire)\n"
             "  --raft replicates every write through a log before applying it\n"
+            "  --group: which cluster this member belongs to. Every member of one\n"
+            "         cluster is given the same number and different clusters get\n"
+            "         different ones; a member refuses to start if a peer reports\n"
+            "         another, or if this directory was written by another. It is\n"
+            "         given rather than derived because a member cannot work it out\n"
+            "         and agree with the others about it (server/group.h)\n"
             "  --snapshot-entries: applied entries between local snapshots, which\n"
             "         bound the log (default 8192; 0 never compacts)\n"
             "  --raft-port is where the other members reach this one\n"
@@ -1365,6 +1372,10 @@ int main(int argc, char **argv) {
      * longer log to replay at startup.
      */
     long snapshot_entries = 8192;
+    /* Which cluster this member belongs to (server/group.h). Given by
+     * whoever places the cluster, because it is the only party that knows
+     * -- a member cannot derive it and agree with the others about it. */
+    long long group = 0;
     /* 0 = not a replica: every write is applied where it lands, which is
      * what this server has always done and what it still does by
      * default. A node id turns the log on. */
@@ -1417,6 +1428,14 @@ int main(int argc, char **argv) {
             max_clients = atoi(argv[++i]);
             if (max_clients < 1 || max_clients > MAX_CLIENTS) {
                 fprintf(stderr, "--max-clients must be between 1 and %d\n", MAX_CLIENTS);
+                return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--group") == 0 && i + 1 < argc) {
+            group = atoll(argv[++i]);
+            if (group <= 0 || (unsigned long long)group > GROUP_MAX) {
+                fprintf(stderr, "--group must be between 1 and %llu\n",
+                        (unsigned long long)GROUP_MAX);
                 return 2;
             }
         }
@@ -1812,9 +1831,14 @@ int main(int argc, char **argv) {
     if (node_id > 0) {
         e = replica_open(&ns, inst, (uint64_t)node_id, px,
                          members.data, (uint32_t)members.len, now_ms(),
-                         rst, (uint64_t)snapshot_entries, &timing, &rep);
+                         rst, (uint64_t)snapshot_entries, (uint64_t)group,
+                         &timing, &rep);
         if (e != BJ_OK) {
-            fprintf(stderr, "cannot open the log: %s\n", dc_strerror(e));
+            /* A refusal has already said why, in full. Anything else needs
+             * naming, and "cannot open the log" would be a second and
+             * wrong diagnosis printed over the first. */
+            if (e != REPLICA_REFUSED)
+                fprintf(stderr, "cannot open the log: %s\n", dc_strerror(e));
             peers_free(px);
             dbi_close(inst);
             root_free(rst);

@@ -10,7 +10,7 @@
 /* The wire spelling of each kind. The only place these strings exist. */
 static const char *const KIND_NAME[] = {
     "requestVote", "appendEntries", "installSnapshot", "join", "leave",
-    "timeoutNow"
+    "timeoutNow", "identity"
 };
 #define KIND_COUNT ((int)(sizeof(KIND_NAME) / sizeof(KIND_NAME[0])))
 
@@ -645,6 +645,77 @@ int rmsg_build_timeout_now(uint64_t term, uint64_t leader_id, dbuf *out) {
     if (!e) e = bj_put_int(b, (int64_t)leader_id);
     if (!e) e = bj_end_object(b);
     return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
+int rmsg_build_identity(uint64_t asking_id, dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = put_key(b, "kind");
+    if (!e) e = bj_put_string(b, (const uint8_t *)"identity", 8);
+    /* Zero is allowed and means "I have no id yet": a joiner asking what
+     * it is about to talk to, rather than a member checking itself. */
+    if (!e) e = put_key(b, "askingId");
+    if (!e) e = bj_put_int(b, (int64_t)asking_id);
+    if (!e) e = bj_end_object(b);
+    return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
+int rmsg_identity_asking(const uint8_t *msg, uint32_t len, uint64_t *out) {
+    int kind = -1;
+    int e = rmsg_kind(msg, len, &kind);
+    if (e) return e;
+    if (kind != RAFT_MSG_IDENTITY) return RAFT_ERR_MESSAGE;
+    *out = num_field(msg, len, "askingId");
+    return BJ_OK;
+}
+
+int rmsg_build_identity_reply(uint64_t group, uint64_t base_index,
+                              uint64_t last_index, uint64_t term, int is_member,
+                              const uint8_t *members, uint32_t members_len,
+                              dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_object(b);
+    if (!e) e = put_key(b, "ok");
+    if (!e) e = bj_put_bool(b, 1);
+    if (!e) e = put_key(b, "group");
+    if (!e) e = bj_put_int(b, (int64_t)group);
+    if (!e) e = put_key(b, "baseIndex");
+    if (!e) e = bj_put_int(b, (int64_t)base_index);
+    if (!e) e = put_key(b, "lastIndex");
+    if (!e) e = bj_put_int(b, (int64_t)last_index);
+    if (!e) e = put_key(b, "term");
+    if (!e) e = bj_put_int(b, (int64_t)term);
+    if (!e) e = put_key(b, "isMember");
+    if (!e) e = bj_put_bool(b, is_member ? 1 : 0);
+    if (!e && members && members_len) {
+        e = put_key(b, "members");
+        if (!e) e = bj_put_raw(b, members, members_len);
+    }
+    if (!e) e = bj_end_object(b);
+    return e ? (bj_builder_free(b), e) : finish(b, out);
+}
+
+int rmsg_identity_read(const uint8_t *msg, uint32_t len, rmsg_identity *out) {
+    memset(out, 0, sizeof(*out));
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(msg, len, (const uint8_t *)"ok", 2, &v, &vlen, &found) != BJ_OK ||
+        !found) return RAFT_ERR_MESSAGE;
+    int ok = 0;
+    { cur c = { v, vlen, 0 }; if (read_bool(&c, &ok) != BJ_OK || !ok) return RAFT_ERR_MESSAGE; }
+    out->group      = num_field(msg, len, "group");
+    out->base_index = num_field(msg, len, "baseIndex");
+    out->last_index = num_field(msg, len, "lastIndex");
+    out->term       = num_field(msg, len, "term");
+    out->is_member  = bool_field(msg, len, "isMember");
+    found = 0;
+    if (obj_get_field(msg, len, (const uint8_t *)"members", 7, &v, &vlen, &found) == BJ_OK
+        && found) {
+        out->members = v;
+        out->members_len = (uint32_t)vlen;
+    }
+    return BJ_OK;
 }
 
 int rmsg_read_membership_reply(const uint8_t *msg, uint32_t len, rmsg_membership *out) {

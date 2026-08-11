@@ -154,6 +154,16 @@ void rn_swap_log(raft_node *n, elog *fresh, const bj_io *io, elog **old);
  * are passed in (bjns.h says why). The node reads the store; it does not
  * scan it.
  */
+/*
+ * The cluster's durable identity, which the host reads off its own disk
+ * and hands over here so that an identity question can be answered
+ * without this file knowing where it is kept. Reported and never
+ * interpreted: 0 means "none", and what a mismatch means is the host's
+ * decision (server/replica.c makes it).
+ */
+void rn_set_group(raft_node *n, uint64_t group);
+uint64_t rn_group(const raft_node *n);
+
 void rn_set_ns(raft_node *n, bj_ns *ns);
 void rn_set_snapstore(raft_node *n, sst *store);
 

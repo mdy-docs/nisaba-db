@@ -702,6 +702,79 @@ static int ref_add(dbuf *refs, const uint8_t *s, uint32_t len) {
     return dbuf_put(refs, &nul, 1);
 }
 
+/*
+ * Every file ONE STORED index definition claims -- and the stored shape is
+ * not the plan's, which is the whole reason this is a function.
+ * put_stored_def writes `file` (a STRING) for an equality or geo index and
+ * `files` (an OBJECT keyed by role) for a text one, while a plan says
+ * `files: [array]` for all three. Code that reads a definition looking for
+ * a plan-shaped `files` array finds nothing on two kinds out of three and
+ * an object on the third.
+ *
+ * That is not hypothetical: dbs_drop_index did exactly that and therefore
+ * deleted NOTHING, for any kind, with no crash involved -- every dropped
+ * index left its whole file behind, and the C server runs no orphan sweep
+ * to collect it (bj_ns has no listing operation, so the sweep needs a host
+ * to hand it one). Found by test/crash-matrix.js, which measured the file
+ * count before and after a clean drop.
+ *
+ * So the sweep, dropCollection and dropIndex all come through here.
+ */
+static int refs_of_index_def(dbuf *refs, const uint8_t *def, size_t def_len) {
+    int e = BJ_OK;
+    if (def_kind(def, def_len) == DC_INDEX_TEXT) {
+        const uint8_t *files; size_t files_len; int has_files = 0;
+        if ((e = obj_get_field(def, def_len, (const uint8_t *)"files", 5,
+                               &files, &files_len, &has_files))) return e;
+        if (!has_files || files_len < 1 || files[0] != BJ_TYPE_OBJECT) return BJ_OK;
+        /* Iterate whatever roles are present rather than the three we
+         * expect: a future role must not be swept away by an older
+         * reader that does not know its name. */
+        cur fc = { files, files_len, 0 };
+        uint32_t fn;
+        if ((e = object_begin(&fc, &fn))) return e;
+        for (uint32_t j = 0; j < fn; j++) {
+            const uint8_t *fk; uint32_t fklen;
+            if ((e = take_key(&fc, &fk, &fklen))) return e;
+            const uint8_t *fv; uint32_t fvlen;
+            cur vc = fc;
+            if (take_string(&vc, &fv, &fvlen) == BJ_OK) {
+                if ((e = ref_add(refs, fv, fvlen))) return e;
+            }
+            if ((e = skip_value(&fc))) return e;
+        }
+        return BJ_OK;
+    }
+    const uint8_t *sp; uint32_t slen; int found = 0;
+    if ((e = str_field(def, def_len, "file", &sp, &slen, &found))) return e;
+    if (found && (e = ref_add(refs, sp, slen))) return e;
+    return BJ_OK;
+}
+
+/* A NUL-separated reference list as a binjson ARRAY of STRINGs, which is
+ * the shape every caller that DELETES wants. */
+static int refs_to_array(const dbuf *refs, dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_array(b);
+    size_t at = 0;
+    while (at < refs->len) {
+        const char *nm = (const char *)refs->data + at;
+        size_t nlen = strlen(nm);
+        if (nlen) bj_put_string(b, (const uint8_t *)nm, (uint32_t)nlen);
+        at += nlen + 1;
+    }
+    bj_end_array(b);
+    int e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
 /* Every file one catalog entry lays claim to. */
 static int refs_of_entry(dbuf *refs, const uint8_t *name, uint32_t name_len,
                          const uint8_t *entry, size_t entry_len) {
@@ -737,35 +810,18 @@ static int refs_of_entry(dbuf *refs, const uint8_t *name, uint32_t name_len,
     for (uint32_t i = 0; i < n; i++) {
         size_t dstart = c.pos;
         if ((e = skip_value(&c))) return e;
-        const uint8_t *def = idxs + dstart;
-        size_t def_len = c.pos - dstart;
-        if (def_kind(def, def_len) == DC_INDEX_TEXT) {
-            const uint8_t *files; size_t files_len; int has_files = 0;
-            if ((e = obj_get_field(def, def_len, (const uint8_t *)"files", 5,
-                                   &files, &files_len, &has_files))) return e;
-            if (!has_files || files_len < 1 || files[0] != BJ_TYPE_OBJECT) continue;
-            /* Iterate whatever roles are present rather than the three we
-             * expect: a future role must not be swept away by an older
-             * reader that does not know its name. */
-            cur fc = { files, files_len, 0 };
-            uint32_t fn;
-            if ((e = object_begin(&fc, &fn))) return e;
-            for (uint32_t j = 0; j < fn; j++) {
-                const uint8_t *fk; uint32_t fklen;
-                if ((e = take_key(&fc, &fk, &fklen))) return e;
-                const uint8_t *fv; uint32_t fvlen;
-                cur vc = fc;
-                if (take_string(&vc, &fv, &fvlen) == BJ_OK) {
-                    if ((e = ref_add(refs, fv, fvlen))) return e;
-                }
-                if ((e = skip_value(&fc))) return e;
-            }
-        } else {
-            if ((e = str_field(def, def_len, "file", &sp, &slen, &found))) return e;
-            if (found && (e = ref_add(refs, sp, slen))) return e;
-        }
+        if ((e = refs_of_index_def(refs, idxs + dstart, c.pos - dstart))) return e;
     }
     return BJ_OK;
+}
+
+int dc_index_files(const uint8_t *def, size_t def_len, dbuf *out) {
+    if (!def || !out || def_len < 1 || def[0] != BJ_TYPE_OBJECT) return DC_ERR_CATALOG_ENTRY;
+    dbuf refs = {0};
+    int e = refs_of_index_def(&refs, def, def_len);
+    if (!e) e = refs_to_array(&refs, out);
+    dbuf_free(&refs);
+    return e;
 }
 
 int dc_sweep_plan(const uint8_t *catalog, size_t catalog_len,
@@ -841,28 +897,8 @@ int dc_collection_files(const uint8_t *entry, size_t entry_len,
     int e = refs_of_entry(&refs, (const uint8_t *)coll, (uint32_t)coll_len,
                           entry, entry_len);
     if (e) { dbuf_free(&refs); return e; }
-
-    bj_builder *b = bj_builder_new();
-    if (!b) { dbuf_free(&refs); return BJ_ERR_OOM; }
-    bj_begin_array(b);
-    {
-        size_t at = 0;
-        while (at < refs.len) {
-            const char *nm = (const char *)refs.data + at;
-            size_t nlen = strlen(nm);
-            if (nlen) bj_put_string(b, (const uint8_t *)nm, (uint32_t)nlen);
-            at += nlen + 1;
-        }
-    }
-    bj_end_array(b);
+    e = refs_to_array(&refs, out);
     dbuf_free(&refs);
-
-    if ((e = bj_builder_error(b))) { bj_builder_free(b); return e; }
-    size_t len = 0;
-    const uint8_t *data = bj_builder_data(b, &len);
-    if (!data) { bj_builder_free(b); return BJ_ERR_STATE; }
-    e = dbuf_put(out, data, len);
-    bj_builder_free(b);
     return e;
 }
 

@@ -1273,6 +1273,45 @@ the opposite of what they said.
   proceeds exactly as it always did. Refusing on silence would mean no
   cluster could ever be started.
 
+  **AND IT REFUSES A CASE IT SHOULD NOT: a bootstrap member that starts
+  late.** Three members are placed together, two of them come up, elect a
+  leader and take writes — and the third arrives seconds later, blank,
+  because it has never run before. Its peers have history and their member
+  set contains its id, which is *exactly* what a wiped member looks like, so
+  it refuses, for ever. Measured in pure C: two members of a trio, 20
+  documents written, then member 3's first ever boot refuses with "that
+  member's set already contains this node's id, so this is a member whose
+  directory was emptied". Concurrent placement makes this a race rather than
+  a mistake, so it is a real fault in normal operation, not a
+  misconfiguration.
+  (It was hidden until the wasm build was refreshed: a mixed C/Node test
+  covers precisely this shape, and the Node members' engine did not yet know
+  the `identity` message, so nothing falsified the claim and the member
+  booted.)
+
+  The ambiguity is genuine — nothing on the member's own disk distinguishes
+  the two, which is what this rule was built on — so it has to be resolved
+  somewhere else, and there are two honest places:
+
+  - **Hold the vote instead of refusing to run.** Boot, replicate, be
+    installed into, but grant no vote and never campaign until a term the
+    member cannot already have voted in — the identity reply already carries
+    the peers' term, so `> that` is the bound. It removes the false positive
+    with no operator input, and it closes the measured hazard by a narrower
+    mechanism: a member that does not vote cannot vote twice. The residual is
+    a vote granted in a term *no surviving peer ever observed*, which needs a
+    second member's evidence to vanish as well — outside the single-fault
+    model this rule addresses.
+  - **Make the cluster remember.** The log is the only durable place that
+    could tell the two apart: the leader marks a member `seen` in the config
+    the first time it holds data, and the identity reply answers "the log has
+    never seen you", which is exact rather than inferred. More code, and it
+    only helps once the whole cluster runs it.
+
+  Until one of them lands, a control plane that places a cluster must start
+  every member before the first write, which is not something a placement can
+  guarantee.
+
   **`--join` is covered too, and the question has to be asked first.** After
   a join, *is this id already a member* is true of a brand-new member as
   well, the join having just made it one — so the seed is asked before the

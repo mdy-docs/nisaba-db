@@ -217,6 +217,21 @@ int dc_collection_files(const uint8_t *entry, size_t entry_len,
                         const char *coll, size_t coll_len, dbuf *out);
 
 /*
+ * Every file ONE STORED index definition claims, as a binjson ARRAY of
+ * STRINGs: `file` for an equality or geo index, every role in `files` for
+ * a text one. dropIndex's plan, and the same computation the sweep and
+ * dropCollection do, from one implementation.
+ *
+ * It is here rather than in the caller because the STORED shape is not the
+ * PLAN shape (put_stored_def says why): a plan says `files: [array]` for
+ * every kind, the catalog says `file` or `files{}` depending on kind. Code
+ * that reaches into a stored definition for a plan-shaped array finds
+ * nothing on two kinds out of three -- which is precisely the bug this
+ * function was extracted to fix, and it needed no crash to happen.
+ */
+int dc_index_files(const uint8_t *def, size_t def_len, dbuf *out);
+
+/*
  * A fresh catalog entry for a collection that does not exist yet: just
  * the primary file name, derived from the naming scheme. Later fields
  * (journal, gen, compactedBytes, indexes) are added as they are earned,

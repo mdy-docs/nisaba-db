@@ -957,8 +957,16 @@ int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
     if (e) return e;
     if (!found) return DC_ERR_NO_COLLECTION;
 
-    /* Find the definition before it is gone: its files are named there
-     * and nowhere else. */
+    /*
+     * Find the definition before it is gone: its files are named there and
+     * nowhere else. WHICH files is db_catalog.h's to say -- this used to
+     * read a plan-shaped `files` array straight out of a STORED definition,
+     * which has `file` for an equality or geo index and an OBJECT for a
+     * text one, so it matched nothing and deleted nothing. Every dropped
+     * index leaked its whole file, no crash required, and the C server runs
+     * no orphan sweep to collect it. dc_index_files is the one answer the
+     * sweep and dropCollection use too.
+     */
     dbuf files = {0};
     {
         const uint8_t *indexes; size_t indexes_len; int has = 0;
@@ -973,12 +981,11 @@ int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
             if ((e = plan_str(def, def_len, "name", &dn, &dn_len, &f))) goto done;
             if (!f || dn_len != name_len || memcmp(dn, name, name_len) != 0) continue;
             seen = 1;
-            const uint8_t *fl; size_t fl_len; int hf = 0;
-            if ((e = plan_raw(def, def_len, "files", &fl, &fl_len, &hf))) goto done;
-            if (hf) e = dbuf_put(&files, fl, fl_len);
+            e = dc_index_files(def, def_len, &files);
             break;
         }
         if (!seen) { e = DC_ERR_NO_INDEX; goto done; }
+        if (e) goto done;
     }
 
     /* The entry first: while it names the index, the files are live. */

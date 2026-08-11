@@ -48,6 +48,7 @@
     "soak": "node test/soak.js",
     "soak:install": "node test/soak-install.js",
     "repro:halt-on-drop": "node test/repro-halt-on-drop.js",
+    "crash:matrix": "node test/crash-matrix.js",
     "bench:server": "node test/bench-server.js",
     "build:wasm": "./build/build-wasm.sh",
     "prepack": "npm run build:wasm",

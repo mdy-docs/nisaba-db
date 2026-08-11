@@ -4687,6 +4687,71 @@ for (const engine of ENGINES) {
    * scan, not a materialized result -- which is the difference between
    * paging a million documents and being sent a million documents.
    */
+  describe.skipIf(!enabled)(`nisaba-server: dropping an index (${engine.name})`, () => {
+    /* Its OWN server and directory: this test reads the directory and
+     * creates a collection, and the compact suite above asserts the exact
+     * set of collections its sweep touched. */
+    let proc, db, dir;
+    const port = nextPort();
+
+    beforeAll(async () => {
+      ({ proc, dir } = await startServer(engine, port, [], 0));
+      db = (await connectServer(port)).db(DB);
+      return async () => { await db.close(); proc.kill(); };
+    });
+
+    it('dropIndex takes the index FILE with it, not just the catalog entry',
+       async () => {
+      /*
+       * IT DELETED NOTHING, FOR ANY INDEX KIND, WITH NO CRASH INVOLVED --
+       * every dropped index left its whole file behind for ever.
+       *
+       * dbs_drop_index read a `files` ARRAY out of the stored definition,
+       * which is the PLAN's shape (dc_index_create_plan). The CATALOG's
+       * shape is `file` -- a string -- for an equality or geo index, and a
+       * `files` OBJECT keyed by role for a text one (put_stored_def says
+       * why the two differ). So the lookup matched nothing on two kinds
+       * out of three and handed an object to an array walker on the third.
+       *
+       * Nobody noticed because the code above it says "an orphan the sweep
+       * collects" -- true of the JS host, which sweeps every Db.open, and
+       * false of this server: bj_ns has no listing operation, so the sweep
+       * needs a host to hand it one and the C server never does. An orphan
+       * here is permanent.
+       *
+       * Found by test/crash-matrix.js, which measures the file count
+       * before and after a clean run of each op before it starts killing
+       * anything -- so the crash harness found a bug that needed no crash.
+       *
+       * This test reads the DIRECTORY, because that is where the bug was:
+       * listIndexes agreed the index was gone the whole time.
+       */
+      const coll = db.collection('dropix');
+      await coll.insertMany(
+        Array.from({ length: 20 }, (_, k) => ({ n: k, team: k % 3 })));
+      const name = await coll.createIndex({ team: 1 });
+      const at = path.join(dir, DB);
+      const listed = () => fs.readdirSync(at).filter((f) => f.includes('dropix'));
+      const withIndex = listed();
+      expect(withIndex.some((f) => f.startsWith('idx-dropix-')),
+        `no index file to drop: ${withIndex.join(' ')}`).toBe(true);
+
+      await coll.dropIndex(name);
+      expect(await coll.listIndexes()).toEqual(
+        expect.not.arrayContaining([expect.objectContaining({ name })]));
+      const after = listed();
+      expect(after.filter((f) => f.startsWith('idx-dropix-')),
+        `the catalog forgot the index but its file is still on disk,` +
+        ` and nothing in this server ever collects it: ${after.join(' ')}`)
+        .toEqual([]);
+      /* The collection itself is untouched -- the deletion has to be the
+       * index's files and no others. */
+      expect(await coll.countDocuments({})).toBe(20);
+      expect((await coll.findOne({ n: 7 })).team).toBe(1);
+    });
+
+  });
+
   describe.skipIf(!enabled)(`nisaba-server: cursors (${engine.name})`, () => {
     let proc, db;
     const port = nextPort();

@@ -3994,6 +3994,73 @@ class Db {
     return this._catalog.toArray().map(({ key }) => key).filter((k) => k !== dbFormatKey());
   }
 
+  /**
+   * THE CATALOG CARRIES AN APPLIED INDEX OF ITS OWN, and a dropped
+   * collection is the whole reason it has to. The C twin is
+   * db_session.c's catalog_note_applied, and this is that fix on this
+   * side of the bridge -- the JS hosts drive their own applies (see
+   * WalDb._applyCommand) and so never reach it.
+   *
+   * Every other structure records the last log index applied to it in its
+   * own metadata, staged before the mutation so the mutation's commit
+   * persists both atomically (Collection.setAppliedIndex). That is exactly
+   * right until the mutation IS the deletion of the structure holding the
+   * record: appliedFloor() is a MAX over the collections that still exist,
+   * so dropping the collection carrying the highest index makes the floor
+   * go BACKWARDS -- by however far that collection was ahead.
+   *
+   * Harmless while the log still holds the entries in between, because
+   * replay is idempotent under each collection's own guard. Fatal once the
+   * log has been COMPACTED past them: the floor is what a restarting node
+   * resumes from (RaftNode.start reads it as lastApplied), the apply pump
+   * then asks the log for an entry at or below its base, and EntryLog
+   * refuses that by contract -- which reaches _pumpApply and halts the
+   * node. Replay being deterministic, it halts again on every later boot.
+   * Measured in C before this existed: a drop and a polite restart left a
+   * database that could not be opened again.
+   *
+   * The catalog is the one structure a drop cannot delete AND does write,
+   * so the record belongs here. All three DDL ops make the catalog's
+   * commit their decisive durable act -- createIndex writes it last,
+   * having built and attached; dropIndex and dropCollection write it and
+   * then remove files, so what a crash leaves behind is an orphan nothing
+   * references and the orphan sweep collects. In every case, a catalog
+   * commit means the entry was applied, which is exactly what may be
+   * recorded in it.
+   *
+   * ONLY for those three (WalDb._applyCommand's caller list). Recording an
+   * index the catalog's next commit would carry without that commit
+   * containing the entry's mutation would let the floor claim an entry
+   * whose effects are not durable -- a lost write, which is worse than the
+   * halt this fixes. Implicit collection creation on a first insert
+   * therefore does NOT note, though it writes the catalog too.
+   */
+  async noteApplied(index) {
+    if (!this.isOpen || !index) return;
+    // The setter refuses a decrease and the value is sticky. A replay that
+    // re-offers an index at or below what is already recorded is the guard
+    // working, not an error to fail the apply with.
+    if (index <= this._catalog.appliedIndex()) return;
+    this._catalog.setAppliedIndex(index);
+  }
+
+  /**
+   * This database's replay floor: the highest log index it has applied.
+   * Apply is strictly ordered, so the max over its structures is the
+   * applied prefix (dbs_applied_floor in engine/src/db_session.c).
+   *
+   * THE CATALOG COUNTS TOO, and it is the only term here that a
+   * dropCollection cannot take away with it -- see noteApplied for what
+   * leaving it out costs.
+   */
+  async appliedFloor() {
+    let floor = this._catalog ? this._catalog.appliedIndex() : 0;
+    for (const name of await this.listCollections()) {
+      floor = Math.max(floor, await (await this.collection(name)).appliedIndex());
+    }
+    return floor;
+  }
+
   async dropCollection(name) {
     checkCollectionName(name); // also shields the reserved format stamp
     const entry = this._catalog.search(name);

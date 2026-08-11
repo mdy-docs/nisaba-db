@@ -122,6 +122,37 @@ describe('WAL instance: one log, many databases', () => {
     await inst.close();
   });
 
+  it('the instance floor survives a dropped collection in one database', async () => {
+    /*
+     * The instance floor is a max over every database, and each
+     * database's is a max over its catalog and its collections. The
+     * catalog's term is the one a dropCollection cannot delete -- without
+     * it, dropping the collection carrying the highest index makes the
+     * INSTANCE floor regress to whatever some other database happens to
+     * have recorded, and a floor below the log's base halts the apply
+     * pump on every boot (Db.noteApplied).
+     */
+    const provider = new MemoryStorageProvider();
+    let inst = await connectWalInstance(provider);
+    await (await (await inst.db('analytics')).collection('users')).insertOne({ _id: oid(1) }); // 1
+    const bills = await (await inst.db('billing')).collection('invoices');
+    for (let i = 2; i <= 4; i++) await bills.insertOne({ _id: oid(i), amount: i });           // 2..4
+    expect(await inst._appliedFloor()).toBe(4);
+
+    // The drop is logged and applied through the envelope, like any write.
+    expect(await (await inst.db('billing')).dropCollection('invoices')).toBe(true);           // 5
+    expect(inst.log.lastIndex).toBe(5);
+    // Not 1 -- analytics' -- which is what surviving collections alone say.
+    expect(await inst._appliedFloor()).toBe(5);
+    await inst.close();
+
+    inst = await connectWalInstance(provider);
+    expect(await inst._appliedFloor()).toBe(5);
+    expect(await (await inst.db('billing')).listCollections()).toEqual([]);
+    expect(await (await (await inst.db('analytics')).collection('users')).countDocuments({})).toBe(1);
+    await inst.close();
+  });
+
   it('refuses a root that is itself a database', async () => {
     const provider = new MemoryStorageProvider();
     const db = await connectWal(provider);

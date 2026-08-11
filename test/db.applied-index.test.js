@@ -357,3 +357,113 @@ describe.skipIf(!hasOPFS)('collection applied index: EntryLog write-ahead integr
     }
   });
 });
+
+/*
+ * ---- the database floor, and the term a drop cannot delete ---------------
+ *
+ * Everything above is per-collection: the record of what has been applied
+ * lives in the collection's own files, staged so the mutation's commit
+ * persists both atomically. That is exactly right until the mutation IS
+ * the deletion of the structure holding the record -- dropping the
+ * collection carrying the highest index made the floor go BACKWARDS, by
+ * however far that collection was ahead.
+ *
+ * So the catalog carries one too (Db.noteApplied, the twin of
+ * db_session.c's catalog_note_applied): it is the one structure a drop
+ * both keeps and writes. db.replicated.test.js has what a regressed floor
+ * costs -- a node that halts on its own files, on every boot.
+ */
+describe('database applied floor', () => {
+  it('is the max over the catalog and every collection', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connect(provider);
+    expect(await db.appliedFloor()).toBe(0);
+
+    const keep = await db.collection('keep');
+    await keep.setAppliedIndex(10);
+    await keep.insertOne({ _id: oid(1), n: 1 });
+    expect(await db.appliedFloor()).toBe(10);
+
+    // The catalog's own term, staged and then committed by a DDL act --
+    // here createIndex, which writes the catalog last, having built and
+    // attached.
+    await db.noteApplied(11);
+    await keep.createIndex({ n: 1 });
+    expect(await db.appliedFloor()).toBe(11);
+    await db.close();
+
+    // Durable, not merely staged: the DDL's catalog commit carried it.
+    const again = await connect(provider);
+    expect(await again.appliedFloor()).toBe(11);
+    await again.close();
+  });
+
+  it('does not go backwards when the collection holding the max is dropped', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connect(provider);
+    const keep = await db.collection('keep');
+    await keep.setAppliedIndex(3);
+    await keep.insertOne({ _id: oid(1), n: 1 });
+
+    const doomed = await db.collection('doomed');
+    await doomed.setAppliedIndex(40);
+    await doomed.insertOne({ _id: oid(2), n: 2 });
+    expect(await db.appliedFloor()).toBe(40);
+
+    // The drop, applied as a logged entry would be: note first, then
+    // mutate -- the catalog's commit is the drop's decisive durable act.
+    await db.noteApplied(41);
+    expect(await db.dropCollection('doomed')).toBe(true);
+    // Without the catalog's term this is 3, the survivor's, and the 38
+    // entries above it look unapplied.
+    expect(await db.appliedFloor()).toBe(41);
+    await db.close();
+
+    const again = await connect(provider);
+    expect(await again.appliedFloor()).toBe(41);
+    await again.close();
+  });
+
+  it('is sticky and never decreases: a replay re-offering an index is no error', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connect(provider);
+    const col = await db.collection('c');
+    await db.noteApplied(9);
+    await col.createIndex({ n: 1 });
+    expect(await db.appliedFloor()).toBe(9);
+
+    // Replay offers 9 again, and 4 from an earlier entry. The setter
+    // refuses a decrease; noteApplied answers that with a skip rather
+    // than an error, because a re-offer is the guard working.
+    await db.noteApplied(9);
+    await db.noteApplied(4);
+    expect(await db.appliedFloor()).toBe(9);
+    await db.close();
+  });
+
+  it('an implicit collection creation does not note, though it writes the catalog', async () => {
+    // ONLY the DDL three note (WalDb._applyCommand). A first insert
+    // creates the collection -- a catalog write -- but its index belongs
+    // to the collection's own commit; recording it here would let the
+    // floor claim an entry whose mutation the catalog's next commit does
+    // not carry, which is a lost write rather than a halt.
+    const provider = new MemoryStorageProvider();
+    const db = await connect(provider);
+    const col = await db.collection('made-by-insert');
+    await col.setAppliedIndex(6);
+    await col.insertOne({ _id: oid(1), n: 1 });
+    await db.close();
+
+    const again = await connect(provider);
+    expect(await (await again.collection('made-by-insert')).appliedIndex()).toBe(6);
+    // The floor is the collection's 6; the catalog recorded nothing.
+    expect(await again.appliedFloor()).toBe(6);
+    // And this is the regression itself, in the only way left to reach it:
+    // a drop that noted nothing takes the record with it. The logged path
+    // cannot get here -- WalDb._applyCommand notes every drop -- which is
+    // exactly why the note is where it is.
+    expect(await again.dropCollection('made-by-insert')).toBe(true);
+    expect(await again.appliedFloor()).toBe(0);
+    await again.close();
+  });
+});

@@ -212,15 +212,24 @@ class WalInstance {
    * strictly ordered across the one log, so the max is the applied
    * prefix; a deterministic failure below it already produced its
    * result and is never retried.
+   *
+   * Each database answers with Db.appliedFloor(), which counts its
+   * CATALOG as well as its collections — the term a dropCollection cannot
+   * delete, and without it this max regresses (Db.noteApplied).
+   *
+   * A dropDATABASE is the same shape one level up and is NOT fixed by
+   * that: it removes the whole scope, catalog included, so nothing inside
+   * the instance survives to remember. The C server answers it by
+   * restoring the committed generation when the floor sits below the
+   * log's base (server/replica.c's restore_if_unusable); this host has the
+   * machinery for that (restoreLatestInstanceSnapshot) and does not yet
+   * trigger it. See docs/db-server.md.
    */
   async _appliedFloor() {
     let floor = 0;
     for (const name of await this.listDatabases()) {
       const idb = await this.db(name);
-      for (const cname of await idb.listCollections()) {
-        const col = await idb._db.collection(cname);
-        floor = Math.max(floor, await col.appliedIndex());
-      }
+      floor = Math.max(floor, await idb._db.appliedFloor());
     }
     return floor;
   }
@@ -356,6 +365,51 @@ class WalInstance {
 }
 
 /**
+ * CAN THE LIVE FILES BE REPLAYED ONTO AT ALL? A floor BELOW the log's
+ * base is not a replay plan: the entries in between were compacted away,
+ * so resuming at the base means resuming AHEAD of what the files contain,
+ * and the first entry naming what a drop removed cannot apply. Replicated,
+ * the apply pump asks the log for an entry at or below its base, EntryLog
+ * refuses that by contract, and the node halts — deterministically, on
+ * every later boot. Measured here: a dropDatabase, a compaction past it
+ * and a restart is enough, no crash required.
+ *
+ * A dropCollection cannot cause it any more (the catalog carries an
+ * applied index the drop keeps — Db.noteApplied). A dropDATABASE removes
+ * the whole scope, catalog included, so nothing inside the instance is
+ * left to remember and there is nowhere to put a record. What CAN be
+ * trusted is the committed generation the compaction was paired with: it
+ * genuinely is the state at the base, and the log's suffix begins exactly
+ * there. So restore it, and let replay carry the difference — including
+ * the drop that started this. The C twin is server/replica.c's
+ * restore_if_unusable.
+ *
+ * Two guards, both load-bearing:
+ *
+ *   - ONLY when the generation is AT the base. An older one would restore
+ *     a state the log can no longer carry forward, losing every entry in
+ *     between — left to fail loudly, with its files intact, rather than
+ *     quietly discarding committed data.
+ *   - ONLY when it would restore something. An empty root reports a floor
+ *     of zero honestly, and beside an empty generation there is no
+ *     difference to reconcile; without this it would "restore" nothing and
+ *     do it again on every boot.
+ *
+ * IT RECURS, and that is a known cost rather than a bug: the restore does
+ * not raise the under-reported floor, so an instance in this shape
+ * restores again on every boot until a write to a surviving database
+ * carries the floor past the base. Correct every time and never cheap —
+ * the C server documents the same behaviour (docs/db-server.md), and the
+ * proper fix in both is an applied index the INSTANCE records for itself.
+ */
+export function generationCanRescue(inst, floor) {
+  const gen = inst._store?.latest;
+  const base = inst._log.baseIndex;
+  return floor < base && !!gen && gen.lastIncludedIndex === base &&
+    (gen.config?.live?.length ?? 0) > 0;
+}
+
+/**
  * Open an instance root: many databases under one directory, one log,
  * one snapshot store — the layout the C server owns when it runs
  * (docs/db-server.md). Requires a provider with listFiles(),
@@ -363,7 +417,7 @@ class WalInstance {
  * itself a database.
  */
 export async function connectWalInstance(provider, options = {}) {
-  const { snapshotPrefix = SNAP_PREFIX, ...dbOptions } = options;
+  const { snapshotPrefix = SNAP_PREFIX, restored = false, ...dbOptions } = options;
   if (typeof provider.listFiles !== 'function' ||
       typeof provider.subProvider !== 'function' ||
       typeof provider.listSubProviders !== 'function') {
@@ -384,6 +438,18 @@ export async function connectWalInstance(provider, options = {}) {
     // and left alone it poisons every write. The applied state IS a
     // snapshot through the floor; re-base the log there.
     const floor = await inst._appliedFloor();
+    // The other direction: live files replay cannot reach. Everything is
+    // closed before the generation lands on top of them — handles are
+    // exclusive on OPFS, and a database held open across a restore would
+    // be reading files that no longer exist. `restored` makes it one
+    // attempt: after a restore the floor IS the base, so the condition
+    // cannot hold again, and a root that still looks unusable is a fault
+    // to surface rather than a loop to spin in.
+    if (!restored && generationCanRescue(inst, floor)) {
+      await inst.close();
+      await restoreLatestInstanceSnapshot(provider, { snapshotPrefix });
+      return connectWalInstance(provider, { ...options, restored: true });
+    }
     if (floor > inst._log.lastIndex) {
       const { currentTerm, votedFor, lastTerm } = inst._log;
       await inst._log.close();

@@ -120,6 +120,83 @@ describe('replicated instance: basics', () => {
     });
     for (const m of cluster.values()) await m.inst.close();
   });
+
+  it('a dropped database the log has outrun restarts instead of halting for ever', async () => {
+    /*
+     * THE SAME FAULT AS db.replicated.test.js's DROPPED COLLECTION, ONE
+     * LEVEL UP, AND IT NEEDS THE OPPOSITE ANSWER. A dropCollection can
+     * record what it applied on the catalog, which the drop keeps
+     * (Db.noteApplied). A dropDATABASE removes the whole scope, catalog
+     * included: nothing inside the instance is left to remember, so the
+     * instance floor -- a max over databases -- regresses with no home to
+     * put the record in.
+     *
+     * Below the log's BASE that is not a replay plan. The entries in
+     * between were compacted away, so the apply pump asks the log for an
+     * entry at or below its base, EntryLog refuses that by contract, and
+     * the node halts -- on every boot, the floor being deterministic.
+     * Measured before this was fixed: floor 2 against a base of 6, and
+     * "Argument out of range (getBatch)" on every restart.
+     *
+     * What CAN be trusted at the base is the committed generation the
+     * compaction was paired with, so connectReplicatedInstance restores it
+     * and the log's suffix replays the difference (the C twin is
+     * server/replica.c's restore_if_unusable).
+     *
+     * CONVERGENCE, not liveness, is the assertion that matters: the
+     * restore brings the dropped database BACK, and the replayed drop has
+     * to remove it again. A member that came up serving resurrected data
+     * would be worse than the halt it replaces.
+     */
+    const sim = new Sim(93);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeCluster(1, sim, net);
+    const solo = leaderOf(cluster);
+    await settle(sim, cluster,
+      (await (await solo.inst.db('keep')).collection('a')).insertOne({ _id: oid(1), n: 1 }));
+    const doomed = await (await solo.inst.db('doomed')).collection('b');
+    for (let i = 2; i <= 5; i++) {
+      await settle(sim, cluster, doomed.insertOne({ _id: oid(i), n: i }));
+    }
+
+    // Compact HERE: the log's base becomes the last insert, so everything
+    // that made 'doomed' is gone from it and only the generation has it.
+    const snap = await solo.inst.snapshot();
+    expect(solo.node.log.baseIndex).toBe(snap.lastIncludedIndex);
+    const { value } = await settle(sim, cluster, solo.inst.dropDatabase('doomed'));
+    expect(value).toEqual({ ok: true, dropped: true });
+
+    // The preconditions, measured off the live pump rather than off the
+    // floor being repaired: the log outran the drop, and the floor the
+    // reborn member would resume from sits below the base it cannot reach.
+    expect(solo.node.log.baseIndex,
+      'the log did not outrun the drop, so replay could still reach it and' +
+      ' this proves nothing').toBeLessThan(solo.node.lastApplied);
+    expect(await solo.inst._appliedFloor(),
+      'the floor did not regress, so there is nothing to restore from')
+      .toBeLessThan(solo.node.log.baseIndex);
+    await solo.inst.close();
+    net.unregister(1);
+
+    const halts = [];
+    const reborn = await bootMember(1, [1], sim, net, solo.provider,
+      { onEvent: (e) => { if (e.type === 'halt') halts.push(e.error); } });
+    cluster.set(1, reborn);
+    await until(sim, cluster, () => halts.length > 0 || leaders(cluster).length === 1);
+    expect(halts, 'it halted on its own files').toEqual([]);
+
+    // Converged, not merely started: the drop the restore undid is applied
+    // again by the log's suffix, and the surviving database is intact.
+    expect(await reborn.inst.listDatabases()).toEqual(['keep']);
+    expect(await (await (await reborn.inst.db('keep')).collection('a'))
+      .countDocuments({})).toBe(1);
+    // And it is a working instance, not a listening socket.
+    const after = await (await reborn.inst.db('keep')).collection('a');
+    expect((await settle(sim, cluster, after.insertOne({ _id: oid(9), n: 9 }))).error)
+      .toBeUndefined();
+    expect(await after.countDocuments({})).toBe(2);
+    await reborn.inst.close();
+  });
 });
 
 describe('replicated instance: the instance-wide install', () => {

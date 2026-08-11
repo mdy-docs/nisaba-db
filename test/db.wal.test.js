@@ -534,6 +534,40 @@ describe('WAL: log lost, applied state survives (the backup-restore shape)', () 
     await db3.close();
   });
 
+  it('re-bases at the floor a dropped collection cannot lower', async () => {
+    /*
+     * The floor used to be a max over the collections that still exist,
+     * so a dropCollection took the record of what had been applied with
+     * it and the floor went BACKWARDS. Here that would re-base the fresh
+     * log below the applied state, handing out index numbers that already
+     * meant something else -- and, replicated, halting the node outright
+     * (db.replicated.test.js, "a drop the log has outrun"). The logged
+     * DDL notes its index on the CATALOG, which a drop keeps.
+     */
+    const provider = new MemoryStorageProvider();
+    const db1 = await connectWal(provider);
+    await (await db1.collection('users')).insertOne({ _id: oid(1) });        // 1
+    const temp = await db1.collection('temp');
+    for (let i = 2; i <= 4; i++) await temp.insertOne({ _id: oid(i), i });   // 2..4
+    await temp.createIndex({ i: 1 });                                       // 5
+    expect(await db1.dropCollection('temp')).toBe(true);                    // 6
+    expect(db1.log.lastIndex).toBe(6);
+    // Not 1, the surviving collection's -- which is what a max over
+    // survivors alone reports once 'temp' and its files are gone.
+    expect(await db1._db.appliedFloor()).toBe(6);
+    await db1.close();
+
+    await provider.deleteFile(WAL_FILE);
+    const db2 = await connectWal(provider);
+    expect(db2.log.baseIndex).toBe(6);
+    expect(await db2.listCollections()).toEqual(['users']);
+    const users = await db2.collection('users');
+    await users.insertOne({ _id: oid(9), i: 9 });
+    expect(db2.log.lastIndex).toBe(7);
+    expect(await users.countDocuments({})).toBe(2);
+    await db2.close();
+  });
+
   it('leaves a consistent log alone', async () => {
     const provider = new MemoryStorageProvider();
     const db1 = await connectWal(provider);

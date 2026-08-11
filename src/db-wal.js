@@ -392,12 +392,21 @@ class WalDb {
    *
    * What is left here is the half that makes and unmakes FILES, which
    * belongs to whoever owns the namespace: resolving the collection, and
-   * the DDL three. DDL does not stage an index (createIndex commits
-   * catalog + index files but not the primary tree, so a staged value
-   * wouldn't persist anyway); their replay is idempotent instead — a
-   * re-run createIndex resolves to the existing index, a re-run drop of
-   * a missing target reports "nothing to do" — bounded by the next
-   * snapshot's log compaction.
+   * the DDL three. Their replay is idempotent — a re-run createIndex
+   * resolves to the existing index, a re-run drop of a missing target
+   * reports "nothing to do" — bounded by the next snapshot's log
+   * compaction.
+   *
+   * AND THE DDL THREE NOTE THEIR INDEX ON THE CATALOG, before the
+   * mutation, exactly as a document command stages its own on the
+   * collection. This used to read "DDL does not stage an index", on the
+   * grounds that createIndex commits the catalog and index files but not
+   * the primary tree — true, and the hole: the record of what had been
+   * applied lived only in files a dropCollection DELETES, so the floor
+   * could go backwards and a compacted log left nothing to bridge the
+   * gap. The catalog is the structure these three commit and a drop
+   * keeps, which is why the record belongs there (Db.noteApplied says
+   * what it cost in C, and why only these three note).
    *
    * Takes the raw payload, not a decoded command: walParse validates it
    * against the grammar first, so an entry naming an op this build cannot
@@ -411,6 +420,7 @@ class WalDb {
     const op = walParse(payload);
     const cmd = decode(payload);
     if (op === WAL_OP.DROP_COLLECTION) {
+      await this._db.noteApplied(index);
       const dropped = await this._db.dropCollection(cmd.c);
       this._collections.delete(cmd.c);
       return dropped;
@@ -419,6 +429,7 @@ class WalDb {
     // Which ops the applier drives is C's classification, not a list
     // here that could fall out of step with it.
     if (walIsDocument(op)) return col.applyCommand(index, payload);
+    await this._db.noteApplied(index);
     if (op === WAL_OP.CREATE_INDEX) return col.createIndex(cmd.keys, cmd.options);
     return col.dropIndex(cmd.name);
   }
@@ -843,7 +854,9 @@ async function adoptLegacyLog(provider, store, log, legacyName) {
 
 /**
  * Reconcile a just-opened entry log with the database's replay floor —
- * the max persisted appliedIndex across collections. A log BEHIND the
+ * Db.appliedFloor(), the max persisted appliedIndex across the catalog and
+ * every collection (the catalog's term is the one a drop cannot take with
+ * it, and leaving it out is what made a floor regress). A log BEHIND the
  * floor cannot arise from any crash the commit journals cover: an entry
  * is durable in the log before it is ever applied, and appliedIndex
  * persists atomically with the applied mutation. It appears exactly when
@@ -864,10 +877,7 @@ async function adoptLegacyLog(provider, store, log, legacyName) {
  * use; the original, untouched, when no re-base is needed.
  */
 export async function reconcileLogWithAppliedFloor(db, log, logName, provider) {
-  let floor = 0;
-  for (const name of await db.listCollections()) {
-    floor = Math.max(floor, await (await db.collection(name)).appliedIndex());
-  }
+  const floor = await db.appliedFloor();
   if (floor <= log.lastIndex) return log;
 
   const { currentTerm, votedFor, lastTerm } = log;

@@ -462,6 +462,84 @@ describe('replicated db: failures and recovery', () => {
     await reborn.rdb.close();
   });
 
+  it('a drop the log has outrun restarts instead of halting for ever', async () => {
+    /*
+     * A DROPPED COLLECTION TOOK THE RECORD OF WHAT HAD BEEN APPLIED WITH
+     * IT, AND THE DATABASE COULD NEVER BE OPENED AGAIN. Found in C
+     * (test/repro-halt-on-drop.js, fixed by db_session.c's
+     * catalog_note_applied); this is the same fault on this side of the
+     * bridge, where the JS hosts drive their own applies and so never
+     * reached that fix.
+     *
+     * Every structure records the last log index applied to it in its own
+     * metadata, staged so the mutation's commit persists both atomically.
+     * That is right until the mutation IS the deletion of the structure
+     * holding the record: the floor was a MAX over the collections that
+     * still exist, so dropping the one carrying the highest index made it
+     * go BACKWARDS.
+     *
+     * Harmless while the log still holds the entries in between. Fatal
+     * once the log has been COMPACTED past them, because the floor is
+     * what a restarting node resumes from (RaftNode.start reads it as
+     * lastApplied) and the apply pump then asks the log for an entry at
+     * or below its base -- which EntryLog refuses by contract. The throw
+     * reaches _pumpApply, which halts the node; the floor being
+     * deterministic, every later boot halts identically.
+     *
+     * THE PRECONDITION IS FORCED, NOT WAITED FOR: the snapshot is taken
+     * at exactly the point that puts the log's base between the entries
+     * that made the collection and the DDL naming it. The base < floor
+     * assertion proves it landed -- without it this test passes while
+     * testing nothing.
+     */
+    const sim = new Sim(97);
+    const net = new MemoryNetwork(sim);
+    const cluster = await makeDbCluster(1, sim, net);
+    const solo = leaderOf(cluster);
+    const doomed = await solo.rdb.collection('doomed');
+    for (let i = 1; i <= 5; i++) {
+      const { error } = await settle(sim, cluster, doomed.insertOne({ _id: oid(i), n: i }));
+      expect(error).toBeUndefined();
+    }
+
+    // Compact the log HERE: its base becomes the last insert, so the
+    // entries that made 'doomed' are gone from it.
+    const snap = await solo.rdb.snapshot();
+    expect(solo.node.log.baseIndex).toBe(snap.lastIncludedIndex);
+
+    // The DDL entries above the base, naming a collection that then goes.
+    expect((await settle(sim, cluster, doomed.createIndex({ n: 1 }))).error).toBeUndefined();
+    expect((await settle(sim, cluster, solo.rdb.dropCollection('doomed'))).error).toBeUndefined();
+    expect(await solo.rdb.listCollections()).not.toContain('doomed');
+
+    // Measured off the LIVE pump, not off the floor being fixed: a
+    // regressed floor must not be able to make this precondition pass.
+    expect(solo.node.log.baseIndex,
+      'the log did not outrun the DDL, so replay could still reach it and' +
+      ' this proves nothing').toBeLessThan(solo.node.lastApplied);
+    await solo.rdb.close();
+    net.unregister(1);
+
+    // THE POINT: it comes back, over its own files, and stays up.
+    const halts = [];
+    const reborn = await bootMember(1, [1], sim, net, solo.provider, {
+      onEvent: (e) => { if (e.type === 'halt') halts.push(e); }
+    });
+    cluster.set(1, reborn);
+    // Whichever comes first, so a halt is reported in the node's own
+    // words rather than as a leaderless timeout.
+    await until(sim, cluster, () => halts.length > 0 || leaders(cluster).length === 1);
+    expect(halts.map((h) => h.error), 'it halted on its own files').toEqual([]);
+    expect(reborn.node.isRunning).toBe(true);
+
+    // And it is a working database, not merely a node that started.
+    const after = await reborn.rdb.collection('after');
+    expect((await settle(sim, cluster, after.insertOne({ _id: oid(9), n: 9 }))).error).toBeUndefined();
+    expect(await after.countDocuments({})).toBe(1);
+    expect(await reborn.rdb.listCollections()).not.toContain('doomed');
+    await reborn.rdb.close();
+  });
+
   it('close() gives the C node back, and the closed group refuses to answer', async () => {
     // One group per tenant database on a long-lived seat: a raft_node
     // left behind per close is a leak that grows with tenant churn. The

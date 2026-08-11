@@ -40,7 +40,9 @@ import {
 } from './nisaba-wasm.js';
 import { RaftNode, NotLeaderError } from './raft.js';
 import { SNAP_PREFIX, openWalStorage } from './db-wal.js';
-import { WalInstance } from './db-wal-instance.js';
+import {
+  WalInstance, generationCanRescue, restoreLatestInstanceSnapshot
+} from './db-wal-instance.js';
 
 /** How many recent per-entry results the state machine retains for
  * local proposers to collect (db-replicated.js says why). */
@@ -274,7 +276,7 @@ export class ReplicatedInstance extends WalInstance {
 export async function connectReplicatedInstance(provider, options = {}) {
   const {
     id, peers, transport, raft: raftOptions = {},
-    snapshotPrefix = SNAP_PREFIX, startNow = 0, ...dbOptions
+    snapshotPrefix = SNAP_PREFIX, startNow = 0, restored = false, ...dbOptions
   } = options;
   if (typeof provider.listFiles !== 'function' ||
       typeof provider.subProvider !== 'function' ||
@@ -294,6 +296,16 @@ export async function connectReplicatedInstance(provider, options = {}) {
     // The restored-applied-state shape (connectWalInstance says why),
     // re-based before the RaftNode ever sees the log.
     const floor = await inst._appliedFloor();
+    // And the other direction: a floor below the log's BASE means replay
+    // cannot reach the live state at all, and the committed generation at
+    // that boundary is the state that can (generationCanRescue says what
+    // it costs not to, and why one attempt). Restored before the RaftNode
+    // exists, so the node never sees the unusable state.
+    if (!restored && generationCanRescue(inst, floor)) {
+      await inst.close();
+      await restoreLatestInstanceSnapshot(provider, { snapshotPrefix });
+      return connectReplicatedInstance(provider, { ...options, restored: true });
+    }
     if (floor > inst._log.lastIndex) {
       const { currentTerm, votedFor, lastTerm } = inst._log;
       await inst._log.close();

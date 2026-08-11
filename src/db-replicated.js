@@ -19,8 +19,9 @@
  *     proposer to pick up, and swallows deterministic command errors so
  *     the apply pump never mistakes an application-level failure for
  *     replica divergence. appliedIndex() is the database's replay floor:
- *     the max of every collection's persisted appliedIndex (apply is
- *     strictly ordered, so the max IS the applied prefix).
+ *     the max persisted appliedIndex across the catalog and every
+ *     collection (apply is strictly ordered, so the max IS the applied
+ *     prefix; the catalog's term is the one a drop cannot delete).
  *
  *   - The SnapshotStore (roadmap step 3) is handed to the RaftNode as
  *     its `files` seam, and the NODE runs the install: it streams the
@@ -64,13 +65,13 @@ export class DbStateMachine {
     this._results = new Map(); // index -> { value } | { error }
   }
 
+  /** The database's replay floor, which RaftNode.start resumes from.
+   * Db.appliedFloor() counts the CATALOG as well as every collection: a
+   * max over surviving collections alone regresses when a dropCollection
+   * takes the highest one with it, and a floor below the log's base halts
+   * the apply pump on every boot (Db.noteApplied). */
   async appliedIndex() {
-    let max = 0;
-    for (const name of await this._rdb._db.listCollections()) {
-      const col = await this._rdb._db.collection(name);
-      max = Math.max(max, await col.appliedIndex());
-    }
-    return max;
+    return this._rdb._db.appliedFloor();
   }
 
   async apply(entry) {

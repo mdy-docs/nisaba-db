@@ -1197,6 +1197,20 @@ the opposite of what they said.
   the live files) remains only as the backstop for an instance with no
   generation at the base at all.
 
+  **Both halves exist twice**, because the JavaScript hosts reach neither of
+  the C ones. `dbs_apply` is where the catalog gets its record and
+  `restore_if_unusable` is `server/replica.c`'s, and `src/db-wal.js` drives
+  its own applies through the collection API instead — so a JS-hosted
+  database halted on exactly the same drop, with `Argument out of range
+  (getBatch)` where C says `-37` (measured: instance floor 2 against a log
+  base of 6). `Db.noteApplied`/`Db.appliedFloor` are the catalog's record on
+  that side, `WalDb._applyCommand` notes the same three DDL ops, and
+  `generationCanRescue` is the restore trigger for both instance openers,
+  with the same two guards and the same recurring cost. Pinned by
+  *a drop the log has outrun* (`db.replicated.test.js`), *a dropped database
+  the log has outrun* (`db.replicated-instance.test.js`), and the floor's own
+  semantics in `db.applied-index.test.js`.
+
   **A committed entry is not necessarily a present one.** The commit index is
   knowledge about the cluster; the log is what has physically arrived. They
   agree on a member whose log only grows, and an install makes them differ —

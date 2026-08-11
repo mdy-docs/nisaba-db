@@ -1041,6 +1041,30 @@ static int open_best_log(replica *r) {
     return BJ_OK;
 }
 
+/*
+ * How many live files a generation would restore. Zero means restoring it
+ * would change nothing -- which matters because the "live files cannot be
+ * replayed onto" test below is satisfied by an EMPTY instance too (nothing
+ * left to record a floor), and an empty instance beside an empty generation
+ * is not a fault. Without this, such a member would restore nothing, log
+ * that it had, and do it again on every boot.
+ */
+static int live_file_count(const dbuf *latest, uint32_t *out) {
+    *out = 0;
+    const uint8_t *config; size_t clen; int f = 0;
+    int e = obj_get_field(latest->data, latest->len, (const uint8_t *)"config", 6,
+                          &config, &clen, &f);
+    if (e || !f) return SST_ERR_MANIFEST;
+    const uint8_t *live; size_t llen;
+    e = obj_get_field(config, clen, (const uint8_t *)"live", 4, &live, &llen, &f);
+    if (e || !f) return SST_ERR_MANIFEST;
+    cur c = { live, llen, 0 };
+    uint32_t count = 0;
+    if (array_begin(&c, &count)) return SST_ERR_MANIFEST;
+    *out = count;
+    return BJ_OK;
+}
+
 /* Copy each of the adopted generation's files onto the live name its
  * config.live maps it to. The node has its own copy of this walk
  * (raft_node.c's live_each); this one exists because a restore at
@@ -1099,7 +1123,7 @@ static int restore_live_files(replica *r, const dbuf *latest) {
  * it is replaced by a fresh one based there, exactly as an adoption
  * would have.
  */
-static int restore_if_stale(replica *r) {
+static int restore_if_unusable(replica *r) {
     if (!sst_has_latest(r->store)) return BJ_OK;
     dbuf latest = {0};
     int has = 0;
@@ -1120,14 +1144,77 @@ static int restore_if_stale(replica *r) {
             (void)read_u64(&vc, &bterm);
         }
     }
-    if (!boundary || boundary <= elog_base_index(r->log)) {
-        dbuf_free(&latest);
-        return BJ_OK;
+    if (!boundary) { dbuf_free(&latest); return BJ_OK; }
+
+    const uint64_t base = elog_base_index(r->log);
+
+    /*
+     * REASON ONE: an adoption that never finished. A committed generation
+     * whose boundary is PAST the log's base means the manifest committed and
+     * the log never moved -- so the live files are behind a state that has
+     * already been promised, and the generation is that state.
+     */
+    const int unfinished = boundary > base;
+
+    /*
+     * REASON TWO: the live files cannot be replayed onto AT ALL.
+     *
+     * The replay floor is a max over what the surviving structures record,
+     * and a drop can delete the structure that recorded the highest -- a
+     * dropDatabase takes a whole directory, catalog included, so nothing
+     * inside the instance is left to remember. Below the log's base that is
+     * not a replay plan: the entries in between are compacted away, so
+     * resuming at the base means resuming AHEAD of what the files contain,
+     * and the first entry naming what the drop removed cannot apply. -37,
+     * which is possible divergence, so the member halts -- deterministically,
+     * on every later boot. Measured: four boots, all halted, after nothing
+     * worse than a drop and a restart.
+     *
+     * The line below this used to raise `applied` to the base and carry on,
+     * on the reasoning that "the snapshot the base came from IS the state at
+     * the base". That is true of the SNAPSHOT and was being asserted of the
+     * LIVE FILES, which had moved past the base and then lost the record of
+     * it. Restoring makes the sentence true by construction rather than by
+     * assumption: the generation at the boundary genuinely is that state, and
+     * the log's suffix -- which begins exactly there -- replays the rest,
+     * including the drop that started this.
+     *
+     * Only when the generation is AT the base. A generation older than the
+     * base would restore a state the log can no longer carry forward, which
+     * loses every entry in between -- so that case is left to halt, loudly
+     * and with its files intact, rather than quietly discarding committed
+     * data.
+     */
+    uint64_t floor = 0;
+    int unaccountable = 0;
+    if (!unfinished && boundary == base && base > 0) {
+        /* Nothing to restore is not a fault: an empty instance reports a
+         * floor of zero honestly, and beside an empty generation there is
+         * no difference to reconcile. */
+        uint32_t live_files = 0;
+        if (live_file_count(&latest, &live_files) == BJ_OK && live_files > 0) {
+            /* Opens each database to read what it recorded and closes what it
+             * opened; safe here only because it runs BEFORE the restore
+             * replaces those files, which is the same reason the whole
+             * reconciliation happens before any database is held open. */
+            floor = dbi_applied_floor(r->inst);
+            unaccountable = floor < base;
+        }
     }
 
-    fprintf(stderr, "nisaba: restoring snapshot at index %llu (an adoption did not"
-                    " finish before the last crash)\n",
-            (unsigned long long)boundary);
+    if (!unfinished && !unaccountable) { dbuf_free(&latest); return BJ_OK; }
+
+    if (unfinished) {
+        fprintf(stderr, "nisaba: restoring snapshot at index %llu (an adoption did not"
+                        " finish before the last crash)\n",
+                (unsigned long long)boundary);
+    } else {
+        fprintf(stderr, "nisaba: restoring snapshot at index %llu: the live files"
+                        " account for only %llu and the log starts at %llu, so there"
+                        " is nothing to replay the difference from\n",
+                (unsigned long long)boundary, (unsigned long long)floor,
+                (unsigned long long)base);
+    }
     fflush(stderr);
 
     /* Stale files that the generation does not restore -- a journal left
@@ -1338,7 +1425,7 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
      * replaces the very files a database handle would be positioned in. */
     int e = store_scan_adopt(r);
     if (!e) e = open_best_log(r);
-    if (!e) e = restore_if_stale(r);
+    if (!e) e = restore_if_unusable(r);
     if (e) {
         if (r->log) elog_free(r->log);
         if (r->log_io.close) r->log_io.close(r->log_io.ctx);
@@ -1431,15 +1518,22 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
      */
     r->applied = dbi_applied_floor(inst);
     /*
-     * The floor is a MAX over databases, and a replicated dropDatabase
-     * can remove the database that held it -- after which the surviving
-     * ones report something older. Below the log's base that is not a
-     * replay plan, it is a trap: the entries between are compacted away,
-     * and the snapshot the base came from IS the state at the base
-     * (the drop applied before the boundary was taken, or the install
-     * adopted it whole). Above the base the regression is legal and the
-     * replay is the answer: re-applying recreates the dropped database
-     * entry by entry and the drop entry removes it again.
+     * The floor is a MAX over databases, and a replicated dropDatabase can
+     * remove the database that held it -- after which the surviving ones
+     * report something older. Above the base that regression is legal and
+     * replay is the answer: re-applying recreates the dropped database entry
+     * by entry, and the drop entry removes it again.
+     *
+     * BELOW the base it is not a replay plan, and this line used to make it
+     * one anyway -- on the reasoning that the snapshot the base came from is
+     * the state at the base. It is; the live files were not, having moved
+     * past the base and lost the record of doing so, and a member that
+     * resumed here halted on the first entry naming what a drop had removed.
+     * restore_if_unusable now restores that snapshot before this runs, so by
+     * the time the clamp is reached the files really are the state at the
+     * base and it has nothing left to paper over. Kept as the backstop for
+     * the one case that cannot be restored -- no generation at the base at
+     * all -- where resuming is still better than refusing to start.
      */
     if (r->applied < elog_base_index(r->log))
         r->applied = elog_base_index(r->log);

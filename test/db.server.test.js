@@ -1797,6 +1797,85 @@ for (const engine of ENGINES) {
         second?.proc.kill();
       }
     }, 60000);
+
+    it('restarts after a dropDATABASE too, by restoring the generation', async () => {
+      /*
+       * THE SAME FAILURE ONE LEVEL UP, and it cannot be fixed the same way.
+       *
+       * A dropCollection leaves the catalog behind, so the catalog can carry
+       * the applied index a drop would otherwise take with it. A
+       * dropDATABASE removes the whole directory, catalog included: nothing
+       * INSIDE the instance survives to remember, and the instance floor --
+       * a max over databases -- regresses to whatever the survivors report,
+       * or to nothing at all.
+       *
+       * So the answer is not another record but a different question. A floor
+       * below the log's base means replay cannot reach consistency: the
+       * entries in between are compacted away. What IS at the base is the
+       * committed generation the compaction was paired with, so it is
+       * restored and the log's suffix -- which begins exactly there --
+       * replays the difference, the drop included.
+       *
+       * Which is why this asserts CONVERGENCE and not merely liveness. The
+       * restore brings the dropped database back; if the replayed drop did
+       * not then remove it, the server would come up serving resurrected
+       * data, which is worse than the halt this replaces.
+       */
+      const port = nextPort();
+      const DOOMED = 'outrun';
+      const first = await startServer(engine, port,
+        ['--raft', '1', '--snapshot-entries', '8'], -1);
+      let second = null;
+      const withLog = (err) => {
+        const tail = [first.stderr?.(), second?.stderr?.()]
+          .filter(Boolean).join('\n--\n').trim().split('\n').slice(-8).join('\n    ');
+        err.message += `\n  server said:\n    ${tail}`;
+        return err;
+      };
+      try {
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        await c.db(DOOMED).collection('x').insertMany(
+          Array.from({ length: 20 }, (_, k) => ({ n: k })));
+
+        /* Compact HERE, so the log's base sits between the entries that made
+         * the database and the DDL naming it. */
+        const gen = await c.snapshot();
+        expect(gen.lastIncludedIndex, 'the snapshot included nothing')
+          .toBeGreaterThan(1);
+
+        await c.db(DOOMED).collection('x').createIndex({ n: 1 });
+        expect(await c.dropDatabase(DOOMED)).toBe(true);
+
+        const before = await c.ping();
+        expect(before.base, 'the log outran the DDL, so replay would skip it' +
+          ' and this proves nothing').toBeLessThan(before.applied);
+        await c.close();
+
+        first.proc.kill();
+        await new Promise((r) => first.proc.once('exit', r));
+
+        second = await startServer(engine, port,
+          ['--raft', '1', '--snapshot-entries', '8'], 0, first.dir);
+        const back = await connectServer(port, { keepAliveMs: 0 });
+        expect((await back.ping()).pong).toBe(true);
+
+        /* It restored, rather than happening to survive some other way. */
+        expect(second.stderr(), 'nothing was restored, so this passed for' +
+          ' a reason it does not name').toMatch(/restoring snapshot at index \d+/);
+        /* AND CONVERGED: back, then dropped again by the replayed entry. */
+        expect(await back.listDatabases(),
+          'the drop did not survive the restore').not.toContain(DOOMED);
+        /* And it is a working instance. */
+        await back.db('after').collection('c').insertOne({ n: 1 });
+        expect(await back.db('after').collection('c').countDocuments({})).toBe(1);
+        await back.close();
+      } catch (err) {
+        throw withLog(err);
+      } finally {
+        first.proc.kill();
+        second?.proc.kill();
+      }
+    }, 60000);
   });
 
   /*

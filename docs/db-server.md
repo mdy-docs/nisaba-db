@@ -1152,6 +1152,25 @@ is what makes the serial engine a property that can be handed back.
   claim an entry whose effects are not durable, which is a lost write, worse
   than the halt. `test/repro-halt-on-drop.js` reproduces the old failure
   against a build without this in one go.
+
+  **A `dropDatabase` needs the other half**, because it removes the whole
+  directory, catalog included: nothing *inside* the instance survives to
+  remember, so the instance floor — a max over databases — regresses the same
+  way. There the question is different. A floor below the log's base means
+  replay **cannot** reach consistency, because the entries in between are
+  compacted away; what *is* at the base is the committed generation the
+  compaction was paired with, so `restore_if_unusable` restores it and the
+  log's suffix — which begins exactly there — replays the difference,
+  including the drop that started it. That is why the test asserts
+  *convergence* and not merely that the server starts: the restore brings the
+  dropped database back, and the replayed drop has to remove it again. Only
+  when the generation is **at** the base; an older one would restore a state
+  the log can no longer carry forward, which is left to halt with its files
+  intact rather than quietly discarding committed data. The clamp that used to
+  paper over this (raising `applied` to the base on the reasoning that the
+  snapshot *is* the state at the base — true of the snapshot, and asserted of
+  the live files) remains only as the backstop for an instance with no
+  generation at the base at all.
 - **Nothing is dropped in silence.** Every refusal is a distinct code
   with `dc_strerror` text.
 
@@ -1159,28 +1178,6 @@ is what makes the serial engine a property that can be handed back.
 
 Stated here rather than discovered later.
 
-- **OPEN: `dropDatabase` has the same shape the catalog fix closed for
-  `dropCollection`.** A dropped database takes its whole directory, catalog
-  included, so the INSTANCE-level floor — a max over databases — regresses
-  exactly as the per-database one used to. With a compacted log the member
-  then halts on restart, on every boot, and the database cannot be opened
-  again. `npm run repro:halt-on-drop -- --via database` does it on the first
-  try; `--via collection` is the fixed case and stays clean.
-
-  There is nowhere left *inside* the instance for the record to survive, so
-  the fix is not another catalog. Two candidates: a small root-level record
-  written atomically with the directory's removal (a format addition), or —
-  better, because it covers this and any future cause — restoring the
-  committed generation when the floor sits below the log's base. That
-  condition means replay *cannot* reach consistency (the entries in between
-  no longer exist), while a generation holding a consistent state at exactly
-  that boundary is usually right there on disk; `restore_if_stale()` already
-  performs that restore and only declines because its trigger is a boundary
-  *past* the base rather than equal to it. Putting the index in the log's own
-  hard state would be the neatest analogue of the catalog fix, but `elog`
-  lives in the `binjson-structures` submodule, and forking a shared
-  dependency is the thing this repo went out of its way not to do for
-  regex-engine.
 - **Cursors are bounded and not timed out on their own.** Sixteen at
   once across all clients (`DBS_MAX_CURSORS`); the seventeenth is `-47`.
   An abandoned cursor is held until its connection ends, which the idle

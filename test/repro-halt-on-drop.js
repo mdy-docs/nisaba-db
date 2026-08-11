@@ -68,14 +68,14 @@ const DB = 'reproduced';
  *   collection  FIXED. A dropCollection deletes the collection's files, and
  *               with them the applied index they carried; the catalog now
  *               carries one too, and a drop keeps the catalog.
- *   database    STILL OPEN. A dropDatabase removes the whole directory, the
- *               catalog included, so the INSTANCE-level floor (a max over
- *               databases) regresses exactly as the database-level one did.
- *               Reproduces on the first try; there is nowhere left inside
- *               the instance for the record to survive, so the fix is not
- *               another catalog but either a root-level record or restoring
- *               the committed generation when the floor sits below the log's
- *               base. See docs/db-server.md.
+ *   database    FIXED DIFFERENTLY, because a dropDatabase removes the whole
+ *               directory, catalog included -- nothing inside the instance
+ *               survives to remember, so there was nowhere to put a record.
+ *               A floor below the log's base instead means replay CANNOT
+ *               reach consistency, and the committed generation at that
+ *               boundary is the state that can: restore_if_unusable
+ *               restores it and the log's suffix replays the difference,
+ *               the drop included. See docs/db-server.md.
  */
 const opts = { tries: 60, maxDelay: 25, boots: 4, via: 'collection',
                port: 38600 + (process.pid % 120) * 4 };

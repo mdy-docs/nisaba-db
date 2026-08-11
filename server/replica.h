@@ -256,6 +256,34 @@ int replica_wait_reads_idle(replica *r, replica_drain_why why);
  */
 #define REPLICA_REFUSED (-1000)
 
+/*
+ * ---- before a member starts, or asks to be let in ------------------------
+ *
+ * Both of these exist for one rule: A MEMBER THAT HAS LOST ITS DISK MUST
+ * NOT COME BACK AS ITSELF. Its log, its term and its vote went with the
+ * disk, so what returns is a stranger wearing a member's id -- able to
+ * vote a second time in a term it has already voted in, and to vote for a
+ * log missing entries its own acknowledgement helped commit.
+ *
+ * replica_open enforces it for the BOOTSTRAP path, where an empty
+ * directory beside peers that have history is a claim to be founding a
+ * cluster that already exists. The JOIN path needs the same rule asked a
+ * moment earlier -- before the join, because afterwards "is this id
+ * already a member" is true of a new member too, the join having just made
+ * it one. So server/main.c asks each seed first, and these are what it
+ * asks with.
+ *
+ * replica_ask_identity returns 1 when the address answered, 0 otherwise --
+ * and silence is never taken as an answer, because a member that cannot
+ * reach anybody must still be able to start a cluster.
+ */
+int replica_ask_identity(const char *host, int port, uint64_t asking_id,
+                         int *has_history, int *is_member, uint64_t *group);
+
+/* Whether this root has ever held a log. The local half of the question:
+ * a blank directory is what a new member and a lost disk look like. */
+int replica_directory_is_blank(root_state *rt, int *blank);
+
 int  replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
                   const uint8_t *members, uint32_t members_len,
                   uint64_t now, root_state *rt, uint64_t snapshot_entries,

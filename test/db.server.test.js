@@ -2409,6 +2409,27 @@ for (const engine of ENGINES) {
       return { proc, said: () => text, serving: /serving/.test(text), gone };
     };
 
+    /* The same, but asking to be let in rather than claiming to found
+     * anything: --join names an ADDRESS, and no --peer list at all. */
+    const tryJoin = async (m, seed) => {
+      const args = ['--raft', String(m.id), '--raft-port', String(m.raftPort),
+        ...CLOCK, ...(m.group ? ['--group', String(m.group)] : []),
+        '--join', `127.0.0.1:${seed.raftPort}`];
+      const [cmd, argv, opts] = engine.argv(m.dir, m.port, args);
+      const proc = spawn(cmd, argv, { stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+      let text = '';
+      let gone = false;
+      proc.stderr.on('data', (d) => { text += String(d); });
+      proc.once('exit', () => { gone = true; });
+      for (let i = 0; i < 30000 && !gone; i++) {
+        if (/serving/.test(text)) break;
+        await sleep(1);
+      }
+      await sleep(150);
+      m.proc = gone ? null : proc;
+      return { proc, said: () => text, serving: /serving/.test(text) };
+    };
+
     it('writes down the group it was given, and starts without one', async () => {
       /*
        * GIVEN, NOT DERIVED, and the first version of this test asserted the
@@ -2540,6 +2561,79 @@ for (const engine of ENGINES) {
         for (const m of all) await stop(m);
       }
     }, 180000);
+
+    it('refuses to REJOIN a dead member\'s id, and still admits a new one',
+       async () => {
+      /*
+       * THE SAME RULE ON THE JOIN PATH, and the reason it is asked before
+       * the join rather than after: afterwards "is this id already a
+       * member" is true of a brand-new member too, the join having just
+       * made it one. So the question is put to the seed first, and the
+       * answer distinguishes the two cases that look identical from the
+       * joining member's own disk -- both are empty directories.
+       *
+       * Both halves are asserted here on purpose. A check that refused
+       * every blank joiner would be safe and useless: joining is how a new
+       * member is meant to arrive.
+       */
+      const all = trio(at(6), 606);
+      const spare = { id: 9, group: 606, port: at(6) + 40,
+                      raftPort: at(6) + 50, dir: null, proc: null };
+      try {
+        for (const m of all) await boot(m, all);
+        const lead = await leaderOf(all);
+        expect(lead, 'no leader emerged').toBeTruthy();
+        const c = await connectServer(lead.port, { keepAliveMs: 0 });
+        await c.db(DB).collection('held').insertOne({ n: 1 });
+        await c.close();
+
+        /* The mistake: a member's disk is gone and the fleet driver points
+         * it back at the cluster under the id it used to have. */
+        const victim = all.find((m) => m !== lead);
+        await stop(victim);
+        fs.rmSync(victim.dir, { recursive: true, force: true });
+        fs.mkdirSync(victim.dir, { recursive: true });
+
+        const rejoin = await tryJoin(victim, lead);
+        try {
+          expect(rejoin.serving, 'it rejoined under a dead member\'s id:\n    ' +
+            rejoin.said()).toBe(false);
+          expect(rejoin.said()).toMatch(/refusing to join/);
+          expect(rejoin.said()).toMatch(new RegExp(`already has node ${victim.id}`));
+          expect(rejoin.said(), 'the refusal has to name the remedy')
+            .toMatch(/--raft <a fresh id>/);
+        } finally {
+          rejoin.proc.kill();
+          await waitExit(rejoin.proc);
+        }
+
+        /* AND A NEW ID GETS IN, which is the remedy the refusal names. */
+        spare.dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-spare-'));
+        const joined = await tryJoin(spare, lead);
+        try {
+          expect(joined.serving, 'a brand-new member could not join:\n    ' +
+            joined.said()).toBe(true);
+          const c2 = await connectServer(spare.port, { keepAliveMs: 0 });
+          /* Caught up by the cluster, not by luck: the document it never
+           * saw written is there. */
+          for (let i = 0; i < 100; i++) {
+            const n = await c2.db(DB).collection('held')
+              .countDocuments({}, { stale: true }).catch(() => -1);
+            if (n === 1) break;
+            await sleep(100);
+          }
+          expect(await c2.db(DB).collection('held')
+            .countDocuments({}, { stale: true }),
+            'the new member never received the cluster\'s data').toBe(1);
+          await c2.close();
+        } finally {
+          joined.proc.kill();
+          await waitExit(joined.proc);
+        }
+      } finally {
+        for (const m of [...all, spare]) await stop(m);
+      }
+    }, 240000);
 
     it('refuses a directory that belongs to another cluster', async () => {
       /*

@@ -1233,6 +1233,18 @@ is what makes the serial engine a property that can be handed back.
   does not reply proves nothing, so a cold boot, where nobody is up yet,
   proceeds exactly as it always did. Refusing on silence would mean no
   cluster could ever be started.
+
+  **`--join` is covered too, and the question has to be asked first.** After
+  a join, *is this id already a member* is true of a brand-new member as
+  well, the join having just made it one — so the seed is asked before the
+  request, and a blank directory whose id the cluster **already has** is
+  refused: that is a member whose files are gone, and readmitting it puts a
+  voter with no memory of its promises back into the group. A blank directory
+  whose id the cluster does not have is an ordinary new member, and joining
+  is exactly how it should arrive; the refusal names the remedy, which is a
+  fresh id and a `--leave` for the old one. Both halves are asserted,
+  because a check that refused every blank joiner would be safe and
+  useless.
 - **`--group N` says which cluster a directory belongs to**, and a member
   refuses to start if a peer reports a different one, or if this directory
   was written under a different one. It is **given, not derived**: the first

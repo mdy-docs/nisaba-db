@@ -1450,38 +1450,89 @@ typedef struct {
     uint64_t history_from;   /* the peer that reported history            */
 } group_survey;
 
-static void ask_identity(replica *r, group_survey *s) {
+/*
+ * HAS THIS DIRECTORY EVER BEEN A MEMBER? Asked by name rather than by
+ * opening anything: a log file exists or it does not, and which names
+ * count as a log is this file's rule (open_best_log) rather than a thing
+ * for the caller to re-derive.
+ *
+ * A blank directory is the state of a member that has just been
+ * provisioned AND of one whose disk was lost -- telling those two apart is
+ * what the identity question is for. This only answers the local half.
+ */
+int replica_directory_is_blank(root_state *rt, int *blank) {
+    *blank = 1;
+    dbuf listing = {0};
+    int e = root_list_files(rt, NULL, 0, &listing);
+    if (e) { dbuf_free(&listing); return e; }
+    for (size_t at = 0; at < listing.len; ) {
+        size_t end = at;
+        while (end < listing.len && listing.data[end] != '\0') end++;
+        const char *name = (const char *)listing.data + at;
+        size_t n = end - at;
+        if ((n == strlen(REPLICA_WAL) && memcmp(name, REPLICA_WAL, n) == 0) ||
+            (n > strlen(REPLICA_SNAP_PREFIX) &&
+             memcmp(name, REPLICA_SNAP_PREFIX, strlen(REPLICA_SNAP_PREFIX)) == 0)) {
+            *blank = 0;
+            break;
+        }
+        at = end + 1;
+    }
+    dbuf_free(&listing);
+    return BJ_OK;
+}
+
+/* One address, one question. Shared by the boot survey below and by the
+ * pre-join check in server/main.c, which asks the same thing of a seed
+ * before it asks to be let in. */
+static int ask_one(const char *host, int port, uint64_t asking,
+                   rmsg_identity *out) {
     dbuf q = {0};
-    if (rmsg_build_identity(r->self_id, &q)) { dbuf_free(&q); return; }
+    if (rmsg_build_identity(asking, &q)) { dbuf_free(&q); return 0; }
+    dbuf reply = {0};
+    char err[160];
+    err[0] = '\0';
+    int rc = peers_call(host, port, q.data, (uint32_t)q.len, GROUP_ASK_MS,
+                        &reply, err, sizeof err);
+    int got = 0;
+    if (rc == 0 && rmsg_identity_read(reply.data, (uint32_t)reply.len, out) == BJ_OK)
+        got = 1;
+    dbuf_free(&reply);
+    dbuf_free(&q);
+    return got;
+}
+
+int replica_ask_identity(const char *host, int port, uint64_t asking_id,
+                         int *has_history, int *is_member, uint64_t *group) {
+    rmsg_identity id;
+    if (!ask_one(host, port, asking_id, &id)) return 0;
+    if (has_history) *has_history = id.last_index > 0 || id.base_index > 0;
+    if (is_member) *is_member = id.is_member;
+    if (group) *group = id.group;
+    return 1;
+}
+
+static void ask_identity(replica *r, group_survey *s) {
     for (uint32_t i = 0; i < peers_count(r->px); i++) {
-        dbuf reply = {0};
-        char err[160];
-        err[0] = '\0';
-        int rc = peers_call(peers_host_at(r->px, i), peers_port_at(r->px, i),
-                            q.data, (uint32_t)q.len, GROUP_ASK_MS, &reply,
-                            err, sizeof err);
-        if (rc == 0) {
-            rmsg_identity id;
-            if (rmsg_identity_read(reply.data, (uint32_t)reply.len, &id) == BJ_OK) {
-                if (id.last_index > 0 || id.base_index > 0) {
-                    if (!s->any_history) s->history_from = peers_id_at(r->px, i);
-                    s->any_history = 1;
-                    if (id.is_member) s->claims_us = 1;
-                }
-                if (id.group && !s->theirs) {
-                    s->theirs = id.group;
-                    s->from = peers_id_at(r->px, i);
-                }
+        rmsg_identity id;
+        if (ask_one(peers_host_at(r->px, i), peers_port_at(r->px, i),
+                    r->self_id, &id)) {
+            if (id.last_index > 0 || id.base_index > 0) {
+                if (!s->any_history) s->history_from = peers_id_at(r->px, i);
+                s->any_history = 1;
+                if (id.is_member) s->claims_us = 1;
+            }
+            if (id.group && !s->theirs) {
+                s->theirs = id.group;
+                s->from = peers_id_at(r->px, i);
             }
         }
-        dbuf_free(&reply);
         /* Enough. One peer with history falsifies a claim to be founding
          * this cluster, and one group id is enough to compare against --
          * so the common case is a single round trip, and the timeout is
          * only paid for peers that are genuinely unreachable. */
         if (s->any_history || s->theirs) break;
     }
-    dbuf_free(&q);
 }
 
 static int settle_group(replica *r, int joined, uint64_t given) {

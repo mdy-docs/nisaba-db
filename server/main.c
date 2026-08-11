@@ -1806,6 +1806,56 @@ int main(int argc, char **argv) {
      */
     dbuf members = {0};
     if (n_seeds) {
+        /*
+         * A MEMBER THAT HAS LOST ITS DISK MAY NOT COME BACK AS ITSELF, and
+         * this is the join path's half of that rule.
+         *
+         * ASKED BEFORE THE JOIN, which is the whole subtlety. Afterwards
+         * "is this id already a member" is true of a brand-new member too,
+         * the join having just made it one -- so the one moment the question
+         * can be told apart from its own answer is now. Blank directory,
+         * plus a cluster that has history, plus an id that cluster ALREADY
+         * has: that is a member whose files are gone, and letting it back in
+         * under its old id readmits a voter with no memory of what it
+         * promised. A blank directory whose id the cluster does NOT have is
+         * an ordinary new member, and joining is exactly how it should
+         * arrive.
+         *
+         * Silence is not an answer here either: a seed that cannot be
+         * reached will refuse the join a moment later anyway, and this
+         * check does not get to decide on nothing.
+         */
+        int blank = 0;
+        if (replica_directory_is_blank(rst, &blank) == BJ_OK && blank) {
+            for (int i = 0; i < n_seeds; i++) {
+                int has_history = 0, is_member = 0;
+                if (!replica_ask_identity(seeds[i].host, seeds[i].port,
+                                          (uint64_t)node_id, &has_history,
+                                          &is_member, NULL)) continue;
+                if (!has_history || !is_member) continue;
+                fprintf(stderr,
+                    "nisaba: refusing to join: %s:%d already has node %d in its"
+                    " cluster, and this directory is empty.\n"
+                    "  A member that has lost its disk cannot come back as"
+                    " itself: its log, its term and its vote went with the"
+                    " disk, so it would vote a second time in terms it has"
+                    " already voted in and could elect a log that is missing"
+                    " committed entries.\n"
+                    "  Join under a NEW id instead -- --raft <a fresh id>"
+                    " --join %s:%d -- and remove the old one with --leave %d"
+                    " once it is caught up.\n",
+                    seeds[i].host, seeds[i].port, node_id,
+                    seeds[i].host, seeds[i].port, node_id);
+                fflush(stderr);
+                dbuf_free(&members);
+                peers_free(px);
+                dbi_close(inst);
+                root_free(rst);
+                instns_free(&ns);
+                return 1;
+            }
+        }
+
         char why[256];
         /* What the joiner announces is the address of record --
          * peers_self_host, which --raft-advertise overrode when the

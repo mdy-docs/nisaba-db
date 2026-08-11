@@ -1448,6 +1448,7 @@ typedef struct {
     uint64_t theirs;         /* the first non-zero group id seen          */
     uint64_t from;           /* the peer that reported `theirs`           */
     uint64_t history_from;   /* the peer that reported history            */
+    uint64_t term;           /* the highest term any peer reported        */
 } group_survey;
 
 /*
@@ -1517,6 +1518,10 @@ static void ask_identity(replica *r, group_survey *s) {
         rmsg_identity id;
         if (ask_one(peers_host_at(r->px, i), peers_port_at(r->px, i),
                     r->self_id, &id)) {
+            /* The highest term anybody admits to. A blank member spends it
+             * before it starts, so the term it woke into cannot be voted in
+             * twice across a restart -- see settle_group. */
+            if (id.term > s->term) s->term = id.term;
             if (id.last_index > 0 || id.base_index > 0) {
                 if (!s->any_history) s->history_from = peers_id_at(r->px, i);
                 s->any_history = 1;
@@ -1572,26 +1577,77 @@ static int settle_group(replica *r, int joined, uint64_t given) {
     group_survey s = {0};
     if (have_peers) ask_identity(r, &s);
 
+    /*
+     * AN EMPTY DIRECTORY BESIDE PEERS THAT HAVE A LOG: START, BUT DO NOT
+     * VOTE.
+     *
+     * This used to refuse to start, and that was wrong in a way only a
+     * mixed C/Node test noticed: the shape has TWO causes and refusing
+     * punished the ordinary one.
+     *
+     *   A BOOTSTRAP MEMBER THAT STARTS LATE. Three members are placed
+     *   together, two come up, elect a leader and take writes, and the
+     *   third's first ever boot happens seconds later. Its peers have
+     *   history and their member set contains its id -- indistinguishable
+     *   from the case below. Concurrent placement makes that a race, not a
+     *   mistake, so refusing meant a placed member could lose its boot to
+     *   timing and never come back. Measured in pure C: two members of a
+     *   trio, 20 documents, then member 3's first boot refused for ever.
+     *
+     *   A MEMBER WHOSE DIRECTORY WAS EMPTIED. Not a crash Raft tolerates: a
+     *   crash keeps the log, the term and the vote, and a wipe takes all
+     *   three, so the member comes back wearing the same id with no memory
+     *   of what it promised. Measured both ways -- two wiped members
+     *   electing each other and telling the member that held 7,319
+     *   committed entries to adopt theirs, and a single wipe electing a log
+     *   16 documents short of what a leader had acknowledged.
+     *
+     * What both failures needed was this member's VOTE, and a vote is the
+     * one thing it has no business casting: it holds nothing to compare
+     * logs with. So it holds no franchise until its log is non-empty
+     * (rn_hold_vote_while_blank), which is the moment it has heard from the
+     * leader of its term and holds that leader's entries. It replicates,
+     * it is installed into, it serves stale reads, it acknowledges -- an
+     * acknowledgement says "I stored this", which is true, unlike a vote.
+     *
+     * AND THE TERM IT WOKE INTO IS SPENT, DURABLY, before the node starts.
+     * The in-memory hold ends when entries arrive; the danger that outlives
+     * it is a RESTART with those entries and a stale pre-wipe vote in the
+     * same term. Writing (term, self) as the hard state closes that with
+     * the ordinary rule -- one vote per term, already used -- and costs a
+     * legitimate new member nothing: it votes from the next term on, and
+     * every election bumps the term.
+     *
+     * The residual, stated rather than hidden: a vote granted pre-wipe in a
+     * term NO surviving peer ever observed is not covered, because nothing
+     * here can know of it. That needs a second member's evidence to vanish
+     * as well, which is outside the single-fault model this addresses.
+     */
     if (blank && !joined && s.any_history) {
         fprintf(stderr,
-            "nisaba: refusing to start: this directory is empty, but member %llu"
-            " already has a log -- so this cluster exists and this is not the"
-            " member that founded it.\n"
-            "  --peer with an empty directory says \"I am founding a new"
-            " cluster\", and starting anyway would let this node vote in terms it"
-            " has already voted in, and elect a log that is missing committed"
-            " entries.\n"
+            "nisaba: this directory is empty and member %llu already has a log,"
+            " so this node will replicate but NOT VOTE until it has entries of"
+            " its own.\n"
             "  %s\n"
-            "  To replace a member that has lost its disk, JOIN A NEW ONE:"
-            " --raft <a fresh id> --join HOST:PORT. To start a new cluster here,"
-            " point --peer at members whose directories are all empty.\n",
+            "  Either is ordinary; they cannot be told apart from here, and a"
+            " member that does not vote cannot vote twice in one term nor elect"
+            " a log missing committed entries. The franchise returns by itself"
+            " once the leader has sent something.\n",
             (unsigned long long)s.history_from,
             s.claims_us
-                ? "That member's set already contains this node's id, so this is"
-                  " a member whose directory was emptied."
-                : "That member's set does not contain this node's id.");
+                ? "This node's id is already in that member's set: either a"
+                  " bootstrap member starting late, or one whose directory was"
+                  " emptied."
+                : "This node's id is NOT in that member's set, so it is not"
+                  " replicating anything yet -- check --peer and --join.");
         fflush(stderr);
-        return REPLICA_REFUSED;
+        /* Spend the term first: if this write fails, the hold alone would be
+         * a promise that a restart could break. */
+        if (s.term > elog_current_term(r->log)) {
+            e = elog_set_hard_state(r->log, s.term, r->self_id);
+            if (e) return e;
+        }
+        rn_hold_vote_while_blank(r->node, 1);
     }
 
     if (mine && s.theirs && mine != s.theirs) {
@@ -2743,6 +2799,13 @@ static int replica_status(const replica *r, dbuf *out) {
     if (!e) e = bj_put_int(b, (int64_t)elog_base_index(r->log));
     if (!e) e = bj_put_key(b, (const uint8_t *)"last", 4);
     if (!e) e = bj_put_int(b, (int64_t)elog_last_index(r->log));
+    /* Whether this member is holding its own franchise -- it booted with an
+     * empty log beside peers that had one, so it replicates but does not
+     * vote until it has entries (rn_hold_vote_while_blank). An operator
+     * needs to see it, and a test needs to see it CLEAR, which is the half
+     * that a log line at startup cannot show. */
+    if (!e) e = bj_put_key(b, (const uint8_t *)"voteHeld", 8);
+    if (!e) e = bj_put_bool(b, rn_vote_held(r->node) ? 1 : 0);
     /* Read routing, for the same reason as the log's bounds above: a
      * decision nobody can observe is a decision nobody can check. Both are
      * 0 on a server that was not asked for reader threads, because it does

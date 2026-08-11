@@ -1259,58 +1259,53 @@ the opposite of what they said.
   carries a read-only `identity` message that any member answers out of its
   own files, in any role, mid-election or not — which is why it is neither a
   join nor a vote, both of which need a leader, and a leaderless moment is
-  when this matters most. `--peer` with an empty directory is a claim to be
-  founding a cluster; a peer with a log falsifies it, and the member
-  **refuses to start** rather than voting its way into somebody's data loss.
-  Two of three is still a quorum, so the cluster is unharmed by the refusal.
-  The remedy is in the message: replace a member that has lost its disk by
-  **joining a new one under a new id**, never by restarting the old id on an
-  empty directory. Only the bootstrap path refuses — `--join` is how a
-  genuinely new member legitimately arrives with an empty log.
+  when this matters most.
+
+  **What it takes is the VOTE, not the boot.** An empty directory beside a
+  peer that has a log means one of two things, and nothing here can tell
+  which: a member whose directory was emptied, or a bootstrap member whose
+  first boot happened after the others began writing. So the member starts,
+  replicates, is installed into, serves stale reads and acknowledges — an
+  acknowledgement says "I stored this", which is true, unlike a vote — but it
+  **grants no vote and never campaigns while its log is empty**
+  (`rn_hold_vote_while_blank`). That is precisely what both measured failures
+  needed from it, and `ping` reports it as `voteHeld` so an operator can see a
+  member that is present but not counted.
+
+  The hold ends on the only evidence that matters: **entries**. Once the log
+  is non-empty this member has heard from the leader of its term and holds
+  that leader's data, so comparing logs means something again. The term it
+  woke into is spent **durably** first — the host writes `(term, self)` as the
+  hard state before the node starts — so a restart cannot hand the vote back
+  inside that term; ordinary Raft ("one vote per term, already used") does the
+  rest. The residual, stated rather than hidden: a vote granted pre-wipe in a
+  term *no surviving peer ever observed* is not covered, which needs a second
+  member's evidence to vanish as well and is outside the single-fault model
+  this addresses.
+
+  A quorum of blanks therefore elects nobody rather than electing an empty
+  log: with one surviving log between three members, no leader emerges and the
+  survivor's entries stay where they are. That is the same availability the
+  earlier refusal gave — and the same as losing two members of three — without
+  requiring an operator to notice.
+
+  **It used to refuse to start instead, and that was wrong.** A refusal cannot
+  distinguish the two causes either, so it punished both: a placed member
+  whose boot lost a race to the first write never came back. Measured in pure
+  C — two members of a trio, 20 documents written, then member 3's first ever
+  boot refused for ever — and covered now by *a bootstrap member that starts
+  LATE joins* and *a member whose directory was emptied comes back, and cannot
+  vote with it*, whose halves fail independently when either half of the fix
+  is disabled.
+
+  Only the bootstrap path holds — `--join` is how a genuinely new member
+  arrives with an empty log, and it is admitted as a learner until it catches
+  up, which already denies it a vote.
 
   Silence is not an answer, and that is the check's honest limit: a peer that
   does not reply proves nothing, so a cold boot, where nobody is up yet,
   proceeds exactly as it always did. Refusing on silence would mean no
   cluster could ever be started.
-
-  **AND IT REFUSES A CASE IT SHOULD NOT: a bootstrap member that starts
-  late.** Three members are placed together, two of them come up, elect a
-  leader and take writes — and the third arrives seconds later, blank,
-  because it has never run before. Its peers have history and their member
-  set contains its id, which is *exactly* what a wiped member looks like, so
-  it refuses, for ever. Measured in pure C: two members of a trio, 20
-  documents written, then member 3's first ever boot refuses with "that
-  member's set already contains this node's id, so this is a member whose
-  directory was emptied". Concurrent placement makes this a race rather than
-  a mistake, so it is a real fault in normal operation, not a
-  misconfiguration.
-  (It was hidden until the wasm build was refreshed: a mixed C/Node test
-  covers precisely this shape, and the Node members' engine did not yet know
-  the `identity` message, so nothing falsified the claim and the member
-  booted.)
-
-  The ambiguity is genuine — nothing on the member's own disk distinguishes
-  the two, which is what this rule was built on — so it has to be resolved
-  somewhere else, and there are two honest places:
-
-  - **Hold the vote instead of refusing to run.** Boot, replicate, be
-    installed into, but grant no vote and never campaign until a term the
-    member cannot already have voted in — the identity reply already carries
-    the peers' term, so `> that` is the bound. It removes the false positive
-    with no operator input, and it closes the measured hazard by a narrower
-    mechanism: a member that does not vote cannot vote twice. The residual is
-    a vote granted in a term *no surviving peer ever observed*, which needs a
-    second member's evidence to vanish as well — outside the single-fault
-    model this rule addresses.
-  - **Make the cluster remember.** The log is the only durable place that
-    could tell the two apart: the leader marks a member `seen` in the config
-    the first time it holds data, and the identity reply answers "the log has
-    never seen you", which is exact rather than inferred. More code, and it
-    only helps once the whole cluster runs it.
-
-  Until one of them lands, a control plane that places a cluster must start
-  every member before the first write, which is not something a placement can
-  guarantee.
 
   **`--join` is covered too, and the question has to be asked first.** After
   a join, *is this id already a member* is true of a brand-new member as
@@ -1576,11 +1571,18 @@ both ways: two wiped members are a quorum of blanks who elect each other and
 tell the member holding the history to adopt theirs (7,319 committed entries
 gone), and *one* wipe is enough — a leader answered a linearizable read with
 768 of the 784 documents it had just acknowledged, its co-committer having
-been wiped and then voted for the shorter log. Wiping is now off by default
-(`--wipeShare`), which costs nothing: a member killed *with* its files is
+been wiped and then voted for the shorter log. Wiping is off by default
+(`--wipeShare`), which costs little: a member killed *with* its files is
 installed into anyway, because the base moves past it in a fraction of a
-second. **The way to replace a member that has lost its disk is to join a new
-one under a new id**, never to restart the old id on an empty directory.
+second. It is worth turning on for this rule specifically — a wiped member now
+starts, holds its vote until it has entries, and is followed back to the
+cluster, and the soak counts both (`churn cycles (N onto an empty
+directory)`, and the time spent waiting for a wiped member to catch up). A
+7-minute TSan run with `--wipeShare 0.3` and half the kills taking the leader:
+20 blank boots, 286 installs, 39 leader kills, clean. **Replacing a member
+that has lost its disk by joining a new one under a new id is still the
+cleanest thing to do** — it never needs a hold — but restarting the old id no
+longer costs the member its boot.
 
 The other was the writer's model: **a lost answer is genuinely ambiguous, and
 no amount of asking afterwards resolves it.** A batch proposed to a member that then died can still commit later,

@@ -164,6 +164,48 @@ void rn_swap_log(raft_node *n, elog *fresh, const bj_io *io, elog **old);
 void rn_set_group(raft_node *n, uint64_t group);
 uint64_t rn_group(const raft_node *n);
 
+/*
+ * NO VOTE UNTIL THERE IS SOMETHING TO VOTE WITH.
+ *
+ * Set by a host that started this member with an EMPTY log beside peers
+ * that have one. That shape has two causes and the member cannot tell them
+ * apart from its own disk: it is either a member of a bootstrap set whose
+ * first boot happened after the others had begun writing -- ordinary, and a
+ * race a concurrent placement cannot avoid -- or a member whose directory
+ * was emptied, which is not a crash Raft tolerates, because a wipe takes
+ * the log, the term AND the vote and brings the member back with no memory
+ * of what it promised.
+ *
+ * Refusing to start told the two apart by punishing both, and the ordinary
+ * one is ordinary. So the member starts, replicates, and is installed into
+ * -- but holds no franchise while its log is empty: it will not campaign
+ * and will not grant a vote. Both halves were measured as failures before
+ * either existed: two wiped members electing each other and telling a
+ * member holding 7,319 committed entries to adopt their empty log, and one
+ * wiped member's vote electing a log short of 16 documents a leader had
+ * already acknowledged.
+ *
+ * IT CLEARS ITSELF on the only evidence that counts -- a non-empty log.
+ * That means this member has heard from the leader of its term, holds that
+ * leader's entries, and can be compared with other logs meaningfully again.
+ * The term it woke into is spent DURABLY by the host before the node starts
+ * (server/replica.c), so a restart cannot hand the vote back inside it.
+ *
+ * A cold bootstrap is untouched, and not by luck: a bootstrapped log holds
+ * no CONFIG history and gains nothing until this member LEADS, so a peer
+ * can only report history once a leader has existed -- which already took a
+ * quorum of votes from members that were up and voting. A staggered cold
+ * start therefore cannot hold itself into a deadlock: the first two members
+ * see nothing to hold for, and the third arrives after an election it was
+ * not needed for, holds for one heartbeat, and clears.
+ */
+void rn_hold_vote_while_blank(raft_node *n, int hold);
+
+/* Whether the franchise is being held right now -- for a host that wants
+ * to say so (nisaba-server puts it in `ping`). A member the SET excludes
+ * is not "held": that is the cluster's answer, not this one. */
+int rn_vote_held(const raft_node *n);
+
 void rn_set_ns(raft_node *n, bj_ns *ns);
 void rn_set_snapstore(raft_node *n, sst *store);
 

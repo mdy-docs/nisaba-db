@@ -203,6 +203,11 @@ struct raft_node {
     rn_peer  peers[RN_MAX_PEERS];
     uint32_t npeers;      /* excludes self                              */
     int      self_voting;
+    /* Set by a host that booted this member with an EMPTY log beside peers
+     * that have one: it may replicate and be installed into, but it may
+     * not vote or campaign until it holds something to vote WITH. See
+     * rn_hold_vote_while_blank. */
+    int      blank_hold;
     uint32_t voter_count; /* including self when self_voting             */
     /* The adopted set as raft_members_adopt normalized it: the member
      * RECORDS (ids, addresses, voting flags), the voter ids and the peer
@@ -305,6 +310,7 @@ _Static_assert(RN_MAX_EFF >= RN_MAX_PEERS * 3 + 8 + RN_MAX_AWAIT,
 static void flush_pending(raft_node *n, int ok);
 static void lose_reads(raft_node *n);
 static void settle_all_lost(raft_node *n);
+static int  votes_now(const raft_node *n);
 
 static rn_peer *peer_of(raft_node *n, uint64_t id) {
     for (uint32_t i = 0; i < n->npeers; i++)
@@ -1934,7 +1940,7 @@ int rn_tick(raft_node *n, int64_t now, double random01) {
     if (now >= n->election_deadline) {
         /* Pre-vote first: a straw poll persists nothing, so a node that
          * cannot win does not bump the term and disturb a live leader. */
-        if (!n->self_voting) { arm_election(n, random01); return BJ_OK; }
+        if (!votes_now(n)) { arm_election(n, random01); return BJ_OK; }
         return start_election(n, 1, random01);
     }
     return BJ_OK;
@@ -1953,11 +1959,47 @@ void rn_wake(raft_node *n, int64_t now, double random01) {
 
 /* ---- incoming ----------------------------------------------------------- */
 
+/*
+ * MAY THIS MEMBER VOTE, RIGHT NOW?
+ *
+ * `self_voting` is the cluster's answer: what the member set says. This
+ * adds the member's own, and it is temporary: a node that came up with an
+ * EMPTY log beside peers that have one holds no franchise until it has
+ * received something. Both halves of that are load-bearing:
+ *
+ *   NOT CAMPAIGNING is what stops two wiped members electing each other
+ *   and handing a survivor their empty log to adopt -- measured, before
+ *   this existed, against a member holding 7,319 committed entries.
+ *
+ *   NOT GRANTING is what stops one wiped member's vote completing a
+ *   majority for a candidate whose log is missing entries that member's
+ *   own acknowledgement helped commit.
+ *
+ * It clears by itself, on the only evidence that matters: entries. Once
+ * the log is non-empty this member has heard from the leader of its term,
+ * its state is that leader's, and comparing logs means something again.
+ * The host also spends the term durably before starting (see
+ * server/replica.c), so a restart cannot hand the vote back inside the
+ * term the member woke into.
+ */
+static int votes_now(const raft_node *n) {
+    if (!n->self_voting) return 0;
+    return !(n->blank_hold && elog_last_index(n->log) == 0);
+}
+
+void rn_hold_vote_while_blank(raft_node *n, int hold) {
+    if (n) n->blank_hold = hold ? 1 : 0;
+}
+
+int rn_vote_held(const raft_node *n) {
+    return n && n->self_voting && !votes_now(n);
+}
+
 static void fill_state(const raft_node *n, raft_msg_state *st) {
     st->self_id             = n->self_id;
     st->is_follower         = n->role == RAFT_FOLLOWER;
     st->is_leader           = n->role == RAFT_LEADER;
-    st->self_is_voter       = n->self_voting;
+    st->self_is_voter       = votes_now(n);
     st->leader_id           = n->leader_id;
     st->commit_index        = n->commit_index;
     st->now                 = n->now;
@@ -2205,7 +2247,7 @@ static int handle_timeout_now(raft_node *n, uint64_t peer, uint64_t corr,
     uint64_t term = 0;
     rmsg_term(msg, len, &term);
     int ok = term >= elog_current_term(n->log) &&
-             n->role != RAFT_LEADER && n->self_voting;
+             n->role != RAFT_LEADER && votes_now(n);
     int e = ok ? rn_campaign(n, random01) : BJ_OK;
     if (e) return e;
     dbuf r = {0};
@@ -2727,7 +2769,7 @@ void rn_seed_commit(raft_node *n, uint64_t index) {
 }
 
 int rn_campaign(raft_node *n, double random01) {
-    if (!n->running || n->role == RAFT_LEADER || !n->self_voting) return BJ_OK;
+    if (!n->running || n->role == RAFT_LEADER || !votes_now(n)) return BJ_OK;
     n->quiesced = 0;
     return start_election(n, 0, random01);
 }

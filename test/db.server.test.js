@@ -2548,65 +2548,209 @@ for (const engine of ENGINES) {
       }
     }, 180000);
 
-    it('refuses to start on an emptied directory, and says what to do instead',
+    it('a bootstrap member that starts LATE joins, rather than refusing for ever',
        async () => {
       /*
-       * THE MEASURED FAILURE, PREVENTED. --peer with an empty directory is
-       * a claim: "I am founding a new cluster". It is falsifiable, and a
-       * peer with a log falsifies it. The member that would have voted its
-       * way into losing somebody's committed entries now refuses to start
-       * at all, which is the only safe answer -- a member that does not
-       * run cannot vote, and two of three is still a quorum.
+       * THE CASE THE REFUSAL PUNISHED. Three members are placed together;
+       * two come up, elect a leader and take writes; the third's first ever
+       * boot happens seconds later, on an empty directory. Its peers have
+       * history and their member set already contains its id -- which is
+       * exactly what a member whose directory was emptied looks like, and
+       * cannot be told apart from it here.
+       *
+       * Refusing meant a placed member could lose its boot to timing and
+       * never come back, and concurrent placement makes that a race rather
+       * than a mistake. So it starts, replicates, and holds no vote until it
+       * has entries of its own (rn_hold_vote_while_blank) -- the vote being
+       * the only thing either failure needed from it.
+       *
+       * JOINS means all of it: catches up, clears the hold by itself,
+       * serves the data, and can be made leader. Anything less is a member
+       * that boots and sits there.
        */
       const all = trio(at(3), 777);
+      try {
+        /* Members 1 and 2 only: a quorum of the three-member set. The
+         * third has never run. */
+        await boot(all[0], all);
+        await boot(all[1], all);
+        const lead = await leaderOf([all[0], all[1]]);
+        expect(lead, 'two of three did not elect a leader').toBeTruthy();
+
+        const c = await connectServer(lead.port, { keepAliveMs: 0 });
+        await c.db(DB).collection('kept').insertMany(
+          Array.from({ length: 20 }, (_, k) => ({ n: k })));
+        expect(await c.db(DB).collection('kept').countDocuments({})).toBe(20);
+        const applied = (await c.ping()).applied;
+        await c.close();
+
+        /* Now the latecomer, for the first time. It has never run, so
+         * nothing has made it a directory yet -- and tryBoot with none runs
+         * the server in the CWD, which is a repository root full of files
+         * that are not a database. */
+        all[2].dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-late-'));
+        const late = await tryBoot(all[2], all);
+        all[2].proc = late.proc;
+        expect(late.serving, 'a bootstrap member starting late did not start:' +
+          '\n    ' + late.said()).toBe(true);
+        /* And it says what it is doing, because a member that silently
+         * declines to vote is a cluster with an invisible quorum. */
+        expect(late.said()).toMatch(/NOT VOTE/);
+        expect(late.said()).toMatch(/already has a log/);
+        expect(late.said()).toMatch(/bootstrap member starting late/);
+
+        const c3 = await connectServer(all[2].port, { keepAliveMs: 0 });
+        /* It catches up, and the hold ends WITHOUT anybody clearing it:
+         * entries are the evidence, and the leader supplies them. */
+        let seen = null;
+        for (let i = 0; i < 200; i++) {
+          seen = await c3.ping();
+          if (seen.applied >= applied && !seen.voteHeld) break;
+          await sleep(100);
+        }
+        expect(seen.applied, `never caught up: ${JSON.stringify(seen)}`)
+          .toBeGreaterThanOrEqual(applied);
+        expect(seen.voteHeld,
+          `the franchise never came back: ${JSON.stringify(seen)}`).toBe(false);
+        expect(await c3.db(DB).collection('kept').countDocuments({}, { stale: true }),
+          'it joined but serves none of the data').toBe(20);
+        await c3.close();
+
+        /* The franchise really is back: it can be made leader, which needs
+         * both halves -- it has to campaign, and the others have to grant. */
+        const cl = await connectServer(lead.port, { keepAliveMs: 0 });
+        await cl.transferLeadership(3);
+        await cl.close();
+        const now = await leaderOf(all);
+        expect(now?.id, 'leadership did not move to the latecomer').toBe(3);
+        const c3b = await connectServer(all[2].port, { keepAliveMs: 0 });
+        await c3b.db(DB).collection('kept').insertOne({ n: 99 });
+        expect(await c3b.db(DB).collection('kept').countDocuments({})).toBe(21);
+        await c3b.close();
+      } finally {
+        for (const m of all) await stop(m);
+      }
+    }, 180000);
+
+    it('a member whose directory was emptied comes back, and cannot vote with it',
+       async () => {
+      /*
+       * THE MEASURED FAILURE, PREVENTED -- by taking the vote rather than
+       * the boot. A wipe takes the log, the term AND the vote, so the member
+       * comes back wearing the same id with no memory of what it promised;
+       * what both measured failures needed from it was a VOTE (two wiped
+       * members electing each other and telling the member holding 7,319
+       * committed entries to adopt their empty log, and a single wipe
+       * electing a log 16 documents short of what a leader had already
+       * acknowledged). A member that does not vote cannot do either.
+       *
+       * THE HOLD IS OBSERVED WITH THE LEADER GONE, on purpose. It ends as
+       * soon as entries arrive, and against a live leader that is one
+       * heartbeat -- a window this test would be racing. So the leader is
+       * stopped first: nobody sends the wiped member anything, its hold
+       * stands, and the survivor CANNOT be elected either, because a quorum
+       * of two needs the blank member's vote and it will not give one. The
+       * cluster is stuck with its data intact, which is the right answer to
+       * losing two members' worth of state -- and exactly what the refusal
+       * did, minus the operator visit.
+       *
+       * Then the third member comes back with its files, and everything
+       * resolves: two logs elect a leader, the wiped one is caught up, and
+       * its franchise returns.
+       */
+      const all = trio(at(7), 778);
       try {
         for (const m of all) await boot(m, all);
         const lead = await leaderOf(all);
         expect(lead, 'no leader emerged').toBeTruthy();
 
-        /* Something committed, so the survivors have history to report. */
         const c = await connectServer(lead.port, { keepAliveMs: 0 });
         await c.db(DB).collection('kept').insertMany(
           Array.from({ length: 20 }, (_, k) => ({ n: k })));
         expect(await c.db(DB).collection('kept').countDocuments({})).toBe(20);
         await c.close();
 
-        /* The re-provisioning mistake: same id, same argv, empty disk. */
-        const victim = all.find((m) => m !== lead);
+        const others = all.filter((m) => m !== lead);
+        const victim = others[0], spare = others[1];
+        /* Stop the leader AND the spare, so the wiped member has nobody to
+         * receive entries from -- and wipe the victim. */
+        await stop(lead);
         await stop(victim);
+        await stop(spare);
         fs.rmSync(victim.dir, { recursive: true, force: true });
         fs.mkdirSync(victim.dir, { recursive: true });
 
+        /* One member with the data, one with nothing. */
+        await boot(spare, all);
         const again = await tryBoot(victim, all);
-        try {
-          expect(again.serving, 'it started anyway, on an empty directory,' +
-            ' beside a cluster that already exists:\n    ' + again.said())
-            .toBe(false);
-          /* It has to say WHICH member falsified the claim, that this looks
-           * like a wiped member rather than a new one, and the remedy. A
-           * refusal nobody can act on is a hang with extra steps. */
-          expect(again.said()).toMatch(/refusing to start/);
-          expect(again.said()).toMatch(/already has a log/);
-          expect(again.said()).toMatch(/contains this node's id/);
-          expect(again.said()).toMatch(/--join/);
-        } finally {
-          again.proc.kill();
-          await waitExit(again.proc);
-        }
+        all[all.indexOf(victim)].proc = again.proc;
+        expect(again.serving, 'the wiped member did not start:\n    ' +
+          again.said()).toBe(true);
+        expect(again.said()).toMatch(/NOT VOTE/);
 
-        /* AND THE CLUSTER IS UNHARMED, which is the whole point: the two
-         * members that still have the data keep serving it. */
-        const back = await leaderOf(all.filter((m) => m !== victim));
-        expect(back, 'the survivors lost their leader').toBeTruthy();
+        const cv = await connectServer(victim.port, { keepAliveMs: 0 });
+        expect((await cv.ping()).voteHeld,
+          'a blank member with no leader to hear from is not holding its vote')
+          .toBe(true);
+        await cv.close();
+
+        /* NOBODY IS ELECTED. The member with the data cannot win a quorum
+         * of two on its own, and the blank one will not lend it a vote it
+         * has no business casting. */
+        await sleep(3000);
+        for (const m of [spare, victim]) {
+          const cc = await connectServer(m.port, { keepAliveMs: 0 });
+          expect((await cc.ping()).role,
+            `member ${m.id} became a leader with one log between two`)
+            .not.toBe('leader');
+          await cc.close();
+        }
+        /* And the survivor's log is untouched -- nothing adopted an empty
+         * one, which is the failure this whole rule is about. */
+        const cs = await connectServer(spare.port, { keepAliveMs: 0 });
+        expect((await cs.ping()).last,
+          'the survivor lost entries to a blank member').toBeGreaterThan(20);
+        await cs.close();
+
+        /* THE DURABLE HALF: the term the wiped member woke into is spent,
+         * so a restart cannot hand the vote back inside it. Read off the
+         * member's own hard state, with the JS decoder -- the member is
+         * stopped first so the file is not being written under us. */
+        await stop(victim);
+        const root = new NodeFSStorageProvider(victim.dir);
+        const log = new EntryLog(await root.openFile('__wal__.bj', { create: false }));
+        await log.open();
+        expect(log.votedFor,
+          'the wiped member left its vote unspent in the term it woke into')
+          .toBe(victim.id);
+        expect(log.currentTerm).toBeGreaterThan(0);
+        await log.close();
+
+        /* Everything resolves once a second log comes back. */
+        await boot(lead, all);
+        await boot(victim, all);
+        const back = await leaderOf(all);
+        expect(back, 'two logs and a blank member elected nobody').toBeTruthy();
         const c2 = await connectServer(back.port, { keepAliveMs: 0 });
         expect(await c2.db(DB).collection('kept').countDocuments({}),
-          'the data the refusal was protecting is gone').toBe(20);
+          'the data the hold was protecting is gone').toBe(20);
         await c2.db(DB).collection('kept').insertOne({ n: 99 });
         await c2.close();
+        const cv2 = await connectServer(victim.port, { keepAliveMs: 0 });
+        let after = null;
+        for (let i = 0; i < 200; i++) {
+          after = await cv2.ping();
+          if (!after.voteHeld) break;
+          await sleep(100);
+        }
+        expect(after.voteHeld,
+          `the wiped member never got its franchise back: ${JSON.stringify(after)}`)
+          .toBe(false);
+        await cv2.close();
       } finally {
         for (const m of all) await stop(m);
       }
-    }, 180000);
+    }, 240000);
 
     it('refuses to REJOIN a dead member\'s id, and still admits a new one',
        async () => {

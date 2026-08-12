@@ -499,9 +499,11 @@ const main = async () => {
   if (results.some((r) => r.leaks?.size)) {
     say('\n  A LEAK is space, not correctness: the files are unreferenced, every');
     say('  check above passed, and the database is right -- just permanently');
-    say('  bigger. The C server runs no orphan sweep (bj_ns has no listing');
-    say('  operation, so the sweep needs a host to hand it one, and only the');
-    say('  JS host does). --strict 1 fails the run on one.');
+    say('  bigger. This is now expected to be EMPTY: the server sweeps every');
+    say('  database at startup and on the open that first reads one');
+    say('  (dbs_sweep_orphans), so a leak here is a regression in that. It was');
+    say('  how the missing sweep was found -- an interrupted compact kept a');
+    say('  whole second copy of the collection for ever. --strict 1 fails on one.');
   }
   process.exit(results.every((r) => r.ok) ? 0 : 1);
 };

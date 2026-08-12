@@ -2944,6 +2944,25 @@ static int names_have(const dbuf *arr, const char *want, uint32_t *count) {
     return found;
 }
 
+/* The same question of root_list_files' shape: NUL-separated names, not
+ * a binjson array (which is why the orphan sweep takes it directly). */
+static int names_have_nul(const dbuf *buf, const char *want, uint32_t *count) {
+    size_t at = 0, n = 0;
+    int found = 0;
+    while (at < buf->len) {
+        const char *nm = (const char *)buf->data + at;
+        const char *nul = (const char *)memchr(nm, '\0', buf->len - at);
+        size_t nlen = nul ? (size_t)(nul - nm) : buf->len - at;
+        if (nlen) {
+            n++;
+            if (nlen == strlen(want) && memcmp(nm, want, nlen) == 0) found = 1;
+        }
+        at += nlen + 1;
+    }
+    if (count) *count = (uint32_t)n;
+    return found;
+}
+
 TEST(an_instance_keeps_its_databases_apart_and_addresses_them_by_name) {
     inst_fixture fx;
     CHECK_FATAL(inst_open(&fx, "nisaba-inst") == 0);
@@ -3018,6 +3037,137 @@ TEST(an_instance_keeps_its_databases_apart_and_addresses_them_by_name) {
     CHECK_OK(dbs_list_collections(a, &still));
     dbuf_free(&still);
 
+    inst_close(&fx);
+}
+
+TEST(opening_a_database_collects_the_files_an_interrupted_op_left) {
+    /*
+     * EVERY DDL OP IN db_session.c SAYS "an orphan the sweep collects",
+     * and until dbs_sweep_orphans nothing in C swept: only the browser
+     * host did, on every Db.open. So a nisaba-server interrupted inside a
+     * compaction kept a whole second copy of the collection FOR EVER, and
+     * every dropped index's file with it. test/crash-matrix.js measured it
+     * as a LEAK -- right answers, permanently more disk.
+     *
+     * The sweep runs on the open that first reads a database, which is the
+     * one moment nothing else holds it: no cursor is positioned in a file
+     * and no compaction is part-way through writing one.
+     */
+    inst_fixture fx;
+    CHECK_FATAL(inst_open(&fx, "nisaba-sweep") == 0);
+
+    dbs *a = NULL;
+    CHECK_OK(dbi_database(fx.i, "app", 3, 1, &a));
+    int made = 0;
+    CHECK_OK(dbs_create_collection(a, "users", 5, &made));
+    CHECK_I64(made, 1);
+    CHECK_I64((long long)dbi_swept(fx.i), 0);   /* nothing to collect yet */
+
+    /*
+     * The debris an interrupted op leaves: files whose names are this
+     * database's shape (db_names.h) that the catalog does not reference --
+     * a generation that was written and never adopted, and an index built
+     * and never attached.
+     */
+    int sub = openat(fx.fd, "app", O_RDONLY | O_DIRECTORY);
+    CHECK_FATAL(sub >= 0);
+    static const char *const DEBRIS[] = {
+        "g1-coll-users.bj", "g1-idx-users-team_1.bj", "idx-users-orphan_1.bj"
+    };
+    for (size_t k = 0; k < sizeof DEBRIS / sizeof *DEBRIS; k++) {
+        int fd = openat(sub, DEBRIS[k], O_CREAT | O_WRONLY, 0666);
+        CHECK_FATAL(fd >= 0);
+        CHECK_FATAL(write(fd, "junk", 4) == 4);
+        close(fd);
+    }
+    /*
+     * Two files that must SURVIVE, and they fail differently:
+     *
+     *   notes.txt is not ours at all -- a host's own bookkeeping in the
+     *   same directory -- which is why the sweep asks two questions rather
+     *   than one (dc_sweep_plan).
+     *
+     *   coll-users-journal.bj IS ours and IS live, though this entry has no
+     *   `journal` field to say so: entries written before that field
+     *   existed still own their generation-0 journal, and sweeping one
+     *   would leave a collection unable to finish the commit it was in the
+     *   middle of. Worse than the leak, and only a fallback prevents it.
+     */
+    for (const char *keep = "notes.txt"; keep; keep = NULL) {
+        int fd = openat(sub, keep, O_CREAT | O_WRONLY, 0666);
+        CHECK_FATAL(fd >= 0);
+        close(fd);
+    }
+    {
+        int fd = openat(sub, "coll-users-journal.bj", O_CREAT | O_WRONLY, 0666);
+        CHECK_FATAL(fd >= 0);
+        close(fd);
+    }
+    close(sub);
+
+    /* Reopen the instance: the debris is collected on the open that first
+     * reads the database, and counted. */
+    inst_close(&fx);
+    fx.fd = open(fx.dir, O_RDONLY);
+    CHECK_FATAL(fx.fd >= 0);
+    fx.st = root_new(fx.fd);
+    CHECK_FATAL(fx.st != NULL);
+    {
+        dbi_root root;
+        root_fill(fx.st, &root);
+        CHECK_OK(dbi_open(&root, ORDER, &fx.i));
+    }
+    CHECK_I64((long long)dbi_swept(fx.i), 0);   /* not until it is opened */
+    dbs *back = NULL;
+    CHECK_OK(dbi_database(fx.i, "app", 3, 0, &back));
+    CHECK_I64((long long)dbi_swept(fx.i), 3);
+
+    /* THE COLLECTION SURVIVED, which is the half a sweep can get
+     * catastrophically wrong: it still answers, out of the files the
+     * catalog does name. */
+    {
+        dbuf list = {0};
+        uint32_t n = 0;
+        CHECK_OK(dbs_list_collections(back, &list));
+        CHECK_I64(names_have(&list, "users", &n), 1);
+        dbuf_free(&list);
+    }
+
+    /* The directory, as it should now be: the catalog, the collection's
+     * own files, and the stranger nobody here owns. */
+    {
+        dbuf names = {0};
+        CHECK_OK(root_list_files(fx.st, "app", 3, &names));
+        uint32_t n = 0;
+        CHECK_I64(names_have_nul(&names, "notes.txt", &n), 1);
+        CHECK_I64(names_have_nul(&names, "__catalog__.bj", &n), 1);
+        CHECK_I64(names_have_nul(&names, "coll-users.bj", &n), 1);
+        CHECK_I64(names_have_nul(&names, "g1-coll-users.bj", &n), 0);
+        CHECK_I64(names_have_nul(&names, "g1-idx-users-team_1.bj", &n), 0);
+        CHECK_I64(names_have_nul(&names, "idx-users-orphan_1.bj", &n), 0);
+        /* The JOURNAL is not debris, and mistaking it for some would be
+         * worse than the leak: recovery replays it over the files it
+         * covers, so a swept journal is a collection that cannot finish
+         * the commit it was in the middle of. */
+        CHECK_I64(names_have_nul(&names, "coll-users-journal.bj", &n), 1);
+        dbuf_free(&names);
+    }
+
+    /* A second open sweeps nothing: the count does not grow on a clean
+     * directory, so "swept > 0" stays a statement about interruption. */
+    inst_close(&fx);
+    fx.fd = open(fx.dir, O_RDONLY);
+    CHECK_FATAL(fx.fd >= 0);
+    fx.st = root_new(fx.fd);
+    CHECK_FATAL(fx.st != NULL);
+    {
+        dbi_root root;
+        root_fill(fx.st, &root);
+        CHECK_OK(dbi_open(&root, ORDER, &fx.i));
+    }
+    dbs *third = NULL;
+    CHECK_OK(dbi_database(fx.i, "app", 3, 0, &third));
+    CHECK_I64((long long)dbi_swept(fx.i), 0);
     inst_close(&fx);
 }
 
@@ -12339,6 +12489,7 @@ int main(void) {
     RUN(ddl_is_a_command_a_second_database_can_be_caught_up_by);
     RUN(a_replicated_write_answers_exactly_what_an_unreplicated_one_does);
     RUN(an_instance_keeps_its_databases_apart_and_addresses_them_by_name);
+    RUN(opening_a_database_collects_the_files_an_interrupted_op_left);
     RUN(one_log_addresses_every_database_and_the_floor_spans_all_of_them);
     RUN(a_replicated_drop_travels_the_log_and_a_dangling_token_is_refused);
     RUN(a_reopened_session_knows_where_its_apply_got_to);

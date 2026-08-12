@@ -216,10 +216,19 @@ static int root_remove(void *ctx, const char *name, uint32_t len, int *removed) 
     return BJ_OK;
 }
 
+/* The per-database listing the orphan sweep needs, in the vtable's shape.
+ * Same walk root_list_files does for the snapshot manifest -- one
+ * implementation of "what is in this database's directory", so the sweep
+ * and the generation cannot disagree about what is there. */
+static int root_list_files_op(void *ctx, const char *name, uint32_t len, dbuf *out) {
+    return root_list_files((root_state *)ctx, name, len, out);
+}
+
 void root_fill(root_state *st, dbi_root *out) {
     out->ctx = st;
     out->open_ns = root_open_ns;
     out->close_ns = root_close_ns;
     out->list = root_list;
     out->remove = root_remove;
+    out->list_files = root_list_files_op;
 }

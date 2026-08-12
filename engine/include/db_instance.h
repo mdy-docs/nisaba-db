@@ -95,11 +95,20 @@ typedef struct dbi dbi;
  *   remove    the whole directory, and everything in it. *removed is 0
  *             when there was none, which is not an error: dropping the
  *             already-gone is what the caller asked for.
+ *   list_files  OPTIONAL: one database's file names, appended
+ *             NUL-SEPARATED. Give it and every database this instance
+ *             opens gets its orphans swept (dbs_sweep_orphans) on the
+ *             open that first reads it; leave it NULL and nothing is
+ *             swept, which is what every host did before it existed.
  *
  * `list` reports the SCOPES that exist -- what the directory says -- and
  * not a set proven to hold a catalog. Proving it would mean opening each
  * one, and a listing that opens every database it names is a listing
  * that cannot be asked for casually.
+ *
+ * Both listings are the HOST's because a bj_ns cannot enumerate (bjns.h
+ * says why), which is also why the sweep takes its listing as an argument
+ * rather than fetching one.
  */
 typedef struct {
     void *ctx;
@@ -107,6 +116,7 @@ typedef struct {
     void (*close_ns)(void *ctx, bj_ns *ns);
     int  (*list)(void *ctx, dbuf *out);
     int  (*remove)(void *ctx, const char *name, uint32_t len, int *removed);
+    int  (*list_files)(void *ctx, const char *name, uint32_t len, dbuf *out);
 } dbi_root;
 
 /* `root` is COPIED; the ctx behind it is borrowed and must outlive this. */
@@ -135,6 +145,21 @@ int dbi_list(dbi *i, dbuf *out);
 int dbi_drop(dbi *i, const char *name, size_t len, int *dropped);
 
 int dbi_open_count(const dbi *i);
+
+/* How many unreferenced files the orphan sweep has collected since this
+ * instance was opened (dbs_sweep_orphans). Zero on a clean history: a
+ * non-zero count means an earlier run was interrupted inside a DDL op,
+ * which the server logs rather than tidying in silence. */
+uint64_t dbi_swept(const dbi *i);
+
+/*
+ * Sweep every database under the root, now, and close again any this call
+ * had to open -- so the disk an interrupted operation wasted is reclaimed
+ * at startup rather than whenever somebody next happens to use that
+ * database. A no-op without dbi_root.list_files. Errors are not reported:
+ * space is not correctness, and a boot must not fail over housekeeping.
+ */
+int dbi_sweep_all(dbi *i);
 
 /* ---- the request path ---------------------------------------------------
  *

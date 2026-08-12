@@ -963,8 +963,8 @@ int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
      * read a plan-shaped `files` array straight out of a STORED definition,
      * which has `file` for an equality or geo index and an OBJECT for a
      * text one, so it matched nothing and deleted nothing. Every dropped
-     * index leaked its whole file, no crash required, and the C server runs
-     * no orphan sweep to collect it. dc_index_files is the one answer the
+     * index leaked its whole file, no crash required, and at the time
+     * nothing in C swept it up either. dc_index_files is the one answer the
      * sweep and dropCollection use too.
      */
     dbuf files = {0};
@@ -1009,6 +1009,85 @@ int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
 done:
     dbuf_free(&files);
     free(entry);
+    return e;
+}
+
+/*
+ * The catalog as dc_sweep_plan's input: a binjson ARRAY of { key, value }
+ * rows. That is the shape the browser host produces with the tree's own
+ * toArray(), and it is why the sweep takes BYTES rather than a tree --
+ * one implementation of "which files does this database own", fed from
+ * either side of the bridge.
+ */
+static int catalog_rows(dbs *s, dbuf *out) {
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+    bpt_cursor *cur_h = bpt_cursor_open(s->catalog, NULL, NULL);
+    if (!cur_h) { bj_builder_free(b); return BJ_ERR_STATE; }
+    for (;;) {
+        bpt_key key;
+        const uint8_t *val; size_t vlen;
+        int r = bpt_cursor_next(cur_h, &key, &val, &vlen);
+        if (r < 0) { e = r; break; }
+        if (r == 0) break;
+        if (!key.is_string) continue;          /* a catalog key is a name */
+        if (!e) e = bj_begin_object(b);
+        if (!e) e = bj_put_key(b, (const uint8_t *)"key", 3);
+        if (!e) e = bj_put_string(b, key.str, key.str_len);
+        if (!e) e = bj_put_key(b, (const uint8_t *)"value", 5);
+        if (!e) e = bj_put_raw(b, val, (uint32_t)vlen);
+        if (!e) e = bj_end_object(b);
+        if (e) break;
+    }
+    bpt_cursor_close(cur_h);
+    if (!e) e = bj_end_array(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+/*
+ * DELETE WHAT THE CATALOG DOES NOT REFERENCE.
+ *
+ * Everything above this line assumes somebody sweeps: "an orphan the
+ * sweep collects" is the sentence that lets createIndex build files
+ * before the catalog names them, lets compact write a whole generation
+ * before adopting it, and lets dropIndex and dropCollection commit the
+ * catalog before removing anything. Every one of those leaves files
+ * nothing references if it is interrupted, and until this function the
+ * only host that swept was the browser one -- so a nisaba-server that
+ * crashed inside a compaction kept a full second copy of the collection
+ * FOR EVER, and every dropped index's file with it. Measured by
+ * test/crash-matrix.js, which reports it as a LEAK: correct answers,
+ * permanently more disk.
+ *
+ * The listing is an INPUT because bj_ns cannot produce one (bjns.h says
+ * why: OPFS enumeration is asynchronous), so the host that owns the
+ * directory reads it and passes it in -- NUL-separated, exactly what
+ * server/root.c's root_list_files already returns.
+ *
+ * SAFE ONLY BEFORE THE DATABASE IS IN USE, which is where dbi_database
+ * calls it: on a first open, nothing else holds this session, no cursor
+ * is positioned in a file, and no compaction is half-way through writing
+ * one. A file that is unreferenced then is garbage by definition -- and
+ * "unreferenced" is decided by the same dc_collection_files the drops
+ * use, so the two cannot disagree about what a collection is made of.
+ */
+int dbs_sweep_orphans(dbs *s, const char *names, size_t names_len,
+                      uint32_t *deleted) {
+    if (deleted) *deleted = 0;
+    if (!s || !s->catalog || !s->ns) return BJ_ERR_STATE;
+    if (!names || !names_len) return BJ_OK;
+    dbuf rows = {0};
+    int e = catalog_rows(s, &rows);
+    if (!e) e = dc_sweep_execute(s->ns, rows.data, rows.len, names, names_len, deleted);
+    dbuf_free(&rows);
     return e;
 }
 

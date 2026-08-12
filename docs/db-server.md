@@ -1358,6 +1358,35 @@ Stated here rather than discovered later.
   a client trickling one byte at a time hold a slot for ever, which is the
   bound "a slot has to be earned" exists to keep. Known, bounded by
   `--idle-timeout`, and preferred to the alternative.
+- **Orphan files are collected at startup, and only there.** Every DDL op
+  leaves files nothing references if it is interrupted — `createIndex`
+  builds before the catalog names them, `compact` writes a whole generation
+  before adopting it, the drops commit the catalog first and remove files
+  after — and each of them says so in the engine as "an orphan the sweep
+  collects". That sweep used to be the **browser** host's alone, run on
+  every `Db.open`, so this server never collected anything: an interrupted
+  compaction kept a full second copy of the collection *for ever*, and (a
+  second bug, since fixed) every dropped index's file with it. Found by
+  `npm run crash:matrix`, which reports it as a LEAK — correct answers,
+  permanently more disk.
+
+  `dbi_sweep_all` now runs before anything is served, and `dbi_database`
+  sweeps any database opened later in the process's life. Both go through
+  `dbs_sweep_orphans`, which decides what is unreferenced with the same
+  `dc_collection_files` the drops use, so the two cannot disagree about
+  what a collection is made of. Two conditions, not one: a file must be
+  unreferenced **and** be this database's, because either alone deletes the
+  wrong thing — a host's own bookkeeping in the same directory survives,
+  and so does a generation-0 journal an old catalog entry does not name
+  (sweeping one would leave a collection unable to finish the commit it was
+  in the middle of).
+
+  **Startup is the only safe moment**, which is why it is not a background
+  task: nothing else holds the database then, so no cursor is positioned in
+  a file and no compaction is part-way through writing one. And a swept
+  file is *news* — it means the previous run did not finish something — so
+  the server says `collected N unreferenced file(s)` rather than tidying in
+  silence, and says nothing at all on a clean boot.
 - **No compaction scheduler for COLLECTIONS.** The engine runs no
   timers, so *when* to sweep stays with whoever is driving
   (`docs/compaction.md`) — which is what `minBytes`/`factor` are for:

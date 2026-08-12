@@ -966,6 +966,29 @@ uint64_t dbs_applied_index(dbs *s, const char *coll, size_t coll_len);
  * about an apply that outlives the response. */
 uint64_t dbs_applied_floor(dbs *s);
 
+/*
+ * Delete every file in this database that the catalog does not reference,
+ * given the directory's listing as NUL-SEPARATED names (bjns.h says why a
+ * listing is an input: a bj_ns cannot produce one). *deleted is how many
+ * went, which is worth logging -- it is normally 0, and a number here says
+ * a previous run of this process was interrupted.
+ *
+ * WHAT IT IS FOR. Every DDL op in this file leaves files nothing
+ * references if it is interrupted -- createIndex builds before the catalog
+ * names it, compact writes a whole generation before adopting it, the
+ * drops commit the catalog first and remove files after -- and each of
+ * them says so in the form "an orphan the sweep collects". This is that
+ * sweep. Without it those orphans are permanent: a crash inside a
+ * compaction costs a second copy of the collection for ever.
+ *
+ * ONLY BEFORE THE DATABASE IS IN USE. dbi_database calls it on a first
+ * open, where nothing else holds the session: no cursor is positioned in
+ * a file and no compaction is half-way through writing one. Called later,
+ * it could delete a generation another operation is still building.
+ */
+int dbs_sweep_orphans(dbs *s, const char *names, size_t names_len,
+                      uint32_t *deleted);
+
 /* ---- what db_request.c uses to implement the two above ------------------
  *
  * Not a host's to call. They are here rather than in a private header

@@ -4896,6 +4896,115 @@ for (const engine of ENGINES) {
 
   });
 
+  describe.skipIf(!enabled)(`nisaba-server: the orphan sweep (${engine.name})`, () => {
+    it('collects what an interrupted operation left, and says it did', async () => {
+      /*
+       * EVERY DDL OP LEAVES FILES NOTHING REFERENCES IF IT IS INTERRUPTED,
+       * and the engine says so in five places as "an orphan the sweep
+       * collects" -- createIndex builds before the catalog names it, compact
+       * writes a whole generation before adopting it, the drops commit the
+       * catalog and remove files after. That sweep was the BROWSER host's,
+       * on every Db.open; this server never ran one, so an interrupted
+       * compaction kept a full second copy of the collection for ever.
+       * test/crash-matrix.js measured it as a LEAK: right answers,
+       * permanently more disk. `npm run crash:matrix -- --strict 1` is clean
+       * now, and this is the deterministic half of that.
+       *
+       * The debris is PLANTED rather than crashed into existence, because
+       * the question here is not whether a crash can leave files -- the
+       * matrix answers that -- but whether the server collects them, and
+       * which ones it dares to.
+       */
+      const port = nextPort();
+      const first = await startServer(engine, port, [], 20);
+      let second = null;
+      try {
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        const users = c.db(DB).collection('users');
+        const before = await users.countDocuments({});
+        expect(before).toBeGreaterThan(0);
+        await users.createIndex({ team: 1 });
+        await c.close();
+        first.proc.kill();
+        await new Promise((r) => first.proc.once('exit', r));
+
+        const at = path.join(first.dir, DB);
+        const live = fs.readdirSync(at).sort();
+        /* Debris: names shaped like this database's own files (db_names.h)
+         * that the catalog does not reference. */
+        const debris = ['g1-coll-users.bj', 'g1-idx-users-team_1.bj',
+                        'idx-users-gone_1.bj'];
+        for (const f of debris) fs.writeFileSync(path.join(at, f), 'junk');
+        /* And a file that is nobody's business here, which must survive:
+         * the sweep asks whether a file is unreferenced AND whether it is
+         * ours, because either question alone deletes the wrong thing. */
+        fs.writeFileSync(path.join(at, 'operator-notes.txt'), 'keep me');
+
+        second = await startServer(engine, port, [], 0, first.dir);
+        /* It SAYS so, because a swept file means the previous run did not
+         * finish something -- tidying that away in silence would hide it. */
+        expect(second.stderr(), 'the server swept without saying so')
+          .toMatch(/collected 3 unreferenced file\(s\)/);
+
+        const after = fs.readdirSync(at).sort();
+        for (const f of debris) {
+          expect(after, `${f} was left behind`).not.toContain(f);
+        }
+        expect(after, 'a file the sweep does not own was deleted')
+          .toContain('operator-notes.txt');
+        /* Every file that WAS live is still there -- the half of a sweep
+         * that can be catastrophically wrong. */
+        for (const f of live) {
+          expect(after, `${f} was live and the sweep took it`).toContain(f);
+        }
+
+        /* And the database is a database: the documents, and the index
+         * answering like a scan rather than like a file that was removed
+         * from under it. */
+        const back = await connectServer(port, { keepAliveMs: 0 });
+        const u2 = back.db(DB).collection('users');
+        expect(await u2.countDocuments({})).toBe(before);
+        const viaScan = await u2.countDocuments({ team: 'bulk' });
+        expect(viaScan).toBeGreaterThan(0);
+        expect((await u2.findByIndex('team_1', ['bulk'])).length).toBe(viaScan);
+        await u2.insertOne({ name: 'after', team: 'bulk' });
+        expect(await u2.countDocuments({})).toBe(before + 1);
+        await back.close();
+      } finally {
+        first.proc.kill();
+        second?.proc.kill();
+      }
+    }, 60000);
+
+    it('says nothing on a clean directory', async () => {
+      /* The counter is a statement about interruption, so it must not fire
+       * on an ordinary boot -- otherwise the line above is noise and the
+       * next person filters it out. */
+      const port = nextPort();
+      const first = await startServer(engine, port, [], 20);
+      let second = null;
+      try {
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        const before = await c.db(DB).collection('users').countDocuments({});
+        await c.db(DB).collection('users').createIndex({ team: 1 });
+        await c.db(DB).collection('users').compact();
+        await c.close();
+        first.proc.kill();
+        await new Promise((r) => first.proc.once('exit', r));
+
+        second = await startServer(engine, port, [], 0, first.dir);
+        expect(second.stderr(), 'a clean boot claimed to collect something')
+          .not.toMatch(/unreferenced file/);
+        const c2 = await connectServer(port, { keepAliveMs: 0 });
+        expect(await c2.db(DB).collection('users').countDocuments({})).toBe(before);
+        await c2.close();
+      } finally {
+        first.proc.kill();
+        second?.proc.kill();
+      }
+    }, 60000);
+  });
+
   describe.skipIf(!enabled)(`nisaba-server: cursors (${engine.name})`, () => {
     let proc, db;
     const port = nextPort();

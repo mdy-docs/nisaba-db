@@ -1810,6 +1810,20 @@ int main(int argc, char **argv) {
     }
 
     /*
+     * The disk an interrupted operation wasted, reclaimed before serving
+     * rather than whenever somebody next happens to open that database.
+     * Every DDL op leaves files nothing references if it is killed
+     * part-way, and every one of them says "an orphan the sweep collects" --
+     * this is where the sweeping is asked for (dbs_sweep_orphans does it,
+     * per database, on the open below).
+     *
+     * Deliberately BEFORE the replica: replay applies entries, and a
+     * database swept afterwards would be swept while the log's own work
+     * was in flight. Nothing has been served yet either way.
+     */
+    (void)dbi_sweep_all(inst);
+
+    /*
      * The peer transport, if this member has anyone to talk to. It comes
      * before the node because the node's member set is built from it --
      * one place the cluster's shape is stated, and it is this one.
@@ -1982,6 +1996,19 @@ int main(int argc, char **argv) {
 #if defined(NISABA_SOCKETS)
         int srv = listen_on(bind_host, port);
         if (srv < 0) { rc = 1; goto done; }
+        /*
+         * Said only when there was something to say, because it is not
+         * routine: a swept file is a file an interrupted DDL op left behind
+         * -- an index built but never adopted, a compaction's generation
+         * abandoned part-way -- so a number here means the last run of this
+         * process did not finish something, and silently tidying that away
+         * would hide it. Zero is the normal answer and prints nothing.
+         */
+        if (dbi_swept(inst)) {
+            fprintf(stderr, "nisaba: collected %llu unreferenced file(s) left by an"
+                            " interrupted operation\n",
+                    (unsigned long long)dbi_swept(inst));
+        }
         /* The line the tests (and a person) wait for: it means bound and
          * listening, not merely started. */
         fprintf(stderr, "nisaba: serving %s:%d (max %d clients, idle timeout %ds)\n",

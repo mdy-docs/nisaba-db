@@ -55,6 +55,11 @@ struct dbi {
     /* The entry log's reader (dbi_set_log), handed to every database
      * this instance opens so a watch can resume. Zeroed = no log. */
     dbs_log   log;
+    /* Files the orphan sweep has collected, over this instance's life.
+     * Normally zero -- a number here says an earlier run of the process
+     * was interrupted part-way through a DDL op, which is worth saying
+     * out loud rather than silently tidying. */
+    uint64_t  swept;
 };
 
 /* ---- opening ------------------------------------------------------------ */
@@ -92,6 +97,8 @@ int dbi_open_count(const dbi *i) {
     for (int k = 0; k < DBI_MAX_DATABASES; k++) if (i->db[k].used) n++;
     return n;
 }
+
+uint64_t dbi_swept(const dbi *i) { return i ? i->swept : 0; }
 
 static dbi_slot *find(dbi *i, const char *name, size_t len) {
     for (int k = 0; k < DBI_MAX_DATABASES; k++) {
@@ -144,6 +151,31 @@ int dbi_database(dbi *i, const char *name, size_t len, int create, dbs **out) {
     d->name_len = (uint32_t)len;
     d->s = s;
     dbs_set_id_source(s, &i->next_id);
+
+    /*
+     * THE ORPHAN SWEEP, HERE AND NOWHERE ELSE. Every DDL op leaves files
+     * nothing references if it is interrupted, and each of them says so as
+     * "an orphan the sweep collects" -- so somebody has to sweep, or a
+     * crash inside a compaction costs a second copy of the collection for
+     * ever. This is the one moment it is safe: the session exists, its
+     * catalog is readable, and nothing else holds it yet, so no cursor is
+     * positioned in a file and no compaction is part-way through writing
+     * one.
+     *
+     * A failure to sweep is NOT a failure to open. Space is not
+     * correctness: a database that cannot be swept still serves every
+     * request correctly, and refusing to open it over housekeeping would
+     * turn a wasted megabyte into an outage.
+     */
+    if (i->root.list_files) {
+        dbuf names = {0};
+        if (i->root.list_files(i->root.ctx, name, (uint32_t)len, &names) == BJ_OK) {
+            uint32_t gone = 0;
+            (void)dbs_sweep_orphans(s, (const char *)names.data, names.len, &gone);
+            i->swept += gone;
+        }
+        dbuf_free(&names);
+    }
     /* The instance's log reader reaches every database it opens, present
      * and future, under that database's own name -- registration happens
      * here so a database opened lazily (an apply creating one, a client
@@ -710,6 +742,47 @@ uint64_t dbi_applied_floor(dbi *i) {
     }
     dbuf_free(&names);
     return floor;
+}
+
+/*
+ * SWEEP EVERY DATABASE, ONCE, AT STARTUP.
+ *
+ * dbi_database sweeps on the open that first reads a database, which is
+ * correct but lazy: on a server that is not replicated nothing opens a
+ * database at boot, so the disk an interrupted operation wasted is
+ * reclaimed only when somebody happens to use it, and the count the host
+ * wants to LOG is zero at the moment it logs. Asking here makes it a
+ * startup fact instead.
+ *
+ * Same walk dbi_applied_floor makes, and the same courtesy: a database
+ * that was not open is closed again, so a sweep does not quietly fill the
+ * table. Nothing to sweep with (no list_files) is not an error -- it is
+ * every host that has not been given one.
+ */
+int dbi_sweep_all(dbi *i) {
+    if (!i) return BJ_ERR_STATE;
+    if (!i->root.list_files) return BJ_OK;
+    dbuf names = {0};
+    if (dbi_list(i, &names) != BJ_OK) { dbuf_free(&names); return BJ_OK; }
+
+    cur c = { names.data, names.len, 0 };
+    uint32_t count = 0;
+    if (array_begin(&c, &count) == BJ_OK) {
+        for (uint32_t k = 0; k < count; k++) {
+            const uint8_t *n; uint32_t nlen;
+            if (take_string(&c, &n, &nlen)) break;
+            int was_open = find(i, (const char *)n, nlen) != NULL;
+            dbs *s = NULL;
+            /* The sweep is dbi_database's, on the open below. */
+            if (dbi_database(i, (const char *)n, nlen, 0, &s) != BJ_OK) continue;
+            if (!was_open) {
+                dbi_slot *d = find(i, (const char *)n, nlen);
+                if (d) slot_close(i, d);
+            }
+        }
+    }
+    dbuf_free(&names);
+    return BJ_OK;
 }
 
 /* ---- clients and streams ------------------------------------------------ */

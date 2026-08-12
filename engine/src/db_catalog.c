@@ -713,9 +713,10 @@ static int ref_add(dbuf *refs, const uint8_t *s, uint32_t len) {
  *
  * That is not hypothetical: dbs_drop_index did exactly that and therefore
  * deleted NOTHING, for any kind, with no crash involved -- every dropped
- * index left its whole file behind, and the C server runs no orphan sweep
- * to collect it (bj_ns has no listing operation, so the sweep needs a host
- * to hand it one). Found by test/crash-matrix.js, which measured the file
+ * index left its whole file behind -- and at the time nothing in C swept,
+ * so it stayed there for ever (the server sweeps now: dbs_sweep_orphans,
+ * which still needs a host to hand it a listing, bj_ns having no way to
+ * produce one). Found by test/crash-matrix.js, which measured the file
  * count before and after a clean drop.
  *
  * So the sweep, dropCollection and dropIndex all come through here.

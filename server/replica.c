@@ -91,6 +91,28 @@ typedef struct {
     dbuf       *results;        /* and what applying each one produced */
     dbs_result *view;           /* the same, in the shape dbs_step takes */
     uint32_t n, cap, at;
+    /*
+     * ONE ROUND, PROPOSED IN WAVES. `round` holds the whole command array
+     * dbs_propose/dbs_step handed over and `total` how many commands it
+     * has; `n` is how many have been APPENDED so far. A round bigger than
+     * the node's await table used to be refused outright -- which made
+     * updateMany over a large collection an operation that simply did not
+     * work (-70, measured at 20,000 documents) -- so it goes out a wave at
+     * a time instead, each wave settling before the next is appended.
+     */
+    dbuf     round;
+    uint32_t total;
+    /*
+     * A WAVE IS DUE, and it is sent from the TICK rather than from the
+     * settlement that finished the last one. On a member that commits
+     * instantly -- a cluster of one, or any leader whose quorum is
+     * quick -- proposing the next wave where the last one settled chains
+     * the whole round inside a single call, and the poll loop never gets
+     * back in: measured at 20,000 documents, 8 sockets of point reads
+     * held 1% of their idle rate for four seconds. One wave per tick puts
+     * the loop back between them.
+     */
+    int      wave_due;
     uint64_t last;
     int      done;              /* the answer is built and waiting */
     dbuf     answer;
@@ -278,6 +300,7 @@ static void pending_release(pending *p) {
     free(p->view);
     free(p->indices);
     dbuf_free(&p->answer);
+    dbuf_free(&p->round);
     memset(p, 0, sizeof *p);
 }
 
@@ -2038,10 +2061,34 @@ int replica_wait_ms(const replica *r, uint64_t now) {
  * to apply (a leader's NOOP, a CONFIG): the node settles what that
  * unlocks, and an index skipped here is a client waiting forever.
  */
+/*
+ * HOW MANY ENTRIES ONE PASS MAY APPLY.
+ *
+ * The pump used to run until it caught up, and applying is the loop
+ * thread's own work: a burst of committed entries is a burst of documents
+ * written with nothing else served in between. That is the head-of-line
+ * blocking the reader-thread milestone left behind, and it is not only a
+ * writer's problem -- a follower catching up after a partition applies
+ * everything it was sent in one pass too.
+ *
+ * A budget makes it resumable, which costs nothing to arrange because it
+ * already is: `applied` advances per entry, the pump runs again on every
+ * message and every tick, and the only thing that must not happen is
+ * stopping with work left and nothing to wake it -- which cannot happen
+ * here, since a tick always comes.
+ *
+ * 32 is chosen against the measurement rather than by taste: at 20,000
+ * documents an unbounded pass held 8 sockets of point reads at 2% of their
+ * idle rate, and the pass is what they were waiting behind.
+ */
+#define REPLICA_APPLY_BUDGET 32u
+
 static int apply_committed(replica *r) {
     dbuf payload = {0};
     int e = BJ_OK;
+    uint32_t applied_here = 0;
     while (r->applied < rn_commit_index(r->node)) {
+        if (++applied_here > REPLICA_APPLY_BUDGET) break;
         uint64_t index = r->applied + 1;
         /*
          * COMMITTED IS NOT THE SAME AS PRESENT.
@@ -2201,26 +2248,95 @@ static int apply_committed(replica *r) {
 
 /* ---- proposing ---------------------------------------------------------- */
 
-/* Append every command of `cmds` (a binjson ARRAY) to the log, recording
- * the index each took. All or nothing: a half-proposed batch is a
- * request that can never be completed. */
+/*
+ * ONE WAVE of the round in `p->round`: append as many commands as the node
+ * can take right now, from where the last wave stopped.
+ *
+ * WHY WAVES. rn_propose refuses the entry that hits the await cap -- not
+ * the ones before it, which are already in the log and commit anyway -- so
+ * a round bigger than the cap used to be refused WHOLE, up front, after
+ * asking the capacity question once. That kept all-or-nothing (discovering
+ * it mid-way once left 256 of a client's 300 documents landing behind a
+ * dropped connection) at the price of making the operation impossible:
+ * `updateMany` plans one command per matched document, so over 20,000
+ * documents it answered -70 and did nothing, on every replicated
+ * deployment. Waves keep the property that matters -- a wave is appended
+ * whole or not at all -- and let the round be any size.
+ *
+ * A WAVE IS SMALLER THAN THE BUDGET, deliberately. Filling the await table
+ * with one request's commands would starve every other writer for as long
+ * as the round lasts, so a wave takes at most REPLICA_WAVE and leaves the
+ * rest for whoever else is writing. It also bounds what one settlement
+ * costs the loop thread, which is the other half of why a long write hurts.
+ *
+ * WHAT IT COSTS, stated rather than hidden: a round is no longer atomic in
+ * the log. If this member loses leadership between waves, the waves that
+ * committed stay committed and the client is told the write was lost -- the
+ * same shape a mid-list bulkWrite failure already has, and the same shape
+ * updateMany has had all along (every matched document is its own entry, so
+ * a crash mid-commit was always partial). What is new is that the window is
+ * wider than one append.
+ */
+#define REPLICA_WAVE 64u
+
+static int propose_wave(replica *r, pending *p) {
+    cur c = { p->round.data, p->round.len, 0 };
+    uint32_t count = 0;
+    int e = array_begin(&c, &count);
+    if (e) return e;
+    /* Skip what earlier waves already appended: the array is walked from
+     * the front because binjson is a forward format, and a round is at most
+     * one request's worth of commands. */
+    for (uint32_t i = 0; i < p->n; i++) if ((e = skip_value(&c))) return e;
+
+    uint32_t free_now = rn_max_await() - rn_awaiting(r->node);
+    uint32_t want = p->total - p->n;
+    if (want > REPLICA_WAVE) want = REPLICA_WAVE;
+    if (want > free_now) want = free_now;
+    /*
+     * Nothing fits and nothing of this request is in flight to free
+     * anything: there is no settlement coming that would wake it, so this
+     * is the one case that still refuses. It takes the whole await table
+     * held by other requests, and the caller can act on it.
+     */
+    if (!want) return DC_ERR_BATCH_TOO_LARGE;
+
+    /*
+     * ONE SYNC FOR THE WAVE. rn_propose is one fsync per entry, which for a
+     * round of thousands was thousands of them on this thread -- the actual
+     * cost behind a long write, not the applying. The wave is bounded, so
+     * the pointer arrays are too.
+     */
+    const uint8_t *pv[REPLICA_WAVE];
+    uint32_t lv[REPLICA_WAVE];
+    for (uint32_t i = 0; i < want; i++) {
+        size_t start = c.pos;
+        if ((e = skip_value(&c))) return e;
+        pv[i] = c.d + start;
+        lv[i] = (uint32_t)(c.pos - start);
+    }
+    uint32_t got = 0;
+    e = rn_propose_batch(r->node, EL_NORMAL, pv, lv, want,
+                         p->indices + p->n, &got);
+    p->n += got;
+    if (got) p->last = p->indices[p->n - 1];
+    if (e) return e;
+    /* Nothing appended and no error is not a state this can be left in: the
+     * request would wait on an index that does not exist. */
+    return got ? BJ_OK : BJ_ERR_STATE;
+}
+
+/* Take on a round: keep its commands, size the per-command arrays for all
+ * of them, and send the first wave. A plan with no commands would leave
+ * nothing to settle on, and the request would wait for an index that will
+ * never arrive. */
 static int propose_batch(replica *r, pending *p, const dbuf *cmds) {
     cur c = { cmds->data, cmds->len, 0 };
     uint32_t count = 0;
     int e = array_begin(&c, &count);
     if (e) return e;
-    /*
-     * Refused WHOLE, before anything is appended. rn_propose refuses the
-     * entry that hits the await cap -- not the entries before it, which
-     * are already in the log and commit anyway. Discovering that mid-way
-     * left 256 of a client's 300 documents landing behind a dropped
-     * connection, which violates all-or-nothing in the worst direction:
-     * silently. So the capacity question is asked once, up front, for
-     * the batch as a whole, counting what other in-flight requests
-     * already hold.
-     */
-    if (count > rn_max_await() - rn_awaiting(r->node))
-        return DC_ERR_BATCH_TOO_LARGE;
+    if (!count) return BJ_ERR_STATE;
+
     if (count > p->cap) {
         uint64_t *ix = (uint64_t *)realloc(p->indices, count * sizeof *ix);
         if (!ix) return BJ_ERR_OOM;
@@ -2234,19 +2350,11 @@ static int propose_batch(replica *r, pending *p, const dbuf *cmds) {
         p->view = v;
         p->cap = count;
     }
+    p->round.len = 0;
+    if ((e = dbuf_put(&p->round, cmds->data, cmds->len))) return e;
+    p->total = count;
     p->n = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        size_t start = c.pos;
-        if ((e = skip_value(&c))) return e;
-        uint64_t at = 0;
-        e = rn_propose(r->node, EL_NORMAL, c.d + start, (uint32_t)(c.pos - start), &at);
-        if (e) return e;
-        p->indices[p->n++] = at;
-        p->last = at;
-    }
-    /* A plan with no commands would leave nothing to settle on, and the
-     * request would wait for an index that will never arrive. */
-    return p->n ? BJ_OK : BJ_ERR_STATE;
+    return propose_wave(r, p);
 }
 
 /* ---- the outbox ---------------------------------------------------------
@@ -3312,6 +3420,19 @@ static int stamp_at(dbuf *answer, uint64_t at) {
 }
 
 static int advance(replica *r, pending *p) {
+    /*
+     * THE ROUND MAY NOT BE FULLY APPENDED YET. A wave settled; if the round
+     * has commands left, the next wave goes out and dbs_step waits -- it
+     * takes one index and one result per command of the plan it handed over
+     * and would refuse a partial list (BJ_ERR_RANGE), which is exactly the
+     * check that catches a caller replicating something other than what it
+     * was given.
+     */
+    if (p->n < p->total) {
+        p->wave_due = 1;
+        return BJ_OK;
+    }
+
     dbuf cmds = {0};
     uint64_t next = 0;
     p->answer.len = 0;
@@ -3385,6 +3506,32 @@ int replica_tick(replica *r, uint64_t now) {
             fflush(stderr);
         }
         if (!se) r->said_snap_failed = 0;
+    }
+
+    /*
+     * ONE WAVE PER TICK, for every request working through a round. This is
+     * where a long write yields: the wave that just settled put the loop
+     * back into poll, whatever arrived there has been served, and now the
+     * next 64 commands go out. A round of 20,000 documents is 313 waves and
+     * 313 trips through the poll loop, which is the difference between
+     * blocking every reader for four seconds and not.
+     */
+    for (int i = 0; i < REPLICA_MAX_PENDING; i++) {
+        pending *p = &r->waiting[i];
+        if (!p->used || p->done || !p->wave_due) continue;
+        p->wave_due = 0;
+        int we = propose_wave(r, p);
+        if (we == DC_ERR_BATCH_TOO_LARGE) {
+            /* Every slot is held by other requests and none of this one's
+             * remains in flight, so no settlement is coming to wake it.
+             * What has been applied stays applied -- the same as any
+             * mid-list failure -- and the refusal says so. */
+            dbi_abandon(r->inst, p->token);
+            p->answer.len = 0;
+            we = refuse(r, DC_ERR_BATCH_TOO_LARGE, &p->answer);
+            p->done = 1;
+        }
+        if (we) return we;
     }
 
     int e = rn_tick(r->node, (int64_t)now, rnd01(r));

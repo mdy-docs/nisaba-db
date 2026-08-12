@@ -2684,6 +2684,59 @@ void rn_applied(raft_node *n, uint64_t index) {
     if (n) settle_through(n, index);
 }
 
+/*
+ * MANY ENTRIES, ONE SYNC.
+ *
+ * rn_propose is one entry and one fsync, which is the right shape for a
+ * single write and the wrong one for a request that plans thousands:
+ * `updateMany` over 20,000 documents is 20,000 commands, so it was 20,000
+ * fsyncs, and every one of them happened on the caller's thread with
+ * nothing else served in between. Measured at 20,000 documents on a solo
+ * member: 4.5 seconds during which eight sockets of point reads held 2% of
+ * their idle rate, most of it inside the syncs.
+ *
+ * Appending the batch and syncing once preserves the property the single
+ * version's comment names -- durable before it counts toward anything --
+ * more plainly than before: every append happens, THEN one sync covers all
+ * of them, THEN they are awaited (which is what makes an entry count) and
+ * the commit index is advanced once.
+ *
+ * PARTIAL IS POSSIBLE AND REPORTED. If an append fails part-way, what was
+ * appended is synced and awaited anyway -- those entries are in the log and
+ * will commit -- and *appended says how many, so the caller can own the
+ * ones that exist rather than guess. Refusing capacity is still whole and
+ * up front: a batch that would not fit takes nothing.
+ */
+int rn_propose_batch(raft_node *n, int type,
+                     const uint8_t *const *payloads, const uint32_t *lens,
+                     uint32_t count, uint64_t *out_indices, uint32_t *appended) {
+    if (!n || !payloads || !lens || !count) return BJ_ERR_STATE;
+    if (appended) *appended = 0;
+    if (n->role != RAFT_LEADER) return BJ_ERR_STATE;
+    if (n->nawait + count > RN_MAX_AWAIT) return RAFT_ERR_CAPACITY;
+
+    const uint64_t term = elog_current_term(n->log);
+    uint32_t done = 0;
+    int e = BJ_OK;
+    for (; done < count; done++) {
+        uint64_t at = 0;
+        e = elog_append(n->log, term, type, payloads[done], lens[done], &at);
+        if (e) break;
+        if (out_indices) out_indices[done] = at;
+    }
+    if (!done) return e;
+
+    int se = elog_sync(n->log);
+    for (uint32_t i = 0; i < done; i++)
+        rn_await(n, out_indices ? out_indices[i] : 0, term);
+    if (appended) *appended = done;
+    if (se) return se;
+
+    int re = replicate_to_all(n);
+    advance_commit(n);          /* single-voter groups: see become_leader */
+    return e ? e : re;
+}
+
 int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
                uint64_t *out_index) {
     if (n->role != RAFT_LEADER) return BJ_ERR_STATE;

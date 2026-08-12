@@ -313,6 +313,98 @@ const main = async () => {
     });
   }
 
+  /*
+   * WRITE INTERFERENCE -- the axis the reader-thread milestone left open.
+   * With scans offloaded, the remaining long thing on the serving thread is
+   * a long WRITE: one `updateMany` over the whole collection, or the
+   * backfill inside `createIndex`. Both hold the loop for their whole
+   * duration, and a write cannot be moved to a read view, so this is the
+   * number any design for them has to beat.
+   *
+   * Reader threads are held at `auto` and at 0, because they should make no
+   * difference here: a point read is inline either way, so it waits behind
+   * the write on the loop thread whatever the pool is doing.
+   */
+  console.log(`\nWRITE INTERFERENCE -- 8 sockets of _id reads, with and without` +
+              ` one client writing over ${opts.scandocs} docs`);
+  console.log('  workers  what              idle reads/s   while writing      held      the write');
+  for (const w of [0, -1]) {
+    const flag = w < 0 ? ['--read-threads', 'auto'] : ['--read-threads', '0'];
+    await withServer(opts.port + 60 + (w < 0 ? 9 : 0), flag, async (port) => {
+      const ids = await seedScan(port);
+      const pick = () => ids[(Math.random() * ids.length) | 0];
+      const points = async (ms) => {
+        const cs = await Promise.all(Array.from({ length: 8 }, () => connectServer(port)));
+        const stop = Date.now() + ms;
+        let n = 0;
+        await Promise.all(cs.map(async (c) => {
+          const cl = c.db(DB).collection('scan');
+          while (Date.now() < stop) { await cl.findOne({ _id: pick() }); n++; }
+        }));
+        await Promise.all(cs.map((c) => c.close().catch(() => {})));
+        return n;
+      };
+      await points(400);
+      const idle = await points(opts.seconds * 1000) / opts.seconds;
+
+      /*
+       * Two long writes, each measured over the same window: `updateMany`
+       * touches every document, `createIndex` reads every document and
+       * writes an index file (and is dropped again so the next round has
+       * work to do). Reads run throughout, and the window is timed rather
+       * than assumed -- a write that is REFUSED returns instantly, and
+       * dividing by the intended seconds would report the readers as
+       * blocked when they simply had nothing to be blocked by.
+       */
+      const WRITES = [
+        ['updateMany', async (cl, round) => {
+          await cl.updateMany({}, { $set: { touched: round } });
+        }],
+        ['createIndex', async (cl) => {
+          const name = await cl.createIndex({ n: 1 });
+          await cl.dropIndex(name);
+        }]
+      ];
+      for (const [what, run] of WRITES) {
+        const writer = await connectServer(port);
+        const cl = writer.db(DB).collection('scan');
+        const cs = await Promise.all(Array.from({ length: 8 }, () => connectServer(port)));
+        let n = 0, go = true;
+        const t0 = Date.now();
+        const reading = Promise.all(cs.map(async (c) => {
+          const rc = c.db(DB).collection('scan');
+          while (go) { await rc.findOne({ _id: pick() }); n++; }
+        }));
+        const stop = t0 + opts.seconds * 1000;
+        let rounds = 0, refused = null, wrote = 0;
+        while (Date.now() < stop) {
+          const w0 = Date.now();
+          try { await run(cl, rounds); } catch (err) {
+            /* "This op does not work at this size" IS the measurement, and
+             * the window keeps running so the reads stay comparable. */
+            refused ??= err.code ?? err.message;
+            await new Promise((r) => setTimeout(r, 50));
+            continue;
+          }
+          wrote += Date.now() - w0;
+          rounds++;
+        }
+        go = false;
+        await reading;
+        const secs = (Date.now() - t0) / 1000;
+        await Promise.all(cs.map((c) => c.close().catch(() => {})));
+        await writer.close();
+        const busy = n / secs;
+        console.log(`  ${String(w < 0 ? 'auto' : w).padStart(7)}  ${what.padEnd(14)}` +
+                    ` ${idle.toFixed(0).padStart(13)} ${busy.toFixed(0).padStart(15)}` +
+                    ` ${((busy / idle) * 100).toFixed(0).padStart(8)}%` +
+                    `   ${refused !== null
+                          ? `REFUSED (${refused})${rounds ? ` after ${rounds}` : ''}`
+                          : `${(wrote / Math.max(rounds, 1)).toFixed(0)}ms x${rounds}`}`);
+      }
+    });
+  }
+
   console.log(`\nSCAN SCALING -- N sockets all scanning ${opts.scandocs} docs at once`);
   const SCANNERS = [1, 2, 4, 8];
   console.log('  workers ' + SCANNERS.map((s) => `${String(s).padStart(8)} scan`).join('') +

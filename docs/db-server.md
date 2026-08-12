@@ -1074,6 +1074,72 @@ a test named *"asks nothing at all when no reader threads were asked for"*
 and one reproducing a sweep bug through a long inline scan were both testing
 the opposite of what they said.
 
+## Long writes, which do not have threads of their own
+
+The reader-thread section above ends with the case it deliberately left
+open: a long **write**. It cannot move to a worker, because a read view is
+only valid while its files are append-only and a write is exactly what
+breaks that — so a write is the serving thread's own work, always.
+
+**The measurement, at 20,000 documents** (`bench-server.js`'s WRITE
+INTERFERENCE axis; eight sockets of `_id` reads, with and without one
+client writing):
+
+| the write | reads/s idle | while writing | held | the write itself |
+|---|---|---|---|---|
+| `updateMany({}, …)` | 19,476 | — | — | **refused, -70** |
+| `createIndex` | 19,476 | 44 | **0.2%** | 718 ms each |
+
+Two different faults, and the first is not a latency problem at all.
+
+**`updateMany` plans one command per matched document**, and a round
+bigger than the node's await table (`RN_MAX_AWAIT`, 256) was refused
+whole: `-70`, nothing applied, "split the list into smaller requests" —
+which a client cannot do, because it does not know which documents
+matched. So the operation did not work at any real size, on every
+replicated deployment.
+
+It goes out in **waves** now (`propose_wave`): at most `REPLICA_WAVE` (64)
+commands appended per wave, each wave settling before the next goes out,
+one wave per tick. A request may be any size. Three things to know:
+
+- **A wave is appended whole or not at all**, which is the property the
+  refusal was protecting — discovering the cap mid-way once left 256 of a
+  client's 300 documents landing behind a dropped connection.
+- **A round is no longer atomic in the log.** Losing leadership between
+  waves leaves the committed waves committed and tells the client the
+  write was lost. `updateMany` never had round atomicity anyway (every
+  matched document is its own entry), but the window is wider than one
+  append now, and a failure mid-round cannot report a count.
+- **One fsync per wave, not per entry** (`rn_propose_batch`). Every append
+  used to sync — 20,000 documents was 20,000 fsyncs — and the batch form
+  keeps the ordering that matters: every append, then one sync, then the
+  awaits that make an entry count. It took the same round from 4.5 s to
+  3.0 s, and it speeds up every multi-document write, `insertMany`
+  included.
+
+The apply pump is bounded too (`REPLICA_APPLY_BUDGET`, 32 entries a pass),
+which also bounds a follower catching up after a partition — it used to
+apply everything it had been sent in one pass.
+
+**AND READS STILL HOLD ONLY ~2% WHILE A LONG WRITE RUNS.** That is not a
+loose end so much as arithmetic: the work is the loop thread's own, so
+slicing redistributes it rather than removing it. A round of 20,000
+durable document writes is ~3 s of loop time however it is cut; finer
+slices buy read latency and pay in write duration (a wave of 1 was
+measured and is far slower, for the same reason). What would actually
+isolate a write is a writer that is not the serving thread — which needs
+the live tree handed over rather than shared, and is a milestone of its
+own, not a knob.
+
+`createIndex` is the sharpest remaining case and is untouched by any of
+this: it is ONE entry whose apply reads every document and builds a file,
+so it is one uninterruptible unit — 718 ms at 20,000 documents, during
+which the loop answers nothing. Slicing it means making an apply
+resumable, and an apply must be all-or-nothing per entry for every
+replica to agree, so it needs the index built in stages that are each
+their own entry. Designed nowhere yet; measured here.
+
 ## Invariants
 
 - **One process per database directory.** The whole answer to concurrent

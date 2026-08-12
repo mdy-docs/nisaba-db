@@ -618,6 +618,28 @@ int rn_installed(raft_node *n, uint64_t peer, uint64_t boundary);
 int rn_propose(raft_node *n, int type, const uint8_t *payload, uint32_t len,
                uint64_t *out_index);
 
+/*
+ * The same, for many entries at once, with ONE fsync covering all of them.
+ *
+ * A request that plans thousands of commands -- updateMany names one per
+ * matched document -- paid one sync per entry through rn_propose, on the
+ * caller's thread, with nothing else served in between: 20,000 documents
+ * measured as 20,000 syncs and four and a half seconds of a serving loop
+ * that answered 2% of its idle read rate. Appending the batch and syncing
+ * once keeps the ordering that matters (every append, then the sync, then
+ * the awaits that make an entry count, then one commit advance) and turns
+ * the per-entry cost into a per-batch one.
+ *
+ * `out_indices` receives one index per appended entry, in order. Capacity
+ * is refused WHOLE and up front (RAFT_ERR_CAPACITY): a batch that does not
+ * fit appends nothing. An append that fails part-way is not undone -- those
+ * entries are in the log and will commit -- so *appended says how many made
+ * it, and the caller owns exactly those.
+ */
+int rn_propose_batch(raft_node *n, int type,
+                     const uint8_t *const *payloads, const uint32_t *lens,
+                     uint32_t count, uint64_t *out_indices, uint32_t *appended);
+
 /* ---- read barriers (section 6.4, ReadIndex) ------------------------------
  *
  * A LEADER'S LOCAL STATE IS NOT AUTHORITATIVE BY ITSELF. Raft does not

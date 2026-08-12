@@ -3873,21 +3873,62 @@ for (const engine of ENGINES) {
      * the batch as a whole -- refused whole, nothing appended, and the
      * refusal is a RESPONSE the connection survives.
      */
-    it('refuses a batch larger than the node can track -- whole, and out loud', async () => {
+    it('a batch larger than the node can track goes out in waves', async () => {
+      /*
+       * IT USED TO BE REFUSED WHOLE (-70), and that made an operation
+       * impossible rather than slow: updateMany plans one command per
+       * matched document, so over any real collection it answered "this
+       * request plans more log entries than the node can track" and did
+       * nothing -- measured at 20,000 documents, on every replicated
+       * deployment, which is all of them.
+       *
+       * The round goes out a WAVE at a time now (REPLICA_WAVE), each wave
+       * settling before the next is appended, so a request may be any size.
+       * What is kept is the property the refusal was protecting: a wave is
+       * appended whole or not at all. What is given up is one round being
+       * atomic in the log -- see propose_wave -- which updateMany never had
+       * anyway, every matched document being its own entry.
+       */
       const coll = client.db('bounds').collection('big');
-      const docs = Array.from({ length: 300 }, (_, i) => ({ n: i }));
-      await expect(coll.insertMany(docs)).rejects.toMatchObject({ code: -70 });
+      const docs = Array.from({ length: 900 }, (_, i) => ({ n: i }));
+      const ok = await coll.insertMany(docs);         // 900 > RN_MAX_AWAIT (256)
+      expect(ok.insertedCount).toBe(900);
+      expect(await coll.countDocuments({})).toBe(900);
+      /* Every id distinct, which is what says 900 entries applied rather
+       * than one wave landing several times. */
+      expect(new Set(Object.values(ok.insertedIds).map(String)).size).toBe(900);
 
-      // Nothing landed: all or nothing means the refusal left the
-      // previous state exactly as it was.
-      expect(await coll.countDocuments({})).toBe(0);
+      /* And the op the whole change is for: one command per matched
+       * document, over more documents than the await table holds. */
+      const many = await coll.updateMany({}, { $set: { touched: true } });
+      expect(many.modifiedCount).toBe(900);
+      expect(await coll.countDocuments({ touched: true })).toBe(900);
 
-      // The connection SURVIVED the refusal -- same client, and a batch
-      // within the bound goes through whole.
-      const ok = await coll.insertMany(docs.slice(0, 200));
-      expect(ok.insertedCount).toBe(200);
-      expect(await coll.countDocuments({})).toBe(200);
-    });
+      /* THE LOOP IS NOT HELD FOR THE WHOLE ROUND. A second connection's
+       * reads are answered while the round is still going -- which is the
+       * difference between waves and one giant append, and it is asserted
+       * rather than assumed because it is the only liveness claim this
+       * change makes. (How MANY get through is a different question: a
+       * write's work is the loop thread's own, and test/bench-server.js's
+       * WRITE INTERFERENCE axis is where that number lives.) */
+      const onlooker = await connectServer(port);
+      try {
+        const watching = onlooker.db('bounds').collection('big');
+        let served = 0;
+        let running = true;
+        const reading = (async () => {
+          while (running) { await watching.countDocuments({ n: 5 }); served++; }
+        })();
+        const second = await coll.updateMany({}, { $set: { again: true } });
+        running = false;
+        await reading;
+        expect(second.modifiedCount).toBe(900);
+        expect(served, 'no read was answered while a 900-entry round ran')
+          .toBeGreaterThan(0);
+      } finally {
+        await onlooker.close();
+      }
+    }, 60000);
 
     it('resumes across a restart at the floor of EVERY database, not one', async () => {
       const before = {

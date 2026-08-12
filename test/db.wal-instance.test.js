@@ -269,6 +269,9 @@ async function startNative(dir, extra = []) {
   }
   return {
     proc, client, port,
+    /* What the server SAID, which is the only place some decisions are
+     * visible -- a generation restored, a sweep, a halt. */
+    stderr: () => stderr,
     stop: async () => {
       await client.close().catch(() => {});
       proc.kill();
@@ -322,6 +325,114 @@ describe.skipIf(!have)('WAL instance ↔ nisaba-server: one artifact', () => {
     }
     fs.rmSync(dir, { recursive: true, force: true });
   }, 60000);
+
+  it('the applied index a drop leaves in the catalog crosses in both directions',
+     async () => {
+    /*
+     * THE NEWEST THING ON DISK, READ BY THE OTHER SIDE. A dropCollection
+     * takes the collection files that recorded what had been applied, so
+     * the catalog records it too -- the one structure a drop keeps and
+     * writes (Db.noteApplied, db_session.c's catalog_note_applied). Both
+     * hosts write it now; neither had ever read the other's.
+     *
+     * It needed no format bump, and that is the claim under test rather
+     * than an assumption: the field is per-tree metadata that
+     * binjson-structures has always written for every tree, so no byte
+     * changed shape -- a number that was always zero is sometimes not. The
+     * break it could hide is not a parse error but a DISAGREEMENT: a floor
+     * computed here and a floor computed there differing about which
+     * entries are applied, which resumes replay in a place the files are
+     * not.
+     *
+     * THE LOG IS COMPACTED PAST THE DROP ON PURPOSE, because otherwise
+     * this test proves nothing: a host that cannot read the field would
+     * replay the suffix and arrive at the same floor by accident. With the
+     * entries gone, the catalog is the ONLY place that answer exists --
+     * and a host that misses it computes a floor BELOW the log's base,
+     * which is the unusable state that restores a generation (or halts).
+     */
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-inst-floor-'));
+
+    /* ---- JS writes it, C reads it -------------------------------------- */
+    const provider = new NodeFSStorageProvider(dir);
+    let inst = await connectWalInstance(provider);
+    const keep = await (await inst.db('appa')).collection('keep');
+    await keep.insertOne({ _id: oid(1), n: 1 });                                 // 1
+    const doomed = await (await inst.db('appa')).collection('doomed');
+    for (let i = 2; i <= 4; i++) await doomed.insertOne({ _id: oid(i), n: i });   // 2..4
+    expect(await (await inst.db('appa')).dropCollection('doomed')).toBe(true);    // 5
+    const jsFloor = await inst._appliedFloor();
+    expect(jsFloor, 'the JS host did not record the drop on the catalog')
+      .toBe(inst.log.lastIndex);
+    expect(jsFloor, 'the survivor alone would report 1').toBeGreaterThan(1);
+    /* Compact: the entries that made and dropped `doomed` leave the log. */
+    const gen = await inst.snapshot();
+    expect(gen.lastIncludedIndex).toBe(jsFloor);
+    expect(inst.log.baseIndex).toBe(jsFloor);
+    await inst.close();
+    await provider.close();
+
+    let cFloor = 0;
+    const server = await startNative(dir);
+    try {
+      await eventually(async () => {
+        const s = await server.client.ping();
+        expect(s.pong).toBe(true);
+      });
+      const seen = await server.client.ping();
+      expect(seen.base, 'the C server did not adopt the JS generation')
+        .toBe(jsFloor);
+      /* The floor is the JS-written one, out of the catalog: there are no
+       * entries left to derive it from. Below the base it would be
+       * unusable state, and the server would say so. */
+      expect(seen.applied,
+        'the C server did not see the applied index JS left in the catalog')
+        .toBeGreaterThanOrEqual(jsFloor);
+      expect(server.stderr(),
+        'the C server treated a perfectly good root as unusable')
+        .not.toMatch(/restoring snapshot|halted/);
+      expect(await server.client.db('appa').listCollections()).toEqual(['keep']);
+
+      /* ---- and now C writes one, for JS to read ----------------------- */
+      const second = server.client.db('appa').collection('second');
+      await eventually(async () => { await second.insertOne({ _id: oid(20), n: 20 }); });
+      for (let i = 21; i <= 23; i++) await second.insertOne({ _id: oid(i), n: i });
+      expect(await server.client.db('appa').dropCollection('second')).toBe(true);
+      await server.client.snapshot();          /* the entries leave the log */
+      const after = await server.client.ping();
+      cFloor = after.applied;
+      expect(after.base, 'the C log did not compact past its own drop').toBe(cFloor);
+      expect(cFloor).toBeGreaterThan(jsFloor);
+      await server.stop();
+    } finally {
+      server.proc.kill();
+    }
+
+    const back = new NodeFSStorageProvider(dir);
+    inst = await connectWalInstance(back);
+    try {
+      /* Same question from the other side: with the log based at cFloor,
+       * a JS host that could not read C's catalog term would compute the
+       * survivor's index, decide the live files are unreachable, and
+       * restore the generation to get there. */
+      expect(await inst._appliedFloor(),
+        'the JS host did not see the applied index C left in the catalog')
+        .toBeGreaterThanOrEqual(cFloor);
+      expect(inst.log.baseIndex).toBe(cFloor);
+      expect((await (await inst.db('appa')).listCollections()).sort()).toEqual(['keep']);
+      expect(await (await (await inst.db('appa')).collection('keep'))
+        .countDocuments({})).toBe(1);
+      /* And it is a working root, not merely a readable one. */
+      await (await (await inst.db('appa')).collection('keep'))
+        .insertOne({ _id: oid(30), n: 30 });
+      expect(await (await (await inst.db('appa')).collection('keep'))
+        .countDocuments({})).toBe(2);
+    } finally {
+      await inst.close();
+      await back.close();
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }, 90000);
 
   it('a C-written root (log, generation and all) opens in the JS host, and back', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-inst-cj-'));

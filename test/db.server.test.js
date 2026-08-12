@@ -4897,6 +4897,12 @@ for (const engine of ENGINES) {
   });
 
   describe.skipIf(!enabled)(`nisaba-server: the orphan sweep (${engine.name})`, () => {
+    /* ONE slot for the whole describe, like every other suite here: the
+     * counter has a hard end and the failure lands on whichever suite is
+     * declared last (see nextPort). The tests run in order and each kills
+     * its servers, so the port is free again by the next one. */
+    const SLOT = nextPort();
+
     it('collects what an interrupted operation left, and says it did', async () => {
       /*
        * EVERY DDL OP LEAVES FILES NOTHING REFERENCES IF IT IS INTERRUPTED,
@@ -4915,7 +4921,7 @@ for (const engine of ENGINES) {
        * matrix answers that -- but whether the server collects them, and
        * which ones it dares to.
        */
-      const port = nextPort();
+      const port = SLOT;
       const first = await startServer(engine, port, [], 20);
       let second = null;
       try {
@@ -4980,7 +4986,7 @@ for (const engine of ENGINES) {
       /* The counter is a statement about interruption, so it must not fire
        * on an ordinary boot -- otherwise the line above is noise and the
        * next person filters it out. */
-      const port = nextPort();
+      const port = SLOT + 1;
       const first = await startServer(engine, port, [], 20);
       let second = null;
       try {
@@ -4998,6 +5004,84 @@ for (const engine of ENGINES) {
         const c2 = await connectServer(port, { keepAliveMs: 0 });
         expect(await c2.db(DB).collection('users').countDocuments({})).toBe(before);
         await c2.close();
+      } finally {
+        first.proc.kill();
+        second?.proc.kill();
+      }
+    }, 60000);
+  });
+
+  describe.skipIf(!enabled)(`nisaba-server: a format from the future (${engine.name})`, () => {
+    const SLOT = nextPort();
+
+    it('is refused, and NOT swept: an old version must not judge new files',
+       async () => {
+      /*
+       * docs/format-compatibility.md has always said a database stamped
+       * above this build's version is refused "before anything touches the
+       * files -- in particular before the orphan sweep, which must never
+       * judge a future format's files by an old version's naming rules".
+       * Until the server had a sweep that sentence cost nothing. It has one
+       * now, so this is the test that makes the sentence true.
+       *
+       * What a future format may legitimately do is name files in ways this
+       * build has never seen. If it were swept by today's rules, an upgrade
+       * followed by a downgrade would DELETE the newer version's data --
+       * silently, and then correctly refuse to open what was left.
+       */
+      const port = SLOT;
+      const first = await startServer(engine, port, [], 20);
+      let second = null;
+      try {
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        expect(await c.db(DB).collection('users').countDocuments({})).toBeGreaterThan(0);
+        await c.close();
+        first.proc.kill();
+        await new Promise((r) => first.proc.once('exit', r));
+
+        const at = path.join(first.dir, DB);
+        /* A file only a future version would write: this build's naming
+         * rules say it belongs to nobody, so today's sweep would take it. */
+        fs.writeFileSync(path.join(at, 'g9-coll-users-v2.bj'), 'future');
+
+        /* Stamp it from the future, through the JS decoder writing the same
+         * key the C gate reads -- one stamp, whoever wrote it. The provider
+         * is CLOSED before the listing below, because it holds a lock file
+         * of its own and the comparison is about what the SERVER touches. */
+        const raw = new NodeFSStorageProvider(at);
+        const catalog = new BPlusTree(
+          await raw.openFile('__catalog__.bj', { create: false }), 32);
+        await catalog.open();
+        catalog.add('__format__', { v: 99 });
+        catalog.flush();
+        await catalog.close();
+        await raw.close();
+        const before = fs.readdirSync(at).sort();
+
+        second = await startServer(engine, port, [], 0, first.dir);
+
+        /*
+         * NOTHING WAS TOUCHED, asserted FIRST because it is the assertion
+         * with teeth: a wrong error message is an annoyance, and a swept
+         * file is somebody's data. The startup sweep has already run by the
+         * time the server says it is serving.
+         */
+        expect(fs.readdirSync(at).sort(),
+          'the sweep judged a future format by this version\'s rules')
+          .toEqual(before);
+        expect(second.stderr(), 'it claimed to collect files it must not read')
+          .not.toMatch(/unreferenced file/);
+
+        /* The SERVER still runs -- one unreadable database is not an outage
+         * for the instance -- and the database itself refuses, saying what
+         * to do about it. */
+        const back = await connectServer(port, { keepAliveMs: 0 });
+        let err = null;
+        try { await back.db(DB).collection('users').countDocuments({}); }
+        catch (e) { err = e; }
+        expect(err, 'a future format was opened and read').toBeTruthy();
+        expect(err.message).toMatch(/format is newer|upgrade nisaba/i);
+        await back.close();
       } finally {
         first.proc.kill();
         second?.proc.kill();

@@ -3873,6 +3873,43 @@ for (const engine of ENGINES) {
      * the batch as a whole -- refused whole, nothing appended, and the
      * refusal is a RESPONSE the connection survives.
      */
+    it('a many-write that matches nothing is an answer, not a dead socket', async () => {
+      /*
+       * AN updateMany WHOSE FILTER MATCHED NOTHING KILLED THE CONNECTION,
+       * on every replicated server, since the multi-document write path
+       * first landed. The planner emits one command per matched document;
+       * zero matches is a plan with zero commands, and the replicated path
+       * HELD it and proposed it -- an empty round, which the replica
+       * refuses (nothing to settle on) with an error the transport cannot
+       * classify, so it hangs up. Two ops reproduce it: one insert, one
+       * zero-match updateMany, socket gone.
+       *
+       * Found by test/apply-oracle.js's randomized workload within 250
+       * writes. Nothing else -- suites, soaks, the bench -- ever ran a
+       * many-write that matched nothing, which is the measure of how
+       * ordinary the trigger is.
+       *
+       * A zero-command plan is now an ANSWER (matched 0, modified 0),
+       * assembled from the same plan, with nothing reaching the log.
+       */
+      const coll = client.db('bounds').collection('nobody');
+      await coll.insertOne({ n: 473 });
+      const before = (await client.ping()).applied;
+
+      const upd = await coll.updateMany({ n: { $lt: 250 } }, { $inc: { b: 1 } });
+      expect(upd.modifiedCount).toBe(0);
+      const del = await coll.deleteMany({ n: { $gt: 900 } });
+      expect(del.deletedCount).toBe(0);
+
+      /* The CONNECTION lives -- the whole bug was that it did not -- and
+       * nothing reached the log for either no-op. */
+      expect((await client.ping()).applied).toBe(before);
+      expect(await coll.countDocuments({})).toBe(1);
+      /* And a matching many-write on the same connection still works. */
+      const real = await coll.updateMany({ n: { $gt: 0 } }, { $set: { hit: true } });
+      expect(real.modifiedCount).toBe(1);
+    });
+
     it('a batch larger than the node can track goes out in waves', async () => {
       /*
        * IT USED TO BE REFUSED WHOLE (-70), and that made an operation

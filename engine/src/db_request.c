@@ -664,6 +664,26 @@ static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
                               upsert, id, out);
     if (e) return e;
     if (!dbs_repl_active(s)) return BJ_OK;
+    /*
+     * A PLAN WITH NO COMMANDS IS AN ANSWER, NOT A PROPOSAL. An updateMany
+     * or deleteMany whose filter matched nothing plans zero commands, and
+     * holding it would send the replica an empty round -- which it refuses
+     * (BJ_ERR_STATE: a round with nothing to settle on would wait for an
+     * index that never arrives), and the transport answers a refusal it
+     * cannot classify by KILLING THE CONNECTION. Measured: two ops, an
+     * insert and a zero-match updateMany, and the client's socket is gone
+     * -- on every replicated server, which is every tenant, since the
+     * multi-document write path first landed. Found by the apply oracle's
+     * randomized workload within 250 writes; nothing else ever ran a
+     * many-write whose filter matched nothing.
+     *
+     * Falling through plans it like an unreplicated no-op: the caller
+     * assembles modified/deleted 0 from the same plan it would have
+     * assembled from anyway, nothing reaches the log, and the connection
+     * lives. The single-document writes never get here -- their no-match
+     * outcome is DC_PLAN_NOTHING, answered inline on both paths already.
+     */
+    if (dc_wal_plan_count(*out) == 0) return BJ_OK;
     e = dbs_repl_hold(s, *out);
     if (e) { dc_wal_plan_free(*out); *out = NULL; return e; }
     /* Planned and kept, and that is as far as this pass goes: whatever

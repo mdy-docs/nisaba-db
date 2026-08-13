@@ -61,6 +61,9 @@ struct dbi {
      * was interrupted part-way through a DDL op, which is worth saying
      * out loud rather than silently tidying. */
     uint64_t  swept;
+    /* Staged-build chunk size, applied to every session this instance
+     * opens (dbi_set_index_chunk). 0 = the session default. */
+    uint32_t  index_chunk;
 };
 
 /* ---- opening ------------------------------------------------------------ */
@@ -152,6 +155,7 @@ int dbi_database(dbi *i, const char *name, size_t len, int create, dbs **out) {
     d->name_len = (uint32_t)len;
     d->s = s;
     dbs_set_id_source(s, &i->next_id);
+    if (i->index_chunk) dbs_set_index_chunk(s, i->index_chunk);
 
     /*
      * THE ORPHAN SWEEP, HERE AND NOWHERE ELSE. Every DDL op leaves files
@@ -465,12 +469,14 @@ int dbi_entry_wrecks_files(const uint8_t *payload, uint32_t len) {
     const uint8_t *coll = NULL; uint32_t coll_len = 0;
     if (dc_wal_parse(cmd, (uint32_t)cmd_len, &op, &coll, &coll_len)) return 1;
     /*
-     * The four document ops append; the DDL three make and unmake files.
      * Asked of db_wal.h rather than answered here, so the two cannot come
      * to different conclusions about what a command does -- and so an
-     * opcode added later is DDL until db_wal.h says otherwise.
+     * opcode added later wrecks files until db_wal.h says otherwise.
+     * (INDEX_CHUNK is the one non-document op that only appends, and that
+     * property is the staged build's whole point: reads keep serving
+     * under views while a backfill runs.)
      */
-    return !dc_wal_is_document(op);
+    return dc_wal_wrecks_files(op);
 }
 
 int dbi_read_view(dbi *i, const uint8_t *req, size_t req_len, dc_collection **out) {
@@ -818,6 +824,145 @@ int dbi_sweep_all(dbi *i) {
     }
     dbuf_free(&names);
     return BJ_OK;
+}
+
+/* ---- staged builds, instance-wide (the resumer's three questions) ------- */
+
+int dbi_building_indexes(dbi *i, dbuf *out) {
+    if (!i || !out) return BJ_ERR_STATE;
+    dbuf names = {0};
+    int e = dbi_list(i, &names);
+    if (e) { dbuf_free(&names); return e; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { dbuf_free(&names); return BJ_ERR_OOM; }
+    e = bj_begin_array(b);
+
+    cur c = { names.data, names.len, 0 };
+    uint32_t count = 0;
+    if (!e && array_begin(&c, &count) == BJ_OK) {
+        for (uint32_t k = 0; !e && k < count; k++) {
+            const uint8_t *n; uint32_t nlen;
+            if (take_string(&c, &n, &nlen)) break;
+            int was_open = find(i, (const char *)n, nlen) != NULL;
+            dbs *s = NULL;
+            if (dbi_database(i, (const char *)n, nlen, 0, &s) != BJ_OK) continue;
+            dbuf per = {0};
+            e = dbs_building_indexes(s, &per);
+            if (!e) {
+                /* Re-wrap each {c, name} as {d, c, name}: the caller
+                 * addresses a build by database as well. */
+                cur pc = { per.data, per.len, 0 };
+                uint32_t pn = 0;
+                if (array_begin(&pc, &pn) == BJ_OK) {
+                    for (uint32_t j = 0; !e && j < pn; j++) {
+                        size_t start = pc.pos;
+                        if ((e = skip_value(&pc))) break;
+                        const uint8_t *row = per.data + start;
+                        size_t row_len = pc.pos - start;
+                        cur rc = { row, row_len, 0 };
+                        uint32_t fields = 0;
+                        if ((e = object_begin(&rc, &fields))) break;
+                        if (!e) e = bj_begin_object(b);
+                        if (!e) e = bj_put_key(b, (const uint8_t *)"d", 1);
+                        if (!e) e = bj_put_string(b, n, nlen);
+                        for (uint32_t f = 0; !e && f < fields; f++) {
+                            const uint8_t *kp; uint32_t klen;
+                            if ((e = take_key(&rc, &kp, &klen))) break;
+                            size_t vstart = rc.pos;
+                            if ((e = skip_value(&rc))) break;
+                            e = bj_put_key(b, kp, klen);
+                            if (!e) e = bj_put_raw(b, row + vstart, (uint32_t)(rc.pos - vstart));
+                        }
+                        if (!e) e = bj_end_object(b);
+                    }
+                }
+            }
+            dbuf_free(&per);
+            if (!was_open) {
+                dbi_slot *d = find(i, (const char *)n, nlen);
+                if (d) slot_close(i, d);
+            }
+        }
+    }
+    dbuf_free(&names);
+    if (!e) e = bj_end_array(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+int dbi_index_building(dbi *i, const char *db, size_t db_len,
+                       const char *coll, size_t coll_len,
+                       const uint8_t *name, uint32_t name_len) {
+    if (!i) return 0;
+    dbs *s = NULL;
+    if (dbi_database(i, db, db_len, 0, &s) != BJ_OK) return 0;
+    return dbs_index_building_state(s, coll, coll_len, name, name_len);
+}
+
+int dbi_chunk_entry(const char *db, size_t db_len,
+                    const char *coll, size_t coll_len,
+                    const uint8_t *name, uint32_t name_len,
+                    uint32_t k, dbuf *out) {
+    if (!db || !coll || !name || !out || k < 1) return BJ_ERR_STATE;
+
+    /* The command comes from the planner, so its spelling stays in
+     * db_wal.c; only the envelope is this file's. */
+    uint8_t kspan[16];
+    uint32_t kspan_len = 0;
+    {
+        bj_builder *kb = bj_builder_new();
+        if (!kb) return BJ_ERR_OOM;
+        int ke = bj_put_int(kb, (int64_t)k);
+        if (!ke) ke = bj_builder_error(kb);
+        if (!ke) {
+            size_t n = 0;
+            const uint8_t *d = bj_builder_data(kb, &n);
+            if (!d || n > sizeof kspan) ke = BJ_ERR_STATE;
+            else { memcpy(kspan, d, n); kspan_len = (uint32_t)n; }
+        }
+        bj_builder_free(kb);
+        if (ke) return ke;
+    }
+    dc_wal_plan *p = NULL;
+    int e = dc_wal_plan_build(NULL, coll, (uint32_t)coll_len, DC_WREQ_INDEX_CHUNK,
+                              name, name_len, kspan, kspan_len, 0, NULL, &p);
+    if (e) return e;
+    uint32_t clen = 0;
+    const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+    if (!cmd) { dc_wal_plan_free(p); return BJ_ERR_STATE; }
+
+    bj_builder *b = bj_builder_new();
+    if (!b) { dc_wal_plan_free(p); return BJ_ERR_OOM; }
+    e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"d", 1);
+    if (!e) e = bj_put_string(b, (const uint8_t *)db, (uint32_t)db_len);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"c", 1);
+    if (!e) e = bj_put_raw(b, cmd, clen);
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t n = 0;
+        const uint8_t *d = bj_builder_data(b, &n);
+        out->len = 0;
+        e = d ? dbuf_put(out, d, n) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    dc_wal_plan_free(p);
+    return e;
+}
+
+void dbi_set_index_chunk(dbi *i, uint32_t k) {
+    if (!i) return;
+    i->index_chunk = k;
+    for (int s = 0; s < DBI_MAX_DATABASES; s++)
+        if (i->db[s].used) dbs_set_index_chunk(i->db[s].s, k);
 }
 
 /* ---- clients and streams ------------------------------------------------ */

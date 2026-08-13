@@ -252,3 +252,9 @@ _rnw_awaiting
 _rnw_campaign
 _rnw_observe_leader
 _rnw_step_down
+_dcw_collection_add_index_staged
+_dcw_collection_index_set_building
+_dcw_collection_index_is_building
+_dcw_backfill_step
+_catw_index_building_set
+_catw_index_building_get

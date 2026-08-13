@@ -387,6 +387,90 @@ describe.skipIf(!have)('WAL instance ↔ nisaba-server: one artifact', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }, 60000);
 
+  it('a staged build interrupted in C replays through the JS host, and C finishes it later', async () => {
+    /*
+     * The staged createIndex writes NEW OPCODES into the instance log
+     * (indexBegin/indexChunk, db_wal.h), and the one-artifact contract
+     * says a log is a log whoever wrote it. So: a C server is killed
+     * MID-BUILD -- the log holds the begin and a prefix of the chunks,
+     * the catalog says building -- and the JS host opens the directory.
+     * It must REPLAY the un-applied chunk entries (Collection.indexChunk,
+     * the JS twin), answer queries correctly off the scan (the index is
+     * still invisible), and keep the build's state intact. It has no
+     * resumer -- that is the server's -- so the build stays in flight
+     * here; handing the directory BACK to a C server finishes it.
+     */
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-inst-staged-'));
+
+    let server = await startNative(dir, ['--index-chunk', '32', '--snapshot-entries', '0']);
+    const docs = server.client.db('appa').collection('docs');
+    await eventually(async () => {
+      await docs.insertOne({ _id: oid(9999), team: -1 });
+    });
+    for (let at = 0; at < 6000; at += 500) {
+      await docs.insertMany(Array.from({ length: 500 }, (_, i) => ({ team: (at + i) % 13 })));
+    }
+    docs.createIndex({ team: 1 }).catch(() => {});
+    /*
+     * Kill once the begin is committed and only a FEW chunks are in --
+     * polled tight, no sleeps. The margin matters: the JS host replays
+     * chunk entries without the C session's already-applied guard
+     * (single-copy convergence, Collection.indexChunk), so a replayed
+     * chunk advances the cursor AGAIN -- n committed chunks re-run
+     * roughly double the cursor. Killed early, 2 x cursor is still far
+     * short of 6000 documents and the build must reopen BUILDING here;
+     * killed late it may legitimately complete during replay, and the
+     * assertion below would be testing a coin flip.
+     */
+    /* A SECOND connection: the first serializes behind the whole
+     * createIndex round, so a wait on it would always outlive the
+     * build and this test would be about a completed one. */
+    const watcher = await connectServer(`127.0.0.1:${server.port}`);
+    const wdocs = watcher.db('appa').collection('docs');
+    for (;;) {
+      const listed = await wdocs.listIndexes();
+      const d = listed.find((ix) => ix.name === 'team_1');
+      if (d) {
+        expect(d.building, 'expected to catch the build in flight').toBe(true);
+        break;
+      }
+    }
+    await watcher.close().catch(() => {});
+    server.proc.kill('SIGKILL');
+    await new Promise((r) => server.proc.once('exit', r));
+
+    /* ---- the JS host: replays the staged suffix, serves, stays honest -- */
+    const provider = new NodeFSStorageProvider(dir);
+    const inst = await connectWalInstance(provider);
+    const jsDocs = await (await inst.db('appa')).collection('docs');
+    expect(await jsDocs.countDocuments({ team: 3 })).toBe(462);
+    const listed = await jsDocs.listIndexes();
+    const def = listed.find((ix) => ix.name === 'team_1');
+    expect(def, 'the JS host lost the in-flight build').toBeTruthy();
+    expect(def.building, 'a mid-build artifact must reopen building').toBe(true);
+    /* Dual maintenance holds here too: a write through the JS host while
+     * the build is parked must not be lost when C later finishes it. */
+    await jsDocs.insertOne({ _id: oid(9998), team: 3 });
+    expect(await jsDocs.countDocuments({ team: 3 })).toBe(463);
+    await inst.close();
+    await provider.close();
+
+    /* ---- back to C: the resumer finishes what everyone preserved ------- */
+    server = await startNative(dir);
+    try {
+      const again = server.client.db('appa').collection('docs');
+      await eventually(async () => {
+        const after = await again.listIndexes();
+        const d = after.find((ix) => ix.name === 'team_1');
+        expect(d && !d.building).toBe(true);
+      }, 60000);
+      expect(await again.countDocuments({ team: 3 })).toBe(463);
+    } finally {
+      await server.stop();
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }, 120000);
+
   it('the applied index a drop leaves in the catalog crosses in both directions',
      async () => {
     /*

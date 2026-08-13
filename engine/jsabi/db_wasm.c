@@ -17,9 +17,11 @@
 #include "db.h"
 #include "dbuf.h"
 #include "hostio.h"
+#include "binjson.h"   /* the backfill_step result object */
 
 #include <limits.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
@@ -111,6 +113,67 @@ EMSCRIPTEN_KEEPALIVE int dcw_collection_add_geo_index(dc_collection *c,
 EMSCRIPTEN_KEEPALIVE int dcw_collection_remove_index(dc_collection *c,
         const char *name, int name_len) {
     return dc_collection_remove_index(c, name, name_len);
+}
+
+/* The staged build's collection-level halves (db.h). `add_index_staged`
+ * attaches EMPTY and BUILDING -- the chunks backfill; `backfill_step`
+ * advances one, answering {advanced, done, last?} through the out slot
+ * so the JS applier can record the cursor exactly as the C session
+ * does. */
+EMSCRIPTEN_KEEPALIVE int dcw_collection_add_index_staged(dc_collection *c,
+        const char *name, int name_len, bpt *index_tree,
+        const uint8_t *fields, int fields_len,
+        int unique, int sparse,
+        const uint8_t *partial_filter, int partial_filter_len) {
+    return dc_collection_add_index_staged(c, name, name_len, index_tree,
+                                          fields, (uint32_t)fields_len,
+                                          unique, sparse,
+                                          partial_filter, (uint32_t)partial_filter_len);
+}
+EMSCRIPTEN_KEEPALIVE int dcw_collection_index_set_building(dc_collection *c,
+        const char *name, int name_len, int building) {
+    return dc_collection_index_set_building(c, name, name_len, building);
+}
+EMSCRIPTEN_KEEPALIVE int dcw_collection_index_is_building(dc_collection *c,
+        const char *name, int name_len) {
+    return dc_collection_index_is_building(c, name, name_len);
+}
+EMSCRIPTEN_KEEPALIVE int dcw_backfill_step(dcw_out *o, dc_collection *c,
+        const char *name, int name_len,
+        const uint8_t *after_id, int k) {
+    reset_out(o);
+    uint8_t last[12];
+    uint32_t advanced = 0;
+    int done = 0;
+    int e = dc_collection_backfill_step(c, name, name_len,
+                                        after_id, (uint32_t)k,
+                                        last, &advanced, &done);
+    if (e) return e;
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"advanced", 8);
+    if (!e) e = bj_put_int(b, (int64_t)advanced);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"done", 4);
+    if (!e) e = bj_put_bool(b, done);
+    if (!e && advanced) {
+        e = bj_put_key(b, (const uint8_t *)"last", 4);
+        if (!e) e = bj_put_oid(b, last);
+    }
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t n = 0;
+        const uint8_t *d = bj_builder_data(b, &n);
+        if (!d) e = BJ_ERR_STATE;
+        else {
+            o->buf = (uint8_t *)malloc(n ? n : 1);
+            if (!o->buf) e = BJ_ERR_OOM;
+            else { memcpy(o->buf, d, n); o->len = n; }
+        }
+    }
+    bj_builder_free(b);
+    return e;
 }
 
 EMSCRIPTEN_KEEPALIVE int dcw_find_by_index(dcw_out *o, dc_collection *c,

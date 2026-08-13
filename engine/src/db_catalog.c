@@ -2,6 +2,7 @@
  * db_catalog.c — see db_catalog.h.
  */
 #include "db_catalog.h"
+#include "db.h"        /* DC_ERR_NO_INDEX, for the building-state setter */
 #include "db_names.h"
 #include "db_validate.h"
 #include "bjcursor.h"
@@ -213,6 +214,14 @@ int dc_catalog_open_plan(const uint8_t *entry, size_t entry_len,
                     bj_put_bool(b, flag_field(def, def_len, "sparse"));
                     pass_through(b, def, def_len, "partialFilterExpression");
                     pass_through(b, def, def_len, "expireAfterSeconds");
+                    /* An in-flight staged build: the opener must attach
+                     * this index MAINTAINED-BUT-INVISIBLE, exactly as the
+                     * begin entry left it. The cursor stays behind -- it
+                     * is the chunk apply's to read, not the opener's. */
+                    if (flag_field(def, def_len, "building")) {
+                        bj_put_key(b, (const uint8_t *)"building", 8);
+                        bj_put_bool(b, 1);
+                    }
                 } else {
                     const uint8_t *fp; uint32_t fplen; int has_field = 0;
                     if ((e = str_field(def, def_len, "field", &fp, &fplen, &has_field))) goto fail;
@@ -307,6 +316,13 @@ int dc_catalog_list_indexes(const uint8_t *entry, size_t entry_len, dbuf *out) {
 
             /* Options are reported only when set, matching the driver (and
              * matching what the JS projection did). */
+            if (flag_field(def, def_len, "building")) {
+                /* A staged build in flight: the index exists, is being
+                 * maintained, and does not serve queries yet. Shown so a
+                 * client that just asked for it can watch it finish. */
+                bj_put_key(b, (const uint8_t *)"building", 8);
+                bj_put_bool(b, 1);
+            }
             if (kind == DC_INDEX_EQUALITY) {
                 if (flag_field(def, def_len, "unique")) {
                     bj_put_key(b, (const uint8_t *)"unique", 6);
@@ -510,6 +526,137 @@ int dc_catalog_drop_index(const uint8_t *entry, size_t entry_len,
     return rewrite_indexes(entry, entry_len, name, name_len, NULL, 0, out);
 }
 
+/* ---- the staged-build fields (db_catalog.h says why they live here) ---- */
+
+/* Copy every field of one stored definition except `building` and
+ * `cursor`, which the caller re-appends as the new state. */
+static int copy_def_except_build_state(bj_builder *b, const uint8_t *def, size_t def_len) {
+    cur c = { def, def_len, 0 };
+    uint32_t n;
+    int e = object_begin(&c, &n);
+    if (e) return e;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *kp; uint32_t klen;
+        if ((e = take_key(&c, &kp, &klen))) return e;
+        size_t vstart = c.pos;
+        if ((e = skip_value(&c))) return e;
+        if (klen == 8 && memcmp(kp, "building", 8) == 0) continue;
+        if (klen == 6 && memcmp(kp, "cursor", 6) == 0) continue;
+        bj_put_key(b, kp, klen);
+        bj_put_raw(b, def + vstart, (uint32_t)(c.pos - vstart));
+    }
+    return BJ_OK;
+}
+
+int dc_catalog_index_building_set(const uint8_t *entry, size_t entry_len,
+                                  const char *name, size_t name_len,
+                                  int building, const uint8_t *cursor,
+                                  dbuf *out) {
+    if (entry_len < 1 || entry[0] != BJ_TYPE_OBJECT) return DC_ERR_CATALOG_ENTRY;
+
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_object(b);
+    int e = copy_entry_except_indexes(b, entry, entry_len);
+    if (e) goto fail;
+
+    int seen = 0;
+    bj_put_key(b, (const uint8_t *)"indexes", 7);
+    bj_begin_array(b);
+    {
+        const uint8_t *idxs; size_t idxs_len; int has_idxs = 0;
+        if ((e = obj_get_field(entry, entry_len, (const uint8_t *)"indexes", 7,
+                               &idxs, &idxs_len, &has_idxs))) goto fail;
+        if (has_idxs && idxs_len >= 1 && idxs[0] == BJ_TYPE_ARRAY) {
+            cur c = { idxs, idxs_len, 0 };
+            uint32_t n;
+            if ((e = array_begin(&c, &n))) goto fail;
+            for (uint32_t i = 0; i < n; i++) {
+                size_t dstart = c.pos;
+                if ((e = skip_value(&c))) goto fail;
+                const uint8_t *def = idxs + dstart;
+                size_t def_len = c.pos - dstart;
+                const uint8_t *np; uint32_t nlen; int has_name = 0;
+                if ((e = str_field(def, def_len, "name", &np, &nlen, &has_name))) goto fail;
+                if (!has_name || nlen != name_len || memcmp(np, name, nlen) != 0) {
+                    bj_put_raw(b, def, (uint32_t)def_len);
+                    continue;
+                }
+                seen = 1;
+                bj_begin_object(b);
+                if ((e = copy_def_except_build_state(b, def, def_len))) goto fail;
+                if (building) {
+                    bj_put_key(b, (const uint8_t *)"building", 8);
+                    bj_put_bool(b, 1);
+                    if (cursor) {
+                        bj_put_key(b, (const uint8_t *)"cursor", 6);
+                        bj_put_oid(b, cursor);
+                    }
+                }
+                /* building == 0 appends nothing: the commit IS the two
+                 * fields disappearing, so a committed def is
+                 * byte-identical to one that was never staged. */
+                bj_end_object(b);
+            }
+        }
+    }
+    bj_end_array(b);
+    bj_end_object(b);
+    if (!seen) { e = DC_ERR_NO_INDEX; goto fail; }
+
+    if ((e = bj_builder_error(b))) goto fail;
+    {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        if (!data) { e = BJ_ERR_STATE; goto fail; }
+        e = dbuf_put(out, data, len);
+    }
+
+fail:
+    bj_builder_free(b);
+    return e;
+}
+
+int dc_catalog_index_building_get(const uint8_t *entry, size_t entry_len,
+                                  const char *name, size_t name_len,
+                                  int *found, int *building,
+                                  uint8_t cursor_out[12], int *has_cursor) {
+    *found = 0;
+    *building = 0;
+    *has_cursor = 0;
+    if (entry_len < 1 || entry[0] != BJ_TYPE_OBJECT) return DC_ERR_CATALOG_ENTRY;
+
+    const uint8_t *idxs; size_t idxs_len; int has_idxs = 0;
+    int e = obj_get_field(entry, entry_len, (const uint8_t *)"indexes", 7,
+                          &idxs, &idxs_len, &has_idxs);
+    if (e) return e;
+    if (!has_idxs || idxs_len < 1 || idxs[0] != BJ_TYPE_ARRAY) return BJ_OK;
+
+    cur c = { idxs, idxs_len, 0 };
+    uint32_t n;
+    if ((e = array_begin(&c, &n))) return e;
+    for (uint32_t i = 0; i < n; i++) {
+        size_t dstart = c.pos;
+        if ((e = skip_value(&c))) return e;
+        const uint8_t *def = idxs + dstart;
+        size_t def_len = c.pos - dstart;
+        const uint8_t *np; uint32_t nlen; int has_name = 0;
+        if ((e = str_field(def, def_len, "name", &np, &nlen, &has_name))) return e;
+        if (!has_name || nlen != name_len || memcmp(np, name, nlen) != 0) continue;
+        *found = 1;
+        *building = flag_field(def, def_len, "building");
+        const uint8_t *cv; size_t cvlen; int has_cv = 0;
+        if ((e = obj_get_field(def, def_len, (const uint8_t *)"cursor", 6,
+                               &cv, &cvlen, &has_cv))) return e;
+        if (has_cv && cvlen == 13 && cv[0] == BJ_TYPE_OID) {
+            memcpy(cursor_out, cv + 1, 12);
+            *has_cursor = 1;
+        }
+        return BJ_OK;
+    }
+    return BJ_OK;
+}
+
 /* ---- planning a new index ---------------------------------------------- */
 
 /* Does `options` carry any of the equality-only options? */
@@ -546,6 +693,12 @@ static int special_spec(const uint8_t *keys, size_t keys_len, const char *want,
     if (slen != strlen(want) || memcmp(sp, want, slen) != 0) return 0;
     *field = kp; *field_len = klen;
     return 1;
+}
+
+int dc_index_keys_is_special(const uint8_t *keys, size_t keys_len) {
+    const uint8_t *f; uint32_t flen;
+    return special_spec(keys, keys_len, "text", &f, &flen) ||
+           special_spec(keys, keys_len, "2dsphere", &f, &flen);
 }
 
 /* options.name, or NULL. */

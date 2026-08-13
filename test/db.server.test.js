@@ -6670,3 +6670,235 @@ describe.each(ENGINES.filter((e) => e.ready()))(
     }, 60000);
   }
 );
+
+/*
+ * THE STAGED INDEX BUILD (docs/db-server.md). One replicated createIndex
+ * is no longer one apply that holds every member's loop for as long as
+ * the backfill takes -- it is a begin entry and N bounded chunk entries,
+ * each a few milliseconds, with the index invisible to the planner until
+ * the final chunk commits it. These suites assert the four properties
+ * that make that safe: it is OBSERVABLE (listIndexes says building),
+ * INVISIBLE (no query is ever answered from a half-built tree),
+ * RESUMABLE (a killed member's reboot, or a new leader, finishes it),
+ * and ABORTABLE (a genuine duplicate under `unique` unwinds it on every
+ * member identically, files included).
+ */
+describe.each(ENGINES.filter((e) => e.ready()))(
+  'nisaba-server: a staged index build ($name)', (engine) => {
+    const SLOT = nextPort();
+
+    const seed = async (coll, n, teams) => {
+      for (let at = 0; at < n; at += 500) {
+        const batch = Math.min(500, n - at);
+        await coll.insertMany(Array.from({ length: batch }, (_, i) => ({
+          n: at + i, team: (at + i) % teams
+        })));
+      }
+    };
+
+    it('is visible as building, invisible to queries, and correct throughout', async () => {
+      const port = SLOT;
+      const { proc } = await startServer(engine, port,
+        ['--raft', '1', '--index-chunk', '32'], -1);
+      try {
+        const client = await connectServer(port);
+        const coll = client.db(DB).collection('docs');
+        await seed(coll, 6000, 13);   // ~188 chunks at k=32
+
+        const watcher = await connectServer(port);
+        const wcoll = watcher.db(DB).collection('docs');
+        let sawBuilding = 0, wrongCounts = 0;
+        const pending = coll.createIndex({ team: 1 });
+        for (let i = 0; i < 400; i++) {
+          const listed = await wcoll.listIndexes();
+          const def = listed.find((ix) => ix.name === 'team_1');
+          if (def?.building) sawBuilding++;
+          /* The scan answers while the build runs; a half-built tree
+           * answering instead would come up short. 6000 docs mod 13,
+           * team 3 -> 462. */
+          if (await wcoll.countDocuments({ team: 3 }) !== 462) wrongCounts++;
+          if (def && !def.building) break;
+        }
+        expect(await pending).toBe('team_1');
+        expect(sawBuilding).toBeGreaterThan(0);
+        expect(wrongCounts).toBe(0);
+        const after = await wcoll.listIndexes();
+        expect(after.find((ix) => ix.name === 'team_1').building).toBeUndefined();
+        expect(await wcoll.countDocuments({ team: 3 })).toBe(462);
+        await watcher.close();
+        await client.close();
+      } finally { proc.kill(); }
+    }, 120000);
+
+    it('a write during the build that violates the pending unique constraint aborts the BUILD, never the write', async () => {
+      const port = SLOT + 1;
+      const { proc } = await startServer(engine, port,
+        ['--raft', '1', '--index-chunk', '32'], -1);
+      try {
+        const client = await connectServer(port);
+        const coll = client.db(DB).collection('docs');
+        for (let at = 0; at < 10000; at += 500) {
+          await coll.insertMany(Array.from({ length: 500 }, (_, i) => ({ u: at + i })));
+        }
+        /* Fire the build, then -- ON ANOTHER CONNECTION, because this one
+         * serializes behind the round -- land a write whose value
+         * collides with a document the backfill will not reach for
+         * hundreds of chunks (u:9900 is ~chunk 309 of 312). The write is
+         * legal when it lands, the constraint is not live yet, so the
+         * BUILD is what pays: the chunk that reaches the original
+         * document finds the new entry, calls it the genuine duplicate
+         * it is, and unwinds. */
+        const writer = await connectServer(port);
+        const pending = coll.createIndex({ u: 1 }, { unique: true });
+        await writer.db(DB).collection('docs').insertOne({ u: 9900 });
+        await expect(pending).rejects.toMatchObject({ code: -12 });
+        expect(await coll.countDocuments({ u: 9900 })).toBe(2);
+        const listed = await coll.listIndexes();
+        expect(listed.some((ix) => ix.name === 'u_1')).toBe(false);
+        await writer.close();
+        await client.close();
+      } finally { proc.kill(); }
+    }, 120000);
+
+    it('killed mid-build, the REBOOT resumes and finishes it', async () => {
+      const port = SLOT + 2;
+      let { proc, dir } = await startServer(engine, port,
+        ['--raft', '1', '--index-chunk', '32'], -1);
+      let client = await connectServer(port);
+      let coll = client.db(DB).collection('docs');
+      await seed(coll, 6000, 13);
+      /* Fire and kill mid-round: the log holds the begin and a prefix of
+       * the chunks, the catalog says building, and nobody is driving. */
+      coll.createIndex({ team: 1 }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 30));
+      proc.kill('SIGKILL');
+      await new Promise((r) => proc.once('exit', r));
+
+      ({ proc } = await startServer(engine, port, ['--raft', '1'], 0, dir));
+      try {
+        client = await connectServer(port);
+        coll = client.db(DB).collection('docs');
+        const deadline = Date.now() + 60000;
+        for (;;) {
+          const listed = await coll.listIndexes();
+          const def = listed.find((ix) => ix.name === 'team_1');
+          if (def && !def.building) break;
+          if (Date.now() > deadline) {
+            throw new Error(`the resumer never finished: ${JSON.stringify(listed)}`);
+          }
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        expect(await coll.countDocuments({ team: 3 })).toBe(462);
+        await client.close();
+      } finally { proc.kill(); }
+    }, 120000);
+
+    it('a duplicate under unique aborts deterministically, files included', async () => {
+      const port = SLOT + 3;
+      const { proc, dir } = await startServer(engine, port,
+        ['--raft', '1', '--index-chunk', '32'], -1);
+      try {
+        const client = await connectServer(port);
+        const coll = client.db(DB).collection('docs');
+        await coll.insertMany([{ dup: 'x' }, { dup: 'x' }, { other: 1 }]);
+        await expect(coll.createIndex({ dup: 1 }, { unique: true, sparse: true }))
+          .rejects.toMatchObject({ code: -12 });
+        const listed = await coll.listIndexes();
+        expect(listed.some((ix) => ix.name === 'dup_1')).toBe(false);
+        /* The unwind removes the files too -- this server never sweeps
+         * on its own, so a leftover here would be permanent. */
+        const files = fs.readdirSync(path.join(dir, DB));
+        expect(files.some((f) => f.includes('dup_1'))).toBe(false);
+        await client.close();
+      } finally { proc.kill(); }
+    }, 120000);
+
+    it('leadership loss mid-build: the NEW leader finishes it', async () => {
+      const base = SLOT + 10;
+      const MEMBERS = [1, 2, 3].map((id) => ({
+        id, port: base + id - 1, raftPort: base + 10 + id - 1
+      }));
+      const argsFor = (m) => [
+        '--raft', String(m.id), '--raft-port', String(m.raftPort),
+        '--index-chunk', '32',
+        '--election-timeout', '600:1200', '--heartbeat', '150',
+        ...MEMBERS.filter((o) => o.id !== m.id)
+          .flatMap((o) => ['--peer', `${o.id}@127.0.0.1:${o.raftPort}`])
+      ];
+      for (const m of MEMBERS) {
+        const { proc, dir } = await startServer(engine, m.port, argsFor(m), -1);
+        m.proc = proc; m.dir = dir; m.alive = true;
+      }
+      try {
+        /* The leader is whoever takes the write. Connections are closed
+         * on refusal -- a probe loop that leaks them walks into the
+         * 64-client cap long before the election finishes. */
+        let leader = null, coll = null, client = null;
+        const deadline = Date.now() + 30000;
+        while (!leader) {
+          for (const m of MEMBERS) {
+            let c = null;
+            try {
+              c = await connectServer(m.port);
+              /* The probe carries `team` too: the build below is
+               * non-sparse over it, and a document missing the field is
+               * a build the chunks must (correctly!) abort -- which is
+               * its own test, not this one. */
+              await c.db(DB).collection('docs').insertOne({ probe: 1, team: -1 });
+              leader = m; client = c; coll = c.db(DB).collection('docs');
+              break;
+            } catch { await c?.close().catch(() => {}); }
+          }
+          if (leader) break;
+          if (Date.now() > deadline) throw new Error('no leader elected');
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        await seed(coll, 3000, 13);
+
+        /* Fire the build, then kill the leader only once the BEGIN is
+         * provably committed -- a watcher connection sees the definition
+         * listed. Killing on a timer can outrun the begin entirely
+         * (wasmtime is slow), and a build that never began is not a
+         * build a survivor can finish. */
+        coll.createIndex({ team: 1 }).catch(() => {});
+        const watcher = await connectServer(leader.port);
+        const began = Date.now() + 30000;
+        for (;;) {
+          const listed = await watcher.db(DB).collection('docs').listIndexes();
+          if (listed.some((ix) => ix.name === 'team_1')) break;
+          if (Date.now() > began) throw new Error('the begin never committed');
+        }
+        await watcher.close().catch(() => {});
+        leader.proc.kill('SIGKILL');
+        leader.alive = false;
+
+        /* A survivor becomes leader, sees the catalog still building,
+         * and drives the remaining chunks itself. */
+        const survivors = MEMBERS.filter((m) => m.alive);
+        const until = Date.now() + 90000;
+        let finished = false;
+        while (!finished) {
+          for (const m of survivors) {
+            try {
+              const c = await connectServer(m.port);
+              const listed = await c.db(DB).collection('docs').listIndexes();
+              const def = listed.find((ix) => ix.name === 'team_1');
+              if (def && !def.building) {
+                expect(await c.db(DB).collection('docs').countDocuments({ team: 3 })).toBe(231);
+                finished = true;
+              }
+              await c.close();
+              if (finished) break;
+            } catch { /* mid-election; keep trying */ }
+          }
+          if (!finished) {
+            if (Date.now() > until) throw new Error('no survivor finished the build');
+            await new Promise((r) => setTimeout(r, 250));
+          }
+        }
+      } finally {
+        for (const m of MEMBERS) if (m.alive) m.proc.kill();
+      }
+    }, 180000);
+  }
+);

@@ -15,7 +15,8 @@
  * in the repository these strings exist -- the host dispatches on the
  * enum, and every command is built below. */
 static const char *const OP_NAME[] = {
-    "i", "u", "r", "d", "createIndex", "dropIndex", "dropCollection"
+    "i", "u", "r", "d", "createIndex", "dropIndex", "dropCollection",
+    "indexBegin", "indexChunk"
 };
 #define OP_COUNT ((int)(sizeof(OP_NAME) / sizeof(OP_NAME[0])))
 
@@ -103,6 +104,23 @@ static int emit(dc_wal_plan *p, dc_wal_op op,
             if (!e) e = bj_put_string(bd, a, (uint32_t)a_len);
             break;
         case DC_WAL_DROP_COLLECTION:
+            break;
+        case DC_WAL_INDEX_BEGIN:
+            /* Same payload as CREATE_INDEX: the whole definition rides
+             * in the entry, so a replica plans the identical index. */
+            if (!e) e = bj_put_key(bd, (const uint8_t *)"keys", 4);
+            if (!e) e = bj_put_raw(bd, a, (uint32_t)a_len);
+            if (!e) e = bj_put_key(bd, (const uint8_t *)"options", 7);
+            if (!e) e = bj_put_raw(bd, b, (uint32_t)b_len);
+            break;
+        case DC_WAL_INDEX_CHUNK:
+            /* The range is DERIVED, not carried: `k` bounds the work and
+             * the catalog's recorded cursor says where it starts, which
+             * is identical on every replica at the same log position. */
+            if (!e) e = bj_put_key(bd, (const uint8_t *)"name", 4);
+            if (!e) e = bj_put_string(bd, a, (uint32_t)a_len);
+            if (!e) e = bj_put_key(bd, (const uint8_t *)"k", 1);
+            if (!e) e = bj_put_raw(bd, b, (uint32_t)b_len);
             break;
     }
 
@@ -350,6 +368,15 @@ int dc_wal_plan_build(dc_collection *c, const char *coll, uint32_t coll_len,
         case DC_WREQ_CREATE_INDEX:
             e = emit(p, DC_WAL_CREATE_INDEX, coll, coll_len, NULL, a, a_len, b, b_len);
             break;
+        case DC_WREQ_INDEX_BEGIN:
+            e = emit(p, DC_WAL_INDEX_BEGIN, coll, coll_len, NULL, a, a_len, b, b_len);
+            break;
+        case DC_WREQ_INDEX_CHUNK:
+            /* a = the index name (raw UTF-8), b = `k` as an encoded
+             * binjson number -- the caller sizes the chunk, because the
+             * caller is the one with a latency budget. */
+            e = emit(p, DC_WAL_INDEX_CHUNK, coll, coll_len, NULL, a, a_len, b, b_len);
+            break;
         case DC_WREQ_DROP_INDEX:
             e = emit(p, DC_WAL_DROP_INDEX, coll, coll_len, NULL, a, a_len, NULL, 0);
             break;
@@ -407,7 +434,9 @@ static const struct { const char *f[3]; int needs_id; } REQUIRED[] = {
     /* DELETE          */ { { NULL, NULL, NULL },         1 },
     /* CREATE_INDEX    */ { { "keys", "options", NULL },  0 },
     /* DROP_INDEX      */ { { "name", NULL, NULL },       0 },
-    /* DROP_COLLECTION */ { { NULL, NULL, NULL },         0 }
+    /* DROP_COLLECTION */ { { NULL, NULL, NULL },         0 },
+    /* INDEX_BEGIN     */ { { "keys", "options", NULL },  0 },
+    /* INDEX_CHUNK     */ { { "name", "k", NULL },        0 }
 };
 
 int dc_wal_parse(const uint8_t *buf, uint32_t len,
@@ -467,6 +496,17 @@ int dc_wal_is_document(int op) {
            op == DC_WAL_REPLACE || op == DC_WAL_DELETE;
 }
 
+int dc_wal_wrecks_files(int op) {
+    /* Document ops append. INDEX_CHUNK appends too -- to one index tree
+     * and the catalog -- and that is the property the whole staged build
+     * exists for: a read view stays valid under every chunk, so reads
+     * keep serving while the backfill runs. Everything else makes or
+     * unmakes files (INDEX_BEGIN creates them and resets the journal),
+     * and an op this build cannot name is the worst case, not the best. */
+    if (dc_wal_is_document(op) || op == DC_WAL_INDEX_CHUNK) return 0;
+    return 1;
+}
+
 /* A field's value span, or NULL. dc_wal_parse has already established
  * that every field the opcode requires is present and typed, so this
  * reads rather than validates. */
@@ -497,7 +537,10 @@ int dc_wal_index_spec(const uint8_t *cmd, uint32_t len,
     int op = -1; const uint8_t *coll; uint32_t coll_len;
     int e = dc_wal_parse(cmd, len, &op, &coll, &coll_len);
     if (e) return e;
-    if (op != DC_WAL_CREATE_INDEX) return DC_ERR_WAL_MISSING_FIELD;
+    /* INDEX_BEGIN carries the same payload deliberately, so one reader
+     * serves both the monolithic build and the staged one's first act. */
+    if (op != DC_WAL_CREATE_INDEX && op != DC_WAL_INDEX_BEGIN)
+        return DC_ERR_WAL_MISSING_FIELD;
 
     size_t klen = 0, olen = 0;
     const uint8_t *k = field(cmd, len, "keys", &klen);
@@ -505,6 +548,31 @@ int dc_wal_index_spec(const uint8_t *cmd, uint32_t len,
     if (!k || !o) return DC_ERR_WAL_MISSING_FIELD;
     *keys = k; *keys_len = (uint32_t)klen;
     *options = o; *options_len = (uint32_t)olen;
+    return BJ_OK;
+}
+
+int dc_wal_index_chunk_spec(const uint8_t *cmd, uint32_t len,
+                            const uint8_t **name, uint32_t *name_len,
+                            uint32_t *k_out) {
+    if (!cmd || !name || !name_len || !k_out) return BJ_ERR_STATE;
+    int op = -1; const uint8_t *coll; uint32_t coll_len;
+    int e = dc_wal_parse(cmd, len, &op, &coll, &coll_len);
+    if (e) return e;
+    if (op != DC_WAL_INDEX_CHUNK) return DC_ERR_WAL_MISSING_FIELD;
+
+    size_t vlen = 0;
+    const uint8_t *v = field(cmd, len, "name", &vlen);
+    if (!v || vlen < 5 || v[0] != BJ_TYPE_STRING) return DC_ERR_WAL_MISSING_FIELD;
+    *name = v + 5;
+    *name_len = rdu32(v + 1);
+
+    const uint8_t *kv = field(cmd, len, "k", &vlen);
+    if (!kv) return DC_ERR_WAL_MISSING_FIELD;
+    cur c = { kv, vlen, 0 };
+    double d = 0;
+    if (read_number(&c, &d) != BJ_OK || d < 1 || d > 1000000)
+        return DC_ERR_WAL_BAD_REQUEST;
+    *k_out = (uint32_t)d;
     return BJ_OK;
 }
 

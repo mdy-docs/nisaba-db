@@ -1152,13 +1152,74 @@ isolate a write is a writer that is not the serving thread — which needs
 the live tree handed over rather than shared, and is a milestone of its
 own, not a knob.
 
-`createIndex` is the sharpest remaining case and is untouched by any of
-this: it is ONE entry whose apply reads every document and builds a file,
-so it is one uninterruptible unit — 718 ms at 20,000 documents, during
-which the loop answers nothing. Slicing it means making an apply
-resumable, and an apply must be all-or-nothing per entry for every
-replica to agree, so it needs the index built in stages that are each
-their own entry. Designed nowhere yet; measured here.
+**`createIndex` is now built in STAGES** — the paragraph that used to
+end this section ("one uninterruptible unit, 718 ms at 20,000
+documents, designed nowhere yet") described the problem this fixes. A
+replicated equality-index build is one `indexBegin` entry and N
+`indexChunk` entries (db_wal.h):
+
+- **begin** creates the files and attaches the index EMPTY and
+  `building`: maintained by every write from that entry on (which is
+  what makes the backfill finite), invisible to the planner and to
+  `findByIndex` (`-79` names why) — a prefix of the truth answers
+  wrongly, not slowly. `listIndexes` shows `building: true`, so the
+  client that asked can watch it finish.
+- **each chunk** advances the backfill by at most `k` documents
+  (`--index-chunk`, default 64 — one updateMany wave's worth of apply)
+  from a cursor recorded IN THE CATALOG, which commits atomically with
+  the catalog's applied index: a replayed chunk is either skipped
+  whole (guard) or re-run from the old cursor with every duplicate
+  absorbed, because backfill adds are if-absent (the composite key
+  ends in the document's own id — presence is one exact search). The
+  range is DERIVED, never carried: the cursor at the same log position
+  is identical on every replica.
+- **the final chunk commits**: the scan exhausts, the staged fields
+  come off the definition, the index is live. No separate commit entry.
+- **abort is deterministic**: a chunk that discovers the build
+  impossible — a genuine duplicate under `unique`, an unindexable
+  document under a non-sparse spec — unwinds it (definition dropped,
+  files removed) identically on every member and answers the code. A
+  write DURING the build that collides with a not-yet-backfilled
+  document wins; the build is what pays.
+- **the round is driven by the leader's session** (one chunk per trip,
+  the bulkWrite pass machinery), and SURVIVES the leader: a member
+  that becomes leader scans its catalogs for `building` definitions —
+  after its apply pump has caught up to commit, or the scan would miss
+  a begin still in the pump — and proposes the remaining chunks
+  itself (`resume_builds`). The original client gets write-lost,
+  exactly as a mid-round updateMany's would; the index still
+  completes, because the log said it would.
+- **chunks are append-only** (`dc_wal_wrecks_files`): read views stay
+  valid under the whole backfill, and the one path that unmakes files
+  (abort) touches files no view can hold — views skip building indexes.
+- Text and geo indexes stay monolithic: their structures have no cheap
+  absence test, and if-absent adds are what make a chunk re-runnable.
+  The unreplicated server does too — no loop to starve, no log.
+- The JS hosts apply staged entries through the same C
+  (`Collection.indexBegin/indexChunk`, db-wal.js), so a server log
+  replays anywhere. A single-copy JS host skips the replay guard
+  (convergent — see the code comment) and has NO resumer: a mid-build
+  artifact opened there keeps the build parked, maintained and
+  invisible, until a server finishes it.
+
+Measured at 20,000 documents (same axis as the table above): the
+**716 ms apply is gone** — the worst read during a build fell from
+~723 ms to ~28 ms, reads/s during from 35 to ~610, and the whole build
+costs ~2.6 s of paced chunks instead of one stall. Read p50 during a
+build is now ~12 ms — **identical to read p50 during an updateMany on
+the same run**, which is the honest statement of what staging bought:
+a build now interferes exactly as much as any other long write, no
+more. That residual is the loop-side apply itself, and it is the
+writer-thread milestone's to remove, not a knob's.
+
+One compatibility note, stated here because format-compatibility.md
+owns the doctrine: the state an IN-FLIGHT staged build leaves behind
+(the two catalog fields, the two log opcodes) needs this build or
+newer. An older engine opening a directory mid-build would attach a
+half-built index as live and refuse the chunk entries. The window is
+the build's own duration; a committed build leaves a definition
+byte-identical to one that was never staged. Format v2 formalizes
+this.
 
 ## Invariants
 

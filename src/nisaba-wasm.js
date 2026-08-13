@@ -1013,7 +1013,8 @@ async function runBulkWrite(target, operations, ordered) {
  */
 const WAL_OP = Object.freeze({
   INSERT: 0, UPDATE: 1, REPLACE: 2, DELETE: 3,
-  CREATE_INDEX: 4, DROP_INDEX: 5, DROP_COLLECTION: 6
+  CREATE_INDEX: 4, DROP_INDEX: 5, DROP_COLLECTION: 6,
+  INDEX_BEGIN: 7, INDEX_CHUNK: 8
 });
 
 /** What the host asks for, before the planner resolves it (dc_wal_req). */
@@ -2431,11 +2432,22 @@ class Collection {
           n.free();
         }
         if (rc !== 0) throw codeError(rc, 'attachIndex');
+        // A build the catalog says is still in flight reopens exactly as
+        // the begin entry left it: maintained by every write, invisible
+        // to the planner, waiting for chunk entries to finish it.
+        if (def.building) {
+          const n2 = allocStr(M, def.name);
+          try {
+            const rc2 = M._dcw_collection_index_set_building(this._collCtx, n2.ptr, n2.len, 1);
+            if (rc2 !== 0) throw codeError(rc2, 'attachIndex');
+          } finally { n2.free(); }
+        }
         this._indexes.set(def.name, {
           kind: 'equality', fields: def.fields, tree, file: def.files[0],
           unique: !!def.unique, sparse: !!def.sparse,
           partialFilterExpression: def.partialFilterExpression || null,
-          expireAfterSeconds: def.expireAfterSeconds
+          expireAfterSeconds: def.expireAfterSeconds,
+          building: !!def.building
         });
       } else if (def.kind === 1) {   // DC_INDEX_TEXT
         // files[] is in attach order -- that ordering is the plan's job,
@@ -2651,6 +2663,135 @@ class Collection {
     // flows create -> catalog -> open, rather than being rebuilt here.
     this._catalogPutIndex(plan);
     return name;
+  }
+
+  /* Record one definition's staged-build state in the catalog entry:
+   * building on/off, and the backfill cursor (12 raw bytes) while on.
+   * The C transform is the same one the server's session uses, so the
+   * two hosts cannot spell the state differently. */
+  _catalogSetIndexBuilding(name, building, cursorBytes) {
+    const entry = this._catalog.search(this.name);
+    const updated = catalogCall((M, ctx) => {
+      const ee = encode(entry);
+      const ep = M._malloc(ee.length || 1);
+      const n = allocStr(M, name);
+      const cp = cursorBytes ? M._malloc(12) : 0;
+      try {
+        if (ee.length) M.HEAPU8.set(ee, ep);
+        if (cursorBytes) M.HEAPU8.set(cursorBytes, cp);
+        return M._catw_index_building_set(ctx, ep, ee.length, n.ptr, n.len,
+                                          building ? 1 : 0, cp);
+      } finally { if (cp) M._free(cp); n.free(); M._free(ep); }
+    });
+    this._catalog.add(this.name, updated);
+  }
+
+  /*
+   * THE STAGED BUILD'S JS TWIN (db_session.h's dbs_index_begin /
+   * dbs_index_chunk). These exist so a log written by a replicated
+   * server -- where one createIndex is a begin entry and N chunk
+   * entries -- replays through this host too (db-wal.js's
+   * _applyCommand): the one-artifact contract says a database is
+   * openable by every host, logs included.
+   *
+   * This host is SINGLE-COPY, so it skips the C session's
+   * already-applied guard: a recovery that re-runs an applied chunk
+   * advances the cursor further and later chunks answer done sooner,
+   * which converges on the identical final index (every add is
+   * if-absent) -- there is no second member whose cursor could
+   * disagree.
+   */
+  async indexBegin(keys, options = {}) {
+    const plan = indexCreatePlan(keys, options, this.name);
+    const name = plan.name;
+    if (plan.kind !== 0) throw codeError(-58, 'indexBegin');  // DC_ERR_INDEX_KIND
+    const held = this._indexes.get(name);
+    if (held) {
+      if (held.building) return name;   // replay: the build is under way
+      throw new Error(`Index already exists: ${name}`);
+    }
+
+    const fields = plan.fields;
+    const fileName = plan.files[0];
+    await this._provider.deleteFile(fileName);
+    const tree = new BPlusTree(await this._provider.openFile(fileName, { create: true }), this._order);
+    await tree.open();
+
+    const M = requireModule();
+    const n = allocStr(M, name);
+    const unique = !!plan.unique, sparse = !!plan.sparse;
+    const partialFilterExpression = plan.partialFilterExpression || null;
+    let rc;
+    try {
+      rc = this._marshalPair(fields, partialFilterExpression, (M2, fp, flen, pp, plen) =>
+        M2._dcw_collection_add_index_staged(this._collCtx, n.ptr, n.len, tree.ctx, fp, flen,
+                                            unique ? 1 : 0, sparse ? 1 : 0, pp, plen));
+    } finally {
+      n.free();
+    }
+    if (rc !== 0) {
+      await tree.close();
+      await this._provider.deleteFile(fileName);
+      throw codeError(rc, 'indexBegin');
+    }
+
+    this._indexes.set(name, {
+      kind: 'equality', fields, tree, file: fileName, unique, sparse, partialFilterExpression,
+      expireAfterSeconds: plan.expireAfterSeconds, building: true
+    });
+    this._catalogPutIndex(plan);
+    this._catalogSetIndexBuilding(name, true, null);
+    return name;
+  }
+
+  async indexChunk(name, k) {
+    // Benign on every path that is not "a build in progress" -- the
+    // same answers the C session gives, for the same reasons.
+    const entry = this._catalog.search(this.name);
+    if (!entry) return { advanced: 0, done: true };
+    const state = catalogCall((M, ctx) => {
+      const ee = encode(entry);
+      const ep = M._malloc(ee.length || 1);
+      const n = allocStr(M, name);
+      try {
+        if (ee.length) M.HEAPU8.set(ee, ep);
+        return M._catw_index_building_get(ctx, ep, ee.length, n.ptr, n.len);
+      } finally { n.free(); M._free(ep); }
+    });
+    if (!state.found || !state.building) return { advanced: 0, done: true };
+    if (!this._indexes.get(name)) return { advanced: 0, done: true };
+
+    const M = requireModule();
+    const cursorBytes = state.cursor ? state.cursor.toBytes() : null;
+    const n = allocStr(M, name);
+    const cp = cursorBytes ? M._malloc(12) : 0;
+    let rc;
+    try {
+      if (cursorBytes) M.HEAPU8.set(cursorBytes, cp);
+      rc = M._dcw_backfill_step(this._outCtx, this._collCtx, n.ptr, n.len, cp, k);
+    } finally { if (cp) M._free(cp); n.free(); }
+    if (rc !== 0) {
+      // The build cannot complete (a genuine duplicate under unique, an
+      // unindexable document under a non-sparse spec): unwind it --
+      // definition, handles, file -- and surface the code, exactly as
+      // the C chunk apply does.
+      await this.dropIndex(name);
+      throw codeError(rc, 'indexChunk');
+    }
+    const step = this._readOut(requireModule()) ?? {};
+    if (step.done) {
+      const n2 = allocStr(M, name);
+      try {
+        const rc2 = M._dcw_collection_index_set_building(this._collCtx, n2.ptr, n2.len, 0);
+        if (rc2 !== 0) throw codeError(rc2, 'indexChunk');
+      } finally { n2.free(); }
+      const held = this._indexes.get(name);
+      if (held) held.building = false;
+      this._catalogSetIndexBuilding(name, false, null);
+    } else {
+      this._catalogSetIndexBuilding(name, true, step.last ? step.last.toBytes() : cursorBytes);
+    }
+    return { advanced: step.advanced ?? 0, done: !!step.done };
   }
 
   async _createTextIndex(plan, options = {}) {

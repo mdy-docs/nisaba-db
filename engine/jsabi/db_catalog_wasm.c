@@ -7,6 +7,7 @@
  * asynchronous -- the plan is computed before any of them happen.
  */
 #include "db_catalog.h"
+#include "binjson.h"
 #include "bjns_bridge.h"
 #include "dbuf.h"
 
@@ -63,6 +64,49 @@ EMSCRIPTEN_KEEPALIVE int catw_create_plan(catw *w, const uint8_t *keys, int keys
     w->buf.len = 0;
     return dc_index_create_plan(keys, (size_t)keys_len, options, (size_t)options_len,
                                 coll, (size_t)coll_len, &w->buf);
+}
+
+/* The staged-build fields of one stored definition (db_catalog.h).
+ * `set` rewrites the entry; `get` answers {found, building, cursor?} --
+ * both pure buffer transforms, like everything else in this file. */
+EMSCRIPTEN_KEEPALIVE int catw_index_building_set(catw *w, const uint8_t *entry, int entry_len,
+                                                 const char *name, int name_len,
+                                                 int building, const uint8_t *cursor) {
+    if (entry_len < 0 || name_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    return dc_catalog_index_building_set(entry, (size_t)entry_len, name, (size_t)name_len,
+                                         building, cursor, &w->buf);
+}
+
+EMSCRIPTEN_KEEPALIVE int catw_index_building_get(catw *w, const uint8_t *entry, int entry_len,
+                                                 const char *name, int name_len) {
+    if (entry_len < 0 || name_len < 0) return BJ_ERR_RANGE;
+    w->buf.len = 0;
+    int found = 0, building = 0, has_cursor = 0;
+    uint8_t cursor[12];
+    int e = dc_catalog_index_building_get(entry, (size_t)entry_len, name, (size_t)name_len,
+                                          &found, &building, cursor, &has_cursor);
+    if (e) return e;
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    e = bj_begin_object(b);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"found", 5);
+    if (!e) e = bj_put_bool(b, found);
+    if (!e) e = bj_put_key(b, (const uint8_t *)"building", 8);
+    if (!e) e = bj_put_bool(b, building);
+    if (!e && has_cursor) {
+        e = bj_put_key(b, (const uint8_t *)"cursor", 6);
+        if (!e) e = bj_put_oid(b, cursor);
+    }
+    if (!e) e = bj_end_object(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t n = 0;
+        const uint8_t *d = bj_builder_data(b, &n);
+        e = d ? dbuf_put(&w->buf, d, n) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
 }
 
 /* `names` is the directory listing as a NUL-separated buffer -- see

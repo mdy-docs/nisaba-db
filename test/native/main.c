@@ -3790,7 +3790,7 @@ TEST(a_replicated_write_answers_exactly_what_an_unreplicated_one_does) {
             bj_end_array(docs);
             size_t alen = 0; const uint8_t *arr = bj_builder_data(docs, &alen);
             rb = request_with_id("insertMany", "users", "docs", arr, alen, oid, &req, &req_len);
-        } else if (round == 2) {              /* DDL: one command, no index staged */
+        } else if (round == 2) {              /* DDL: now a staged ROUND (begin + chunks) */
             d = doc_new();
             doc_int(d, "age", 1);
             uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
@@ -3829,7 +3829,29 @@ TEST(a_replicated_write_answers_exactly_what_an_unreplicated_one_does) {
             uint64_t more = 0;
             dbuf again = {0};
             CHECK_OK(dbs_step(split, token, indices, batch.r, n, &more, &again, &b_res));
-            CHECK_I64((long long)more, 0);
+            /*
+             * A STAGED createIndex answers over several trips -- the
+             * begin, then one chunk per settle -- so the round is driven
+             * the way a server drives it: apply what the step handed
+             * over, hand its results back, until nothing more is
+             * planned. Every other round completes in one.
+             */
+            while (more) {
+                batch_free(&batch);
+                free(indices);
+                memset(&batch, 0, sizeof batch);
+                n = array_len(again.data, again.len);
+                CHECK_FATAL(n >= 1);
+                indices = (uint64_t *)malloc(n * sizeof *indices);
+                CHECK_FATAL(indices != NULL);
+                dbuf trip = {0};
+                CHECK_OK(dbuf_put(&trip, again.data, again.len));
+                CHECK_FATAL(batch_apply(split, &trip, &next_index, indices, &batch) == 0);
+                dbuf_free(&trip);
+                again.len = 0;
+                b_res.len = 0;
+                CHECK_OK(dbs_step(split, more, indices, batch.r, n, &more, &again, &b_res));
+            }
             dbuf_free(&again);
             batch_free(&batch);
             free(indices);

@@ -1222,7 +1222,7 @@ static void usage(const char *me) {
             "           [--join HOST:PORT ...] [--leave NODE_ID]\n"
             "           [--snapshot-entries N] [--group N]\n"
             "           [--election-timeout MIN[:MAX]] [--heartbeat MS]\n"
-            "           [--max-batch BYTES]\n"
+            "           [--max-batch BYTES] [--index-chunk DOCS]\n"
             "           [--read-threads N|auto] [--read-offload-min DOCS]\n"
             "  serves the instance in the preopened directory \".\"\n"
             "  --bind: where the client wire listens (default 127.0.0.1;\n"
@@ -1254,6 +1254,10 @@ static void usage(const char *me) {
             "  --heartbeat: the leader's idle interval in ms (default 50); it\n"
             "         must be well under --election-timeout's minimum, or the\n"
             "         others depose a leader that is working\n"
+            "  --index-chunk: documents one staged index-build entry advances\n"
+            "           (default 64 -- one updateMany wave's worth of apply).\n"
+            "           Smaller = shorter applies; larger = a faster build.\n"
+            "           Applies to builds this member proposes.\n"
             "  --max-batch: the replication window in bytes (default 65536).\n"
             "         One AppendEntries is in flight per follower, so catch-up\n"
             "         throughput is window/RTT: widen it for members a WAN\n"
@@ -1408,6 +1412,7 @@ int main(int argc, char **argv) {
     replica_timing timing = {0};
     /* 0 is the engine's default window (64 KB). */
     long max_batch = 0;
+    long index_chunk = 0;
     /* -1 means "not given", so an explicit --read-threads 0 is
      * distinguishable from silence -- it is not, in effect, but a flag
      * whose absence and whose zero are the same value is one that cannot
@@ -1465,6 +1470,14 @@ int main(int argc, char **argv) {
             long long ms = atoll(argv[++i]);
             if (ms <= 0) { fprintf(stderr, "--heartbeat must be positive\n"); return 2; }
             timing.heartbeat_ms = (int64_t)ms;
+        }
+        else if (strcmp(argv[i], "--index-chunk") == 0 && i + 1 < argc) {
+            index_chunk = atol(argv[++i]);
+            if (index_chunk < 1 || index_chunk > 1000000) {
+                fprintf(stderr, "--index-chunk must be 1..1000000 (documents per"
+                                " staged-build entry)\n");
+                return 2;
+            }
         }
         else if (strcmp(argv[i], "--max-batch") == 0 && i + 1 < argc) {
             max_batch = atol(argv[++i]);
@@ -1963,6 +1976,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (max_batch) replica_set_max_batch(rep, (uint32_t)max_batch);
+        if (index_chunk) replica_set_index_chunk(rep, (uint32_t)index_chunk);
         if (read_threads >= 0 || read_min_docs >= 0) {
             int rte = replica_set_read_offload(rep, (int)read_threads,
                                                (int64_t)read_min_docs);

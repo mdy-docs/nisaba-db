@@ -143,6 +143,12 @@ void replica_timing_resolve(replica_timing *tm);
  */
 void replica_set_max_batch(replica *r, uint32_t bytes);
 
+/* How many documents one staged-build chunk advances (--index-chunk):
+ * the entries this member PROPOSES -- its sessions' rounds and its
+ * resumer's -- never how it applies anyone else's, whose k rides in the
+ * entry. Bounded to what the entry validator accepts. */
+void replica_set_index_chunk(replica *r, uint32_t k);
+
 /* Collection size below which no read is long enough to be worth moving
  * off the serving thread. Chosen from measurement rather than taste: a
  * scan costs ~0.22us per document on this hardware, so a thousand is

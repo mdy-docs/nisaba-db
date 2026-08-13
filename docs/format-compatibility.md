@@ -124,6 +124,26 @@ message answers nothing, and *silence is not an answer* — the identity
 check treats no reply as no information rather than as permission
 (`docs/db-server.md`).
 
+## The staged-build window (unstamped, deliberately)
+
+The staged index build (docs/db-server.md) writes two things an older
+engine does not know: the `building`/`cursor` fields on a catalog
+definition, and the `indexBegin`/`indexChunk` log opcodes. They exist
+only while a build is IN FLIGHT — the final chunk strips the fields,
+leaving a definition byte-identical to one that was never staged, and
+the opcodes compact out of the log with everything else.
+
+This did not bump the format version, and the trade is stated rather
+than hidden: a version bump would refuse EVERY database the new engine
+ever touched, forever, to protect against opening one during a window
+that lasts seconds. Inside that window an older engine would attach a
+half-built index as live (wrong reads) and refuse the chunk entries at
+replay (`DC_ERR_WAL_UNKNOWN_OP`). The deployment rule that covers it is
+the one nisaba-web already follows — one engine version per fleet, and
+never downgrade a directory that crashed mid-DDL without replaying it
+on the version that wrote it. Format v2 (the scalar-`_id` bump) will
+stamp this along with everything else it stamps.
+
 ## Escape hatch
 
 A refused database is never modified, so downgrading the data is always

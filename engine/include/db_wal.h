@@ -110,11 +110,24 @@ extern "C" {
  *   CREATE_INDEX     { c, op:"createIndex", keys, options }
  *   DROP_INDEX       { c, op:"dropIndex", name }
  *   DROP_COLLECTION  { c, op:"dropCollection" }
+ *   INDEX_BEGIN      { c, op:"indexBegin", keys, options }
+ *   INDEX_CHUNK      { c, op:"indexChunk", name, k }
  *
  * The three DDL opcodes are logged (so replicas and crash replay perform
  * them too) and applied idempotently rather than under the appliedIndex
  * guard — see src/db-wal.js's _applyCommand for that reasoning, which is
  * unchanged.
+ *
+ * INDEX_BEGIN and INDEX_CHUNK are the STAGED equality-index build
+ * (db_session.h's dbs_index_begin/dbs_index_chunk): one build becomes a
+ * begin entry and N chunk entries, each bounded, so one createIndex stops
+ * costing one 700ms apply. A chunk's RANGE is derived, never carried --
+ * the catalog's recorded cursor at the same log position is identical on
+ * every replica -- and the final chunk (the one that exhausts the primary
+ * tree) commits the build by clearing the catalog's `building` state.
+ * Text and geo indexes stay on CREATE_INDEX: their structures have no
+ * cheap absence test, and if-absent adds are what make a chunk
+ * re-runnable.
  */
 typedef enum {
     DC_WAL_INSERT          = 0,
@@ -123,7 +136,9 @@ typedef enum {
     DC_WAL_DELETE          = 3,
     DC_WAL_CREATE_INDEX    = 4,
     DC_WAL_DROP_INDEX      = 5,
-    DC_WAL_DROP_COLLECTION = 6
+    DC_WAL_DROP_COLLECTION = 6,
+    DC_WAL_INDEX_BEGIN     = 7,
+    DC_WAL_INDEX_CHUNK     = 8
 } dc_wal_op;
 
 /*
@@ -156,7 +171,12 @@ typedef enum {
     DC_WREQ_DELETE_MANY     = 6,
     DC_WREQ_CREATE_INDEX    = 7,
     DC_WREQ_DROP_INDEX      = 8,
-    DC_WREQ_DROP_COLLECTION = 9
+    DC_WREQ_DROP_COLLECTION = 9,
+    /* The staged build's two acts. BEGIN takes the same a/b as
+     * CREATE_INDEX (keys, options); CHUNK takes a = the index name (raw
+     * UTF-8) and b = `k`, an encoded binjson number bounding the work. */
+    DC_WREQ_INDEX_BEGIN     = 10,
+    DC_WREQ_INDEX_CHUNK     = 11
 } dc_wal_req;
 
 /* dc_wal_plan_outcome. NOTHING means the request resolved to no commands
@@ -272,6 +292,19 @@ int dc_wal_index_spec(const uint8_t *cmd, uint32_t len,
                       const uint8_t **options, uint32_t *options_len);
 int dc_wal_index_name(const uint8_t *cmd, uint32_t len,
                       const uint8_t **name, uint32_t *name_len);
+
+/* An INDEX_CHUNK's payload: which build to advance and by at most how
+ * many documents. `k` is validated to [1, 1e6] -- a chunk that does no
+ * work or unbounded work is a malformed entry, not a policy choice. */
+int dc_wal_index_chunk_spec(const uint8_t *cmd, uint32_t len,
+                            const uint8_t **name, uint32_t *name_len,
+                            uint32_t *k_out);
+
+/* Whether performing `op` truncates, replaces or removes a file, as
+ * opposed to appending to one -- the property a read view depends on
+ * (db.h). Asked here so the transport's entry classifier and the
+ * request table cannot come to different conclusions about one opcode. */
+int dc_wal_wrecks_files(int op);
 
 /*
  * Apply one logged command to `c`, an ALREADY-OPEN collection for the

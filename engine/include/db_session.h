@@ -412,6 +412,70 @@ int dbs_create_index(dbs *s, const char *coll, size_t coll_len,
                      const uint8_t *options, size_t options_len,
                      dbuf *name_out);
 
+/*
+ * THE STAGED BUILD -- one createIndex as a begin entry and N bounded
+ * chunk entries, so a build over a large collection stops costing one
+ * multi-hundred-millisecond apply (the WRITE INTERFERENCE bench's worst
+ * number was a 716ms createIndex; a chunk is a few milliseconds at the
+ * default k).
+ *
+ * `dbs_index_begin` plans the index exactly as dbs_create_index would,
+ * creates its files, attaches it EMPTY as building -- maintained by
+ * every write from that entry on, invisible to the planner -- and
+ * records the definition with `building: true`. Equality only: text and
+ * geo structures have no cheap absence test, and if-absent adds are
+ * what make a chunk re-runnable (they stay on dbs_create_index).
+ *
+ * `dbs_index_chunk` advances the build by at most `k` documents from
+ * the catalog's recorded cursor and records the new cursor -- or, when
+ * the scan exhausts the primary tree, COMMITS: the staged fields come
+ * off the definition and the index is live. There is no separate commit
+ * entry; the final chunk is it. A chunk that finds no build in progress
+ * (committed already, aborted, collection dropped) answers
+ * {advanced: 0, done: 1} benignly -- the same on every replica, which
+ * is what lets a stray entry from a second driver, or a replay, land
+ * without a halt.
+ *
+ * A chunk that discovers the build IMPOSSIBLE -- a genuine duplicate
+ * under `unique`, an unindexable document under a non-sparse spec --
+ * unwinds it (definition dropped, files gone) and returns the code.
+ * Every replica reaches the same verdict from the same data, so the
+ * code is in dc_is_deterministic's list and the apply pump records it
+ * rather than halting.
+ *
+ * `index` is the log index this entry commits at; both stage it on the
+ * catalog themselves (AFTER the chunk's already-applied guard, which it
+ * would otherwise satisfy), so the cursor advance and the replay guard
+ * commit atomically -- the whole crash story of a chunk in one bpt_add.
+ */
+/* The default and the knob for how many documents one chunk advances.
+ * 64 on purpose: at ~36µs per document (the bench's 20k baseline) a
+ * chunk applies in ~2.3ms -- the same work one updateMany WAVE of 64
+ * commands costs -- so reads during a build are held exactly as much
+ * as reads during any long write, no more (measured: k=128 doubled the
+ * per-trip stall for no build-time gain worth having). The knob is
+ * about entries this member PROPOSES; how it applies anyone else's is
+ * the entry's own `k`. */
+#define DBS_INDEX_CHUNK_DEFAULT 64u
+uint32_t dbs_index_chunk_docs(const dbs *s);
+void dbs_set_index_chunk(dbs *s, uint32_t k);
+
+int dbs_index_begin(dbs *s, const char *coll, size_t coll_len,
+                    const uint8_t *keys, size_t keys_len,
+                    const uint8_t *options, size_t options_len,
+                    uint64_t index, dbuf *name_out);
+int dbs_index_chunk(dbs *s, const char *coll, size_t coll_len,
+                    const uint8_t *name, uint32_t name_len, uint32_t k,
+                    uint64_t index, uint32_t *advanced, int *done);
+
+/* Every index this database is still building ([{c, name}, ...]), and
+ * whether one still is -- what a new leader's resumer scans and polls
+ * (server/replica.c): a begin whose driver died with the old leader
+ * must still get its chunks, or it dual-maintains forever unseen. */
+int dbs_building_indexes(dbs *s, dbuf *out);
+int dbs_index_building_state(dbs *s, const char *coll, size_t coll_len,
+                             const uint8_t *name, uint32_t name_len);
+
 /* Drop an index by name: out of the catalog entry first, then its files.
  * DC_ERR_NO_INDEX if the collection has no index of that name. */
 int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,

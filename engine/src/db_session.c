@@ -189,6 +189,12 @@ struct dbs {
     const uint64_t   *indices;
     const dbs_result *results;
     uint32_t          nindices, nresults, at_index;
+
+    /* How many documents one staged-build chunk advances (db_session.h's
+     * dbs_index_begin/dbs_index_chunk). Decided by the PROPOSER and
+     * carried in each entry, so this is a knob about entries this member
+     * emits, never about how it applies anyone else's. */
+    uint32_t          index_chunk;
 };
 
 /* ---- plan reading ------------------------------------------------------ */
@@ -392,6 +398,17 @@ static int open_index(dbs *s, dbs_entry *en, const char *coll, size_t coll_len,
                                        has_pfe ? pfe : NULL,
                                        has_pfe ? (uint32_t)pfe_len : 0);
         if (e) goto fail;
+
+        /* A build the catalog says is still in flight reopens exactly as
+         * the begin entry left it: maintained by every write, invisible
+         * to the planner, waiting for chunk entries to finish it. */
+        int bldg = 0;
+        if ((e = plan_flag(def, def_len, "building", &bldg))) goto fail;
+        if (bldg) {
+            e = dc_collection_index_set_building(en->coll, (const char *)name,
+                                                 (int)name_len, 1);
+            if (e) goto fail;
+        }
     }
 
     en->n_idx++;
@@ -560,6 +577,7 @@ int dbs_open(bj_ns *ns, int order, int create, dbs **out) {
     if (!s) return BJ_ERR_OOM;
     s->ns = ns;
     s->order = order;
+    s->index_chunk = DBS_INDEX_CHUNK_DEFAULT;
 
     /* No catalog is its own answer: a directory with no database in it is
      * something a caller can act on ("make one"), where BJ_ERR_STATE
@@ -854,8 +872,15 @@ int dbs_drop_collection(dbs *s, const char *name, size_t name_len, int *dropped)
  * against every document already in the collection -- db.h) and record
  * the definition. Split out because the three kinds differ only in
  * which attach call takes which handles.
+ *
+ * `staged` attaches an equality index EMPTY and BUILDING instead
+ * (dc_collection_add_index_staged): no backfill here -- the chunk
+ * entries do it, bounded -- and the planner cannot see it until the
+ * final chunk commits. Only equality stages; a staged text/geo build is
+ * refused before any file exists.
  */
-static int build_index(dbs *s, dbs_entry *en, const uint8_t *def, size_t def_len) {
+static int build_index(dbs *s, dbs_entry *en, const uint8_t *def, size_t def_len,
+                       int staged) {
     int found = 0;
     const uint8_t *name; uint32_t name_len;
     int e = plan_str(def, def_len, "name", &name, &name_len, &found);
@@ -864,6 +889,7 @@ static int build_index(dbs *s, dbs_entry *en, const uint8_t *def, size_t def_len
 
     int kind = DC_INDEX_EQUALITY;
     if ((e = plan_int(def, def_len, "kind", &kind, &found))) return e;
+    if (staged && kind != DC_INDEX_EQUALITY) return DC_ERR_INDEX_KIND;
 
     const uint8_t *files; size_t files_len;
     if ((e = plan_raw(def, def_len, "files", &files, &files_len, &found))) return e;
@@ -920,10 +946,15 @@ static int build_index(dbs *s, dbs_entry *en, const uint8_t *def, size_t def_len
         if ((e = plan_flag(def, def_len, "sparse", &sparse))) goto fail;
         const uint8_t *pfe = NULL; size_t pfe_len = 0; int has_pfe = 0;
         if ((e = plan_raw(def, def_len, "partialFilterExpression", &pfe, &pfe_len, &has_pfe))) goto fail;
-        e = dc_collection_add_index(en->coll, (const char *)name, (int)name_len,
-                                    tree[0], fields, (uint32_t)fields_len,
-                                    uniq, sparse,
-                                    has_pfe ? pfe : NULL, has_pfe ? (uint32_t)pfe_len : 0);
+        e = staged
+            ? dc_collection_add_index_staged(en->coll, (const char *)name, (int)name_len,
+                                             tree[0], fields, (uint32_t)fields_len,
+                                             uniq, sparse,
+                                             has_pfe ? pfe : NULL, has_pfe ? (uint32_t)pfe_len : 0)
+            : dc_collection_add_index(en->coll, (const char *)name, (int)name_len,
+                                      tree[0], fields, (uint32_t)fields_len,
+                                      uniq, sparse,
+                                      has_pfe ? pfe : NULL, has_pfe ? (uint32_t)pfe_len : 0);
         if (e) goto fail;
     }
 
@@ -992,7 +1023,7 @@ int dbs_create_index(dbs *s, const char *coll, size_t coll_len,
         }
     }
 
-    if ((e = build_index(s, en, plan.data, plan.len))) { dbuf_free(&plan); return e; }
+    if ((e = build_index(s, en, plan.data, plan.len, 0))) { dbuf_free(&plan); return e; }
 
     /* Built and attached; now recorded. The plan IS the stored shape's
      * input, so one definition flows create -> catalog -> open rather
@@ -1009,6 +1040,235 @@ int dbs_create_index(dbs *s, const char *coll, size_t coll_len,
     if (!e) e = dbuf_put(name_out, name, name_len);
     dbuf_free(&plan);
     return e;
+}
+
+int dbs_index_begin(dbs *s, const char *coll, size_t coll_len,
+                    const uint8_t *keys, size_t keys_len,
+                    const uint8_t *options, size_t options_len,
+                    uint64_t index, dbuf *name_out) {
+    if (!s || !coll || !keys || !name_out) return BJ_ERR_STATE;
+
+    dc_collection *c = NULL;
+    int e = dbs_collection(s, coll, coll_len, &c);
+    if (e) return e;
+    dbs_entry *en = find_entry(s, coll, coll_len);
+    if (!en) return BJ_ERR_STATE;
+
+    dbuf plan = {0};
+    if ((e = dc_index_create_plan(keys, keys_len, options, options_len,
+                                  coll, coll_len, &plan))) {
+        dbuf_free(&plan);
+        return e;
+    }
+
+    int found = 0;
+    const uint8_t *name; uint32_t name_len;
+    if ((e = plan_str(plan.data, plan.len, "name", &name, &name_len, &found))) {
+        dbuf_free(&plan); return e;
+    }
+    if (!found) { dbuf_free(&plan); return DC_ERR_CATALOG_ENTRY; }
+
+    /*
+     * Re-offered by replay, or raced by a second client asking for the
+     * same index: a def already BUILDING answers its name -- the build
+     * is under way and the chunks will finish it -- and a live one is
+     * the same "already exists" the monolithic path reports. Both are
+     * facts about the catalog every replica reached identically.
+     */
+    for (int i = 0; i < en->n_idx; i++) {
+        if (en->idx[i].name_len == name_len &&
+            memcmp(en->idx[i].name, name, name_len) == 0) {
+            int b = dc_collection_index_is_building(en->coll, (const char *)name,
+                                                    (int)name_len);
+            e = (b == 1) ? dbuf_put(name_out, name, name_len) : DC_ERR_INDEX_EXISTS;
+            dbuf_free(&plan);
+            return e;
+        }
+    }
+    if (en->n_idx >= DBS_MAX_INDEXES) { dbuf_free(&plan); return DC_ERR_TOO_MANY_INDEXES; }
+
+    if ((e = build_index(s, en, plan.data, plan.len, 1))) { dbuf_free(&plan); return e; }
+
+    /* Built empty and attached building; now recorded, with the staged
+     * state ON the definition -- one bpt_add commits the def, the
+     * building flag and the staged applied index together. */
+    uint8_t *entry = NULL; size_t entry_len = 0;
+    if ((e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found))) return e;
+    if (!found) { free(entry); return DC_ERR_NO_COLLECTION; }
+
+    dbuf with_def = {0}, staged = {0};
+    e = dc_catalog_put_index(entry, entry_len, plan.data, plan.len, &with_def);
+    free(entry);
+    if (!e) e = dc_catalog_index_building_set(with_def.data, with_def.len,
+                                              (const char *)name, name_len,
+                                              1, NULL, &staged);
+    /* Staged here, not by the dispatcher: the put below is the commit
+     * that makes "this entry applied" true, so the record rides it. */
+    if (!e) e = catalog_note_applied(s, index);
+    if (!e) e = catalog_put(s, coll, coll_len, staged.data, staged.len);
+    dbuf_free(&with_def);
+    dbuf_free(&staged);
+    if (!e) e = dbuf_put(name_out, name, name_len);
+    dbuf_free(&plan);
+    return e;
+}
+
+/*
+ * Unwind a build a chunk proved impossible (a genuine duplicate on a
+ * unique index; an unindexable value on a non-sparse one). The
+ * dropIndex discipline, minus the parts a build does not need: the
+ * CATALOG commits first -- while the entry names the index its files
+ * are live, and the commit also carries the staged applied index, so a
+ * replayed chunk lands on "no such build" and answers benignly -- then
+ * the one index's handles close and its files go. No cursor can be
+ * positioned in a building index (it is planner-invisible) and no view
+ * holds one (dc_collection_snapshot skips them), which is what makes
+ * this safe without the WRECKS pause a dropIndex needs.
+ */
+static int unwind_building_index(dbs *s, dbs_entry *en,
+                                 const char *coll, size_t coll_len,
+                                 const uint8_t *name, uint32_t name_len) {
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    int e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found);
+    if (e) return e;
+    if (!found) { free(entry); return DC_ERR_NO_COLLECTION; }
+
+    /* The files, read while the entry still names them. */
+    dbuf files = {0};
+    {
+        const uint8_t *indexes; size_t indexes_len; int has = 0;
+        if ((e = plan_raw(entry, entry_len, "indexes", &indexes, &indexes_len, &has))) goto done;
+        uint32_t n = 0;
+        if (has && (e = arr_len(indexes, indexes_len, &n))) goto done;
+        for (uint32_t i = 0; has && i < n; i++) {
+            const uint8_t *def; size_t def_len;
+            if ((e = arr_at(indexes, indexes_len, i, &def, &def_len))) goto done;
+            const uint8_t *dn; uint32_t dn_len; int f = 0;
+            if ((e = plan_str(def, def_len, "name", &dn, &dn_len, &f))) goto done;
+            if (!f || dn_len != name_len || memcmp(dn, name, name_len) != 0) continue;
+            e = dc_index_files(def, def_len, &files);
+            break;
+        }
+        if (e) goto done;
+    }
+
+    {
+        dbuf updated = {0};
+        e = dc_catalog_drop_index(entry, entry_len, (const char *)name, name_len, &updated);
+        if (!e) e = catalog_put(s, coll, coll_len, updated.data, updated.len);
+        dbuf_free(&updated);
+        if (e) goto done;
+    }
+
+    /* Detach and close THIS index only: the entry's other handles stay,
+     * and so does every cursor -- none of them can reference a building
+     * index. */
+    dc_collection_remove_index(en->coll, (const char *)name, (int)name_len);
+    for (int i = 0; i < en->n_idx; i++) {
+        if (en->idx[i].name_len != name_len ||
+            memcmp(en->idx[i].name, name, name_len) != 0) continue;
+        index_release(s->ns, &en->idx[i]);
+        for (int j = i; j + 1 < en->n_idx; j++) en->idx[j] = en->idx[j + 1];
+        memset(&en->idx[en->n_idx - 1], 0, sizeof en->idx[0]);
+        en->n_idx--;
+        break;
+    }
+    if (files.len) remove_all(s, files.data, files.len);
+
+done:
+    dbuf_free(&files);
+    free(entry);
+    return e;
+}
+
+int dbs_index_chunk(dbs *s, const char *coll, size_t coll_len,
+                    const uint8_t *name, uint32_t name_len, uint32_t k,
+                    uint64_t index, uint32_t *advanced, int *done) {
+    if (!s || !coll || !name || !advanced || !done) return BJ_ERR_STATE;
+    *advanced = 0;
+    *done = 0;
+
+    /*
+     * Benign on every path that is not "a build in progress": the
+     * collection dropped under the build, the build committed (replay),
+     * the build aborted (a stray entry from a second driver). Each is a
+     * fact every replica computed identically, and a chunk that finds
+     * no work answers done rather than halting the member over
+     * housekeeping.
+     */
+    dc_collection *c = NULL;
+    int e = dbs_collection(s, coll, coll_len, &c);
+    if (e == DC_ERR_NO_COLLECTION) { *done = 1; return BJ_OK; }
+    if (e) return e;
+    dbs_entry *en = find_entry(s, coll, coll_len);
+    if (!en) return BJ_ERR_STATE;
+
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    if ((e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found))) return e;
+    if (!found) { free(entry); *done = 1; return BJ_OK; }
+
+    int def_found = 0, building = 0, has_cursor = 0;
+    uint8_t cursor[12];
+    e = dc_catalog_index_building_get(entry, entry_len, (const char *)name, name_len,
+                                      &def_found, &building, cursor, &has_cursor);
+    free(entry);
+    if (e) return e;
+    if (!def_found || !building) { *done = 1; return BJ_OK; }
+
+    /*
+     * ALREADY APPLIED: the catalog's applied index covers this entry, so
+     * its cursor advance committed. Scanning again would advance PAST
+     * where the original run stopped -- the one way a replay could
+     * diverge from a member that never crashed.
+     */
+    if (index && index <= bpt_applied_index(s->catalog)) return BJ_OK;
+    /* Staged now -- AFTER the guard it would otherwise satisfy -- and
+     * committed by whichever catalog write ends this chunk: the cursor
+     * advance, the final commit, or the unwind. */
+    if ((e = catalog_note_applied(s, index))) return e;
+
+    uint8_t last[12];
+    int scan_done = 0;
+    e = dc_collection_backfill_step(en->coll, (const char *)name, (int)name_len,
+                                    has_cursor ? cursor : NULL, k,
+                                    last, advanced, &scan_done);
+    if (e) {
+        /*
+         * The build cannot complete -- a genuine duplicate under
+         * `unique`, or an unindexable document under a non-sparse spec.
+         * The verdict is a fact about data every replica holds
+         * identically, so the unwind is too: def gone, files gone, and
+         * the client (when there is one) is told the code. A failure of
+         * the UNWIND itself still wins: it is the harder error.
+         */
+        int ue = unwind_building_index(s, en, coll, coll_len, name, name_len);
+        return ue ? ue : e;
+    }
+
+    /* Record where this chunk got to -- or, if the scan is exhausted,
+     * COMMIT: clear the staged state, and the index is live from this
+     * entry on. One catalog write either way, carrying the staged
+     * applied index with it. */
+    if ((e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found))) return e;
+    if (!found) { free(entry); return DC_ERR_NO_COLLECTION; }
+    dbuf updated = {0};
+    e = dc_catalog_index_building_set(entry, entry_len, (const char *)name, name_len,
+                                      scan_done ? 0 : 1,
+                                      (!scan_done && *advanced) ? last
+                                      : (!scan_done && has_cursor) ? cursor : NULL,
+                                      &updated);
+    free(entry);
+    if (!e) e = catalog_put(s, coll, coll_len, updated.data, updated.len);
+    dbuf_free(&updated);
+    if (e) return e;
+
+    if (scan_done) {
+        e = dc_collection_index_set_building(en->coll, (const char *)name,
+                                             (int)name_len, 0);
+        if (e) return e;
+        *done = 1;
+    }
+    return BJ_OK;
 }
 
 int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
@@ -1080,6 +1340,84 @@ done:
     dbuf_free(&files);
     free(entry);
     return e;
+}
+
+/*
+ * Every index this database is still building: a binjson ARRAY of
+ * { c, name } objects. What a NEW LEADER scans (through the instance) to
+ * resume staged builds whose driver died with the old one -- a begin
+ * without its chunks would otherwise dual-maintain forever, invisible,
+ * doing work no query can ever use.
+ */
+int dbs_building_indexes(dbs *s, dbuf *out) {
+    if (!s || !out) return BJ_ERR_STATE;
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    int e = bj_begin_array(b);
+    bpt_cursor *cur_h = bpt_cursor_open(s->catalog, NULL, NULL);
+    if (!cur_h) { bj_builder_free(b); return BJ_ERR_STATE; }
+    for (;;) {
+        bpt_key key;
+        const uint8_t *val; size_t vlen;
+        int r = bpt_cursor_next(cur_h, &key, &val, &vlen);
+        if (r < 0) { e = r; break; }
+        if (r == 0) break;
+        if (!key.is_string) continue;
+        const uint8_t *idxs; size_t idxs_len; int has = 0;
+        if ((e = plan_raw(val, vlen, "indexes", &idxs, &idxs_len, &has))) break;
+        if (!has || idxs_len < 1 || idxs[0] != BJ_TYPE_ARRAY) continue;
+        cur c = { idxs, idxs_len, 0 };
+        uint32_t n = 0;
+        if ((e = array_begin(&c, &n))) break;
+        for (uint32_t i = 0; !e && i < n; i++) {
+            size_t start = c.pos;
+            if ((e = skip_value(&c))) break;
+            const uint8_t *def = idxs + start;
+            size_t def_len = c.pos - start;
+            int bldg = 0;
+            if ((e = plan_flag(def, def_len, "building", &bldg))) break;
+            if (!bldg) continue;
+            const uint8_t *np; uint32_t nlen; int f = 0;
+            if ((e = plan_str(def, def_len, "name", &np, &nlen, &f))) break;
+            if (!f) { e = DC_ERR_CATALOG_ENTRY; break; }
+            if (!e) e = bj_begin_object(b);
+            if (!e) e = bj_put_key(b, (const uint8_t *)"c", 1);
+            if (!e) e = bj_put_string(b, key.str, key.str_len);
+            if (!e) e = bj_put_key(b, (const uint8_t *)"name", 4);
+            if (!e) e = bj_put_string(b, np, nlen);
+            if (!e) e = bj_end_object(b);
+        }
+        if (e) break;
+    }
+    bpt_cursor_close(cur_h);
+    if (!e) e = bj_end_array(b);
+    if (!e) e = bj_builder_error(b);
+    if (!e) {
+        size_t len = 0;
+        const uint8_t *data = bj_builder_data(b, &len);
+        e = data ? dbuf_put(out, data, len) : BJ_ERR_STATE;
+    }
+    bj_builder_free(b);
+    return e;
+}
+
+/* Is the named index still building? 1 / 0 -- an absent collection or
+ * index answers 0, because "nothing left to resume" is the fact the one
+ * caller (the resumer) is asking about. */
+int dbs_index_building_state(dbs *s, const char *coll, size_t coll_len,
+                             const uint8_t *name, uint32_t name_len) {
+    if (!s || !coll || !name) return 0;
+    uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+    if (catalog_get(s, coll, coll_len, &entry, &entry_len, &found) || !found) {
+        free(entry);
+        return 0;
+    }
+    int def_found = 0, building = 0, has_cursor = 0;
+    uint8_t cursor[12];
+    int e = dc_catalog_index_building_get(entry, entry_len, (const char *)name, name_len,
+                                          &def_found, &building, cursor, &has_cursor);
+    free(entry);
+    return (!e && def_found && building) ? 1 : 0;
 }
 
 /*
@@ -1236,6 +1574,14 @@ int dbs_ttl_filters(dbs *s, const char *coll, size_t coll_len,
             const uint8_t *v; size_t vlen; int hs = 0;
             if ((e = plan_raw(def, def_len, "expireAfterSeconds", &v, &vlen, &hs))) break;
             if (!hs) continue;
+
+            /* A building TTL index expires nothing: the sweep DELETES
+             * documents, and a constraint must not act before the entry
+             * that makes it live has committed. The chunk that finishes
+             * the backfill clears the flag, and the next sweep acts. */
+            int bldg = 0;
+            if ((e = plan_flag(def, def_len, "building", &bldg))) break;
+            if (bldg) continue;
             double secs = 0;
             { cur nc = { v, vlen, 0 }; if ((e = read_number(&nc, &secs))) break; }
 
@@ -2029,6 +2375,52 @@ int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
         return flag_result(result, "dropped", 1);
     }
 
+    /* The staged build. These two stage the applied index THEMSELVES --
+     * a chunk's already-applied guard has to run before the record is
+     * staged, or the record would satisfy it -- which is why they are
+     * not in the catalog_note_applied list above. */
+    if (op == DC_WAL_INDEX_BEGIN) {
+        const uint8_t *keys = NULL, *options = NULL;
+        uint32_t keys_len = 0, options_len = 0;
+        e = dc_wal_index_spec(cmd, len, &keys, &keys_len, &options, &options_len);
+        if (e) return e;
+        dbuf name = {0};
+        e = dbs_index_begin(s, (const char *)coll, coll_len,
+                            keys, keys_len, options, options_len, index, &name);
+        if (!e) e = name_result(result, &name);
+        dbuf_free(&name);
+        return e;
+    }
+
+    if (op == DC_WAL_INDEX_CHUNK) {
+        const uint8_t *name = NULL; uint32_t name_len = 0; uint32_t k = 0;
+        e = dc_wal_index_chunk_spec(cmd, len, &name, &name_len, &k);
+        if (e) return e;
+        uint32_t advanced = 0; int done = 0;
+        e = dbs_index_chunk(s, (const char *)coll, coll_len,
+                            name, name_len, k, index, &advanced, &done);
+        if (e) return e;
+        /* { advanced, done } -- what the driver (the session's staged
+         * dispatch, or the server's resumer) reads to decide whether the
+         * next entry is another chunk or nothing at all. */
+        bj_builder *b = bj_builder_new();
+        if (!b) return BJ_ERR_OOM;
+        e = bj_begin_object(b);
+        if (!e) e = bj_put_key(b, (const uint8_t *)"advanced", 8);
+        if (!e) e = bj_put_int(b, (int64_t)advanced);
+        if (!e) e = bj_put_key(b, (const uint8_t *)"done", 4);
+        if (!e) e = bj_put_bool(b, done);
+        if (!e) e = bj_end_object(b);
+        if (!e) e = bj_builder_error(b);
+        if (!e) {
+            size_t n = 0;
+            const uint8_t *d = bj_builder_data(b, &n);
+            e = d ? dbuf_put(result, d, n) : BJ_ERR_STATE;
+        }
+        bj_builder_free(b);
+        return e;
+    }
+
     dc_collection *c = NULL;
     e = dbs_collection(s, (const char *)coll, coll_len, &c);
     /* A first insert makes the collection, the way it does on the wire
@@ -2081,6 +2473,18 @@ void dbs_close(dbs *s) {
  */
 
 int dbs_repl_active(const dbs *s) { return s && s->resuming != NULL; }
+
+uint32_t dbs_index_chunk_docs(const dbs *s) {
+    return s ? s->index_chunk : DBS_INDEX_CHUNK_DEFAULT;
+}
+
+void dbs_set_index_chunk(dbs *s, uint32_t k) {
+    if (!s) return;
+    /* The entry validator's own bounds (dc_wal_index_chunk_spec): a
+     * value the entry would refuse must not be settable. */
+    if (k < 1 || k > 1000000) return;
+    s->index_chunk = k;
+}
 
 /* Keep a plan. The slot is already chosen -- dbs_propose takes one
  * before dispatching, because a request that cannot be held is one that

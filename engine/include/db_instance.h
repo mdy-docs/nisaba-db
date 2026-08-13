@@ -161,6 +161,25 @@ uint64_t dbi_swept(const dbi *i);
  */
 int dbi_sweep_all(dbi *i);
 
+/*
+ * The staged-build resumer's three questions (server/replica.c), plus
+ * its knob. A new leader scans `dbi_building_indexes` ([{d, c, name}]),
+ * proposes entries built by `dbi_chunk_entry` (the enveloped
+ * indexChunk command -- the spelling stays db_wal.c's), and polls
+ * `dbi_index_building` after each applies to decide between the next
+ * chunk and nothing. `dbi_set_index_chunk` sizes the chunks every
+ * session under this instance proposes, present and future.
+ */
+int dbi_building_indexes(dbi *i, dbuf *out);
+int dbi_index_building(dbi *i, const char *db, size_t db_len,
+                       const char *coll, size_t coll_len,
+                       const uint8_t *name, uint32_t name_len);
+int dbi_chunk_entry(const char *db, size_t db_len,
+                    const char *coll, size_t coll_len,
+                    const uint8_t *name, uint32_t name_len,
+                    uint32_t k, dbuf *out);
+void dbi_set_index_chunk(dbi *i, uint32_t k);
+
 /* ---- the request path ---------------------------------------------------
  *
  * The same three entry points db_session.h has, with the routing in

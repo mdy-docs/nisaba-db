@@ -144,6 +144,34 @@ int dc_catalog_drop_index(const uint8_t *entry, size_t entry_len,
                           const char *name, size_t name_len, dbuf *out);
 
 /*
+ * The staged-build fields of ONE stored definition: `building: true` and
+ * the backfill `cursor` (the OID of the last document backfilled). They
+ * live in the CATALOG deliberately -- the catalog stages an applied
+ * index of its own (catalog_note_applied), so one bpt_add commits the
+ * cursor and the replay guard atomically, which is the whole crash
+ * story of a chunk: fully applied (guarded), or re-run from the old
+ * cursor with every duplicate absorbed by the backfill's if-absent adds.
+ *
+ * `set` rewrites the named definition inside `entry`, appending the
+ * updated entry to `out`. building=1 stores the flag and, when given,
+ * the 12-byte cursor; building=0 strips both -- the COMMIT, so a
+ * committed definition is byte-identical to one that was never staged
+ * (the apply-equivalence oracle depends on exactly that). DC_ERR_NO_INDEX
+ * when nothing in `entry` has that name.
+ *
+ * `get` reads the same state back: *found says the definition exists at
+ * all; *building and the cursor say where its build stands.
+ */
+int dc_catalog_index_building_set(const uint8_t *entry, size_t entry_len,
+                                  const char *name, size_t name_len,
+                                  int building, const uint8_t *cursor,
+                                  dbuf *out);
+int dc_catalog_index_building_get(const uint8_t *entry, size_t entry_len,
+                                  const char *name, size_t name_len,
+                                  int *found, int *building,
+                                  uint8_t cursor_out[12], int *has_cursor);
+
+/*
  * Plan a NEW index from a createIndex call: what kind it is, what it will
  * be called, and which files it needs created. Appends one plan-shaped
  * definition to `out` -- the same shape dc_catalog_open_plan emits and
@@ -172,6 +200,12 @@ int dc_catalog_drop_index(const uint8_t *entry, size_t entry_len,
 int dc_index_create_plan(const uint8_t *keys, size_t keys_len,
                          const uint8_t *options, size_t options_len,
                          const char *coll, size_t coll_len, dbuf *out);
+
+/* Is this key spec a text/2dsphere index? Asked by the dispatch that
+ * chooses between the staged build (equality only) and the monolithic
+ * one -- the same single-field-string convention dc_index_create_plan
+ * applies, exposed so the chooser cannot re-derive it differently. */
+int dc_index_keys_is_special(const uint8_t *keys, size_t keys_len);
 
 /*
  * Decide which files the orphan sweep may delete.

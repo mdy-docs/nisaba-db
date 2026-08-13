@@ -27,6 +27,17 @@ typedef struct {
     char *name;
     uint32_t name_len;
     dc_index_kind kind;
+    /*
+     * STILL BEING BACKFILLED (a staged build, db_session.h's
+     * dbs_index_begin/dbs_index_chunk). A building index is MAINTAINED
+     * by every write -- that is what makes the backfill finite -- and
+     * INVISIBLE to the planner: its tree holds a prefix of the truth,
+     * and a query answered from a prefix is not a slow answer, it is a
+     * wrong one. One flag read in two places (plan_equality_index,
+     * dc_collection_find_by_index), so the two kinds of visibility
+     * cannot disagree.
+     */
+    int building;
 
     /* DC_IDX_EQUALITY */
     bpt *tree;                  /* not owned */
@@ -132,6 +143,10 @@ static int clone_index_def(const dc_index *src, dc_index *dst) {
     dst->kind = src->kind;
     dst->unique = src->unique;
     dst->sparse = src->sparse;
+    /* A view presents exactly the live index set, building state
+     * included: the planner reads views too, and a half-built index
+     * must be as invisible there as it is live. */
+    dst->building = src->building;
 
     dst->name = (char *)malloc(src->name_len ? (size_t)src->name_len : 1);
     if (!dst->name) return BJ_ERR_OOM;
@@ -205,6 +220,17 @@ int dc_collection_snapshot(const dc_collection *live, dc_collection **out) {
 
     for (uint32_t i = 0; i < live->index_count; i++) {
         const dc_index *src = &live->indexes[i];
+        /*
+         * A BUILDING index is not cloned at all. The planner could not
+         * use it through the view (it skips building indexes), so the
+         * view loses nothing -- and a view that held its snapshot would
+         * pin its files, which is exactly what an ABORTED build must be
+         * free to close and delete without waiting for readers. This is
+         * what lets a chunk entry stay classified append-only: the one
+         * path on which a build unmakes files touches files no view can
+         * be holding.
+         */
+        if (src->building) continue;
         dc_index *ix = &v->indexes[v->index_count];
         int e = clone_index_def(src, ix);
         /* Counted before the handles exist, so the unwind below frees this
@@ -714,6 +740,20 @@ int dc_collection_remove_index(dc_collection *c, const char *name, int name_len)
     return BJ_ERR_STATE;
 }
 
+int dc_collection_index_set_building(dc_collection *c, const char *name,
+                                     int name_len, int building) {
+    if (c->is_view) return DC_ERR_READ_ONLY;
+    dc_index *ix = find_index(c, name, name_len);
+    if (!ix) return DC_ERR_NO_INDEX;
+    ix->building = building ? 1 : 0;
+    return BJ_OK;
+}
+
+int dc_collection_index_is_building(dc_collection *c, const char *name, int name_len) {
+    dc_index *ix = find_index(c, name, name_len);
+    return ix ? ix->building : -1;
+}
+
 /* ---- shared helpers ----------------------------------------------------- */
 
 static void oid_key(const uint8_t id[12], bpt_key *k) {
@@ -1099,6 +1139,128 @@ static int remove_from_indexes(dc_collection *c, const uint8_t *doc, size_t doc_
     return BJ_OK;
 }
 
+/*
+ * check_unique_one, for the BACKFILL: an entry in the prefix range that
+ * belongs to `id` ITSELF is the dual-maintenance write that got here
+ * first, not a conflict -- backfill is the one caller whose document is
+ * already allowed to be in the index. Everything else in the range is a
+ * genuine duplicate.
+ */
+static int check_unique_excluding(const dc_index *ix, const uint8_t *doc, size_t doc_len,
+                                  const uint8_t id[12], int *conflict) {
+    *conflict = 0;
+    dbuf prefix; memset(&prefix, 0, sizeof(prefix));
+    int e = build_index_key_prefix(ix, doc, doc_len, &prefix);
+    if (e) { dbuf_free(&prefix); return e; }
+
+    dbuf upper; memset(&upper, 0, sizeof(upper));
+    e = dbuf_put(&upper, prefix.data, prefix.len);
+    if (!e) e = qk_put_upper_bound(&upper);
+    if (e) { dbuf_free(&prefix); dbuf_free(&upper); return e; }
+
+    bpt_key min_key; min_key.is_string = 1; min_key.num = 0;
+    min_key.str = prefix.data; min_key.str_len = (uint32_t)prefix.len;
+    bpt_key max_key; max_key.is_string = 1; max_key.num = 0;
+    max_key.str = upper.data; max_key.str_len = (uint32_t)upper.len;
+
+    bpt_cursor *cur_h = bpt_cursor_open(ix->tree, &min_key, &max_key);
+    if (!cur_h) { dbuf_free(&prefix); dbuf_free(&upper); return BJ_ERR_OOM; }
+    for (;;) {
+        bpt_key k; const uint8_t *val; size_t vlen;
+        int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
+        if (r < 0) { e = r; break; }
+        if (r == 0) break;
+        /* The stored value is a binjson OID (add_to_one_index's idval). */
+        if (vlen == 13 && val[0] == BJ_TYPE_OID && memcmp(val + 1, id, 12) == 0) continue;
+        *conflict = 1;
+        break;
+    }
+    bpt_cursor_close(cur_h);
+    dbuf_free(&prefix);
+    dbuf_free(&upper);
+    return e;
+}
+
+/*
+ * One backfill add: like add_to_one_index, but IF-ABSENT. The document
+ * may already be in the index -- written after the build began (dual
+ * maintenance), or added by an earlier run of the same chunk that
+ * committed the index file and crashed before the catalog -- and both
+ * are the ordinary shape of a staged build, not errors. The composite
+ * key ends in the document's own id, so presence is one exact search.
+ */
+static int backfill_add(dc_index *ix, const uint8_t *doc, size_t doc_len,
+                        const uint8_t id[12]) {
+    int applies = 1;
+    int e = equality_index_applies(ix, doc, doc_len, &applies);
+    if (e) return e;
+    if (!applies) return BJ_OK;
+
+    dbuf key_bytes; memset(&key_bytes, 0, sizeof(key_bytes));
+    e = build_index_key(ix, doc, doc_len, id, &key_bytes);
+    if (e) { dbuf_free(&key_bytes); return e; }
+    bpt_key key; key.is_string = 1; key.num = 0;
+    key.str = key_bytes.data; key.str_len = (uint32_t)key_bytes.len;
+
+    int found = 0;
+    const uint8_t *vp; size_t vl;
+    e = bpt_search(ix->tree, &key, &found, &vp, &vl);
+    if (!e && found) { dbuf_free(&key_bytes); return BJ_OK; }
+
+    if (!e && ix->unique) {
+        int conflict = 0;
+        e = check_unique_excluding(ix, doc, doc_len, id, &conflict);
+        if (!e && conflict) e = DC_ERR_DUPLICATE_KEY;
+    }
+    if (!e) {
+        uint8_t idval[13]; idval[0] = BJ_TYPE_OID; memcpy(idval + 1, id, 12);
+        e = bpt_add(ix->tree, &key, idval, 13);
+    }
+    dbuf_free(&key_bytes);
+    return e;
+}
+
+int dc_collection_backfill_step(dc_collection *c, const char *name, int name_len,
+                                const uint8_t *after_id, uint32_t k,
+                                uint8_t last_id_out[12], uint32_t *advanced, int *done) {
+    if (!c || !advanced || !done || !last_id_out) return BJ_ERR_STATE;
+    *advanced = 0;
+    *done = 0;
+    if (c->is_view) return DC_ERR_READ_ONLY;
+    if (k == 0) return BJ_ERR_STATE;
+
+    dc_index *ix = find_index(c, name, name_len);
+    if (!ix) return DC_ERR_NO_INDEX;
+    if (ix->kind != DC_IDX_EQUALITY) return DC_ERR_INDEX_KIND;
+    if (!ix->building) { *done = 1; return BJ_OK; }   /* already committed: replay */
+
+    /* From just past the cursor. bpt ranges are inclusive, so the
+     * cursor's own document -- already backfilled by the chunk that
+     * recorded it -- is skipped by comparison rather than by arithmetic
+     * on key bytes. */
+    bpt_key min; bpt_key *minp = NULL;
+    if (after_id) { oid_key(after_id, &min); minp = &min; }
+
+    bpt_cursor *cur_h = bpt_cursor_open(c->primary, minp, NULL);
+    if (!cur_h) return BJ_ERR_OOM;
+    int e = BJ_OK;
+    uint32_t n = 0;
+    for (;;) {
+        bpt_key key; const uint8_t *val; size_t vlen;
+        int r = bpt_cursor_next(cur_h, &key, &val, &vlen);
+        if (r < 0) { e = r; break; }
+        if (r == 0) { *done = 1; break; }
+        if (after_id && key.str_len == 12 && memcmp(key.str, after_id, 12) == 0) continue;
+        e = backfill_add(ix, val, vlen, key.str);
+        if (e) break;
+        memcpy(last_id_out, key.str, 12);
+        if (++n == k) break;
+    }
+    bpt_cursor_close(cur_h);
+    *advanced = n;
+    return e;
+}
+
 int dc_collection_add_index(dc_collection *c, const char *name, int name_len,
                             bpt *index_tree,
                             const uint8_t *fields, uint32_t fields_len,
@@ -1114,6 +1276,27 @@ int dc_collection_add_index(dc_collection *c, const char *name, int name_len,
     return BJ_OK;
 }
 
+/*
+ * Attach a NEW, EMPTY equality index as a staged build: maintained by
+ * every write from this moment, invisible to the planner, and backfilled
+ * later by dc_collection_backfill_step -- the begin half of the staged
+ * protocol (db_session.h). The journal reset is the same one every
+ * index-count change performs (see dc_collection_add_index).
+ */
+int dc_collection_add_index_staged(dc_collection *c, const char *name, int name_len,
+                                   bpt *index_tree,
+                                   const uint8_t *fields, uint32_t fields_len,
+                                   int unique, int sparse,
+                                   const uint8_t *partial_filter, uint32_t partial_filter_len) {
+    int e = dc_collection_attach_index(c, name, name_len, index_tree, fields, fields_len,
+                                       unique, sparse, partial_filter, partial_filter_len);
+    if (e) return e;
+    e = dc_collection_index_set_building(c, name, name_len, 1);
+    if (!e) e = dctj_truncate(c);
+    if (e) { dc_collection_remove_index(c, name, name_len); return e; }
+    return BJ_OK;
+}
+
 int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len,
                                 const uint8_t *values, uint32_t values_len,
                                 uint8_t **out, size_t *out_len) {
@@ -1124,6 +1307,10 @@ int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len
      * belong to a different union of purposes -- so this is a refusal
      * before it is a preference. */
     if (ix->kind != DC_IDX_EQUALITY) return DC_ERR_INDEX_KIND;
+    /* Named explicitly or picked by the planner, the answer is the same:
+     * a building index holds a prefix of the truth and cannot serve. The
+     * code says WHY it cannot serve, because listIndexes shows it. */
+    if (ix->building) return DC_ERR_INDEX_BUILDING;
 
     cur vc = { values, values_len, 0 };
     uint32_t vcount;
@@ -1245,6 +1432,7 @@ static int plan_equality_index(dc_collection *c, const uint8_t *filter, size_t f
     for (uint32_t ixi = 0; ixi < c->index_count; ixi++) {
         dc_index *ix = &c->indexes[ixi];
         if (ix->kind != DC_IDX_EQUALITY) continue; /* text/geo indexes have no fields to "pin" */
+        if (ix->building) continue; /* a prefix of the truth answers wrongly, not slowly */
         bj_builder *b = bj_builder_new();
         if (!b) return BJ_ERR_OOM;
         e = bj_begin_array(b);

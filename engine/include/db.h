@@ -361,6 +361,49 @@ int dc_collection_remove_index(dc_collection *c, const char *name, int name_len)
 /* As many values as the index has fields, in its order, or neither the
  * key nor the answer means anything. */
 #define DC_ERR_INDEX_ARITY   (-59)
+/* The named index exists and is still being backfilled (a staged build,
+ * db_session.h). It holds a prefix of the truth, so it cannot serve a
+ * lookup -- not slowly: wrongly. The code says WHY, because listIndexes
+ * shows the index and a bare NO_INDEX would contradict it. */
+#define DC_ERR_INDEX_BUILDING (-79)
+
+/*
+ * A staged index build's visibility switch and its unit of work
+ * (db_session.h's dbs_index_begin/dbs_index_chunk own the protocol; these
+ * are the collection-level halves they are made of).
+ *
+ * `set_building` flips the flag on an attached index: 1 = maintained by
+ * every write, invisible to the planner and to findByIndex; 0 = live.
+ * `is_building` answers -1 for no such index.
+ *
+ * `backfill_step` advances a building EQUALITY index by at most `k`
+ * documents of the primary tree, starting just past `after_id` (NULL =
+ * from the first document). Every add is IF-ABSENT -- the document may
+ * already be indexed, written after the build began (dual maintenance)
+ * or by an interrupted run of this same step -- which is what makes the
+ * step idempotent and therefore replayable. On a `unique` index a range
+ * entry belonging to a DIFFERENT document is DC_ERR_DUPLICATE_KEY: a
+ * genuine duplicate the constraint would have forbidden, and the
+ * caller's cue to unwind the build. `*done` = the primary tree is
+ * exhausted; `last_id_out` = the last document backfilled, the cursor
+ * the next step starts after.
+ */
+int dc_collection_index_set_building(dc_collection *c, const char *name,
+                                     int name_len, int building);
+
+/* Attach a NEW, EMPTY equality index as a staged build: maintained by
+ * every write, invisible to the planner, backfilled by backfill_step.
+ * Same signature as dc_collection_add_index; the difference is that no
+ * backfill runs here -- the chunks do it, bounded. */
+int dc_collection_add_index_staged(dc_collection *c, const char *name, int name_len,
+                                   bpt *index_tree,
+                                   const uint8_t *fields, uint32_t fields_len,
+                                   int unique, int sparse,
+                                   const uint8_t *partial_filter, uint32_t partial_filter_len);
+int dc_collection_index_is_building(dc_collection *c, const char *name, int name_len);
+int dc_collection_backfill_step(dc_collection *c, const char *name, int name_len,
+                                const uint8_t *after_id, uint32_t k,
+                                uint8_t last_id_out[12], uint32_t *advanced, int *done);
 
 /*
  * Every document whose indexed fields equal `values` (a binjson ARRAY of

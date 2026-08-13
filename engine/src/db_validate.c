@@ -56,6 +56,9 @@ const char *dc_strerror(int code) {
         case DC_ERR_INDEX_ARITY:
             return "findByIndex needs one value per indexed field, "
                    "in the index's own order";
+        case DC_ERR_INDEX_BUILDING:
+            return "that index is still being built; it will serve "
+                   "queries once the backfill commits";
         case DC_ERR_NO_READ_VIEW:
             return "This collection cannot produce a read view: a geo index "
                    "has no snapshot, and a view without one of the "

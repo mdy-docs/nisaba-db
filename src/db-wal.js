@@ -431,6 +431,11 @@ class WalDb {
     if (walIsDocument(op)) return col.applyCommand(index, payload);
     await this._db.noteApplied(index);
     if (op === WAL_OP.CREATE_INDEX) return col.createIndex(cmd.keys, cmd.options);
+    // The staged build's entries (a server's log replayed here -- the
+    // one-artifact contract). Collection.indexBegin/indexChunk say why
+    // this single-copy host may skip the C session's replay guard.
+    if (op === WAL_OP.INDEX_BEGIN) return col.indexBegin(cmd.keys, cmd.options);
+    if (op === WAL_OP.INDEX_CHUNK) return col.indexChunk(cmd.name, cmd.k);
     return col.dropIndex(cmd.name);
   }
 

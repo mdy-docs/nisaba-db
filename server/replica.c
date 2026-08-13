@@ -190,6 +190,31 @@ struct replica {
      */
     uint64_t   mark;
     int        mark_carries;
+    /*
+     * THE STAGED-BUILD RESUMER. A createIndex round is driven by the
+     * session of the leader that took it; when that leader dies, the
+     * committed begin (and any committed chunks) survive on every member
+     * and the DRIVER does not. Without a resumer the half-built index
+     * dual-maintains forever, invisible: every write pays for it and no
+     * query can ever use it. So a member that BECOMES leader scans its
+     * instance for building indexes (`builds`, [{d, c, name}] rows) and
+     * proposes chunk entries -- one per tick, the same pacing a wave
+     * gets -- until each build's catalog state stops saying building.
+     * The original client was already told write-lost by the leadership
+     * change, exactly as a mid-round updateMany's would have been; the
+     * INDEX still completes, because the log said it would.
+     *
+     * A stray chunk from a driver racing this one is benign by design:
+     * chunks derive their range from the catalog's cursor and answer
+     * {advanced: 0, done: 1} when there is nothing to do.
+     */
+    dbuf       builds;
+    uint32_t   builds_n, builds_at;
+    uint64_t   build_inflight;  /* the proposed chunk's index; 0 = none */
+    int        was_leader;
+    int        builds_scan_due; /* leading, but not yet caught up enough to scan */
+    uint32_t   index_chunk;     /* chunk size for resumed builds (--index-chunk) */
+
     uint64_t   rnd;             /* the election-timeout draw's state */
     int        tick_ms;         /* the clock slice, derived from the heartbeat */
     uint64_t   self_id;
@@ -1425,6 +1450,16 @@ void replica_set_max_batch(replica *r, uint32_t bytes) {
     if (r && r->node) rn_set_limits(r->node, bytes);
 }
 
+void replica_set_index_chunk(replica *r, uint32_t k) {
+    /* The same bounds the entry validator enforces
+     * (dc_wal_index_chunk_spec): a value an entry would refuse must not
+     * be settable. Applies to chunks THIS member proposes -- the
+     * resumer's, and through the instance every session's. */
+    if (!r || k < 1 || k > 1000000) return;
+    r->index_chunk = k;
+    if (r->inst) dbi_set_index_chunk(r->inst, k);
+}
+
 void replica_timing_resolve(replica_timing *tm) {
     if (!tm) return;
     int given_min = tm->min_election_ms > 0;
@@ -1741,6 +1776,7 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
      * is about the point where a queue hop stops being the bigger cost. */
     r->read_threads = 0;
     r->read_min_docs = REPLICA_READ_MIN_DOCS;
+    r->index_chunk = DBS_INDEX_CHUNK_DEFAULT;
     /* Non-zero, or xorshift stays at zero forever and every member draws
      * the same nothing -- which is the bug this exists to avoid. */
     r->rnd = (self_id * 0x9E3779B97F4A7C15ULL) ^ (now + 0x100000001B3ULL);
@@ -1968,6 +2004,7 @@ void replica_close(replica *r) {
         if (r->log) elog_free(r->log);
         if (r->log_io.close) r->log_io.close(r->log_io.ctx);
     }
+    dbuf_free(&r->builds);
     sst_free(r->store);
     free(r);
 }
@@ -3566,6 +3603,114 @@ static int lost(replica *r, pending *p) {
     return e;
 }
 
+/* One field of one row of the resumer's [{d, c, name}] scan. */
+static int build_row_str(const uint8_t *row, size_t row_len, const char *key,
+                         const uint8_t **s, uint32_t *slen) {
+    const uint8_t *v; size_t vlen; int found = 0;
+    if (obj_get_field(row, row_len, (const uint8_t *)key, (uint32_t)strlen(key),
+                      &v, &vlen, &found) || !found) return BJ_ERR_STATE;
+    cur c = { v, vlen, 0 };
+    return take_string(&c, s, slen);
+}
+
+/* The resumer's row `at`, or an error once the array runs out. */
+static int build_row(const dbuf *builds, uint32_t at,
+                     const uint8_t **row, size_t *row_len) {
+    cur c = { builds->data, builds->len, 0 };
+    uint32_t count = 0;
+    int e = array_begin(&c, &count);
+    if (e) return e;
+    if (at >= count) return BJ_ERR_RANGE;
+    for (uint32_t i = 0; i < at; i++) if ((e = skip_value(&c))) return e;
+    size_t start = c.pos;
+    if ((e = skip_value(&c))) return e;
+    *row = c.d + start;
+    *row_len = c.pos - start;
+    return BJ_OK;
+}
+
+/*
+ * Drive at most ONE resumed-build step per tick (see the struct's
+ * comment for why this exists at all). The pacing is the wave's: a
+ * chunk is proposed from the tick, its apply happens through the
+ * ordinary pump, and the next is proposed only after the catalog has
+ * been asked whether the build still needs one.
+ */
+static void resume_builds(replica *r) {
+    int lead = replica_is_leader(r);
+    if (lead && !r->was_leader) {
+        /* Freshly leading -- but the scan reads the CATALOGS, and this
+         * member's pump may not have applied the old leader's begin yet.
+         * A scan taken now would miss it and idle forever, so it waits
+         * for applied to reach commit: the term-start NOOP commits and
+         * applies quickly, and everything before it (the begin, the
+         * chunks that made it) has applied by then too. */
+        r->builds_scan_due = 1;
+        r->builds.len = 0;
+        r->builds_n = r->builds_at = 0;
+        r->build_inflight = 0;
+    }
+    r->was_leader = lead;
+    if (!lead) { r->builds_scan_due = 0; return; }
+
+    if (r->builds_scan_due) {
+        if (r->applied < rn_commit_index(r->node)) return;
+        r->builds_scan_due = 0;
+        /* A failure to scan is a resumer that stays idle until the next
+         * leadership change, never a halted member -- the builds are not
+         * lost, only not yet driven. */
+        if (dbi_building_indexes(r->inst, &r->builds) == BJ_OK) {
+            cur c = { r->builds.data, r->builds.len, 0 };
+            if (array_begin(&c, &r->builds_n) != BJ_OK) r->builds_n = 0;
+            if (r->builds_n) {
+                fprintf(stderr, "replica: resuming %u staged index build(s)\n",
+                        r->builds_n);
+                fflush(stderr);
+            }
+        }
+    }
+    if (r->builds_at >= r->builds_n) return;
+
+    /* A chunk is in flight: wait for the pump to bring it home. */
+    if (r->build_inflight) {
+        if (r->applied < r->build_inflight) return;
+        r->build_inflight = 0;
+    }
+
+    const uint8_t *row; size_t row_len;
+    const uint8_t *d, *cl, *nm; uint32_t dlen, cllen, nmlen;
+    if (build_row(&r->builds, r->builds_at, &row, &row_len) ||
+        build_row_str(row, row_len, "d", &d, &dlen) ||
+        build_row_str(row, row_len, "c", &cl, &cllen) ||
+        build_row_str(row, row_len, "name", &nm, &nmlen)) {
+        /* A row this build cannot read is a row it cannot drive. */
+        r->builds_at++;
+        return;
+    }
+
+    if (!dbi_index_building(r->inst, (const char *)d, dlen,
+                            (const char *)cl, cllen, nm, nmlen)) {
+        r->builds_at++;                 /* finished, aborted, or dropped */
+        return;
+    }
+
+    dbuf entry = {0};
+    if (dbi_chunk_entry((const char *)d, dlen, (const char *)cl, cllen,
+                        nm, nmlen, r->index_chunk, &entry) != BJ_OK) {
+        dbuf_free(&entry);
+        r->builds_at++;
+        return;
+    }
+    const uint8_t *pv[1] = { entry.data };
+    uint32_t lv[1] = { (uint32_t)entry.len };
+    uint64_t idx[1] = { 0 };
+    uint32_t got = 0;
+    int e = rn_propose_batch(r->node, EL_NORMAL, pv, lv, 1, idx, &got);
+    dbuf_free(&entry);
+    /* A full await table is not a failure: the tick retries. */
+    if (!e && got == 1) r->build_inflight = idx[0];
+}
+
 int replica_tick(replica *r, uint64_t now) {
     if (!r) return BJ_ERR_STATE;
 
@@ -3599,6 +3744,10 @@ int replica_tick(replica *r, uint64_t now) {
      * 313 trips through the poll loop, which is the difference between
      * blocking every reader for four seconds and not.
      */
+    /* Staged builds a dead leader left behind: at most one chunk per
+     * tick, the same pacing the waves below get. */
+    resume_builds(r);
+
     for (int i = 0; i < REPLICA_MAX_PENDING; i++) {
         pending *p = &r->waiting[i];
         if (!p->used || p->done || !p->wave_due) continue;

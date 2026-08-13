@@ -17,6 +17,7 @@
  *   would be a second opinion about what the client said.
  */
 #include "db_session.h"
+#include "db_catalog.h"   /* dc_index_keys_is_special: staged vs monolithic build */
 
 #include "db_wal.h"
 #include "db_query.h"
@@ -682,7 +683,8 @@ static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
      * makes the two hosts agree again, which is the property that matters
      * more than either behaviour on its own.
      */
-    if (!c && (wreq == DC_WREQ_CREATE_INDEX || wreq == DC_WREQ_DROP_INDEX)) {
+    if (!c && (wreq == DC_WREQ_CREATE_INDEX || wreq == DC_WREQ_DROP_INDEX ||
+               wreq == DC_WREQ_INDEX_BEGIN)) {
         dc_collection *have = NULL;
         int ce = dbs_collection(s, coll, coll_len, &have);
         if (ce) return ce;
@@ -1322,6 +1324,127 @@ typedef struct {
      * thing run_read could not build. */
     int         error_at;
 } made_body;
+
+/*
+ * One act of a STAGED build: plan-or-resume a single command and hand
+ * back what applying it produced. Only ever called while the session is
+ * replicating -- the unreplicated server keeps the monolithic build,
+ * whose one apply blocks nobody there.
+ *
+ * DC_PENDING = this pass planned the command; the caller unwinds, the
+ * command rides to the log, and the next pass resumes here with its
+ * result. `*rc` is the apply's own verdict, which for a chunk can be
+ * the deterministic code that ABORTED the build.
+ */
+static int staged_op(dbs *s, const char *coll, uint32_t coll_len, int wreq,
+                     const uint8_t *a, size_t a_len,
+                     const uint8_t *b, size_t b_len,
+                     dbuf *result, int *rc) {
+    dc_wal_plan *p = NULL;
+    *rc = 0;
+    int e = plan_open(s, NULL, coll, coll_len, wreq,
+                      a, (uint32_t)a_len, b, (uint32_t)b_len, 0, NULL, &p);
+    if (e) return e;                    /* DC_PENDING included */
+    (void)dbs_repl_next_index(s);       /* the lists stay in step */
+    e = dbs_repl_applied(s, result, rc);
+    plan_close(s, p);                   /* replicating: the session keeps it */
+    return e;
+}
+
+/*
+ * The staged createIndex: a begin entry, then one chunk entry per trip
+ * until a chunk answers done. Each pass of this function resumes every
+ * act already applied from the cache and plans exactly one more, which
+ * is the same shape bulkWrite has -- the loop below is 157 passes for a
+ * 20,000-document build at the default k, and each pass's cached
+ * replays are memcpys.
+ *
+ * The ANSWER is the begin's chosen name, exactly what the monolithic
+ * path answers. A chunk that aborts the build (a genuine duplicate on a
+ * unique index) surfaces its code as the request's refusal -- the same
+ * code, and the same moment relative to the client, that the monolith's
+ * inline backfill would have produced.
+ */
+static int staged_create_index(dbs *s, const char *coll, uint32_t coll_len,
+                               const uint8_t *keys, size_t keys_len,
+                               const uint8_t *opt, size_t opt_len,
+                               made_body *made) {
+    dbuf res = {0};
+    int rc = 0;
+    int e = staged_op(s, coll, coll_len, DC_WREQ_INDEX_BEGIN,
+                      keys, keys_len, opt, opt_len, &res, &rc);
+    if (!e && rc) e = rc;
+    if (e) { dbuf_free(&res); return e; }
+
+    /* The chosen name, out of the begin's result: the chunks are
+     * addressed by it, and it is the answer. Copied -- `res` is reused
+     * by every chunk below. */
+    dbuf name = {0};
+    {
+        const uint8_t *v; size_t vlen; int f = 0;
+        e = obj_get_field(res.data, res.len, (const uint8_t *)"name", 4, &v, &vlen, &f);
+        if (!e && !f) e = BJ_ERR_STATE;
+        if (!e) {
+            cur c = { v, vlen, 0 };
+            const uint8_t *nm; uint32_t nmlen;
+            e = take_string(&c, &nm, &nmlen);
+            if (!e) e = dbuf_put(&name, nm, nmlen);
+        }
+        if (e) { dbuf_free(&name); dbuf_free(&res); return e; }
+    }
+
+    /* `k`, encoded once and carried in every chunk entry: the applier
+     * of an entry must need nothing this member happened to have
+     * configured. */
+    uint8_t kspan[16];
+    uint32_t kspan_len = 0;
+    {
+        bj_builder *kb = bj_builder_new();
+        if (!kb) { dbuf_free(&name); dbuf_free(&res); return BJ_ERR_OOM; }
+        e = bj_put_int(kb, (int64_t)dbs_index_chunk_docs(s));
+        if (!e) e = bj_builder_error(kb);
+        if (!e) {
+            size_t n = 0;
+            const uint8_t *d = bj_builder_data(kb, &n);
+            if (!d || n > sizeof kspan) e = BJ_ERR_STATE;
+            else { memcpy(kspan, d, n); kspan_len = (uint32_t)n; }
+        }
+        bj_builder_free(kb);
+        if (e) { dbuf_free(&name); dbuf_free(&res); return e; }
+    }
+
+    for (;;) {
+        res.len = 0;
+        rc = 0;
+        e = staged_op(s, coll, coll_len, DC_WREQ_INDEX_CHUNK,
+                      name.data, name.len, kspan, kspan_len, &res, &rc);
+        if (!e && rc) e = rc;       /* the build aborted: the code is the answer */
+        if (e) break;               /* DC_PENDING rides out here too */
+        const uint8_t *v; size_t vlen; int f = 0;
+        if ((e = obj_get_field(res.data, res.len, (const uint8_t *)"done", 4,
+                               &v, &vlen, &f))) break;
+        if (!f || vlen < 1) { e = BJ_ERR_STATE; break; }
+        if (v[0] == BJ_TYPE_TRUE) break;    /* committed: the index is live */
+    }
+
+    if (!e) {
+        bj_builder *nb = bj_builder_new();
+        if (!nb) e = BJ_ERR_OOM;
+        if (!e) e = bj_put_string(nb, name.data, (uint32_t)name.len);
+        if (!e) e = bj_builder_error(nb);
+        if (!e) {
+            size_t n = 0;
+            const uint8_t *d = bj_builder_data(nb, &n);
+            made->body.len = 0;
+            e = d ? dbuf_put(&made->body, d, n) : BJ_ERR_STATE;
+        }
+        if (nb) bj_builder_free(nb);
+        made->body_key = "name";
+    }
+    dbuf_free(&name);
+    dbuf_free(&res);
+    return e;
+}
 
 /* The one place a successful reply is built. */
 static int render_made(const made_body *made, dbuf *out) {
@@ -2104,6 +2227,29 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             if (!have) { e = DC_ERR_REQ_MISSING_FIELD; break; }
             const uint8_t *opt = NULL; size_t opt_len = 0; int has_opt = 0;
             if ((e = field_raw(req, req_len, "options", &opt, &opt_len, &has_opt))) break;
+            /*
+             * REPLICATED, and an equality spec: the STAGED build. One
+             * begin entry and N bounded chunk entries instead of one
+             * apply that holds every member's loop for as long as the
+             * backfill takes -- the write-interference bench's worst
+             * single number (716ms at 20k documents) was exactly this
+             * op. Text and geo stay monolithic (db_wal.h says why), and
+             * an unreplicated server does too: there is no loop to
+             * starve and no log to stage through.
+             */
+            if (dbs_repl_active(s) && !dc_index_keys_is_special(keys, keys_len)) {
+                e = staged_create_index(s, (const char *)coll, coll_len,
+                                        keys, keys_len,
+                                        has_opt ? opt : EMPTY_OBJ,
+                                        has_opt ? opt_len : sizeof EMPTY_OBJ, &made);
+                /* Set on every pass: a mid-round pass renders (and then
+                 * discards -- dbs_step's `more`) a {name: null} body,
+                 * and render_made must never see a NULL key. */
+                made.body_key = "name";
+                /* Planned this pass; the passes continue. */
+                if (e == DC_PENDING) e = BJ_OK;
+                break;
+            }
             /* Absent options are the empty object, not an absent field: a
              * command carries what it needs to be performed anywhere, and
              * a missing `options` would be a command a replica had to

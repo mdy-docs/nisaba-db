@@ -169,6 +169,46 @@ void replica_set_index_chunk(replica *r, uint32_t k);
 int replica_set_read_offload(replica *r, int threads, int64_t min_docs);
 
 /*
+ * Whether committed entries are applied on a WRITER THREAD
+ * (server/writer.h) instead of on the serving thread. `on` of 0 -- and
+ * every wasm build, which has no threads -- keeps today's inline apply,
+ * byte for byte; that reversibility is proven by the apply-equivalence
+ * oracle (test/oracle-server.js), not asserted.
+ *
+ * Called once, from argv, after replica_open. BJ_ERR_STATE if the thread
+ * would not start -- said, not swallowed, because a server asked for a
+ * writer thread and applying inline is a different server.
+ */
+int replica_set_write_thread(replica *r, int on);
+
+/*
+ * The writer's wake pipe, for the pollset -- a finished apply must end a
+ * poll() that is blocked with no timeout, exactly like a finished read.
+ * -1 when there is no writer.
+ */
+int replica_write_wake_fd(const replica *r);
+
+/*
+ * THE BOUNDARY PAUSE, for the transport's own engine touches. Everything
+ * loop-side that reaches into a live tree or a session -- dbi_stream_take,
+ * dbi_stream_pending, dbi_drop_client -- runs between these two calls, or
+ * it races the writer. Bounded by one entry's apply (the staged index
+ * build capped the largest); free when there is no writer, which is every
+ * unreplicated server and every wasm build. NULL-safe.
+ */
+void replica_pause_applies(replica *r);
+void replica_resume_applies(replica *r);
+
+/*
+ * Wait out everything already handed to the writer, DELIVERING each
+ * result to the request waiting for it -- never discarding one -- and
+ * walking no further into the log. Call it before anything that closes
+ * or replaces the instance (the install path), after which the writer is
+ * idle and stays idle until the loop pumps again.
+ */
+int replica_drain_applies(replica *r);
+
+/*
  * ---- offloaded reads (server/readers.h) ----------------------------------
  *
  * The read end of the reader pool's wake pipe, or -1 when there is no pool.

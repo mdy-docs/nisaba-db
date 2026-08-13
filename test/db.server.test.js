@@ -6672,6 +6672,78 @@ describe.each(ENGINES.filter((e) => e.ready()))(
 );
 
 /*
+ * THE WRITER THREAD (server/writer.h). Committed entries apply off the
+ * serving thread, so a long round stops holding every other client's
+ * reads behind it. The BENCH owns the latency numbers; what a test owns
+ * is that the flag and its default are observable, and that reads
+ * during a live round ANSWER and answer CORRECTLY -- the field the
+ * round is writing is not the field the reads ask about, so the right
+ * answer is knowable at every instant of the overlap. Native only: wasm
+ * has no threads, and --stdio refuses the flag.
+ */
+describe.each(ENGINES.filter((e) => e.ready() && e.threads))(
+  'nisaba-server: the writer thread ($name)', (engine) => {
+    const SLOT = nextPort();
+
+    it('is on by default, visible in ping, and --write-thread 0 turns it off',
+       async () => {
+      let started = await startServer(engine, SLOT, ['--raft', '1'], -1);
+      try {
+        const c = await connectServer(SLOT);
+        expect((await c.ping()).writeThread).toBe(true);
+        await c.close();
+      } finally { started.proc.kill('SIGKILL'); }
+      started = await startServer(engine, SLOT + 1,
+                                  ['--raft', '1', '--write-thread', '0'], -1);
+      try {
+        const c = await connectServer(SLOT + 1);
+        expect((await c.ping()).writeThread).toBe(false);
+        await c.close();
+      } finally { started.proc.kill('SIGKILL'); }
+    });
+
+    it('keeps answering reads, correctly, while an updateMany round runs',
+       async () => {
+      const { proc } = await startServer(engine, SLOT + 2, ['--raft', '1'], -1);
+      try {
+        const client = await connectServer(SLOT + 2);
+        const coll = client.db(DB).collection('docs');
+        for (let at = 0; at < 6000; at += 500) {
+          await coll.insertMany(Array.from({ length: 500 }, (_, i) => ({
+            n: at + i, team: (at + i) % 13
+          })));
+        }
+
+        /* A SECOND connection: the round's own connection owes an answer
+         * and is not read from while it does. */
+        const reader = await connectServer(SLOT + 2);
+        const rcoll = reader.db(DB).collection('docs');
+        let done = false;
+        const round = coll.updateMany({}, { $inc: { n: 100000 } })
+          .finally(() => { done = true; });
+        /* `team` is untouched by the $inc, so the count is the same
+         * number before, during and after: 6000 docs mod 13, team 3 ->
+         * 462. A read served off a half-applied ENTRY would break it;
+         * a read merely behind some fully-applied entries cannot. */
+        let during = 0, wrong = 0;
+        while (!done) {
+          if (await rcoll.countDocuments({ team: 3 }) !== 462) wrong++;
+          if (!done) during++;
+        }
+        await round;
+        expect(wrong).toBe(0);
+        /* The overlap has to have happened, or this proved nothing. A
+         * 6000-entry round is ~94 waves; even a slow machine fits many
+         * reads inside it. */
+        expect(during).toBeGreaterThan(3);
+        expect(await rcoll.countDocuments({ n: { $gte: 100000 } })).toBe(6000);
+        await reader.close();
+        await client.close();
+      } finally { proc.kill('SIGKILL'); }
+    });
+  });
+
+/*
  * THE STAGED INDEX BUILD (docs/db-server.md). One replicated createIndex
  * is no longer one apply that holds every member's loop for as long as
  * the backfill takes -- it is a begin entry and N bounded chunk entries,

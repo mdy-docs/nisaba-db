@@ -1074,12 +1074,17 @@ a test named *"asks nothing at all when no reader threads were asked for"*
 and one reproducing a sweep bug through a long inline scan were both testing
 the opposite of what they said.
 
-## Long writes, which do not have threads of their own
+## Long writes, and the thread they now run on
 
 The reader-thread section above ends with the case it deliberately left
-open: a long **write**. It cannot move to a worker, because a read view is
-only valid while its files are append-only and a write is exactly what
-breaks that — so a write is the serving thread's own work, always.
+open: a long **write**. It cannot move to a *reader* worker, because a
+read view is only valid while its files are append-only and a write is
+exactly what breaks that — so for most of this server's life a write was
+the serving thread's own work. This section is the history of what that
+cost, the two structural fixes that came first (waves, and the staged
+index build), and the writer thread that finally moved the applies off
+the loop. The history is kept because the table below is what the writer
+thread is judged against.
 
 **The measurement, at 20,000 documents** (`bench-server.js`'s WRITE
 INTERFERENCE axis; eight sockets of `_id` reads, with and without one
@@ -1142,15 +1147,14 @@ The apply pump is bounded too (`REPLICA_APPLY_BUDGET`, 32 entries a pass),
 which also bounds a follower catching up after a partition — it used to
 apply everything it had been sent in one pass.
 
-**AND READS STILL HOLD ONLY ~2% WHILE A LONG WRITE RUNS.** That is not a
-loose end so much as arithmetic: the work is the loop thread's own, so
-slicing redistributes it rather than removing it. A round of 20,000
-durable document writes is ~3 s of loop time however it is cut; finer
-slices buy read latency and pay in write duration (a wave of 1 was
-measured and is far slower, for the same reason). What would actually
-isolate a write is a writer that is not the serving thread — which needs
-the live tree handed over rather than shared, and is a milestone of its
-own, not a knob.
+**And reads still held only ~2% while a long write ran**, which was not a
+loose end so much as arithmetic: the work was the loop thread's own, so
+slicing redistributed it rather than removing it. Finer slices buy read
+latency and pay in write duration (a wave of 1 was measured and is far
+slower, for the same reason). What actually isolates a write is a writer
+that is not the serving thread — which needed the live tree handed over
+rather than shared, and got its milestone. See *the writer thread*,
+below.
 
 **`createIndex` is now built in STAGES** — the paragraph that used to
 end this section ("one uninterruptible unit, 718 ms at 20,000
@@ -1206,11 +1210,94 @@ Measured at 20,000 documents (same axis as the table above): the
 **716 ms apply is gone** — the worst read during a build fell from
 ~723 ms to ~28 ms, reads/s during from 35 to ~610, and the whole build
 costs ~2.6 s of paced chunks instead of one stall. Read p50 during a
-build is now ~12 ms — **identical to read p50 during an updateMany on
+build was then ~12 ms — **identical to read p50 during an updateMany on
 the same run**, which is the honest statement of what staging bought:
-a build now interferes exactly as much as any other long write, no
-more. That residual is the loop-side apply itself, and it is the
-writer-thread milestone's to remove, not a knob's.
+a build interferes exactly as much as any other long write, no more.
+That residual was the loop-side apply itself, and the writer thread
+below is what removed it. Staging was its prerequisite, not a rival
+design: the writer's whole latency argument is that an entry boundary
+comes every few milliseconds, and one 716 ms entry is what used to make
+that false.
+
+### The writer thread (`--write-thread`)
+
+Committed entries are applied on a thread of their own — **the pool of
+exactly one** (`server/writer.c`, readers.c's queue/wake/reap shape with
+one worker and a boundary pause). The ownership split is strict, and it
+is the whole design:
+
+- **The loop owns the raft node, the entry log, and every socket.** It
+  fetches committed entries (`elog_get` stays loop-side — the log stays
+  single-threaded), copies each payload, and hands them over
+  (`pump_submit`, at most `REPLICA_WRITER_DEPTH` = 64 in flight — one
+  wave's worth). `rn_applied` is called by the loop at **reap**, in log
+  order, which is completion order because there is one worker; `applied`
+  is the reaped floor, so everything the node is told has its result
+  already routed to whoever proposed it.
+- **The writer owns `dbi_apply` and nothing else.** One entry at a time,
+  in log order. A finished apply queues `(index, rc, result)` and writes
+  one byte to a self-pipe in the loop's pollset — a finished apply is
+  deliverable work exactly as a finished read is.
+- **Barrier entries are the loop's own.** A CONFIG entry mutates the
+  node; a destructive command (drop, dropDatabase, index abort's kin)
+  unmakes files that read views — and the writer itself — may be inside.
+  The submit walk stops at one, lets everything before it apply *and*
+  reap, drains the reader pool as it always did, and applies the entry
+  inline on the loop. Ordinary document writes — the entire volume of a
+  long round — never wait for any of that.
+- **The halt is judged on the writer** (`writer.c` says why it cannot
+  wait for the reap): an entry that fails non-deterministically parks the
+  worker before the next entry can apply over the divergence; the loop
+  reaps the failure and halts the member exactly as the inline pump did.
+- **Everything else the loop does against live trees runs under the
+  boundary pause** (`wr_pause`): planning a write, stepping a session
+  round, minting a read view, draining streams, tearing down a client.
+  The pause waits out at most ONE entry's apply — bounded because the
+  staged build capped the largest entry — and is free when the writer is
+  idle. Pauses nest (a teardown inside the event drain is two holders of
+  one park).
+- **`snapshot_take` and an install drain fully first**: boundary equals
+  files, or replay after a restore would double-count; and an instance is
+  never closed with an apply in flight against it.
+
+**The read floor moved from the commit index to the read's own arrival**,
+and that is the latency story. Linearizability requires a read to reflect
+every write some client was *acknowledged* for before the read began —
+and an acknowledgement is built from the apply's own result, on the
+serving thread, so a write acked before a read arrived was applied here
+before it arrived. The committed-but-unapplied backlog behind a burst is
+a set of writes nobody has been told about yet; a read that reflects none
+of them is concurrent with them, which linearizability permits. The one
+thing `applied` cannot vouch for is a write a *previous* leader
+acknowledged: covered by the term's floor (`lin_floor` — leader
+completeness puts every such write at or below the log as this member
+took over). A read arriving before the floor is covered — leadership
+fresh enough that the term-start entry has not applied yet — is PARKED,
+not refused: the tick performs it the moment `applied` reaches the
+floor, and its barrier settles through the same two-condition machinery
+an offloaded read uses, so a floor that never arrives still ends in the
+barrier's own refusal. The quorum barrier — the proof nobody newer is
+leading — is unchanged. Stale reads on a catching-up
+follower stop waiting for the backlog too, for the plainer reason that
+`stale: true` never promised otherwise (`after:` is still honored against
+the reaped floor).
+
+**Measured** (same WRITE INTERFERENCE axis, 50,000 documents, solo
+member): during a full-collection `updateMany`, eight sockets of point
+reads went from 226/s (1% of idle) to **2,700/s (15%)**, read p50 from
+12.3 ms to **0.94 ms** (idle 0.35 ms), p99 from **1,373 ms to 3.5 ms**;
+`getMore` beside them the same. The write round itself: 14.3 s vs 14.0 s
+(+2%). During a staged `createIndex`, read p50 fell from ~12 ms to
+~7 ms — the residue there is the loop's per-chunk fsync, not the apply.
+Idle throughput is unchanged, and `ping` reports `writeThread` so the
+config being measured is never a guess.
+
+**`--write-thread 0` keeps the inline pump, byte for byte** — proven, not
+asserted: `test/apply-oracle.js --a "--write-thread 0" --b
+"--write-thread 1"` replays the same log through both and compares every
+data file. The default is ON for a replicated server on a build with
+threads; wasm has none and `--stdio` refuses the flag (one client, no
+poll loop, nobody to isolate applies from).
 
 One compatibility note, stated here because format-compatibility.md
 owns the doctrine: the state an IN-FLIGHT staged build leaves behind
@@ -1236,16 +1323,22 @@ this.
   carries the bytes of a request that has only partly arrived and a
   response that has only partly gone out; a client that stops reading
   delays nobody but itself.
-- **The one exception, and its boundary.** With `--read-threads N` a long
-  scanning read runs on a worker thread — against a **read view**, which
-  is a collection pinned at one instant and private to that one read. A
-  worker performs no write, opens and closes no file, holds no session,
-  and touches nothing another worker or the serving thread can see. Every
-  answer is still assembled, framed and written by the serving thread, so
-  `conn.out` has one owner as it always did. This says "there are no
-  threads" no longer; it does not say the engine is concurrent, and the
-  drain above is what keeps the difference from mattering. Default 0, and
-  wasm has none on either target.
+- **Two exceptions, each with a stated boundary.** With `--read-threads`
+  (default `auto` on a replicated server) a long scanning read runs on a
+  worker thread — against a **read view**, a collection pinned at one
+  instant and private to that one read. A worker performs no write, opens
+  and closes no file, holds no session, and touches nothing another
+  worker or the serving thread can see; the reader drain is what lets a
+  file be unmade. And with `--write-thread` (default on, same scope) the
+  apply of an ordinary committed entry runs on the **writer thread** —
+  one worker, log order, owning `dbi_apply` and nothing else, with every
+  loop-side engine touch either behind a full drain or inside the
+  boundary pause (*the writer thread*, above). Every answer is still
+  assembled, framed and written by the serving thread, so `conn.out` has
+  one owner as it always did. Neither says the engine is concurrent:
+  nothing mutates a tree while anything else is inside it — the drains
+  and the pause are that sentence, enforced. wasm has no threads on
+  either target.
 - **Bounded, and it says so.** `--max-clients` is a fixed table sized at
   startup, for the reason every other table here is bounded: a server
   that grows one per client has a failure mode nobody tests. Nothing is

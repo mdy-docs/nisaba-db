@@ -4,6 +4,7 @@
 #include "group.h"
 #include "applied.h"
 #include "readers.h"   /* the threads that perform long reads */
+#include "writer.h"    /* the thread that performs applies */
 
 #include "raft_node.h"
 #include "raft_msg.h"      /* the member-record grammar; this file reads it */
@@ -143,6 +144,19 @@ typedef struct {
     int      answered;
     int      stale;
     uint64_t read_seq;
+    /*
+     * A READ PARKED ON THE TERM'S FLOOR (submit_read): it arrived at a
+     * fresh leader whose applied state does not yet cover what a
+     * previous leader may have acknowledged (`lin_floor`), so it cannot
+     * be performed yet -- and it must not be refused either, because the
+     * window is one commit round wide and the old path served through it
+     * by waiting on the barrier. So it waits like an offloaded read
+     * does, request bytes kept, and the tick performs it the moment the
+     * floor is covered; the barrier half is exactly the offloaded read's
+     * two-condition machinery, reused whole.
+     */
+    dbuf     parked;
+    uint64_t wait_floor;
 } pending;
 
 /*
@@ -178,6 +192,14 @@ struct replica {
     uint64_t   snap_every;      /* applied entries between snapshots; 0 = never */
     uint64_t   applied;
     /*
+     * The pump's high-water mark: the highest index HANDED OVER -- to
+     * the writer thread, or applied right here when there is none (the
+     * two stay equal on the inline path). Entries in (applied,
+     * submitted] are inside the writer; applied itself only advances at
+     * reap, in log order, which is what keeps rn_applied honest.
+     */
+    uint64_t   submitted;
+    /*
      * The instance-level applied mark (server/applied.h): `mark` mirrors
      * what __applied__.bj holds; `mark_carries` says the mark is currently
      * the ONLY durable record of how far this instance applied -- set when
@@ -212,6 +234,23 @@ struct replica {
     uint32_t   builds_n, builds_at;
     uint64_t   build_inflight;  /* the proposed chunk's index; 0 = none */
     int        was_leader;
+    /*
+     * THE LINEARIZABLE FLOOR OF THIS TERM: the log's last index at the
+     * moment this member became leader. Every write a PREVIOUS leader
+     * can have acknowledged is committed, therefore in this log
+     * (leader completeness), therefore at or below this mark -- so once
+     * `applied` covers it, everything any client was ever told about is
+     * in this member's own applied state, and a linearizable read can be
+     * served from state at or above ITS OWN ARRIVAL rather than from the
+     * commit index's. The difference is the whole point of the writer
+     * thread: a read no longer waits out the apply backlog of a write
+     * burst it arrived in the middle of, because every entry in that
+     * backlog is one nobody has been told about yet -- acknowledgements
+     * are built from apply results, on this thread, so ack'd implies
+     * applied HERE. The barrier still supplies the other half (nobody
+     * newer is leader), unchanged.
+     */
+    uint64_t   lin_floor;
     int        builds_scan_due; /* leading, but not yet caught up enough to scan */
     uint32_t   index_chunk;     /* chunk size for resumed builds (--index-chunk) */
 
@@ -260,6 +299,22 @@ struct replica {
     uint64_t   next_read_seq;   /* 1, 2, 3, ... never reused */
     uint64_t   reads_moved;     /* actually handed to a reader thread */
     /*
+     * THE WRITER THREAD (server/writer.h): the thread that owns
+     * dbi_apply, so a burst of committed entries stops being a burst of
+     * documents written with nothing else served in between. NULL means
+     * every apply runs inline on this thread, byte for byte as it always
+     * did -- the default on wasm, and what --write-thread 0 asks for.
+     *
+     * The handoff is currently SYNCHRONOUS -- apply_entry submits one
+     * entry, waits for it, and reaps it -- which moves the ownership
+     * without moving the schedule: the loop still applies-then-serves in
+     * exactly today's order, so every semantic downstream (settlements,
+     * read floors, halt handling, the mark) is untouched while the split
+     * itself soaks. The asynchronous pump, published-root views and the
+     * boundary pause layer on top of this, in that order.
+     */
+    wrpool    *writer;
+    /*
      * THE DRAIN, COUNTED -- because the drain is the correctness argument
      * for offloading reads at all, and a soak proves it only by failing to
      * crash. Racing finds a MISSING barrier approximately never, so these
@@ -286,6 +341,13 @@ struct replica {
     uint64_t   install_drains;
     uint64_t   install_drained_reads;
 };
+
+/* The pump lives below the snapshot machinery, which needs its drained
+ * form (snapshot_take's boundary argument says why); the role bookkeeping
+ * lives beside the resumer, and the read path -- defined earlier -- has
+ * to notice a mid-pass leadership arrival too. */
+static int apply_caught_up(replica *r);
+static void note_role(replica *r);
 
 static conversation *conv_open(replica *r, uint64_t theirs, uint64_t from) {
     for (int i = 0; i < REPLICA_MAX_CONV; i++) {
@@ -340,6 +402,7 @@ static void pending_release(pending *p) {
     free(p->indices);
     dbuf_free(&p->answer);
     dbuf_free(&p->round);
+    dbuf_free(&p->parked);
     memset(p, 0, sizeof *p);
 }
 
@@ -851,9 +914,18 @@ static int compact_log_into(replica *r, uint64_t gen, uint64_t boundary,
  * WalDb.snapshot() struck under its write chain.
  */
 static int snapshot_take(replica *r) {
+    /*
+     * The writer drained first, results delivered: the boundary is
+     * r->applied, the generation is the FILES, and the two must be the
+     * same statement -- an entry applied to the files but not yet
+     * counted in the boundary would be replayed onto the restored state,
+     * and an $inc replayed is an $inc counted twice.
+     */
+    int e = apply_caught_up(r);
+    if (e) return e;
     uint64_t boundary = r->applied;
     uint64_t bterm = 0;
-    int e = elog_term_at(r->log, boundary, &bterm);
+    e = elog_term_at(r->log, boundary, &bterm);
     if (e) return e;
     uint64_t gen = sst_next_gen(r->store);
 
@@ -1444,6 +1516,18 @@ int replica_set_read_offload(replica *r, int threads, int64_t min_docs) {
     return BJ_OK;
 }
 
+int replica_set_write_thread(replica *r, int on) {
+    if (!r) return BJ_ERR_STATE;
+    if (!on) return BJ_OK;
+    /* Replacing a running writer would orphan whatever it holds, and
+     * nothing needs to: this is called once, from argv. */
+    if (r->writer) return BJ_ERR_STATE;
+    r->writer = wr_open(r->inst);
+    /* Said, not swallowed: a server asked for a writer thread and
+     * applying inline is a different server. */
+    return r->writer ? BJ_OK : BJ_ERR_STATE;
+}
+
 void replica_set_max_batch(replica *r, uint32_t bytes) {
     /* rn_set_limits keeps its default on 0, so this needs no policy of
      * its own -- one place decides what 0 means. */
@@ -1935,6 +2019,7 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
      */
     if (r->applied < elog_base_index(r->log))
         r->applied = elog_base_index(r->log);
+    r->submitted = r->applied;
     rn_seed_commit(r->node, r->applied > elog_commit_index(r->log)
                                 ? r->applied : elog_commit_index(r->log));
 
@@ -1990,6 +2075,11 @@ void replica_close(replica *r) {
      * another thread is still reading.
      */
     if (r->readers) { rdpool_close(r->readers); r->readers = NULL; }
+    /* The writer next, for the same reason: it applies into the
+     * instance, and everything below this line assumes nothing else is
+     * inside the engine. (Idle here by construction -- the handoff is
+     * synchronous -- but the join is the proof, not the assumption.) */
+    if (r->writer) { wr_close(r->writer); r->writer = NULL; }
     /* The instance outlives this call in some teardowns, and a reader
      * whose ctx has been freed must not be reachable from it. */
     if (r->inst) dbi_set_log(r->inst, NULL);
@@ -2031,6 +2121,7 @@ int replica_adopt(replica *r, const char *victims, size_t victims_len) {
     r->host_owns_log = 0;
     r->log = rn_log(r->node);
     r->applied = boundary;
+    r->submitted = boundary;
     /* The adopted generation is this member's whole state and the rebased
      * log starts at its boundary -- a mark that covers the whole log by
      * construction, which is the only kind the boot trusts (applied.h).
@@ -2087,6 +2178,17 @@ void replica_set_instance(replica *r, dbi *inst) {
     if (inst) {
         dbs_log reader = { r, log_base, log_floor, log_entry };
         dbi_set_log(inst, &reader);
+        /* The writer's copy of the same pointer. Refused only if
+         * something is still unapplied, which the install path's drain
+         * has already made impossible -- so a refusal here is a broken
+         * invariant worth hearing about, not a state to limp on in. */
+        if (r->writer && wr_set_instance(r->writer, inst) != BJ_OK) {
+            fprintf(stderr, "replica: the writer would not adopt the new"
+                            " instance; applies stay inline\n");
+            fflush(stderr);
+            wr_close(r->writer);
+            r->writer = NULL;
+        }
     }
 }
 
@@ -2137,7 +2239,24 @@ int replica_wait_ms(const replica *r, uint64_t now) {
      * It cannot spin: apply_committed either advances `applied` or
      * halts the replica outright.
      */
-    if (r->applied < rn_commit_index(r->node)) return 0;
+    if (r->applied < rn_commit_index(r->node)) {
+        if (!r->writer) return 0;
+        /*
+         * With a writer, "committed and unapplied" is ready work for
+         * THIS thread only when it can act now: finished applies to
+         * reap, or -- with the writer idle -- entries to hand over or a
+         * barrier entry to apply here. While the writer is chewing, the
+         * wake pipe in the pollset ends the sleep the moment an apply
+         * lands, and the reap that follows tops the queue back up; a
+         * zero here would just be a spin against a busy thread.
+         */
+        int unapplied = wr_unapplied(r->writer);
+        if (wr_inflight(r->writer) > unapplied) return 0;   /* reapable now */
+        if (unapplied == 0 &&
+            r->submitted < rn_commit_index(r->node) &&
+            r->submitted + 1 <= elog_last_index(r->log)) return 0;
+        return r->tick_ms;
+    }
     return r->tick_ms;
 }
 
@@ -2178,7 +2297,271 @@ int replica_wait_ms(const replica *r, uint64_t now) {
  */
 #define REPLICA_APPLY_BUDGET 32u
 
+/*
+ * How many entries may sit with the writer at once -- handed over and
+ * not yet reaped. One wave's worth: the round machinery paces proposals
+ * in REPLICA_WAVE steps, so a queue that swallows a whole wave lets the
+ * writer chew one while the loop serves reads and proposes the next.
+ * Memory-bounded like every other table here: an entry past the cap
+ * simply waits in the log, which is where entries wait.
+ */
+#define REPLICA_WRITER_DEPTH 64u
+
+/*
+ * WHY the log could not produce a committed entry -- the diagnosis the
+ * halt owes whoever has to act on it, shared by the inline pump and the
+ * reap path (which learns of the failure after the payload it would have
+ * printed from is gone, and re-fetches it from the log).
+ */
+static void halt_say(replica *r, uint64_t index, int rc) {
+    const uint8_t *cmd = NULL;
+    size_t cmd_len = 0;
+    int op = -1;
+    const uint8_t *coll = NULL;
+    uint32_t coll_len = 0;
+    uint64_t term = 0;
+    int type = 0;
+    const uint8_t *p = NULL;
+    size_t plen = 0;
+    if (elog_get(r->log, index, &term, &type, &p, &plen) == BJ_OK && p &&
+        dbi_entry_cmd(p, (uint32_t)plen, NULL, 0, &cmd, &cmd_len) == BJ_OK && cmd) {
+        if (dc_wal_parse(cmd, (uint32_t)cmd_len, &op, &coll, &coll_len)) op = -1;
+    }
+    fprintf(stderr, "replica: entry %llu (opcode %d, collection"
+                    " '%.*s') would not apply: %s\n",
+            (unsigned long long)index, op,
+            (int)(coll ? coll_len : 0), coll ? (const char *)coll : "",
+            dc_strerror(rc));
+    fflush(stderr);
+}
+
+/*
+ * Apply ONE entry on THIS thread: the inline pump's whole body, and the
+ * writer path's barrier entries -- a CONFIG (it mutates the node, which
+ * is loop-owned), a destructive command (it unmakes files that read
+ * views and the writer itself may be inside), and anything that is not
+ * an ordinary document write. The caller has copied the payload out of
+ * the log, and -- on the writer path -- has drained the writer first.
+ */
+static int apply_one_here(replica *r, uint64_t index, int type, dbuf *payload) {
+    int e = BJ_OK;
+    /*
+     * A membership change taking effect. The index guard skips one
+     * OLDER than the set in force -- the startup scan adopts the
+     * last CONFIG in the log, which may sit above the applied floor,
+     * and replaying an earlier one would regress the cluster's shape.
+     */
+    if (type == EL_CONFIG && index >= r->config_index) {
+        e = adopt_config(r, payload->data, (uint32_t)payload->len, index);
+        if (e) return e;
+        /* Whoever just ARRIVED has to be caught up, and the entry
+         * that put them here is already behind us: this runs against
+         * the peer table sync_peers has now widened, where
+         * adopt_config's own pass ran against the set as it stood.
+         * A peer in both is asked twice and replicates once
+         * (rn_replicate skips one with a request already in
+         * flight). */
+        if (replica_is_leader(r))
+            for (uint32_t i = 0; i < peers_count(r->px); i++)
+                rn_replicate(r->node, peers_id_at(r->px, i));
+    }
+
+    if (type == EL_NORMAL) {
+        /*
+         * READERS OUT OF THE WAY FIRST, if this entry unmakes a file.
+         *
+         * A read view shares its live handles' ios, so it is valid
+         * exactly as long as its files are only appended to. Dropping a
+         * collection or a database, or any other DDL, leaves a worker's
+         * pread aiming at a descriptor that has been closed and very
+         * possibly reused -- which returns another file's bytes with no
+         * error at all. This drain is not an optimisation to be tuned;
+         * it is the correctness argument for the whole design.
+         *
+         * Only for the destructive ones. An ordinary document write
+         * proceeds with reads in flight, which is what keeps a write's
+         * latency what it was -- quiescing the whole pump would make
+         * every write wait out the longest scan.
+         */
+        if (r->readers && dbi_entry_wrecks_files(payload->data, (uint32_t)payload->len)) {
+            e = replica_wait_reads_idle(r, REPLICA_DRAIN_UNMAKE);
+            if (e) return e;
+        }
+
+        /* Into whoever proposed it, if that was a client of this
+         * process -- because the response is built from exactly what
+         * applying produced, and this is the only place it happens.
+         * A follower's pump writes into a scratch buffer instead;
+         * nobody local is waiting on it. */
+        dbuf  scratch = {0};
+        dbuf *into = &scratch;
+        pending *p = pending_for_index(r, index, &into);
+        int rc = dbi_apply(r->inst, index, payload->data, (uint32_t)payload->len, into);
+        if (p) p->view[p->at].rc = rc;
+        /*
+         * Does the instance-level mark carry the floor from here on?
+         * A dropDatabase's apply destroys every applied-index record
+         * its database held, so after one the mark is the only durable
+         * memory; any OTHER apply leaves a per-database record of its
+         * own and relieves it (server/applied.h, and the catch-up
+         * store in mark_store_if_final).
+         */
+        if (!rc || dc_is_deterministic(rc))
+            r->mark_carries = dbi_entry_is_db_drop(payload->data,
+                                                   (uint32_t)payload->len);
+        dbuf_free(&scratch);
+        if (rc && !dc_is_deterministic(rc)) {
+            /*
+             * WHICH ENTRY, and what it was. A halt is the strongest
+             * thing this member does -- it stops serving entirely,
+             * because the alternative is diverging quietly -- and
+             * "halted (-37)" tells whoever has to diagnose it nothing
+             * about where to look.
+             */
+            halt_say(r, index, rc);
+            return rc;
+        }
+    }
+    r->applied = index;
+    if (r->submitted < index) r->submitted = index;
+    rn_applied(r->node, index);
+    return BJ_OK;
+}
+
+/*
+ * CAUGHT UP WITH A DROP AS THE LAST WORD: store the mark. Only now --
+ * a mark below the log's last index is ignored by every reader, so
+ * storing one mid-stream would be a synced write that says nothing.
+ * Idle instances are the whole audience: their next boot reads
+ * mark == last, skips both the replay and the restore, and the
+ * rewrite-everything-on-every-boot cost is gone. One fsync per
+ * drop-terminated burst, nothing on any other write path.
+ */
+static void mark_store_if_final(replica *r) {
+    if (r->mark_carries && r->applied >= rn_commit_index(r->node) &&
+        r->applied > r->mark && r->applied >= elog_last_index(r->log)) {
+        if (applied_mark_store(r->ns, r->applied) == BJ_OK)
+            r->mark = r->applied;
+    }
+}
+
+/*
+ * Everything the writer has FINISHED, brought home: the result routed to
+ * whoever proposed the entry, the halt judged (the worker has already
+ * parked itself if one is coming -- writer.c says why the judgement
+ * cannot wait for this reap), and rn_applied told, in log order, which
+ * is completion order because there is one worker.
+ */
+static int pump_reap(replica *r) {
+    if (!r->writer) return BJ_OK;
+    wr_drain_wake(r->writer);
+    dbuf res = {0};
+    int e = BJ_OK;
+    for (;;) {
+        uint64_t index = 0;
+        int rc = 0, have = 0;
+        res.len = 0;
+        e = wr_reap(r->writer, &index, &rc, &res, &have);
+        if (e || !have) break;
+        if (index != r->applied + 1) { e = BJ_ERR_STATE; break; }
+        dbuf *into = NULL;
+        pending *p = pending_for_index(r, index, &into);
+        if (p) {
+            e = res.len ? dbuf_put(into, res.data, res.len) : BJ_OK;
+            if (e) break;
+            p->view[p->at].rc = rc;
+        }
+        if (rc && !dc_is_deterministic(rc)) {
+            halt_say(r, index, rc);
+            e = rc;
+            break;
+        }
+        /* Only ordinary document writes ride the writer -- a drop is a
+         * barrier entry and never reaches here -- and every one of them
+         * leaves a per-database record of its own: the mark stops
+         * carrying (server/applied.h). */
+        r->mark_carries = 0;
+        r->applied = index;
+        rn_applied(r->node, index);
+    }
+    dbuf_free(&res);
+    return e;
+}
+
+/*
+ * Hand the writer everything committed that it has room for, in log
+ * order, pausing the walk at a BARRIER ENTRY -- anything this thread
+ * must apply itself -- until every entry before it has been applied AND
+ * reaped, so rn_applied stays in order and the engine is quiet when the
+ * barrier work touches it.
+ */
+static int pump_submit(replica *r) {
+    dbuf payload = {0};
+    int e = BJ_OK;
+    while (!e && r->submitted < rn_commit_index(r->node)) {
+        uint64_t index = r->submitted + 1;
+        /* COMMITTED IS NOT THE SAME AS PRESENT: an install can leave a
+         * commit index above a rebased log's last entry, with the rest
+         * on its way from the leader (the inline pump's -9 story). */
+        if (index > elog_last_index(r->log)) break;
+        if (wr_inflight(r->writer) >= (int)REPLICA_WRITER_DEPTH) break;
+        uint64_t term = 0;
+        int type = 0;
+        const uint8_t *p = NULL;
+        size_t plen = 0;
+        e = elog_get(r->log, index, &term, &type, &p, &plen);
+        if (e) {
+            fprintf(stderr, "replica: committed entry %llu is not in the log"
+                            " (base %llu, last %llu, commit %llu): %s\n",
+                    (unsigned long long)index,
+                    (unsigned long long)elog_base_index(r->log),
+                    (unsigned long long)elog_last_index(r->log),
+                    (unsigned long long)rn_commit_index(r->node),
+                    dc_strerror(e));
+            fflush(stderr);
+            break;
+        }
+        /* The log owns that pointer and it dies on the next operation on
+         * this log -- and the writer outlives many of them. */
+        payload.len = 0;
+        e = dbuf_put(&payload, p, plen);
+        if (e) break;
+
+        int plain = type == EL_NORMAL &&
+                    !dbi_entry_wrecks_files(payload.data, (uint32_t)payload.len);
+        if (!plain) {
+            /* A barrier entry. Everything before it must be applied and
+             * REAPED first -- reaped, because rn_applied is called at
+             * reap and must stay in log order. The completions that get
+             * us there wake the loop through the pipe, and this walk
+             * resumes exactly here. */
+            if (r->applied < r->submitted) break;
+            e = apply_one_here(r, index, type, &payload);
+            continue;
+        }
+        e = wr_submit(r->writer, index, payload.data, (uint32_t)payload.len);
+        if (e) break;
+        r->submitted = index;
+    }
+    dbuf_free(&payload);
+    return e;
+}
+
 static int apply_committed(replica *r) {
+    /*
+     * THE ASYNCHRONOUS PUMP, when there is a writer: bring home what has
+     * finished, hand over what has committed, and DO NOT WAIT -- the
+     * loop goes back to its sockets while the writer chews, and a
+     * completion wakes it through the pipe in the pollset. The paths
+     * that need today's caught-up state before they read it call
+     * apply_caught_up below instead.
+     */
+    if (r->writer) {
+        int e = pump_reap(r);
+        if (!e) e = pump_submit(r);
+        if (!e) mark_store_if_final(r);
+        return e;
+    }
     dbuf payload = {0};
     int e = BJ_OK;
     uint32_t applied_here = 0;
@@ -2211,8 +2594,8 @@ static int apply_committed(replica *r) {
          * entries that had arrived since, and stopped serving for good over
          * the fourth. Stopping the sweep is all that is needed: the pump
          * runs again on every message and tick, so the rest applies as it
-         * lands. The fprintf below still fires for the case that IS a
-         * fault -- an index below the log's base, which is state this
+         * lands. The fprintf in pump_submit still fires for the case that
+         * IS a fault -- an index below the log's base, which is state this
          * member needs and nothing can supply.
          */
         if (index > elog_last_index(r->log)) break;
@@ -2222,15 +2605,6 @@ static int apply_committed(replica *r) {
         size_t plen = 0;
         e = elog_get(r->log, index, &term, &type, &p, &plen);
         if (e) {
-            /*
-             * WHY THE LOG COULD NOT PRODUCE A COMMITTED ENTRY, because the
-             * caller turns this into a halt and "-9: Argument out of range"
-             * says nothing about which range. The interesting case is an
-             * index ABOVE the last entry: a commit index is knowledge about
-             * the cluster and an install replaces this member's log with one
-             * based at the generation's boundary, so the entries in between
-             * are committed, not yet here, and on their way from the leader.
-             */
             fprintf(stderr, "replica: committed entry %llu is not in the log"
                             " (base %llu, last %llu, commit %llu): %s\n",
                     (unsigned long long)index,
@@ -2246,124 +2620,58 @@ static int apply_committed(replica *r) {
         payload.len = 0;
         e = dbuf_put(&payload, p, plen);
         if (e) break;
-
-        /*
-         * A membership change taking effect. The index guard skips one
-         * OLDER than the set in force -- the startup scan adopts the
-         * last CONFIG in the log, which may sit above the applied floor,
-         * and replaying an earlier one would regress the cluster's shape.
-         */
-        if (type == EL_CONFIG && index >= r->config_index) {
-            e = adopt_config(r, payload.data, (uint32_t)payload.len, index);
-            if (e) break;
-            /* Whoever just ARRIVED has to be caught up, and the entry
-             * that put them here is already behind us: this runs against
-             * the peer table sync_peers has now widened, where
-             * adopt_config's own pass ran against the set as it stood.
-             * A peer in both is asked twice and replicates once
-             * (rn_replicate skips one with a request already in
-             * flight). */
-            if (replica_is_leader(r))
-                for (uint32_t i = 0; i < peers_count(r->px); i++)
-                    rn_replicate(r->node, peers_id_at(r->px, i));
-        }
-
-        if (type == EL_NORMAL) {
-            /*
-             * READERS OUT OF THE WAY FIRST, if this entry unmakes a file.
-             *
-             * A read view shares its live handles' ios, so it is valid
-             * exactly as long as its files are only appended to. Dropping a
-             * collection or a database, or any other DDL, leaves a worker's
-             * pread aiming at a descriptor that has been closed and very
-             * possibly reused -- which returns another file's bytes with no
-             * error at all. This drain is not an optimisation to be tuned;
-             * it is the correctness argument for the whole design.
-             *
-             * Only for the destructive ones. An ordinary document write
-             * proceeds with reads in flight, which is what keeps a write's
-             * latency what it was -- quiescing the whole pump would make
-             * every write wait out the longest scan.
-             */
-            if (r->readers && dbi_entry_wrecks_files(payload.data, (uint32_t)payload.len)) {
-                e = replica_wait_reads_idle(r, REPLICA_DRAIN_UNMAKE);
-                if (e) break;
-            }
-
-            /* Into whoever proposed it, if that was a client of this
-             * process -- because the response is built from exactly what
-             * applying produced, and this is the only place it happens.
-             * A follower's pump writes into a scratch buffer instead;
-             * nobody local is waiting on it. */
-            dbuf  scratch = {0};
-            dbuf *into = &scratch;
-            pending *p = pending_for_index(r, index, &into);
-            int rc = dbi_apply(r->inst, index, payload.data, (uint32_t)payload.len, into);
-            if (p) p->view[p->at].rc = rc;
-            /*
-             * Does the instance-level mark carry the floor from here on?
-             * A dropDatabase's apply destroys every applied-index record
-             * its database held, so after one the mark is the only durable
-             * memory; any OTHER apply leaves a per-database record of its
-             * own and relieves it (server/applied.h, and the catch-up
-             * store at the bottom of this function).
-             */
-            if (!rc || dc_is_deterministic(rc))
-                r->mark_carries = dbi_entry_is_db_drop(payload.data,
-                                                       (uint32_t)payload.len);
-            dbuf_free(&scratch);
-            if (rc && !dc_is_deterministic(rc)) {
-                /*
-                 * WHICH ENTRY, and what it was. A halt is the strongest
-                 * thing this member does -- it stops serving entirely,
-                 * because the alternative is diverging quietly -- and
-                 * "halted (-37)" tells whoever has to diagnose it nothing
-                 * about where to look. The index is what to fetch from the
-                 * log; the opcode and collection are what to reason about.
-                 *
-                 * Written here rather than left to the caller: by the time
-                 * this returns, the index is gone and the payload is freed.
-                 */
-                const uint8_t *cmd = NULL;
-                size_t cmd_len = 0;
-                int op = -1;
-                const uint8_t *coll = NULL;
-                uint32_t coll_len = 0;
-                if (dbi_entry_cmd(payload.data, (uint32_t)payload.len, NULL, 0,
-                                  &cmd, &cmd_len) == BJ_OK && cmd) {
-                    if (dc_wal_parse(cmd, (uint32_t)cmd_len, &op, &coll, &coll_len)) {
-                        op = -1;
-                    }
-                }
-                fprintf(stderr, "replica: entry %llu (opcode %d, collection"
-                                " '%.*s') would not apply: %s\n",
-                        (unsigned long long)index, op,
-                        (int)(coll ? coll_len : 0), coll ? (const char *)coll : "",
-                        dc_strerror(rc));
-                fflush(stderr);
-                e = rc;
-                break;
-            }
-        }
-        r->applied = index;
-        rn_applied(r->node, index);
+        e = apply_one_here(r, index, type, &payload);
+        if (e) break;
     }
     dbuf_free(&payload);
-    /*
-     * CAUGHT UP WITH A DROP AS THE LAST WORD: store the mark. Only now --
-     * a mark below the log's last index is ignored by every reader, so
-     * storing one mid-stream would be a synced write that says nothing.
-     * Idle instances are the whole audience: their next boot reads
-     * mark == last, skips both the replay and the restore, and the
-     * rewrite-everything-on-every-boot cost is gone. One fsync per
-     * drop-terminated burst, nothing on any other write path.
-     */
-    if (!e && r->mark_carries && r->applied >= rn_commit_index(r->node) &&
-        r->applied > r->mark && r->applied >= elog_last_index(r->log)) {
-        if (applied_mark_store(r->ns, r->applied) == BJ_OK)
-            r->mark = r->applied;
-    }
+    if (!e) mark_store_if_final(r);
     return e;
+}
+
+/*
+ * Today's caught-up semantics, for the paths that READ state right after
+ * pumping (a read's floor, a snapshot's boundary): everything handed to
+ * the writer is waited out -- results delivered, never discarded -- and
+ * the walk continues until the commit index or until nothing can advance
+ * (an install's gap, a halt). Returns with the writer IDLE, which is
+ * what lets the caller touch live trees with no further ceremony. One
+ * budgeted pass without a writer, exactly what these callers always got.
+ */
+static int apply_caught_up(replica *r) {
+    int e = apply_committed(r);
+    if (e || !r->writer) return e;
+    for (;;) {
+        if (wr_unapplied(r->writer) > 0) {
+            wr_wait_applied(r->writer);
+            e = pump_reap(r);
+            if (e) return e;
+        }
+        if (r->applied >= rn_commit_index(r->node)) return BJ_OK;
+        uint64_t before = r->applied;
+        e = apply_committed(r);
+        if (e) return e;
+        if (r->applied == before && wr_unapplied(r->writer) == 0) return BJ_OK;
+    }
+}
+
+/*
+ * The boundary pause, replica-shaped: everything loop-side that touches
+ * a live tree or a session -- a plan, a cursor step, a stream drain, a
+ * client's teardown -- runs between these two calls. Bounded by ONE
+ * entry's apply, which the staged index build capped; free when the
+ * writer is idle or absent, which is most of the time and every
+ * unreplicated server.
+ */
+static void engine_pause(replica *r)  { if (r->writer) wr_pause(r->writer); }
+static void engine_resume(replica *r) { if (r->writer) wr_resume(r->writer); }
+
+/* An abandoned plan releases session state, which is an engine touch
+ * like any other -- and it happens on enough error paths that the pair
+ * earns a wrapper. */
+static void abandon_paused(replica *r, uint64_t token) {
+    engine_pause(r);
+    dbi_abandon(r->inst, token);
+    engine_resume(r);
 }
 
 /* ---- proposing ---------------------------------------------------------- */
@@ -2793,6 +3101,16 @@ static int submit_read_stale(replica *r, pending *p, uint64_t client,
      * this batch -- see submit_read. Only what this request appends past
      * the mark may be taken back. */
     size_t mark = out->len;
+    /*
+     * Pumped, not caught up: a follower that is catching up after a
+     * partition can hold thousands of committed-unapplied entries, and a
+     * stale read that waited them all out would turn "eventually
+     * consistent, available now" into "unavailable while behind" --
+     * exactly what the flag exists to avoid. The floor below is tested
+     * against what has ACTUALLY applied, so a client that asked for
+     * read-your-writes still gets the honest refusal; everything after
+     * runs under the boundary pause, because the writer is still going.
+     */
     int e = apply_committed(r);
     if (e) return e;
     /* After the pump, so the floor is tested against everything this
@@ -2815,18 +3133,20 @@ static int submit_read_stale(replica *r, pending *p, uint64_t client,
      * No barrier: `stale: true` is the client waiving currency, so there
      * is nothing to prove and the answer waits only on the reader.
      */
+    engine_pause(r);
     if (read_is_long(r, req, len)) {
         int off = offload_read(r, p, client, req, len, 0, out, mark);
-        if (off >= 0) return off;
+        if (off >= 0) { engine_resume(r); return off; }
     }
 
     dbuf cmds = {0};
     uint64_t token = 0;
     e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
+    engine_resume(r);
     dbuf_free(&cmds);
     if (e || token) {
         /* A read plans nothing; see submit_read. */
-        if (token) dbi_abandon(r->inst, token);
+        if (token) abandon_paused(r, token);
         return e ? e : BJ_ERR_STATE;
     }
     return 0;
@@ -2931,34 +3251,87 @@ static int submit_read(replica *r, pending *p, uint64_t client,
 
     e = apply_committed(r);
     if (e) { rn_read_release(r->node, barrier); return e; }
-    if (r->applied < read_index) {
-        /* Unreachable: everything at or below the commit index is in the
-         * log and the pump just ran. Said out loud rather than serving
-         * from state that is demonstrably too old. */
-        rn_read_release(r->node, barrier);
-        e = refuse(r, DC_ERR_NOT_CURRENT, out);
-        return e ? e : 0;
+
+    /* Leadership may have arrived THIS pass, after the tick's own
+     * noticing: the floor below must be this term's. */
+    note_role(r);
+
+    /*
+     * THE FLOOR IS THE READ'S OWN ARRIVAL, NOT THE COMMIT INDEX'S -- and
+     * the difference is the whole latency story of the writer thread.
+     *
+     * `read_index` (the commit index as the read arrived) is what the
+     * node's contract names, and it is SUFFICIENT: everything committed
+     * is at or below it. But it is more than linearizability NEEDS. A
+     * read must reflect every write some client was ACKNOWLEDGED for
+     * before the read began -- and an acknowledgement is built from the
+     * apply's own result, on this thread, so a write acked before this
+     * read arrived was applied here before it arrived: it sits at or
+     * below `r->applied` as of this line. The committed-but-unapplied
+     * backlog behind a burst is, by the same token, a set of writes
+     * NOBODY has been told about yet, and a read that reflects none of
+     * them is concurrent with them, which linearizability permits.
+     *
+     * The one thing `applied` cannot vouch for is a write a PREVIOUS
+     * leader acknowledged: covered by the term's floor (`lin_floor` --
+     * leader completeness puts every such write at or below the log as
+     * this member took over), waited out once per term and gone. The
+     * barrier below still supplies the leadership proof, unchanged.
+     */
+    if (r->applied < r->lin_floor) {
+        e = apply_caught_up(r);
+        if (e) { rn_read_release(r->node, barrier); return e; }
+        if (r->applied < r->lin_floor) {
+            /*
+             * The floor is not here yet -- a leadership fresh enough
+             * that its term-start entry has not committed and applied.
+             * PARKED, not refused: the window is one commit round wide,
+             * and the tick performs this read the moment `applied`
+             * covers the floor. The barrier stays held and settles
+             * through the offloaded-read machinery; every barrier
+             * terminates, so a floor that never arrives (leadership
+             * lost again) still ends in the refusal the barrier's loss
+             * writes.
+             */
+            p->used = 1;
+            p->client = client;
+            p->barrier = barrier;
+            p->offloaded = 1;
+            p->done = 0;
+            p->wait_floor = r->lin_floor;
+            e = dbuf_put(&p->parked, req, len);
+            if (e) { pending_release(p); rn_read_release(r->node, barrier); return e; }
+            out->len = mark;
+            e = flush_out(r);
+            return e ? e : 1;
+        }
     }
 
     /*
      * Long enough to be worth moving? Then move it, and if that cannot be
      * arranged for any reason, fall through and perform it here -- which is
      * what this server did for its whole life before reader threads.
+     *
+     * Under the boundary pause either way: the writer may be mid-entry,
+     * and both the sizing and the view -- or the inline read itself --
+     * walk live trees. Bounded by one entry's apply.
      */
+    engine_pause(r);
     if (read_is_long(r, req, len)) {
         int off = offload_read(r, p, client, req, len, barrier, out, mark);
-        if (off >= 0) return off;
+        if (off >= 0) { engine_resume(r); return off; }
     }
 
     dbuf cmds = {0};
     uint64_t token = 0;
     e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
+    engine_resume(r);
     dbuf_free(&cmds);
     if (e || token) {
         /* A read plans nothing. A token here means the classifier and
          * the session disagree about what this op does, which is the one
          * thing that must never be true (db_session.h says why). */
-        if (token) dbi_abandon(r->inst, token);
+        if (token) abandon_paused(r, token);
         rn_read_release(r->node, barrier);
         return e ? e : BJ_ERR_STATE;
     }
@@ -3041,6 +3414,12 @@ static int replica_status(const replica *r, dbuf *out) {
      * could never be moved anywhere is in neither. */
     if (!e) e = bj_put_key(b, (const uint8_t *)"readThreads", 11);
     if (!e) e = bj_put_int(b, (int64_t)r->read_threads);
+    /* Whether applies run on the writer thread -- the same visibility
+     * rule as the read routing: a threading decision nobody can observe
+     * is one nobody can check, and the equivalence gate needs to know
+     * which server it measured. */
+    if (!e) e = bj_put_key(b, (const uint8_t *)"writeThread", 11);
+    if (!e) e = bj_put_bool(b, r->writer ? 1 : 0);
     if (!e) e = bj_put_key(b, (const uint8_t *)"longReads", 9);
     if (!e) e = bj_put_int(b, (int64_t)r->reads_long);
     if (!e) e = bj_put_key(b, (const uint8_t *)"shortReads", 10);
@@ -3437,9 +3816,19 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
         if (de) return de;
     }
 
+    /*
+     * The plan -- and `compact`, which dbi_propose PERFORMS rather than
+     * logs -- touches live trees, so the writer parks for it. A plan
+     * made against a state some committed entries have not reached yet
+     * is already today's contract (the pump is budgeted), and it cannot
+     * diverge anybody: what replicates is the plan's COMMANDS, the same
+     * bytes on every member.
+     */
+    engine_pause(r);
     dbuf cmds = {0};
     uint64_t token = 0;
     int e = dbi_propose(r->inst, client, req, len, &token, &cmds, out);
+    engine_resume(r);
     if (e) { dbuf_free(&cmds); return e; }
     if (!token) { dbuf_free(&cmds); return 0; }   /* a ping, or a refusal */
 
@@ -3450,7 +3839,9 @@ int replica_submit(replica *r, uint64_t client, const uint8_t *req, size_t len,
     e = propose_batch(r, p, &cmds);
     dbuf_free(&cmds);
     if (e) {
+        engine_pause(r);
         dbi_abandon(r->inst, token);
+        engine_resume(r);
         pending_release(p);
         /* A batch the node cannot track is a REFUSAL, not a transport
          * failure: nothing was appended, the previous state stands
@@ -3560,7 +3951,13 @@ static int advance(replica *r, pending *p) {
         p->view[i].data = p->results[i].data;
         p->view[i].len = (uint32_t)p->results[i].len;
     }
+    /* The session's next pass plans against live trees. Its OWN entries
+     * are all applied and reaped -- that is what the settlement that
+     * called this means -- but other requests' may be inside the writer,
+     * so it parks for the step. */
+    engine_pause(r);
     int e = dbi_step(r->inst, p->token, p->indices, p->view, p->n, &next, &cmds, &p->answer);
+    engine_resume(r);
     if (e) { dbuf_free(&cmds); return e; }
     if (!next) {
         dbuf_free(&cmds);
@@ -3583,20 +3980,20 @@ static int advance(replica *r, pending *p) {
          * failure; what this one cannot do is report them, because a
          * refusal has no result to carry them in. The refusal names the
          * rule, and the caller re-reads to learn where the list got to. */
-        dbi_abandon(r->inst, p->token);
+        abandon_paused(r, p->token);
         p->answer.len = 0;
         e = refuse(r, DC_ERR_BATCH_TOO_LARGE, &p->answer);
         p->done = 1;
         return e;
     }
-    if (e) dbi_abandon(r->inst, p->token);
+    if (e) abandon_paused(r, p->token);
     return e;
 }
 
 /* A write whose entry a different leader wrote over. It did not happen
  * and no replica holds it, so the client is told exactly that. */
 static int lost(replica *r, pending *p) {
-    dbi_abandon(r->inst, p->token);
+    abandon_paused(r, p->token);
     p->answer.len = 0;
     int e = refuse(r, DC_ERR_WRITE_LOST, &p->answer);
     p->done = 1;
@@ -3636,22 +4033,38 @@ static int build_row(const dbuf *builds, uint32_t at,
  * ordinary pump, and the next is proposed only after the catalog has
  * been asked whether the build still needs one.
  */
-static void resume_builds(replica *r) {
+/*
+ * Notice a leadership transition, WHEREVER it is noticed first. The tick
+ * sees one on its next pass, but leadership can arrive mid-pass -- a vote
+ * reply inside serve_peers -- and a linearizable read taken later in the
+ * same pass must not serve under the previous term's floor. So the read
+ * path asks too, and whichever asks first does the bookkeeping once.
+ */
+static void note_role(replica *r) {
     int lead = replica_is_leader(r);
     if (lead && !r->was_leader) {
-        /* Freshly leading -- but the scan reads the CATALOGS, and this
-         * member's pump may not have applied the old leader's begin yet.
-         * A scan taken now would miss it and idle forever, so it waits
-         * for applied to reach commit: the term-start NOOP commits and
-         * applies quickly, and everything before it (the begin, the
-         * chunks that made it) has applied by then too. */
+        /* The term's linearizable floor (see the field): everything any
+         * previous leader can have acknowledged sits at or below the
+         * log as it stands right now. */
+        r->lin_floor = elog_last_index(r->log);
+        /* Freshly leading -- but the resumer's scan reads the CATALOGS,
+         * and this member's pump may not have applied the old leader's
+         * begin yet. A scan taken now would miss it and idle forever, so
+         * it waits for applied to reach commit: the term-start NOOP
+         * commits and applies quickly, and everything before it (the
+         * begin, the chunks that made it) has applied by then too. */
         r->builds_scan_due = 1;
         r->builds.len = 0;
         r->builds_n = r->builds_at = 0;
         r->build_inflight = 0;
     }
     r->was_leader = lead;
-    if (!lead) { r->builds_scan_due = 0; return; }
+    if (!lead) r->builds_scan_due = 0;
+}
+
+static void resume_builds(replica *r) {
+    note_role(r);
+    if (!r->was_leader) return;
 
     if (r->builds_scan_due) {
         if (r->applied < rn_commit_index(r->node)) return;
@@ -3688,8 +4101,14 @@ static void resume_builds(replica *r) {
         return;
     }
 
-    if (!dbi_index_building(r->inst, (const char *)d, dlen,
-                            (const char *)cl, cllen, nm, nmlen)) {
+    /* A catalog read, and other requests' entries may be inside the
+     * writer -- the scan above ran drained (applied == commit), but this
+     * per-chunk poll does not. */
+    engine_pause(r);
+    int still = dbi_index_building(r->inst, (const char *)d, dlen,
+                                   (const char *)cl, cllen, nm, nmlen);
+    engine_resume(r);
+    if (!still) {
         r->builds_at++;                 /* finished, aborted, or dropped */
         return;
     }
@@ -3758,7 +4177,7 @@ int replica_tick(replica *r, uint64_t now) {
              * remains in flight, so no settlement is coming to wake it.
              * What has been applied stays applied -- the same as any
              * mid-list failure -- and the refusal says so. */
-            dbi_abandon(r->inst, p->token);
+            abandon_paused(r, p->token);
             p->answer.len = 0;
             we = refuse(r, DC_ERR_BATCH_TOO_LARGE, &p->answer);
             p->done = 1;
@@ -3833,6 +4252,45 @@ int replica_tick(replica *r, uint64_t now) {
          * which is an AppendEntries with somewhere to go. */
         e = flush_out(r);
         if (e) return e;
+    }
+
+    /*
+     * Reads parked on the term's floor (submit_read): performed the
+     * moment `applied` covers it, or finished by the refusal their
+     * barrier's loss already wrote. BEFORE the barrier sweep, so a read
+     * whose floor and proof both arrived this tick goes out in one.
+     */
+    for (int i = 0; i < REPLICA_MAX_PENDING; i++) {
+        pending *p = &r->waiting[i];
+        if (!p->used || p->done || !p->wait_floor) continue;
+        if (p->stale) {
+            /* The barrier lost and its refusal is the final answer;
+             * there is nothing left to perform. */
+            p->wait_floor = 0;
+            p->answered = 1;
+            read_maybe_done(p);
+            continue;
+        }
+        if (r->applied < p->wait_floor) continue;
+        p->wait_floor = 0;
+        p->answer.len = 0;
+        dbuf cmds = {0};
+        uint64_t token = 0;
+        engine_pause(r);
+        int pe = dbi_propose(r->inst, p->client, p->parked.data, p->parked.len,
+                             &token, &cmds, &p->answer);
+        engine_resume(r);
+        dbuf_free(&cmds);
+        if (token) { abandon_paused(r, token); if (!pe) pe = BJ_ERR_STATE; }
+        if (pe) {
+            /* The read could not be performed at all: the refusal is
+             * the answer, built here where every other refusal is. */
+            p->answer.len = 0;
+            pe = refuse(r, pe, &p->answer);
+            if (pe) return pe;
+        }
+        p->answered = 1;
+        read_maybe_done(p);
     }
 
     /*
@@ -3928,6 +4386,28 @@ int replica_read_wake_fd(const replica *r) {
     return r ? rdpool_wake_fd(r->readers) : -1;
 }
 
+int replica_write_wake_fd(const replica *r) {
+    return r ? wr_wake_fd(r->writer) : -1;
+}
+
+void replica_pause_applies(replica *r)  { if (r) engine_pause(r); }
+void replica_resume_applies(replica *r) { if (r) engine_resume(r); }
+
+int replica_drain_applies(replica *r) {
+    if (!r || !r->writer) return BJ_OK;
+    /* Wait out and DELIVER everything handed to the writer -- the same
+     * never-discard rule the reader drain states -- without walking any
+     * further into the log: what is coming next may be exactly the
+     * install this drain is clearing the way for. */
+    int e = BJ_OK;
+    while (!e && wr_unapplied(r->writer) > 0) {
+        wr_wait_applied(r->writer);
+        e = pump_reap(r);
+    }
+    if (!e) e = pump_reap(r);
+    return e;
+}
+
 int replica_reads_in_flight(const replica *r) {
     return r ? rdpool_inflight(r->readers) : 0;
 }
@@ -3993,7 +4473,7 @@ void replica_drop_client(replica *r, uint64_t client) {
          * to go. Whatever was held is given back. */
         if (r->transfer_waiter == p) r->transfer_waiter = NULL;
         if (p->barrier) rn_read_release(r->node, p->barrier);
-        else if (!p->done && p->token) dbi_abandon(r->inst, p->token);
+        else if (!p->done && p->token) abandon_paused(r, p->token);
         pending_release(p);
     }
 }

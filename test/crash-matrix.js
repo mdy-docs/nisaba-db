@@ -286,8 +286,28 @@ const OPS = {
 async function indexesAgree(c) {
   if (!(await c.db(DB).listCollections()).includes('c')) return null;
   const col = c.db(DB).collection('c');
-  for (const ix of await col.listIndexes()) {
+  for (let ix of await col.listIndexes()) {
     if (ix.name === '_id_' || !/^bucket_/.test(ix.name)) continue;
+    /*
+     * A kill inside a staged createIndex leaves a BUILDING definition, and
+     * the reboot legitimately RESUMES it (resume_builds): that is recovery
+     * doing its job, not debris, and findByIndex answers -79 until the
+     * backfill commits. So a building index is waited out -- BOUNDED,
+     * because a resumed build that never commits is exactly the regression
+     * this file must not wave through -- and then held to the same
+     * agreement as any other. One that vanishes instead was aborted or
+     * dropped by a replayed inverse, which the file-count check judges.
+     */
+    const deadline = Date.now() + 15000;
+    while (ix && ix.building) {
+      if (Date.now() > deadline) {
+        return `index ${ix.name} was still building 15s after boot:` +
+               ` a resumed build never committed`;
+      }
+      await new Promise((res) => setTimeout(res, 50));
+      ix = (await col.listIndexes()).find((i) => i.name === ix.name);
+    }
+    if (!ix) continue;
     for (let v = 0; v < 7; v++) {
       const viaIndex = (await col.findByIndex(ix.name, [v])).length;
       const viaScan = await col.countDocuments({ bucket: v });

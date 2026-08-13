@@ -49,11 +49,15 @@
  * MANY CONNECTIONS, ONE AT A TIME THROUGH THE ENGINE. poll() over the
  * listener and every accepted socket; whichever is ready is served, and
  * a client that holds a connection open without asking anything costs a
- * table slot and nothing else. There are no threads and there is no
- * second engine: dbs_handle runs to completion for one request before
- * the next is looked at, so the database sees exactly the serial stream
- * it saw when there was one connection. What changed is who has to wait
- * for whom.
+ * table slot and nothing else. There is one engine: dbs_handle runs to
+ * completion for one request before the next is looked at, so the
+ * database sees exactly the serial stream it saw when there was one
+ * connection. What changed is who has to wait for whom. The two threads
+ * a replicated native server does run -- readers for long scans
+ * (server/readers.h) and the writer for committed applies
+ * (server/writer.h) -- never overlap the engine with this loop: views,
+ * drains and the boundary pause are the whole of that story, told in
+ * those headers.
  *
  * That means the sockets are non-blocking and a connection carries state
  * -- the bytes of a request that has only partly arrived, and the bytes
@@ -128,6 +132,7 @@
 #include "group.h"
 #include "replica.h"
 #include "readers.h"   /* SERVER_HAS_READ_THREADS */
+#include "writer.h"    /* SERVER_HAS_WRITE_THREAD */
 #include "root.h"
 #include "peers.h"
 #include "join.h"
@@ -357,7 +362,10 @@ static int serve(dbi *inst, replica *rep, int in_fd, int out_fd) {
         for (;;) {
             dbuf frame = {0};
             int have = 0;
-            if (dbi_stream_take(inst, 1, &frame, &have) != 0 || !have) {
+            replica_pause_applies(rep);
+            int te = dbi_stream_take(inst, 1, &frame, &have);
+            replica_resume_applies(rep);
+            if (te != 0 || !have) {
                 dbuf_free(&frame);
                 break;
             }
@@ -432,7 +440,11 @@ static void conn_close(conn *c) {
  * and still apply, but the answer has nowhere to go.
  */
 static void conn_gone(dbi *inst, replica *rep, conn *c) {
+    /* The session teardown reaches into cursors and streams, which the
+     * writer thread may be applying beside: parked for it. */
+    replica_pause_applies(rep);
     dbi_drop_client(inst, c->client);
+    replica_resume_applies(rep);
     if (rep) replica_drop_client(rep, c->client);
     conn_close(c);
 }
@@ -715,10 +727,11 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
      * have watched -- its own listener and one socket per direction per
      * member (server/peers.h bounds it, which is what makes this one
      * allocation rather than a growing array). */
-    /* ...plus one for the reader pool's wake pipe (server/readers.h), which
-     * is how a read finished on another thread interrupts a poll() that is
-     * otherwise blocked with no timeout at all. */
-    struct pollfd *pf = (struct pollfd *)calloc((size_t)max_clients + 1 + PEERS_MAX_FDS + 1,
+    /* ...plus one each for the reader pool's and the writer's wake pipes
+     * (server/readers.h, server/writer.h), which are how work finished on
+     * another thread interrupts a poll() that is otherwise blocked with
+     * no timeout at all. */
+    struct pollfd *pf = (struct pollfd *)calloc((size_t)max_clients + 1 + PEERS_MAX_FDS + 2,
                                                 sizeof *pf);
     if (!cs || !pf) { free(cs); free(pf); return -1; }
     for (int i = 0; i < max_clients; i++) cs[i].fd = -1;
@@ -774,6 +787,13 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
         pf[wbase].fd = wake_fd;
         pf[wbase].events = POLLIN;
         pf[wbase].revents = 0;
+        /* The writer's wake, one slot on: a committed entry finishing its
+         * apply is deliverable work exactly as a finished read is. */
+        const int wwbase = wbase + (wake_fd >= 0 ? 1 : 0);
+        const int wwake_fd = replica_write_wake_fd(rep);
+        pf[wwbase].fd = wwake_fd;
+        pf[wwbase].events = POLLIN;
+        pf[wwbase].revents = 0;
 
         /* Sleep until something happens or the earliest deadline, rather
          * than waking on a tick to find nothing to do. No timer, no
@@ -788,7 +808,10 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
          * overflow notice sits undelivered until an unrelated request
          * happens to wake the loop.
          */
-        if (dbi_stream_pending(inst)) wait_ms = 0;
+        replica_pause_applies(rep);
+        int events_due = dbi_stream_pending(inst);
+        replica_resume_applies(rep);
+        if (events_due) wait_ms = 0;
         else if (idle_ms && n > 0) {
             uint64_t now = now_ms(), earliest = 0;
             for (int i = 0; i < n; i++)
@@ -807,7 +830,8 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
             if (wait_ms < 0 || tick < wait_ms) wait_ms = tick;
         }
 
-        int r = poll(pf, (nfds_t)(n + 1 + (int)pn + (wake_fd >= 0 ? 1 : 0)), wait_ms);
+        int r = poll(pf, (nfds_t)(n + 1 + (int)pn + (wake_fd >= 0 ? 1 : 0)
+                                  + (wwake_fd >= 0 ? 1 : 0)), wait_ms);
         if (r < 0) {
             if (errno == EINTR) continue;
             perror("poll");
@@ -857,6 +881,18 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
              * anyway.
              */
             if (replica_adopt_pending(rep)) {
+                /* THE WRITER FIRST: everything already handed to it is
+                 * applied and its results delivered into the requests
+                 * waiting for them, before the instance those applies run
+                 * against is closed. It stays idle from here to the swap
+                 * -- nothing below pumps -- which is what makes closing
+                 * the instance under it safe. */
+                int wde = replica_drain_applies(rep);
+                if (wde != 0) {
+                    fprintf(stderr, "replica: the writer would not finish before"
+                                    " an install (%d: %s)\n", wde, dc_strerror(wde));
+                    break;
+                }
                 /* Adoption closes the whole instance and puts different
                  * files where the database looks. Every read view any
                  * worker holds points into the files being replaced, so
@@ -1115,6 +1151,7 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
          * becoming this process's problem, and it says so (-60, on the
          * stream, when it overflows).
          */
+        replica_pause_applies(rep);
         for (int i = n - 1; i >= 0; i--) {
             int any = 0;
             /* Not while an answer is deferred. Events would jump the
@@ -1150,6 +1187,7 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                 n--;
             }
         }
+        replica_resume_applies(rep);
 
         /*
          * Answers to writes that have now committed and applied. They
@@ -1224,6 +1262,7 @@ static void usage(const char *me) {
             "           [--election-timeout MIN[:MAX]] [--heartbeat MS]\n"
             "           [--max-batch BYTES] [--index-chunk DOCS]\n"
             "           [--read-threads N|auto] [--read-offload-min DOCS]\n"
+            "           [--write-thread 0|1]\n"
             "  serves the instance in the preopened directory \".\"\n"
             "  --bind: where the client wire listens (default 127.0.0.1;\n"
             "         widen it consciously -- there is no auth on this wire)\n"
@@ -1275,7 +1314,11 @@ static void usage(const char *me) {
             "  --read-offload-min: how many documents a collection must hold\n"
             "         before a scanning read of it is worth moving (default\n"
             "         %d). Below it a read is cheaper answered inline than\n"
-            "         queued\n", me, REPLICA_READ_MIN_DOCS);
+            "         queued\n"
+            "  --write-thread: whether committed entries are applied on a\n"
+            "         writer thread (default 1 on a replicated server; wasm\n"
+            "         has none). 0 applies inline on the serving thread,\n"
+            "         byte for byte as it always did\n", me, REPLICA_READ_MIN_DOCS);
 }
 
 /*
@@ -1424,6 +1467,12 @@ int main(int argc, char **argv) {
      * no threads, where the announcement it feeds cannot be reached. */
     int auto_threads = 0;
     long read_min_docs = -1;
+    /* -1 means "not given": the default is ON for a replicated server on
+     * a build with threads, and --write-thread 0 is the reversibility
+     * lever -- applies inline on the serving thread, byte for byte as
+     * they always ran, proven equivalent by the oracle rather than
+     * asserted. */
+    long write_thread = -1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stdio") == 0) use_stdio = 1;
@@ -1511,6 +1560,13 @@ int main(int argc, char **argv) {
             if (read_threads > SERVER_MAX_READ_THREADS) {
                 fprintf(stderr, "--read-threads %ld is more than this build will run"
                                 " (max %d)\n", read_threads, SERVER_MAX_READ_THREADS);
+                return 2;
+            }
+        }
+        else if (strcmp(argv[i], "--write-thread") == 0 && i + 1 < argc) {
+            write_thread = atol(argv[++i]);
+            if (write_thread != 0 && write_thread != 1) {
+                fprintf(stderr, "--write-thread is 0 (apply inline, as always) or 1\n");
                 return 2;
             }
         }
@@ -1632,6 +1688,35 @@ int main(int argc, char **argv) {
                         " --read-threads\n");
         return 2;
     }
+    /* The writer thread applies COMMITTED entries, and only a replicated
+     * server has any: an unreplicated one applies inside the request
+     * that carried the write, and there is nothing to hand a thread. */
+    if (write_thread > 0 && !SERVER_HAS_WRITE_THREAD) {
+        fprintf(stderr, "--write-thread is not available in this build: wasm has no"
+                        " threads, so every entry is applied on the serving thread\n");
+        return 2;
+    }
+    if (write_thread > 0 && node_id <= 0) {
+        fprintf(stderr, "--write-thread needs --raft NODE_ID: only a replicated"
+                        " server applies committed entries\n");
+        return 2;
+    }
+    /* One client and no poll loop: --stdio turns the clock by spinning,
+     * and a spin racing a thread is a timeout dressed as concurrency.
+     * There is also nobody to isolate the applies FROM. */
+    if (write_thread > 0 && use_stdio) {
+        fprintf(stderr, "--write-thread does not fit --stdio: one client, no"
+                        " poll loop, nobody to isolate the applies from\n");
+        return 2;
+    }
+#if SERVER_HAS_WRITE_THREAD
+    /* ON unless declined, wherever it can exist: the isolation is the
+     * default for the same reason the reader threads' is -- shipping it
+     * off means nobody gets the fix. */
+    if (write_thread < 0) write_thread = (node_id > 0 && !use_stdio) ? 1 : 0;
+#else
+    if (write_thread < 0) write_thread = 0;
+#endif
 #if SERVER_HAS_READ_THREADS
     /*
      * ---- THE DEFAULT IS NOW ON -------------------------------------------
@@ -1977,6 +2062,17 @@ int main(int argc, char **argv) {
         }
         if (max_batch) replica_set_max_batch(rep, (uint32_t)max_batch);
         if (index_chunk) replica_set_index_chunk(rep, (uint32_t)index_chunk);
+        if (write_thread > 0) {
+            int wte = replica_set_write_thread(rep, 1);
+            if (wte != 0) {
+                fprintf(stderr, "cannot start the writer thread: %s\n", dc_strerror(wte));
+                replica_close(rep);
+                dbi_close(inst);
+                root_free(rst);
+                instns_free(&ns);
+                return 1;
+            }
+        }
         if (read_threads >= 0 || read_min_docs >= 0) {
             int rte = replica_set_read_offload(rep, (int)read_threads,
                                                (int64_t)read_min_docs);
@@ -2038,6 +2134,11 @@ int main(int argc, char **argv) {
                     (long long)(read_min_docs >= 0 ? read_min_docs
                                                    : REPLICA_READ_MIN_DOCS));
         }
+        /* Same rule as the reader threads' line: a thread that appears
+         * after an upgrade has to be explicable from the log alone. */
+        if (rep && write_thread > 0)
+            fprintf(stderr, "nisaba: writer thread (committed entries apply off"
+                            " the serving thread)\n");
         fflush(stderr);
         rc = serve_forever(&inst, rep, px, srv, max_clients, idle_seconds,
                            &rootops, order, rst) == 0 ? 0 : 1;

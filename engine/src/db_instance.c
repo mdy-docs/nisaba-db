@@ -2,6 +2,7 @@
 #include "db_instance.h"
 
 #include "db_validate.h"
+#include "db_names.h"   /* DC_FORMAT_VERSION, for the -55 refusal */
 #include "db_wal.h"     /* DC_ERR_WAL_MISSING_FIELD: a malformed entry */
 #include "bjcursor.h"
 
@@ -381,6 +382,23 @@ static int resolve(dbi *i, const uint8_t *req, size_t len, dbs **out, dbuf *res)
         return e ? e : 1;
     }
     e = dbi_database(i, (const char *)name, nlen, 1, out);
+    if (e == DC_ERR_FORMAT_NEWER) {
+        /* The one refusal whose useful content is two numbers the code
+         * cannot carry: which version the directory holds, and which this
+         * build understands. The session is already gone (dbs_open freed
+         * it on refusal), so the stamp is re-read through a short-lived
+         * namespace -- a failure to re-read omits the number rather than
+         * inventing one. */
+        int64_t found_v = -1;
+        bj_ns ns;
+        memset(&ns, 0, sizeof ns);
+        if (i->root.open_ns(i->root.ctx, (const char *)name, (uint32_t)nlen, 0, &ns) == BJ_OK) {
+            found_v = dbs_peek_format(&ns);
+            i->root.close_ns(i->root.ctx, &ns);
+        }
+        e = dbs_refusal_format_newer(res, found_v, DC_FORMAT_VERSION);
+        return e ? e : 1;
+    }
     if (e) { e = dbs_refusal(e, res); return e ? e : 1; }
     return 0;
 }

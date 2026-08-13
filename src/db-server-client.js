@@ -443,6 +443,10 @@ class Connection {
        * only by whoever built the list. */
       const err = new ServerError(res.code, res.msg || `error ${res.code}`);
       if (typeof res.index === 'number') err.index = res.index;
+      /* A format refusal names both versions -- "upgrade nisaba" is only
+       * actionable when the caller can say from what to what. */
+      if (typeof res.found === 'number') err.found = res.found;
+      if (typeof res.understands === 'number') err.understands = res.understands;
       /* A refusal can also name WHO to ask instead. A replicated server
        * refuses a write it cannot take with the leader's id and, when it
        * knows one, the member record carrying its address -- an id alone

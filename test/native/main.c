@@ -2649,10 +2649,15 @@ TEST(the_bare_set_is_exactly_the_ops_that_need_no_session) {
      * name -- so a caller that switched on the op alone would hand a cursor
      * to somebody with no session to own it.
      */
-    static const char *BARE[] = { "find", "findOne", "count", "distinct" };
+    static const char *BARE[] = { "find", "findOne", "count", "distinct",
+        /* aggregate joined once made_body grew error_at -- the stage-naming
+         * failure shape was the only thing run_read could not build; the
+         * read path was proven against a view long before (the read-view
+         * aggregate test below in this file). */
+        "aggregate" };
     static const char *NOT_BARE[] = {
         "ping", "getMore", "closeCursor", "watch", "closeStream",
-        "listCollections", "listIndexes", "aggregate", "explain",
+        "listCollections", "listIndexes", "explain",
         "findByIndex", "insert", "insertMany", "update", "updateMany",
         "replace", "delete", "deleteMany", "bulkWrite", "compact",
         "createCollection", "dropCollection", "createIndex", "dropIndex",

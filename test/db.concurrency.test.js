@@ -396,6 +396,15 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
         (k) => k.coll.distinct('tag'),
         (k) => k.coll.find({}, { sort: { n: -1 }, limit: 3 }).toArray(),
         (k) => k.coll.find({}, { projection: { tag: 1 } , limit: 2 }).toArray(),
+        /* aggregate, offloadable since made_body grew error_at: both
+         * pipeline halves -- a leading $match pushed into the scan, and a
+         * $group over materialized documents -- and a $sort, whose order is
+         * exactly what a read that moved threads could get wrong. */
+        (k) => k.coll.aggregate([{ $match: { team: 'other' } }, { $count: 'n' }]).toArray(),
+        (k) => k.coll.aggregate([
+          { $group: { _id: '$team', total: { $sum: 1 } } },
+          { $sort: { _id: 1 } }
+        ]).toArray(),
       ];
       /* Everything compared, ids and order included. */
       for (let i = 0; i < shapes.length; i++) {
@@ -414,6 +423,16 @@ describe.skipIf(!enabled)('a busy server: long reads on reader threads', () => {
        * required one, and it must come back as a refusal rather than as a
        * dead connection. */
       await expect(A.coll.distinct('')).rejects.toThrow();
+      expect((await A.c.ping()).pong).toBe(true);
+
+      /* An aggregate's failure NAMES ITS STAGE through the offloaded path
+       * -- the response shape that kept it inline for a whole release. */
+      let stageErr = null;
+      try { await A.coll.aggregate([{ $match: {} }, { $obliterate: {} }]).toArray(); }
+      catch (e) { stageErr = e; }
+      expect(stageErr, 'a bad stage did not refuse').toBeTruthy();
+      expect(stageErr.message, 'the refusal lost the stage position')
+        .toMatch(/stage 1/);
       expect((await A.c.ping()).pong).toBe(true);
 
       await A.c.close(); await B.c.close();

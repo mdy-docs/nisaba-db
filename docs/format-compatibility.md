@@ -23,10 +23,12 @@ server:
 - A database stamped **above** the build's version is refused before
   anything touches the files — in particular before the orphan sweep,
   which must never judge a future format's files by an old version's
-  naming rules. The JS host's error names both versions; the C server
-  answers `DC_ERR_FORMAT_NEWER`, whose text points here and does *not*
-  carry the version it found (a coded error cannot; threading the number
-  out of `check_format` is the change if that ever matters).
+  naming rules. Both hosts name both versions: the JS host in its error
+  message, the C server as `found`/`understands` fields beside the coded
+  `DC_ERR_FORMAT_NEWER` refusal (additive, the `respond_error_at`
+  precedent) — the stamp is re-read after the refusal (`dbs_peek_format`)
+  because a coded int cannot carry it, and an unreadable stamp omits
+  `found` rather than inventing it.
 
   **That sentence is now load-bearing, and measured.** It cost nothing
   while the C server had no sweep. It has one (`dbi_sweep_all`, run before

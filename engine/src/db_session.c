@@ -514,6 +514,44 @@ static int check_format(dbs *s, int create) {
     return e;
 }
 
+/*
+ * The stamp, read without opening the database -- for the one error that
+ * needs it AFTER dbs_open has refused. A refusal is a coded int and cannot
+ * carry the version it found; whoever answers a client re-asks here and
+ * puts both numbers in the response (dbi's resolve). Read-only: the
+ * catalog is opened, the stamp read, everything closed. -1 = could not
+ * read (which the caller reports as unknown, not as an error -- the
+ * refusal already happened).
+ */
+int64_t dbs_peek_format(bj_ns *ns) {
+    if (!ns || !ns->open) return -1;
+    bj_io io;
+    if (ns->open(ns->ctx, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE), 0, &io))
+        return -1;
+    bpt *cat = io.size(io.ctx) == 0 ? NULL : bpt_open(&io);
+    if (!cat) {
+        if (io.close) io.close(io.ctx);
+        return -1;
+    }
+    bpt_key key = { .is_string = 1, .num = 0,
+                    .str = (const uint8_t *)DC_FORMAT_KEY,
+                    .str_len = (uint32_t)strlen(DC_FORMAT_KEY) };
+    int found = 0;
+    const uint8_t *vp = NULL; size_t vlen = 0;
+    int64_t v = -1;
+    if (bpt_search(cat, &key, &found, &vp, &vlen) == BJ_OK && found) {
+        const uint8_t *nv; size_t nvlen; int f = 0;
+        if (obj_get_field(vp, vlen, (const uint8_t *)"v", 1, &nv, &nvlen, &f) == BJ_OK && f) {
+            cur c = { nv, nvlen, 0 };
+            double d = 0;
+            if (read_number(&c, &d) == BJ_OK) v = (int64_t)d;
+        }
+    }
+    bpt_free(cat);
+    if (io.close) io.close(io.ctx);
+    return v;
+}
+
 int dbs_open(bj_ns *ns, int order, int create, dbs **out) {
     if (!ns || !ns->open || !ns->close || !out) return BJ_ERR_STATE;
     *out = NULL;

@@ -99,10 +99,12 @@ typedef enum {
  * NOT offloadable is the DEFAULT, and every op states its answer, so an op
  * added later cannot be raced by omission. DBS_REQ_READ is not the same
  * question and does not imply this one: `getMore` reads, but it advances a
- * cursor the session owns; `watch` reads, but it registers a stream;
- * `listCollections` reads the catalog rather than a collection; and
- * `aggregate` reads a collection but answers a failure by naming the stage
- * that failed, which is a response shape run_read does not build.
+ * cursor the session owns; `watch` reads, but it registers a stream; and
+ * `listCollections` reads the catalog rather than a collection.
+ * (`aggregate` sat on this list for one release: it answers a failure by
+ * naming the stage that failed, a response shape run_read did not build
+ * until made_body grew `error_at`. The read path itself was proven against
+ * a view the whole time.)
  */
 /*
  * The fifth column is whether performing the op TRUNCATES, REPLACES OR
@@ -165,7 +167,7 @@ static const struct {
     OP("listCollections",  OP_LIST_COLLECTIONS,  DBS_REQ_READ, OWNED, KEEPS),
     OP("insertMany",       OP_INSERT_MANY,       DBS_REQ_WRITE, OWNED, KEEPS),
     OP("bulkWrite",        OP_BULK_WRITE,        DBS_REQ_WRITE, OWNED, KEEPS),
-    OP("aggregate",        OP_AGGREGATE,         DBS_REQ_READ, OWNED, KEEPS),
+    OP("aggregate",        OP_AGGREGATE,         DBS_REQ_READ, BARE,  KEEPS),
     OP("explain",          OP_EXPLAIN,           DBS_REQ_READ, OWNED, KEEPS),
     OP("findOneAndUpdate",  OP_FIND_ONE_AND_UPDATE,  DBS_REQ_WRITE, OWNED, KEEPS),
     OP("findOneAndReplace", OP_FIND_ONE_AND_REPLACE, DBS_REQ_WRITE, OWNED, KEEPS),
@@ -394,6 +396,32 @@ static int respond_error_at(dbuf *out, int code, int index) {
 int dbs_refusal(int code, dbuf *out) {
     if (!out) return BJ_ERR_STATE;
     return respond_error(out, code);
+}
+
+/*
+ * DC_ERR_FORMAT_NEWER, naming both versions. Additive beside
+ * {ok, code, msg} exactly as respond_error_at's `at` is: the numbers are
+ * the whole content of the answer -- "upgrade nisaba" is only actionable
+ * when the client can say from what to what -- and a coded int cannot
+ * carry them, so the resolver re-reads the stamp (dbs_peek_format) and
+ * hands them here. `found` < 0 means the stamp could not be re-read,
+ * and the field is omitted rather than invented.
+ */
+int dbs_refusal_format_newer(dbuf *out, int64_t found, int64_t understands) {
+    if (!out) return BJ_ERR_STATE;
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    const char *msg = dc_strerror(DC_ERR_FORMAT_NEWER);
+    bj_begin_object(b);
+    PUT_KEY(b, "ok");   bj_put_bool(b, 0);
+    PUT_KEY(b, "code"); bj_put_int(b, DC_ERR_FORMAT_NEWER);
+    PUT_KEY(b, "msg");  bj_put_string(b, (const uint8_t *)msg, (uint32_t)strlen(msg));
+    if (found >= 0) { PUT_KEY(b, "found"); bj_put_int(b, found); }
+    PUT_KEY(b, "understands"); bj_put_int(b, understands);
+    bj_end_object(b);
+    int e = finish(b, out);
+    bj_builder_free(b);
+    return e;
 }
 
 /* {_id: <oid>} -- the filter that reads one document back by id, which
@@ -1287,6 +1315,12 @@ typedef struct {
     int         is_number;
     int         is_bool_found;
     int         found_doc;
+    /* A POSITION a failure names -- an aggregate's failed stage. -1 when
+     * the error has none; dbs_read renders it with respond_error_at, the
+     * same additive shape a malformed bulkWrite uses. This field is what
+     * made aggregate offloadable: the stage-naming response was the only
+     * thing run_read could not build. */
+    int         error_at;
 } made_body;
 
 /* The one place a successful reply is built. */
@@ -1416,6 +1450,25 @@ static int run_read(dc_collection *c, int op,
             made->body_key = "values";
             return e;
         }
+        case OP_AGGREGATE: {
+            /* The same call the session path makes (dc_aggregate against a
+             * plain dc_collection -- a read view IS one, proven by the C
+             * harness's read-view aggregate test long before this case
+             * existed). A failed stage's position lands in made->error_at
+             * for dbs_read to render; the session path renders the same
+             * number through the same respond_error_at. */
+            const uint8_t *stages; size_t stages_len; int have = 0;
+            if ((e = field_raw(req, req_len, "stages", &stages, &stages_len, &have))) return e;
+            if (!have) return DC_ERR_REQ_MISSING_FIELD;
+            uint8_t *docs = NULL; size_t docs_len = 0;
+            int bad = -1;
+            e = dc_aggregate(c, stages, stages_len, &bad, &docs, &docs_len);
+            if (e) { free(docs); made->error_at = bad; return e; }
+            e = dbuf_put(&made->body, docs, docs_len);
+            free(docs);
+            made->body_key = "docs";
+            return e;
+        }
         default:
             /* Reached only by a caller that ignored the table's `bare`
              * column, which is a programming error rather than a request
@@ -1517,14 +1570,17 @@ int dbs_read(dc_collection *coll, const uint8_t *req, size_t req_len, dbuf *out)
     if (e) return respond_error(out, DC_ERR_REQ_MALFORMED);
 
     made_body made = {0};
+    made.error_at = -1;
     e = run_read(coll, op_of(req, req_len), req, req_len, filter, filter_len, &made);
     if (e) {
         dbuf_free(&made.body);
         /* A refusal is an ANSWER here, exactly as it is from dbs_handle:
          * whoever is holding this request has a client waiting on it, and
          * the error travels as a response rather than as a return code
-         * somebody else has to render. */
-        return respond_error(out, e);
+         * somebody else has to render -- including the position a failure
+         * names (an aggregate's stage), which respond_error_at renders and
+         * a positionless error (-1) degrades past. */
+        return respond_error_at(out, e, made.error_at);
     }
     e = render_made(&made, out);
     dbuf_free(&made.body);

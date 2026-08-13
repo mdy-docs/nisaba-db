@@ -989,6 +989,16 @@ uint64_t dbs_applied_floor(dbs *s);
 int dbs_sweep_orphans(dbs *s, const char *names, size_t names_len,
                       uint32_t *deleted);
 
+/* The format stamp, read without opening the database: what version a
+ * directory dbs_open just refused (DC_ERR_FORMAT_NEWER) actually carries,
+ * so the refusal shown to a client can name both numbers. -1 = unreadable,
+ * reported as unknown. */
+int64_t dbs_peek_format(bj_ns *ns);
+
+/* The -55 refusal with both versions in it (found may be -1 = unknown);
+ * db_request.c builds it, dbi's resolver calls it. */
+int dbs_refusal_format_newer(dbuf *out, int64_t found, int64_t understands);
+
 /* ---- what db_request.c uses to implement the two above ------------------
  *
  * Not a host's to call. They are here rather than in a private header

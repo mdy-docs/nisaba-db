@@ -5284,6 +5284,15 @@ for (const engine of ENGINES) {
         catch (e) { err = e; }
         expect(err, 'a future format was opened and read').toBeTruthy();
         expect(err.message).toMatch(/format is newer|upgrade nisaba/i);
+        /* WITH THE NUMBERS: "upgrade nisaba" is only actionable when the
+         * client can say from what to what. Additive fields beside the
+         * coded refusal, the respond_error_at precedent -- the stamp is
+         * re-read after the refusal because a coded int cannot carry it. */
+        expect(err.body?.found ?? err.found, 'the refusal does not name the' +
+          ' version it found').toBe(99);
+        expect(err.body?.understands ?? err.understands,
+          'the refusal does not name the version this build understands')
+          .toBe(1);
         await back.close();
       } finally {
         first.proc.kill();

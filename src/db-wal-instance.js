@@ -402,6 +402,44 @@ class WalInstance {
  * the C server documents the same behaviour (docs/db-server.md), and the
  * proper fix in both is an applied index the INSTANCE records for itself.
  */
+/*
+ * The instance's own applied mark -- the JS half of server/applied.h,
+ * same file, same encoding, same guard. `__applied__.bj` at the root (the
+ * one place a dropDatabase cannot reach) holds the highest index this
+ * instance is KNOWN to have fully applied, and it is trusted only when it
+ * covers the whole log: a partial mark would let replay resume above the
+ * per-database records but below entries whose prerequisites a drop
+ * destroyed -- the -37 the rescue exists to prevent, with the rescue
+ * suppressed. Covering the whole log means there is nothing left to
+ * replay, which is exactly the idle-instance case whose rescue-on-every-
+ * open this ends.
+ */
+const APPLIED_FILE = '__applied__.bj';
+
+async function appliedMarkLoad(provider) {
+  try {
+    const files = await provider.listFiles();
+    if (!files.includes(APPLIED_FILE)) return 0;
+    const handle = await provider.openFile(APPLIED_FILE, { create: false });
+    const size = handle.getSize();
+    const buf = new Uint8Array(size);
+    handle.read(buf, { at: 0 });
+    await handle.close();
+    return Number(decode(buf).applied) || 0;
+  } catch {
+    return 0;   /* unreadable is the same as absent: the net stays up */
+  }
+}
+
+async function appliedMarkStore(provider, applied) {
+  const handle = await provider.openFile(APPLIED_FILE, { create: true });
+  handle.truncate(0);
+  const bytes = encode({ applied });
+  handle.write(bytes, { at: 0 });
+  handle.flush();
+  await handle.close();
+}
+
 export function generationCanRescue(inst, floor) {
   const gen = inst._store?.latest;
   const base = inst._log.baseIndex;
@@ -446,9 +484,15 @@ export async function connectWalInstance(provider, options = {}) {
     // cannot hold again, and a root that still looks unusable is a fault
     // to surface rather than a loop to spin in.
     if (!restored && generationCanRescue(inst, floor)) {
-      await inst.close();
-      await restoreLatestInstanceSnapshot(provider, { snapshotPrefix });
-      return connectWalInstance(provider, { ...options, restored: true });
+      /* Unless the mark says this whole log was already replayed -- the
+       * open that follows a completed rescue writes it (below), so an
+       * idle instance stops re-rescuing on every open. */
+      const mark = await appliedMarkLoad(provider);
+      if (mark < inst._log.lastIndex) {
+        await inst.close();
+        await restoreLatestInstanceSnapshot(provider, { snapshotPrefix });
+        return connectWalInstance(provider, { ...options, restored: true });
+      }
     }
     if (floor > inst._log.lastIndex) {
       const { currentTerm, votedFor, lastTerm } = inst._log;
@@ -462,6 +506,16 @@ export async function connectWalInstance(provider, options = {}) {
     }
     if (inst._log.currentTerm === 0) inst._log.setHardState(1);
     await inst._recover();
+    /* A rescued open has now SYNCHRONOUSLY replayed the whole suffix, so
+     * the mark can honestly say "everything in this log is applied" --
+     * which is what the guard above reads, and what ends the recurrence.
+     * Written only after a rescue: an ordinary open's per-database records
+     * already carry the floor, and the mark would be one fsync of noise.
+     * (The REPLICATED opener never writes one: its pump replays
+     * asynchronously, so there is no moment inside the open where the
+     * claim is true -- it honors a mark the WAL opener wrote, and
+     * otherwise keeps the documented rescue-per-boot cost.) */
+    if (restored) await appliedMarkStore(provider, inst._log.lastIndex);
     return inst;
   } catch (err) {
     await client.close();
@@ -511,4 +565,4 @@ export async function restoreLatestInstanceSnapshot(provider, { snapshotPrefix =
   }
 }
 
-export { WalInstance, InstanceDb };
+export { WalInstance, InstanceDb, appliedMarkLoad, appliedMarkStore };

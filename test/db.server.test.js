@@ -1900,6 +1900,13 @@ for (const engine of ENGINES) {
         first.proc.kill();
         await new Promise((r) => first.proc.once('exit', r));
 
+        /* The pre-mark shape: the drop's catch-up wrote the instance mark
+         * (server/applied.h), and a MARKED instance boots as itself with
+         * no restore to observe -- "restores ONCE" pins that. This test is
+         * the RESTORE PATH's regression net, so it studies the shape every
+         * pre-mark root on disk has. */
+        fs.rmSync(path.join(first.dir, '__applied__.bj'), { force: true });
+
         second = await startServer(engine, port,
           ['--raft', '1', '--snapshot-entries', '8'], 0, first.dir);
         const back = await connectServer(port, { keepAliveMs: 0 });
@@ -1947,6 +1954,12 @@ for (const engine of ENGINES) {
    */
   describe.skipIf(!enabled)(
       `nisaba-server: reconciling a generation (${engine.name})`, () => {
+    /* ONE slot for the whole describe (see nextPort's comment: the counter
+     * has a hard end and its exhaustion lands on whichever suite is
+     * declared last). Tests run sequentially and each kills its servers,
+     * but killAfterRestore leaves sockets in TIME_WAIT, so each test still
+     * gets its own offset within the slot. */
+    const SLOT = nextPort();
     /* No AUTOMATIC snapshots: this suite builds its generations by hand
      * and needs to know that the two it took are the two on disk. */
     const RAFT = ['--raft', '1', '--snapshot-entries', '0'];
@@ -2110,12 +2123,25 @@ for (const engine of ENGINES) {
       const dir = scratch('unusable');
       fs.rmSync(dir, { recursive: true, force: true });
       fs.cpSync(fixture.dir, dir, { recursive: true });
+      /*
+       * THE PRE-MARK SHAPE, MADE RATHER THAN FOUND. The fixture's own
+       * construction ends with a drop and a catch-up, so the build that
+       * has the instance mark (server/applied.h) writes __applied__.bj ==
+       * log last into it -- after which none of the unaccountable shapes
+       * this describe studies can arise: a marked-and-converged instance
+       * boots as itself, restoring nothing and halting on nothing (the
+       * "restores ONCE" test pins that directly). Every test here is
+       * about the OTHER instances -- everything on disk that predates the
+       * mark, and every crash that lands before a catch-up writes one --
+       * so the fixture sheds it.
+       */
+      fs.rmSync(path.join(dir, '__applied__.bj'), { force: true });
       return { ...fixture, dir };
     };
 
     it('leaves a generation older than the log alone, with the files intact',
        async () => {
-      const port = nextPort();
+      const port = SLOT + 0;
       const st = unusable();
       /* Every store file as the last boot left it, so the repair at the
        * end of this test puts back exactly what the surgery took. */
@@ -2208,7 +2234,7 @@ for (const engine of ENGINES) {
        * copy, where a partly restored file already carries an applied
        * index and could talk the next boot out of finishing the job.
        */
-      const port = nextPort();
+      const port = SLOT + 80;
       const st = unusable();
       const pristine = fixture.dir;
 
@@ -2217,6 +2243,10 @@ for (const engine of ENGINES) {
       for (const delay of [0, 1, 2, 4, 8, 16]) {
         fs.rmSync(st.dir, { recursive: true, force: true });
         fs.cpSync(pristine, st.dir, { recursive: true });
+        /* Fresh from the RAW fixture each attempt, so the mark comes back
+         * with it -- shed it again (see unusable(): a marked instance has
+         * no restore to interrupt). */
+        fs.rmSync(path.join(st.dir, '__applied__.bj'), { force: true });
 
         const hit = await boot(port, st.dir, delay);
         if (!hit.interrupted) {
@@ -2265,39 +2295,72 @@ for (const engine of ENGINES) {
         ` ${notes.join('; ')}`).toBeGreaterThan(0);
     }, 180000);
 
-    it('reconciles on EVERY boot until one write catches the floor up',
+    it('ignores a mark that does not cover the log, and restores anyway', async () => {
+      /*
+       * THE GUARD IS THE FIX'S OTHER HALF. A mark below the log's last
+       * index would lift the boot floor above the per-database records
+       * while entries above it still need replaying -- into state a drop
+       * may have removed, which is the -37 halt the restore exists to
+       * prevent, now with the restore suppressed. So a partial mark is
+       * IGNORED: this boot must behave exactly as if the file were absent
+       * -- restore, replay, serve -- and the halt must not occur.
+       *
+       * The mark is doctored to the log's BASE, the most tempting wrong
+       * value (it is what a naive "record the snapshot boundary" design
+       * writes, and what an interrupted post-restore replay would leave
+       * meaningful-looking).
+       */
+      const port = SLOT + 160;
+      const st = unusable();
+      const doctored = encode({ applied: st.g2.lastIncludedIndex });
+      fs.writeFileSync(path.join(st.dir, '__applied__.bj'), doctored);
+
+      const only = await boot(port, st.dir);
+      try {
+        expect(only.halted, 'a partial mark suppressed the restore and the' +
+          ' replay met an entry whose state a drop removed:\n    ' + tail(only))
+          .toBe(false);
+        expect(only.serving, 'it did not start:\n    ' + tail(only)).toBe(true);
+        expect(only.restored, 'a partial mark was trusted -- the whole-log' +
+          ' guard is gone:\n    ' + tail(only)).toBe(true);
+        const c = await connectServer(port, { keepAliveMs: 0 });
+        expect(await c.listDatabases()).not.toContain(DOOMED);
+        expect(await c.db(SAFE).collection('keep').countDocuments({})).toBe(KEPT);
+        await c.close();
+      } finally {
+        only.proc.kill();
+        await waitExit(only.proc);
+      }
+    }, 120000);
+
+    it('restores ONCE: the instance mark ends the reconcile-on-every-boot cost',
        async () => {
       /*
-       * A COST THIS PAYS, MEASURED RATHER THAN ASSUMED -- and the reason
-       * the restore is not the end of the story.
+       * THE COST THIS USED TO PAY, NOW GONE, AND THIS TEST IS THE PROOF
+       * EITHER WAY. The restore's trigger was "the live files account for
+       * less than the log's base", and converging by restore-then-replay
+       * reached a state that still recorded nothing above the base -- so an
+       * IDLE instance restored on every boot, rewriting its whole dataset
+       * each time, until one ordinary write happened to land. The previous
+       * version of this test asserted that recurrence on purpose, with a
+       * note saying which expectation should turn red when an instance-
+       * level applied index landed. It landed (server/applied.h): the
+       * completed restore -- and every snapshot commit, and every install
+       * adoption -- writes the boundary into __applied__.bj at the root,
+       * the one place a dropDatabase cannot reach, and the boot floor and
+       * the restore trigger both take the max with it.
        *
-       * The restore does not clear its own trigger. The trigger is "the
-       * live files account for less than the log's base", and what made
-       * that true was a drop with nowhere to record what it had applied;
-       * restoring the generation and replaying the drop again reaches the
-       * same state, which is still a state nothing records. So the next
-       * boot reads the same floor, draws the same conclusion, and rewrites
-       * every live file from the generation once more.
-       *
-       * That is not merely wasteful. It is what keeps the instance
-       * BOOTABLE: replay resumes at the base every time, and the entries
-       * above it name a database the drop removed -- so a boot that
-       * skipped the restore would halt exactly as it did before the fix.
-       * Correctness is not at risk (each boot converges, asserted below);
-       * startup time proportional to the whole dataset is.
-       *
-       * ONE ORDINARY WRITE ends it, because a write records its index in
-       * the collection it touches, and that is above the base -- no
-       * snapshot required. A busy instance therefore heals itself within
-       * a request; an idle one restores on every boot until somebody
-       * writes to it. Both halves are asserted here so that a change to
-       * either is visible: if a later fix records the applied index at
-       * instance level, the SECOND expectation below is the one that
-       * turns red, and it should.
+       * So: boot one RESTORES (the fault is real), boot two DOES NOT (the
+       * mark held), and both serve the same converged state -- because a
+       * mark that suppressed a restore that was genuinely owed would be
+       * quiet data loss, which is why convergence is asserted beside the
+       * absence of work.
        */
-      const port = nextPort();
+      const port = SLOT + 240;
       const st = unusable();
-
+      /* unusable() already shed the fixture's mark -- the upgrade shape:
+       * every instance on disk today predates __applied__.bj, and the
+       * first boot after upgrading is exactly this test. */
       const first = await boot(port, st.dir);
       try {
         expect(first.serving, 'it did not start:\n    ' + tail(first)).toBe(true);
@@ -2305,26 +2368,27 @@ for (const engine of ENGINES) {
           ' prove nothing:\n    ' + tail(first)).toBe(true);
         const c = await connectServer(port, { keepAliveMs: 0 });
         expect(await c.listDatabases()).not.toContain(DOOMED);
+        expect(await c.db(SAFE).collection('keep').countDocuments({})).toBe(KEPT);
         await c.close();
       } finally {
         first.proc.kill();
         await waitExit(first.proc);
       }
 
-      /* Again, over files that were just reconciled and converged. */
+      /* Again, idle -- NO write between boots, which is exactly the case
+       * that used to recur. */
       const second = await boot(port, st.dir);
       try {
         expect(second.serving, 'it did not start again:\n    ' + tail(second))
           .toBe(true);
-        expect(second.restored, 'THE COST IS GONE: it did not reconcile a' +
-          ' second time. If that is deliberate -- an applied index the whole' +
-          ' instance records, rather than one per surviving collection -- this' +
-          ' expectation is the one to delete:\n    ' + tail(second)).toBe(true);
+        expect(second.restored, 'it reconciled AGAIN over files a completed' +
+          ' restore already marked -- the instance mark is not being read,' +
+          ' or not being written:\n    ' + tail(second)).toBe(false);
         const c = await connectServer(port, { keepAliveMs: 0 });
         expect(await c.listDatabases(),
-          'it reconciled twice and diverged the second time').not.toContain(DOOMED);
+          'the restore was skipped and the drop came back').not.toContain(DOOMED);
         expect(await c.db(SAFE).collection('keep').countDocuments({})).toBe(KEPT);
-        /* The write that ends it. */
+        /* Still a working instance, and a write still lands. */
         await c.db(SAFE).collection('keep').insertOne({ n: -1, pad: 'z' });
         await c.close();
       } finally {
@@ -2336,8 +2400,7 @@ for (const engine of ENGINES) {
       try {
         expect(third.serving, 'it did not start after the write:\n    ' +
           tail(third)).toBe(true);
-        expect(third.restored, 'one write above the base did not stop it' +
-          ' reconciling, so nothing ends this:\n    ' + tail(third)).toBe(false);
+        expect(third.restored, 'a healthy instance reconciled').toBe(false);
         const c = await connectServer(port, { keepAliveMs: 0 });
         expect(await c.db(SAFE).collection('keep').countDocuments({}))
           .toBe(KEPT + 1);

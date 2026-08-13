@@ -2,6 +2,7 @@
 #include "replica.h"
 
 #include "group.h"
+#include "applied.h"
 #include "readers.h"   /* the threads that perform long reads */
 
 #include "raft_node.h"
@@ -176,6 +177,19 @@ struct replica {
     sst       *store;           /* owned; the snapshot store's policy */
     uint64_t   snap_every;      /* applied entries between snapshots; 0 = never */
     uint64_t   applied;
+    /*
+     * The instance-level applied mark (server/applied.h): `mark` mirrors
+     * what __applied__.bj holds; `mark_carries` says the mark is currently
+     * the ONLY durable record of how far this instance applied -- set when
+     * an instance-level dropDatabase applies (its apply destroys every
+     * record its database held), cleared by any other normal apply (which
+     * leaves a per-database record of its own). While it carries, the pump
+     * stores r->applied into the mark each time it catches up -- so an
+     * instance whose LAST entry is a drop remembers, across any number of
+     * idle reboots, that it already replayed it.
+     */
+    uint64_t   mark;
+    int        mark_carries;
     uint64_t   rnd;             /* the election-timeout draw's state */
     int        tick_ms;         /* the clock slice, derived from the heartbeat */
     uint64_t   self_id;
@@ -1223,6 +1237,16 @@ static int restore_if_unusable(replica *r) {
              * replaces those files, which is the same reason the whole
              * reconciliation happens before any database is held open. */
             floor = dbi_applied_floor(r->inst);
+            /* The instance mark ends the restore-on-every-boot recurrence,
+             * under the same guard the boot floor applies: only a mark
+             * covering the WHOLE log proves the suffix was already
+             * replayed; anything partial must keep the restore net, or a
+             * post-drop crash would replay into state a drop removed and
+             * halt with the net cut (applied.h). */
+            uint64_t mark = 0;
+            if (applied_mark_load(r->ns, &mark) == BJ_OK &&
+                mark >= elog_last_index(r->log) && mark > floor)
+                floor = mark;
             unaccountable = floor < base;
         }
     }
@@ -1829,6 +1853,33 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
      */
     r->applied = dbi_applied_floor(inst);
     /*
+     * And the instance's own mark, which survives what no per-database
+     * record can: a dropDatabase takes the directory, catalog and all,
+     * and after the log compacts past it the survivors' max understates
+     * what this instance applied. The mark holds the last committed
+     * generation's boundary -- proven state, never speculation -- and
+     * taking the max here is what makes an already-restored instance
+     * boot as itself instead of restoring again (applied.h).
+     */
+    {
+        uint64_t mark = 0;
+        if (applied_mark_load(r->ns, &mark) == BJ_OK) r->mark = mark;
+        /*
+         * USED ONLY WHEN IT COVERS THE WHOLE LOG. A mark below the log's
+         * last index would make replay resume above the per-database
+         * records but below entries whose prerequisites a drop may have
+         * destroyed -- the exact -37 the restore exists to prevent, now
+         * with the restore suppressed. When mark == last there is nothing
+         * left to replay, so there is nothing left to halt on: the one
+         * case the mark may decide, and exactly the idle-instance case
+         * whose every-boot restore it exists to end. Anything partial
+         * falls back to the per-database floor and the restore net,
+         * unchanged.
+         */
+        if (r->mark >= elog_last_index(r->log) && r->mark > r->applied)
+            r->applied = r->mark;
+    }
+    /*
      * The floor is a MAX over databases, and a replicated dropDatabase can
      * remove the database that held it -- after which the surviving ones
      * report something older. Above the base that regression is legal and
@@ -1943,6 +1994,13 @@ int replica_adopt(replica *r, const char *victims, size_t victims_len) {
     r->host_owns_log = 0;
     r->log = rn_log(r->node);
     r->applied = boundary;
+    /* The adopted generation is this member's whole state and the rebased
+     * log starts at its boundary -- a mark that covers the whole log by
+     * construction, which is the only kind the boot trusts (applied.h).
+     * Best-effort: a miss costs one restore, converging. */
+    (void)applied_mark_store(r->ns, boundary);
+    r->mark = boundary;
+    r->mark_carries = 0;
 
     /*
      * Whatever is STILL waiting is waiting on an instance that no longer
@@ -2205,6 +2263,17 @@ static int apply_committed(replica *r) {
             pending *p = pending_for_index(r, index, &into);
             int rc = dbi_apply(r->inst, index, payload.data, (uint32_t)payload.len, into);
             if (p) p->view[p->at].rc = rc;
+            /*
+             * Does the instance-level mark carry the floor from here on?
+             * A dropDatabase's apply destroys every applied-index record
+             * its database held, so after one the mark is the only durable
+             * memory; any OTHER apply leaves a per-database record of its
+             * own and relieves it (server/applied.h, and the catch-up
+             * store at the bottom of this function).
+             */
+            if (!rc || dc_is_deterministic(rc))
+                r->mark_carries = dbi_entry_is_db_drop(payload.data,
+                                                       (uint32_t)payload.len);
             dbuf_free(&scratch);
             if (rc && !dc_is_deterministic(rc)) {
                 /*
@@ -2243,6 +2312,20 @@ static int apply_committed(replica *r) {
         rn_applied(r->node, index);
     }
     dbuf_free(&payload);
+    /*
+     * CAUGHT UP WITH A DROP AS THE LAST WORD: store the mark. Only now --
+     * a mark below the log's last index is ignored by every reader, so
+     * storing one mid-stream would be a synced write that says nothing.
+     * Idle instances are the whole audience: their next boot reads
+     * mark == last, skips both the replay and the restore, and the
+     * rewrite-everything-on-every-boot cost is gone. One fsync per
+     * drop-terminated burst, nothing on any other write path.
+     */
+    if (!e && r->mark_carries && r->applied >= rn_commit_index(r->node) &&
+        r->applied > r->mark && r->applied >= elog_last_index(r->log)) {
+        if (applied_mark_store(r->ns, r->applied) == BJ_OK)
+            r->mark = r->applied;
+    }
     return e;
 }
 

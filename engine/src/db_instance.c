@@ -413,6 +413,23 @@ int dbi_request_wrecks_files(const uint8_t *req, size_t req_len) {
     return dbs_request_wrecks_files(req, req_len);
 }
 
+/*
+ * Is this entry an INSTANCE-LEVEL drop -- `{ d, i: "drop" }`? The one
+ * entry whose apply destroys every record its own database held, which is
+ * what makes it the one entry after which the host's instance-level
+ * applied mark is load-bearing (server/applied.h). Anything unreadable
+ * answers 0: a malformed entry fails at apply, loudly, and this question
+ * is only about bookkeeping.
+ */
+int dbi_entry_is_db_drop(const uint8_t *payload, uint32_t len) {
+    const uint8_t *cmd; size_t cmd_len;
+    if (dbi_entry_cmd(payload, len, NULL, 0, &cmd, &cmd_len) != BJ_OK) return 0;
+    if (cmd) return 0;                     /* a command is FOR a database */
+    const uint8_t *act; uint32_t alen; int af = 0;
+    if (req_str(payload, len, "i", &act, &alen, &af) || !af) return 0;
+    return alen == 4 && memcmp(act, "drop", 4) == 0;
+}
+
 int dbi_entry_wrecks_files(const uint8_t *payload, uint32_t len) {
     if (!payload) return 1;
     /*

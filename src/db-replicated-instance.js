@@ -41,7 +41,7 @@ import {
 import { RaftNode, NotLeaderError } from './raft.js';
 import { SNAP_PREFIX, openWalStorage } from './db-wal.js';
 import {
-  WalInstance, generationCanRescue, restoreLatestInstanceSnapshot
+  WalInstance, generationCanRescue, restoreLatestInstanceSnapshot, appliedMarkLoad
 } from './db-wal-instance.js';
 
 /** How many recent per-entry results the state machine retains for
@@ -302,9 +302,17 @@ export async function connectReplicatedInstance(provider, options = {}) {
     // it costs not to, and why one attempt). Restored before the RaftNode
     // exists, so the node never sees the unusable state.
     if (!restored && generationCanRescue(inst, floor)) {
-      await inst.close();
-      await restoreLatestInstanceSnapshot(provider, { snapshotPrefix });
-      return connectReplicatedInstance(provider, { ...options, restored: true });
+      /* Honors a whole-log mark exactly as connectWalInstance does (it is
+       * the opener that WRITES one -- this opener's pump replays
+       * asynchronously, so no moment inside the open can truthfully claim
+       * "everything is applied"). Without a mark this keeps the documented
+       * rescue-per-boot cost. */
+      const mark = await appliedMarkLoad(provider);
+      if (mark < inst._log.lastIndex) {
+        await inst.close();
+        await restoreLatestInstanceSnapshot(provider, { snapshotPrefix });
+        return connectReplicatedInstance(provider, { ...options, restored: true });
+      }
     }
     if (floor > inst._log.lastIndex) {
       const { currentTerm, votedFor, lastTerm } = inst._log;

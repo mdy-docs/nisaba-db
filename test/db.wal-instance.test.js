@@ -153,6 +153,67 @@ describe('WAL instance: one log, many databases', () => {
     await inst.close();
   });
 
+  it('rescues ONCE: the applied mark ends the rescue-on-every-open cost', async () => {
+    /*
+     * The C server's twin test is "restores ONCE" (db.server.test.js);
+     * this is the JS opener's, and it can be sharper because
+     * connectWalInstance replays SYNCHRONOUSLY at open: after a rescued
+     * open completes, everything in the log is applied, so the mark it
+     * writes (__applied__.bj == log last) is true the moment it is
+     * written. The next open honors it -- only when it covers the WHOLE
+     * log -- and skips the rescue.
+     *
+     * "Skipped" is proven, not inferred: the GENERATION IS DELETED after
+     * the marked open, so any later rescue attempt would fail loudly
+     * rather than quietly succeed. An open that comes up serving the
+     * converged state without those files provably never rescued.
+     */
+    const provider = new MemoryStorageProvider();
+    let inst = await connectWalInstance(provider);
+    const keep = await (await inst.db('keep')).collection('c');
+    await keep.insertOne({ _id: oid(1), n: 1 });
+    const doomed = await (await inst.db('doomed')).collection('c');
+    for (let i = 2; i <= 5; i++) await doomed.insertOne({ _id: oid(i), n: i });
+    const gen = await inst.snapshot();                    // base = boundary
+    await inst.dropDatabase('doomed');                    // the floor-eater
+    const last = inst.log.lastIndex;
+    expect(inst.log.baseIndex).toBe(gen.lastIncludedIndex);
+    await inst.close();
+
+    /* The pre-mark shape: every root on disk today. */
+    for (const f of await provider.listFiles()) {
+      if (f === '__applied__.bj') await provider.deleteFile(f);
+    }
+
+    /* Open 2: rescued (floor < base, generation at base), replayed, and
+     * MARKED -- the whole log, because replay here is synchronous. */
+    inst = await connectWalInstance(provider);
+    expect(await inst.listDatabases()).toEqual(['keep']);
+    expect(Number(decode(
+      await (async () => {
+        const h = await provider.openFile('__applied__.bj', { create: false });
+        const b = new Uint8Array(h.getSize());
+        h.read(b, { at: 0 });
+        await h.close();
+        return b;
+      })()
+    ).applied)).toBe(last);
+    await inst.close();
+
+    /* Burn the boats: no generation, no possible rescue. */
+    for (const f of await provider.listFiles()) {
+      if (f.startsWith('__snap__-') && !f.includes('-log-')) await provider.deleteFile(f);
+    }
+
+    /* Open 3: serves the converged state without rescuing -- it cannot
+     * have rescued, the files it would need are gone. */
+    inst = await connectWalInstance(provider);
+    expect(await inst.listDatabases()).toEqual(['keep']);
+    expect(await (await (await inst.db('keep')).collection('c')).countDocuments({})).toBe(1);
+    await (await (await inst.db('keep')).collection('c')).insertOne({ _id: oid(9), n: 9 });
+    await inst.close();
+  });
+
   it('refuses a root that is itself a database', async () => {
     const provider = new MemoryStorageProvider();
     const db = await connectWal(provider);

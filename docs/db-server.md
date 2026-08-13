@@ -1317,18 +1317,33 @@ their own entry. Designed nowhere yet; measured here.
   same floor, reaches the same conclusion, and does it again, which is what
   makes an interrupted restore recoverable rather than fatal — asserted at a
   spread of kill offsets across the copy in `db.server.test.js`'s
-  *reconciling a generation*. The same property has a cost in the ordinary
-  case: converging by restore-then-replay reaches a state that *still* has
-  nothing recording the applied index, so the member reconciles on **every**
-  boot — rewriting its whole dataset each time — and, because replay would
-  otherwise resume at the base and meet the same unapplyable entry, that
-  repetition is what keeps it bootable rather than mere waste. **One ordinary
-  write ends it**, since a write records its index in the collection it
-  touches and that is above the base; no snapshot needed. A busy instance
-  therefore heals itself within a request, an idle one restores until somebody
-  writes to it. Recording an applied index for the whole instance would fix it
-  properly and is not done: the honest place for it is the one thing a
-  `dropDatabase` cannot delete, and an instance has no catalog of its own.
+  *reconciling a generation*.
+
+  **And the instance now records an applied index of its own**
+  (`server/applied.h`, `__applied__.bj` at the root — the one thing a
+  `dropDatabase` cannot delete), which ends the cost this paragraph used to
+  carry: an idle instance no longer reconciles on **every** boot after a
+  drop outran its floor. The mark is written when the pump catches up with
+  a dropDatabase as the last applied entry (the only moment it is
+  load-bearing — every other apply leaves a per-database record of its own)
+  and at install adoption, one fsync each, on no other write path.
+
+  **It is trusted only when it covers the whole log**, and the guard is the
+  design: a partial mark would lift the boot floor above the per-database
+  records while entries above it still need replaying — into state the drop
+  removed, which is the `-37` halt the restore exists to prevent, with the
+  restore suppressed. When mark == last there is nothing left to replay and
+  so nothing left to halt on; anything partial is ignored and the restore
+  net stands, unchanged. Pinned three ways in *reconciling a generation*:
+  *restores ONCE* (marked idle instance boots as itself), *ignores a mark
+  that does not cover the log* (a doctored partial mark still restores —
+  removing both guards fails exactly this test), and the interrupted-restore
+  spread (a crash before the catch-up store leaves no mark, so the restore
+  correctly runs again). The JS instance opener has the same mark with a
+  sharper write moment — `connectWalInstance` replays synchronously at
+  open, so a rescued open marks the whole log the instant it is true
+  (*rescues ONCE*, `db.wal-instance.test.js`); the replicated JS opener
+  honors a mark and never writes one, its pump being asynchronous.
 - **A member with no history does not found a cluster that already
   exists.** Emptying a member's directory is not a crash Raft tolerates: a
   crash keeps the log, the term and the vote, and a wipe takes all three and

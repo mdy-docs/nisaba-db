@@ -235,6 +235,13 @@ int dbi_request_wrecks_files(const uint8_t *req, size_t req_len);
  */
 int dbi_entry_wrecks_files(const uint8_t *payload, uint32_t len);
 
+/* `{ d, i: "drop" }` -- the instance-level dropDatabase, the one entry
+ * whose apply destroys every applied-index record its database held. The
+ * host consults this to know when its own instance-level mark
+ * (server/applied.h) has become the only record left. 0 for anything
+ * unreadable: malformed entries fail at apply, loudly. */
+int dbi_entry_is_db_drop(const uint8_t *payload, uint32_t len);
+
 /*
  * The replicated fork (db_session.h's dbs_propose / dbs_step), with one
  * addition: every command comes back WRAPPED.

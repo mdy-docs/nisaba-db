@@ -333,19 +333,33 @@ const main = async () => {
     await withServer(opts.port + 60 + (w < 0 ? 9 : 0), flag, async (port) => {
       const ids = await seedScan(port);
       const pick = () => ids[(Math.random() * ids.length) | 0];
-      const points = async (ms) => {
+      /* Throughput AND latency: the writer milestone is judged on read
+       * p50/p99 during a write, so the samples are kept, not just counted. */
+      const pctl = (samples, q) => {
+        if (!samples.length) return 0;
+        const s = samples.slice().sort((a, b) => a - b);
+        return s[Math.min(s.length - 1, Math.floor(q * s.length))];
+      };
+      const points = async (ms, lat = null) => {
         const cs = await Promise.all(Array.from({ length: 8 }, () => connectServer(port)));
         const stop = Date.now() + ms;
         let n = 0;
         await Promise.all(cs.map(async (c) => {
           const cl = c.db(DB).collection('scan');
-          while (Date.now() < stop) { await cl.findOne({ _id: pick() }); n++; }
+          while (Date.now() < stop) {
+            const t = process.hrtime.bigint();
+            await cl.findOne({ _id: pick() });
+            if (lat) lat.push(Number(process.hrtime.bigint() - t) / 1e6);
+            n++;
+          }
         }));
         await Promise.all(cs.map((c) => c.close().catch(() => {})));
         return n;
       };
       await points(400);
-      const idle = await points(opts.seconds * 1000) / opts.seconds;
+      const idleLat = [];
+      const idle = await points(opts.seconds * 1000, idleLat) / opts.seconds;
+      const idleP50 = pctl(idleLat, 0.5), idleP99 = pctl(idleLat, 0.99);
 
       /*
        * Two long writes, each measured over the same window: `updateMany`
@@ -370,11 +384,45 @@ const main = async () => {
         const cl = writer.db(DB).collection('scan');
         const cs = await Promise.all(Array.from({ length: 8 }, () => connectServer(port)));
         let n = 0, go = true;
+        const busyLat = [];
         const t0 = Date.now();
         const reading = Promise.all(cs.map(async (c) => {
           const rc = c.db(DB).collection('scan');
-          while (go) { await rc.findOne({ _id: pick() }); n++; }
+          while (go) {
+            const t = process.hrtime.bigint();
+            await rc.findOne({ _id: pick() });
+            busyLat.push(Number(process.hrtime.bigint() - t) / 1e6);
+            n++;
+          }
         }));
+        /* A CURSOR beside the point reads: getMore holds session state on
+         * live handles, so under the writer design it takes the boundary
+         * pause rather than a view -- its number is the pause's number. */
+        const cursorConn = await connectServer(port);
+        const gmLat = [];
+        let gmErrors = 0, gmLastErr = null;
+        const paging = (async () => {
+          const cc = cursorConn.db(DB).collection('scan');
+          while (go) {
+            /* Errors are counted, not fatal: a cursor refused mid-churn is
+             * itself a data point (createIndex wrecks-files handling may
+             * legitimately invalidate one), and a bench that dies cannot
+             * report it. */
+            try {
+              const cur = cc.find({}, { batchSize: 50 });
+              for (let b = 0; b < 20 && go; b++) {
+                const t = process.hrtime.bigint();
+                const batch = await cur.nextBatch();
+                gmLat.push(Number(process.hrtime.bigint() - t) / 1e6);
+                if (!batch.length) break;
+              }
+              await cur.close().catch(() => {});
+            } catch (err) {
+              gmErrors++;
+              gmLastErr = err.code ?? err.message;
+            }
+          }
+        })();
         const stop = t0 + opts.seconds * 1000;
         let rounds = 0, refused = null, wrote = 0;
         while (Date.now() < stop) {
@@ -391,6 +439,8 @@ const main = async () => {
         }
         go = false;
         await reading;
+        await paging;
+        await cursorConn.close().catch(() => {});
         const secs = (Date.now() - t0) / 1000;
         await Promise.all(cs.map((c) => c.close().catch(() => {})));
         await writer.close();
@@ -401,6 +451,41 @@ const main = async () => {
                     `   ${refused !== null
                           ? `REFUSED (${refused})${rounds ? ` after ${rounds}` : ''}`
                           : `${(wrote / Math.max(rounds, 1)).toFixed(0)}ms x${rounds}`}`);
+        console.log(`           p50/p99 ms      idle ${idleP50.toFixed(2)}/${idleP99.toFixed(2)}` +
+                    `   during ${pctl(busyLat, 0.5).toFixed(2)}/${pctl(busyLat, 0.99).toFixed(2)}` +
+                    `   getMore ${pctl(gmLat, 0.5).toFixed(2)}/${pctl(gmLat, 0.99).toFixed(2)}` +
+                    (gmErrors ? `   (${gmErrors} cursor error(s), last ${gmLastErr})` : ''));
+      }
+
+      /*
+       * SNAPSHOT HOLD -- the same family: snapshot_take runs synchronously
+       * between poll passes, copying every file of every database, and the
+       * whole time nothing is served. Measured as the worst single read
+       * latency while one snapshot is taken, which IS the hold, observed
+       * from where a client sits.
+       */
+      {
+        const sc = await connectServer(port);
+        const probe = await connectServer(port);
+        const pl = probe.db(DB).collection('scan');
+        await pl.findOne({ _id: pick() });                        // warm
+        let worst = 0, going = true;
+        const probing = (async () => {
+          while (going) {
+            const t = process.hrtime.bigint();
+            await pl.findOne({ _id: pick() });
+            worst = Math.max(worst, Number(process.hrtime.bigint() - t) / 1e6);
+          }
+        })();
+        const s0 = Date.now();
+        await sc.snapshot();
+        const snapMs = Date.now() - s0;
+        going = false;
+        await probing;
+        await sc.close();
+        await probe.close();
+        console.log(`           snapshot_take ${snapMs}ms; worst read while it ran` +
+                    ` ${worst.toFixed(1)}ms (idle p99 ${idleP99.toFixed(2)}ms)`);
       }
     });
   }

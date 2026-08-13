@@ -125,7 +125,8 @@ check treats no reply as no information rather than as permission
 ## Escape hatch
 
 A refused database is never modified, so downgrading the data is always
-possible from the newer version's side (its CLI can export; a
-dump/restore pair is planned — `docs/roadmap.md` P2). There is no
+possible from the newer version's side: the CLI's dump/restore pair
+(`db <name> dump > x.jsonl` / `restore < x.jsonl` — shipped, `docs/
+roadmap.md` P2, which once listed it as planned). There is no
 in-place downgrade path and none is planned: one direction of migration
 is a maintained promise, two is a liability.

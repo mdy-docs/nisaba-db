@@ -1083,14 +1083,34 @@ breaks that — so a write is the serving thread's own work, always.
 
 **The measurement, at 20,000 documents** (`bench-server.js`'s WRITE
 INTERFERENCE axis; eight sockets of `_id` reads, with and without one
-client writing):
+client writing). Two epochs of it, because the first fault it found was
+fixed and the table is the baseline the write-isolation milestone is
+judged against:
 
-| the write | reads/s idle | while writing | held | the write itself |
-|---|---|---|---|---|
-| `updateMany({}, …)` | 19,476 | — | — | **refused, -70** |
-| `createIndex` | 19,476 | 44 | **0.2%** | 718 ms each |
+*Before waves* — `updateMany` was **refused outright** (`-70`: the round
+planned more entries than the await table holds), and `createIndex` held
+the loop whole: reads at 44/s of 19,476 idle (0.2%), 718 ms per build.
 
-Two different faults, and the first is not a latency problem at all.
+*The baseline as of the waves* (one fsync per wave, one wave per tick;
+reader threads make no difference here, as predicted — a point read is
+inline either way):
+
+| the write | reads/s idle | while writing | held | read p50/p99 (ms) | the write itself |
+|---|---|---|---|---|---|
+| — (idle) | 19,145 | — | — | 0.34 / 1.31 | — |
+| `updateMany({}, …)` | 19,145 | 417 | 2% | 8.4 / 470 | 3.06 s per round |
+| `createIndex` | 19,145 | 35 | 0.2% | 4.4 / 723 | 716 ms per build |
+| `snapshot_take` | — | — | — | worst single read **927 ms** | 927 ms hold |
+
+A `getMore` cursor paging beside the point reads tracks them during
+`updateMany` (p50 8.3 ms) and is **killed** by each `createIndex` round's
+`dropIndex` (`-46`, the stale-cursor refusal — the DDL-kills-cursors
+contract, *cursors vs DDL* in `db.server.test.js`; it used to be a
+use-after-free, found by this very lane). `snapshot_take`'s hold equals
+its duration exactly: 927 ms copying files, worst read 927 ms.
+
+Two different faults originally, and the first was not a latency problem
+at all.
 
 **`updateMany` plans one command per matched document**, and a round
 bigger than the node's await table (`RN_MAX_AWAIT`, 256) was refused

@@ -4872,7 +4872,7 @@ for (const engine of ENGINES) {
    * scan, not a materialized result -- which is the difference between
    * paging a million documents and being sent a million documents.
    */
-  describe.skipIf(!enabled)(`nisaba-server: dropping an index (${engine.name})`, () => {
+  describe.skipIf(!enabled)(`nisaba-server: DDL against a live server (${engine.name})`, () => {
     /* Its OWN server and directory: this test reads the directory and
      * creates a collection, and the compact suite above asserts the exact
      * set of collections its sweep touched. */
@@ -4933,6 +4933,68 @@ for (const engine of ENGINES) {
        * index's files and no others. */
       expect(await coll.countDocuments({})).toBe(20);
       expect((await coll.findOne({ n: 7 })).team).toBe(1);
+    });
+
+    it('a dropIndex kills open cursors cleanly, instead of freeing the tree under them', async () => {
+      /*
+       * A HEAP-USE-AFTER-FREE, REACHABLE BY ANY CLIENT. dropIndex releases
+       * the collection's open handles so the next request reopens from the
+       * catalog (entry_release) -- and a batched cursor is POSITIONED in
+       * the tree those handles hold. dropCollection closed every cursor
+       * first, with a comment naming exactly this hazard; dropIndex did
+       * not, so cursor + dropIndex + getMore read freed memory. ASan:
+       * heap-use-after-free in bjfile_read_record. On a normal build the
+       * freed bytes usually failed to parse (-3), which is a UAF getting
+       * lucky, not a behavior.
+       *
+       * Found by bench-server.js's WRITE INTERFERENCE axis the day it
+       * gained a paging cursor -- nothing else ever held a cursor across a
+       * dropIndex.
+       *
+       * The contract now: DDL that releases handles kills ALL cursors
+       * (neither cursor struct records its collection, so there is nothing
+       * to select by -- documented at close_all_cursors), and the killed
+       * cursor's next getMore is the CODED refusal a stale id always got,
+       * never bytes.
+       */
+      const users = db.collection('cvd');
+      const other = db.collection('elsewhere');
+      await users.insertMany(Array.from({ length: 40 }, (_, k) =>
+        ({ n: k, team: k % 3, name: k === 0 ? 'Ada' : `u${k}` })));
+      await other.insertMany(Array.from({ length: 30 }, (_, k) => ({ k })));
+      await users.createIndex({ team: 1 });
+
+      const mine = users.find({}, { batchSize: 5 });
+      const bystander = other.find({}, { batchSize: 5 });
+      expect((await mine.nextBatch()).length).toBe(5);
+      expect((await bystander.nextBatch()).length).toBe(5);
+
+      /* Writes and createIndex do NOT kill cursors -- appends leave a
+       * positioned scan valid, and createIndex releases nothing. Pinned
+       * so the kill below stays tied to its cause. */
+      await users.updateOne({ n: 0 }, { $set: { seen: true } });
+      await users.createIndex({ name: 1 });
+      expect((await mine.nextBatch()).length).toBe(5);
+
+      await users.dropIndex('team_1');
+      let err = null;
+      try { await mine.nextBatch(); } catch (e) { err = e; }
+      expect(err, 'the cursor outlived the handles it was positioned in')
+        .toBeTruthy();
+      expect(err.code, `expected the stale-cursor refusal, got: ${err.message}`)
+        .toBe(-46);
+      /* ALL cursors, the documented semantic -- a later change to
+       * selective closing should update this line deliberately. */
+      let err2 = null;
+      try { await bystander.nextBatch(); } catch (e) { err2 = e; }
+      expect(err2?.code).toBe(-46);
+
+      /* And the server is fine: same connection, fresh cursor, all rows. */
+      const again = users.find({}, { batchSize: 100 });
+      expect((await again.nextBatch()).length).toBeGreaterThan(0);
+      await again.close();
+      await users.dropIndex('name_1');
+      await db.dropCollection('elsewhere');
     });
 
   });

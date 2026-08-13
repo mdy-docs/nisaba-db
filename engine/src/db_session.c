@@ -743,6 +743,35 @@ int dbs_create_collection(dbs *s, const char *name, size_t name_len, int *create
     return BJ_OK;
 }
 
+/*
+ * CURSORS FIRST, BEFORE ANY entry_release. A batched cursor is positioned
+ * inside the collection's live tree, and entry_release closes that tree and
+ * its io: a cursor that outlives the release reads through freed memory on
+ * its next getMore. Found by ASan as a heap-use-after-free in
+ * bjfile_read_record, reachable by ANY client -- open a cursor, let anyone
+ * dropIndex on that collection, ask for the next batch. On a non-sanitized
+ * build the freed bytes usually fail to parse (-3, "Unexpected end of
+ * data"), which is the lucky outcome of a UAF, not a behavior.
+ *
+ * ALL cursors, not this collection's: neither dbs_cursor nor dc_cursor
+ * records which collection it walks, so there is nothing to select by. DDL
+ * is rare and a killed cursor is a clean, actionable client error
+ * (DC_ERR_NO_CURSOR on the next getMore -- ids are never reused). Tagging
+ * cursors with their collection to close selectively is a refinement, not
+ * the fix.
+ *
+ * dropCollection always did this (it is where this loop and its comment
+ * lived); dropIndex called entry_release WITHOUT it, which was the bug.
+ * Compact needs neither: it refuses to run while any cursor is open.
+ */
+static void close_all_cursors(dbs *s) {
+    for (int i = 0; i < DBS_MAX_CURSORS; i++) {
+        if (!s->cursors[i].id) continue;
+        dc_cursor_close(s->cursors[i].cur);
+        memset(&s->cursors[i], 0, sizeof s->cursors[i]);
+    }
+}
+
 int dbs_drop_collection(dbs *s, const char *name, size_t name_len, int *dropped) {
     if (!s || !name || !dropped) return BJ_ERR_STATE;
     *dropped = 0;
@@ -755,13 +784,9 @@ int dbs_drop_collection(dbs *s, const char *name, size_t name_len, int *dropped)
     if (!found) return BJ_OK;   /* nothing to drop is not a failure */
 
     /* Cursors first: a scan positioned in files about to be unlinked
-     * would read bytes that are gone -- the same hazard compaction
-     * refuses on, except that here there is nothing to preserve. */
-    for (int i = 0; i < DBS_MAX_CURSORS; i++) {
-        if (!s->cursors[i].id) continue;
-        dc_cursor_close(s->cursors[i].cur);
-        memset(&s->cursors[i], 0, sizeof s->cursors[i]);
-    }
+     * would read bytes that are gone (close_all_cursors says why, and
+     * why all of them). */
+    close_all_cursors(s);
 
     dbs_entry *en = find_entry(s, name, name_len);
     if (en) entry_release(s->ns, en);
@@ -997,12 +1022,19 @@ int dbs_drop_index(dbs *s, const char *coll, size_t coll_len,
         if (e) goto done;
     }
 
-    /* Then the open handles, then the files. Reopened lazily: the next
-     * request that wants this collection gets it from the catalog, which
-     * no longer mentions the index. */
+    /* Then the cursors, the open handles, and the files, in that order.
+     * The cursor close is load-bearing: entry_release frees the tree a
+     * batched cursor is positioned in, and a cursor that outlives it is a
+     * use-after-free on its next getMore (close_all_cursors -- this call
+     * being absent HERE, while dropCollection had it, was the bug).
+     * Reopened lazily: the next request that wants this collection gets
+     * it from the catalog, which no longer mentions the index. */
     {
         dbs_entry *en = find_entry(s, coll, coll_len);
-        if (en) entry_release(s->ns, en);
+        if (en) {
+            close_all_cursors(s);
+            entry_release(s->ns, en);
+        }
     }
     if (files.len) remove_all(s, files.data, files.len);
 

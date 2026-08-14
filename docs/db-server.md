@@ -879,13 +879,20 @@ answered from it without anyone reconnecting, and the old files are
 deleted after the flip. Refused with `-49` while any cursor — anyone's —
 is scanning that collection.
 
-**Ids stay with the caller, and so does the clock.** `id` supplies the 12
-bytes a write needs if it *turns out* to need one — an upsert that
-matched nothing, which is the only write whose need for an id cannot be
-known until it has run. Generating one needs a clock, which
+**Ids stay with the caller, and so does the clock.** `id` supplies the id
+a write needs if it *turns out* to need one — an upsert that matched
+nothing, which is the only write whose need for an id cannot be known
+until it has run. Generating one needs a clock, which
 `engine/include/db.h` keeps out of the engine deliberately, so a write that
 needed an id and was not given one is refused rather than given an id
 invented in C.
+
+Since format 2 that field carries any id the format can key — an
+ObjectId, a string, a finite number or a Date (`docs/db-api.md`) — not
+the twelve fixed bytes of format 1. A client whose documents are keyed by
+strings sends a string here, and one that mints its own default sends the
+ObjectId it minted. (A 12-byte *binary* is still accepted and read as an
+ObjectId, for a codec with no ObjectId type of its own.)
 
 An **insert** is not one of those writes: its document carries its own
 `_id`, exactly as every member of an `insertMany` list must, and `id` is
@@ -1298,6 +1305,16 @@ staged `createIndex`, read p50 fell from ~12 ms to ~5.7 ms — the residue
 there is the loop's per-chunk fsync, not the apply. Idle throughput is
 unchanged, and `ping` reports `writeThread` so the config being measured
 is never a guess.
+
+**Re-measured on format 2** (scalar `_id`s: variable-length primary keys
+and index back-pointers, `docs/format-compatibility.md`), because a key
+that is no longer fixed-width is exactly the kind of change that pays
+for itself somewhere invisible. It does not: same machine, same 20,000
+documents — `updateMany` reads **4,636/s (24% of idle)** at p50 **0.79
+ms** / p99 3.23 ms against an idle+cursor p50 of 0.65 ms, which is the
+same **1.22×** like-for-like; `createIndex` read p50 **5.81 ms**;
+`snapshot_take`'s hold still equals its duration exactly (1061 ms hold,
+worst read 1060.7 ms). Idle is 19,232/s.
 
 Two costs found on the way there, both structural and both removed: the
 read path used to pump the writer's completions inline (a slice of

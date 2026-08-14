@@ -127,13 +127,11 @@ class MissingIndexedFieldError extends NisabaError {}
 class UnindexableValueError extends NisabaError {}
 /** A ChangeStream's iterator buffer overflowed (see ChangeStream). */
 class ChangeStreamOverflowError extends NisabaError {}
-/** `_id` isn't an ObjectId (see toObjectId). Unlike MongoDB, scalar _ids
- * (numbers, arbitrary strings, Dates) are not supported: the on-disk
- * format keys the primary tree and every index back-pointer with fixed
- * 12-byte OIDs (db.c's dc_get_id/oid_key), so lifting the restriction is
- * a format-version bump with a migration, not a validation tweak
- * (docs/roadmap.md P0 #3 records the spike). Keep natural keys in their
- * own field with a unique index instead. */
+/** `_id` is outside the domain the on-disk format can order (see toId):
+ * an ObjectId, a string without U+0000, a finite number, or a Date.
+ * Everything else -- bool, null, array, object, NaN -- is refused,
+ * because the primary tree and every index back-pointer are keyed by
+ * the ordered encoding of the id, which has no part for them. */
 class InvalidIdError extends NisabaError {}
 /** A collection or database name broke the rules in db_validate.h
  * (-15/-16 malformed, -17 the reserved format-stamp key). */
@@ -159,9 +157,9 @@ const ERR_CLASS = {
   [-17]: InvalidNameError,
   [-18]: InvalidIndexSpecError,
   [-19]: InvalidIndexSpecError,
-  // db.h's DC_ERR_UNSUPPORTED_ID: an upsert filter pinning a non-ObjectId
-  // _id is the same complaint toObjectId makes about a document's, so it
-  // arrives as the same error class.
+  // db.h's DC_ERR_UNSUPPORTED_ID: an upsert filter pinning an _id outside
+  // the admissible domain is the same complaint toId makes about a
+  // document's, so it arrives as the same error class.
   [-35]: InvalidIdError
 };
 
@@ -728,24 +726,52 @@ function dbFormatKey() {
 }
 
 /**
- * Duck-types rather than strict `instanceof ObjectId`: a caller that built
- * its own value against a *different* copy of binjson's ObjectId (same
- * class, different module instance -- e.g. a thin client package that only
- * depends on binjson, not this whole engine) would otherwise fail this
- * check even though it's a perfectly valid 12-byte id, re-wrapped here into
- * this module's own canonical ObjectId via the hex round-trip. Mirrors how
- * the real MongoDB driver tolerates cross-realm/cross-copy ObjectId values.
+ * The format-v2 id gate: an _id may be an ObjectId, a string, a finite
+ * number, or a Date -- the exact domain the on-disk key encoding orders
+ * (engine/include/db.h's dc_id_ok is the authority; this is the
+ * JS-type half of the same rule, asked here because C is handed bytes).
+ *
+ * ObjectId still duck-types across module copies (a caller holding a
+ * different binjson instance's ObjectId re-wraps via the hex
+ * round-trip). What v2 REMOVED is the 24-hex STRING coercion: with
+ * string ids legal, "is this hex string an ObjectId or a string id?"
+ * has two answers, and real MongoDB drivers never coerced either -- a
+ * string _id stays exactly the string you stored.
  */
-function toObjectId(id) {
+function toId(id) {
   if (id instanceof ObjectId) return id;
-  if (typeof id === 'string' && /^[0-9a-fA-F]{24}$/.test(id)) return new ObjectId(id);
-  if (id && typeof id.toHexString === 'function') return new ObjectId(id.toHexString());
+  if (id && typeof id === 'object' && typeof id.toHexString === 'function') {
+    return new ObjectId(id.toHexString());
+  }
+  if (typeof id === 'string') {
+    if (id.includes('\u0000')) {
+      throw new InvalidIdError(
+        'Invalid _id: a string id must not contain U+0000 (it is the key ' +
+        "encoding's terminator).");
+    }
+    return id;
+  }
+  if (typeof id === 'number') {
+    if (!Number.isFinite(id)) {
+      throw new InvalidIdError('Invalid _id: a numeric id must be finite.');
+    }
+    return id;
+  }
+  if (id instanceof Date) return id;
   throw new InvalidIdError(
-    `Invalid _id: ${JSON.stringify(id)} -- _id must be an ObjectId (or its 24-hex string). ` +
-    'Unlike MongoDB, scalar _ids (numbers, arbitrary strings, Dates) are not supported by the ' +
-    'on-disk format; keep natural keys in their own field with a unique index: ' +
-    "createIndex({ field: 1 }, { unique: true }). See docs/db-api.md."
+    `Invalid _id: ${JSON.stringify(id)} -- an _id must be an ObjectId, ` +
+    'a string, a finite number, or a Date. See docs/db-api.md.'
   );
+}
+
+/**
+ * An id's VALUE form: the binjson scalar C takes and returns wherever an
+ * _id crosses the bridge (engine/include/db.h's dc_id -- a pointer and a
+ * length, not the fixed twelve bytes v1 could assume). Reading one back
+ * is plain decode(), since the value form IS a top-level binjson value.
+ */
+function encodeId(id) {
+  return encode(toId(id));
 }
 
 // Name and key-spec validation lives in engine/src/db_validate.c. Only the
@@ -1048,7 +1074,8 @@ const WAL_PLAN = Object.freeze({ NOTHING: 0, MATCHED: 1, UPSERT: 2 });
  */
 function walPlan(collection, collName, req, a, b, { upsert = false, defaultId } = {}) {
   const M = requireModule();
-  const oid = defaultId ?? new ObjectId();
+  // The seed id crosses as its VALUE form, like every other id in v2.
+  const dBytes = encodeId(defaultId ?? new ObjectId());
   // DROP_INDEX's `a` is an index name, not a document; everything else
   // crosses as binjson (db_wal.h's request table).
   const enc = (v, raw) => v === undefined || v === null
@@ -1060,16 +1087,16 @@ function walPlan(collection, collName, req, a, b, { upsert = false, defaultId } 
   const n = allocStr(M, collName);
   const ap = M._malloc(aBytes.length || 1);
   const bp = M._malloc(bBytes.length || 1);
-  const dp = M._malloc(12);
+  const dp = M._malloc(dBytes.length);
   const rp = M._malloc(4);
   let plan = 0;
   try {
     if (aBytes.length) M.HEAPU8.set(aBytes, ap);
     if (bBytes.length) M.HEAPU8.set(bBytes, bp);
-    M.HEAPU8.set(oid.toBytes(), dp);
+    M.HEAPU8.set(dBytes, dp);
     plan = M._walw_plan(collection ? collection._collCtx : 0, n.ptr, n.len, req,
                         ap, aBytes.length, bp, bBytes.length,
-                        upsert ? 1 : 0, dp, rp);
+                        upsert ? 1 : 0, dp, dBytes.length, rp);
     const rc = readI32(M, rp);
     if (rc !== 0) throw codeError(rc, collName);
 
@@ -1084,11 +1111,12 @@ function walPlan(collection, collName, req, a, b, { upsert = false, defaultId } 
     const prePtr = M._walw_preimage_ptr(plan);
     const preLen = M._walw_preimage_len(plan);
     const tid = M._walw_target_id(plan);
+    const tidLen = tid ? M._walw_target_id_len(plan) : 0;
     return {
       outcome: M._walw_outcome(plan),
       commands,
       preimage: prePtr ? decode(M.HEAPU8.slice(prePtr, prePtr + preLen)) : null,
-      targetId: tid ? new ObjectId(M.HEAPU8.slice(tid, tid + 12)) : null
+      targetId: tid ? decode(M.HEAPU8.slice(tid, tid + tidLen)) : null
     };
   } finally {
     if (plan) M._walw_plan_free(plan);
@@ -2666,21 +2694,23 @@ class Collection {
   }
 
   /* Record one definition's staged-build state in the catalog entry:
-   * building on/off, and the backfill cursor (12 raw bytes) while on.
-   * The C transform is the same one the server's session uses, so the
-   * two hosts cannot spell the state differently. */
+   * building on/off, and the backfill cursor -- the VALUE form of the
+   * last backfilled _id, whatever type it is -- while on. The C
+   * transform is the same one the server's session uses, so the two
+   * hosts cannot spell the state differently. */
   _catalogSetIndexBuilding(name, building, cursorBytes) {
     const entry = this._catalog.search(this.name);
     const updated = catalogCall((M, ctx) => {
       const ee = encode(entry);
       const ep = M._malloc(ee.length || 1);
       const n = allocStr(M, name);
-      const cp = cursorBytes ? M._malloc(12) : 0;
+      const cp = cursorBytes ? M._malloc(cursorBytes.length) : 0;
       try {
         if (ee.length) M.HEAPU8.set(ee, ep);
         if (cursorBytes) M.HEAPU8.set(cursorBytes, cp);
         return M._catw_index_building_set(ctx, ep, ee.length, n.ptr, n.len,
-                                          building ? 1 : 0, cp);
+                                          building ? 1 : 0,
+                                          cp, cursorBytes ? cursorBytes.length : 0);
       } finally { if (cp) M._free(cp); n.free(); M._free(ep); }
     });
     this._catalog.add(this.name, updated);
@@ -2762,13 +2792,16 @@ class Collection {
     if (!this._indexes.get(name)) return { advanced: 0, done: true };
 
     const M = requireModule();
-    const cursorBytes = state.cursor ? state.cursor.toBytes() : null;
+    // The cursor is an id of any admissible type, so it travels as bytes
+    // (its value form) rather than as twelve raw ObjectId bytes.
+    const cursorBytes = state.cursor !== undefined ? encodeId(state.cursor) : null;
     const n = allocStr(M, name);
-    const cp = cursorBytes ? M._malloc(12) : 0;
+    const cp = cursorBytes ? M._malloc(cursorBytes.length) : 0;
     let rc;
     try {
       if (cursorBytes) M.HEAPU8.set(cursorBytes, cp);
-      rc = M._dcw_backfill_step(this._outCtx, this._collCtx, n.ptr, n.len, cp, k);
+      rc = M._dcw_backfill_step(this._outCtx, this._collCtx, n.ptr, n.len,
+                                cp, cursorBytes ? cursorBytes.length : 0, k);
     } finally { if (cp) M._free(cp); n.free(); }
     if (rc !== 0) {
       // The build cannot complete (a genuine duplicate under unique, an
@@ -2789,7 +2822,8 @@ class Collection {
       if (held) held.building = false;
       this._catalogSetIndexBuilding(name, false, null);
     } else {
-      this._catalogSetIndexBuilding(name, true, step.last ? step.last.toBytes() : cursorBytes);
+      this._catalogSetIndexBuilding(
+        name, true, step.last !== undefined ? encodeId(step.last) : cursorBytes);
     }
     return { advanced: step.advanced ?? 0, done: !!step.done };
   }
@@ -2941,7 +2975,7 @@ class Collection {
       throw new Error('insertOne requires a document object');
     }
     const M = requireModule();
-    const _id = doc._id !== undefined ? toObjectId(doc._id) : new ObjectId();
+    const _id = doc._id !== undefined ? toId(doc._id) : new ObjectId();
     const bytes = encode({ ...doc, _id });
     const rc = withBytes(M, bytes, (p, n) => M._dcw_insert_one(this._collCtx, p, n));
     if (rc !== 0) throw codeError(rc, 'insertOne');
@@ -3009,7 +3043,7 @@ class Collection {
       throw new Error('insertMany requires a non-empty array of documents');
     }
     const M = requireModule();
-    const ids = docs.map(doc => doc._id !== undefined ? toObjectId(doc._id) : new ObjectId());
+    const ids = docs.map(doc => doc._id !== undefined ? toId(doc._id) : new ObjectId());
     const bytes = encode(docs.map((doc, i) => ({ ...doc, _id: ids[i] })));
     const rc = withBytes(M, bytes, (p, n) => M._dcw_insert_many(this._outCtx, this._collCtx, p, n, ordered ? 1 : 0));
     if (rc !== 0) throw codeError(rc, 'insertMany');
@@ -3065,7 +3099,7 @@ class Collection {
    * ever called when this collection actually has active watchers.
    */
   async _resolveDocumentKeyForWatch(filter) {
-    if (filter && filter._id !== undefined) return toObjectId(filter._id);
+    if (filter && filter._id !== undefined) return toId(filter._id);
     const doc = await this.findOne(filter);
     return doc ? doc._id : null;
   }
@@ -3413,20 +3447,23 @@ class Collection {
   }
 
   /**
-   * Malloc `a`/`b` (encoded) plus 24 bytes of id space, call
-   * fn(M, aPtr, aLen, bPtr, bLen, idPtr, outIdPtr), free everything, and
-   * return { rc, upsertedId }. Shared by replaceOne/updateOne/updateMany,
-   * which all pass a filter + a second document and may need a fresh id
-   * for an upsert (see the Db/Collection section's top comment for why JS
-   * always generates one rather than C inventing it).
+   * Malloc `a`/`b` (encoded) plus a freshly generated default id in its
+   * value form, call fn(M, aPtr, aLen, bPtr, bLen, idPtr, idLen), free
+   * everything, and return what fn returned. Shared by
+   * replaceOne, updateOne, updateMany and both findOneAnd forms, which
+   * all pass a filter + a second document and may need a fresh id for an
+   * upsert (see the
+   * Db/Collection section's top comment for why JS always generates one
+   * rather than C inventing it).
    *
-   * `upsertedId` is what C says it used, NOT the id passed in. Those
-   * differ whenever the filter or the replacement pinned an `_id`: the
-   * upserted document takes that one. This side used to work the answer
-   * out for itself (`replacement._id !== undefined ? ... : defaultId`),
-   * which is the rule written twice -- and the update form's copy was
-   * simply wrong, reporting a generated id for a document stored under
-   * the filter's.
+   * The id an upsert ACTUALLY used is not always the one passed in --
+   * a filter or replacement that pinned an `_id` gets that one instead --
+   * so it comes back from C rather than being re-derived here: through
+   * the out slot for the single-document forms (read it when the return
+   * is 2), and as `upsertedId` in the result object for updateMany. This
+   * side used to work the answer out for itself, which is the rule
+   * written twice -- and the update form's copy was simply wrong,
+   * reporting a generated id for a document stored under the filter's.
    *
    * The id used to be overridable, so the WAL layer could pin the one a
    * logged upsert command had resolved at proposal time. It no longer
@@ -3438,19 +3475,17 @@ class Collection {
     const M = requireModule();
     const aBytes = encode(a);
     const bBytes = encode(b);
+    const dBytes = encodeId(new ObjectId());
 
     const ap = aBytes.length ? M._malloc(aBytes.length) : 0;
     const bp = bBytes.length ? M._malloc(bBytes.length) : 0;
-    const dp = M._malloc(24);          // [0,12) the default id, [12,24) C's answer
+    const dp = M._malloc(dBytes.length);
     if (aBytes.length) M.HEAPU8.set(aBytes, ap);
     if (bBytes.length) M.HEAPU8.set(bBytes, bp);
-    M.HEAPU8.set(new ObjectId().toBytes(), dp);
+    M.HEAPU8.set(dBytes, dp);
 
     try {
-      const rc = fn(M, ap, aBytes.length, bp, bBytes.length, dp, dp + 12);
-      // Only meaningful when C reports an upsert (rc === 2); read
-      // unconditionally so the caller has one thing to look at.
-      return { rc, upsertedId: new ObjectId(M.HEAPU8.slice(dp + 12, dp + 24)) };
+      return fn(M, ap, aBytes.length, bp, bBytes.length, dp, dBytes.length);
     } finally {
       if (ap) M._free(ap);
       if (bp) M._free(bp);
@@ -3464,12 +3499,13 @@ class Collection {
     }
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
-    const { rc, upsertedId } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp, op) =>
-      M._dcw_replace_one(this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0, op));
+    const rc = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp, dn) =>
+      M._dcw_replace_one(this._outCtx, this._collCtx, fp, fn, rp, rn, dp, dn, upsert ? 1 : 0));
     if (rc < 0) throw codeError(rc, 'replaceOne');
 
     if (rc === 0) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
     if (rc === 2) {
+      const upsertedId = this._readOut(requireModule());
       if (watching) {
         this._emitChange({ operationType: 'insert', documentKey: { _id: upsertedId }, fullDocument: { ...replacement, _id: upsertedId } });
       }
@@ -3493,8 +3529,9 @@ class Collection {
       throw new Error('findOneAndReplace requires a replacement document object');
     }
     const returnNew = returnDocument === 'after';
-    const { rc } = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp) =>
-      M._dcw_find_one_and_replace(this._outCtx, this._collCtx, fp, fn, rp, rn, dp, upsert ? 1 : 0, returnNew ? 1 : 0));
+    const rc = this._marshalTriple(filter, replacement, (M, fp, fn, rp, rn, dp, dn) =>
+      M._dcw_find_one_and_replace(this._outCtx, this._collCtx, fp, fn, rp, rn, dp, dn,
+                                  upsert ? 1 : 0, returnNew ? 1 : 0));
     // No upserted-id out-param: these return the document itself, which
     // carries the id whatever it turned out to be.
     if (rc < 0) throw codeError(rc, 'findOneAndReplace');
@@ -3524,12 +3561,13 @@ class Collection {
     update = resolveCurrentDate(update);
     const watching = this._watchers.size > 0;
     const preId = watching ? await this._resolveDocumentKeyForWatch(filter) : null;
-    const { rc, upsertedId } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp, op) =>
-      M._dcw_update_one(this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0, op));
+    const rc = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp, dn) =>
+      M._dcw_update_one(this._outCtx, this._collCtx, fp, fn, up, un, dp, dn, upsert ? 1 : 0));
     if (rc < 0) throw codeError(rc, 'updateOne');
 
     if (rc === 0) return { acknowledged: true, matchedCount: 0, modifiedCount: 0, upsertedId: null };
     if (rc === 2) {
+      const upsertedId = this._readOut(requireModule());
       if (watching) {
         this._emitChange({ operationType: 'insert', documentKey: { _id: upsertedId }, fullDocument: await this.findOne({ _id: upsertedId }) });
       }
@@ -3553,8 +3591,9 @@ class Collection {
     }
     update = resolveCurrentDate(update);
     const returnNew = returnDocument === 'after';
-    const { rc } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_find_one_and_update(this._outCtx, this._collCtx, fp, fn, up, un, dp, upsert ? 1 : 0, returnNew ? 1 : 0));
+    const rc = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp, dn) =>
+      M._dcw_find_one_and_update(this._outCtx, this._collCtx, fp, fn, up, un, dp, dn,
+                                 upsert ? 1 : 0, returnNew ? 1 : 0));
     if (rc < 0) throw codeError(rc, 'findOneAndUpdate');
     if (!rc) return null;
     const doc = this._readOut(requireModule());
@@ -3583,8 +3622,8 @@ class Collection {
     // so collecting them costs nothing -- where this side previously ran
     // one find() for the ids and then one findOne() per matched document,
     // which its own comment called "O(matched) extra round trips".
-    const { rc } = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp) =>
-      M._dcw_update_many(this._outCtx, this._collCtx, fp, fn, up, un, dp,
+    const rc = this._marshalTriple(filter, update, (M, fp, fn, up, un, dp, dn) =>
+      M._dcw_update_many(this._outCtx, this._collCtx, fp, fn, up, un, dp, dn,
                          upsert ? 1 : 0, watching ? 1 : 0));
     if (rc !== 0) throw codeError(rc, 'updateMany');
 
@@ -3751,6 +3790,29 @@ class Collection {
    * Returns { generation, bytesBefore, bytesAfter, bytesFreed }.
    */
   async compact() {
+    return this._rebuild(false);
+  }
+
+  /**
+   * Migrate this collection to format v2: the compaction above, with the
+   * primary tree's rows re-keyed from each document's own `_id` instead
+   * of copied key-for-key (docs/format-compatibility.md). Index files are
+   * copied unchanged -- their composite keys already end in the tagged
+   * key form and their rows already hold the id's value form, so for
+   * ObjectId ids they are byte-identical across the bump.
+   *
+   * Driven by Db.open() when the stamp it found was older than this
+   * build's, one collection at a time. Deriving each key from the
+   * document makes the copy idempotent, so a crash between two
+   * collections resumes by simply running again: the catalog flip that
+   * commits the new generation also marks the entry `keys: 2`, and an
+   * entry already marked is skipped.
+   */
+  async _migrate() {
+    return this._rebuild(true);
+  }
+
+  async _rebuild(rekey) {
     // Wait until BOTH hold in one synchronous region: no other compact in
     // flight (back-to-back compacts serialize) and no counted operation
     // in flight (see _inFlight's doc in the constructor). Each is
@@ -3762,8 +3824,9 @@ class Collection {
       if (this._inFlight > 0) { await new Promise((resolve) => this._drainWaiters.push(resolve)); continue; }
       break;
     }
+    const what = rekey ? 'migrate' : 'compact';
     if (this._openCursors.size > 0) {
-      throw new Error(`compact: collection "${this.name}" has open find() cursors -- close or exhaust them first`);
+      throw new Error(`${what}: collection "${this.name}" has open find() cursors -- close or exhaust them first`);
     }
     let settleCompacting;
     this._compacting = new Promise((resolve) => { settleCompacting = resolve; });
@@ -3879,11 +3942,15 @@ class Collection {
         const cn = allocStr(M, this.name);
         try {
           if (planEnc.length) M.HEAPU8.set(planEnc, pp);
-          const rc = M._catw_compact_execute(
+          // Same plan, same files, same flip -- the migration differs
+          // only in how the primary tree's rows are keyed on the way out
+          // (see _migrate).
+          const execute = rekey ? M._catw_migrate_execute : M._catw_compact_execute;
+          const rc = execute(
             scope, this._catalog.ctx, cn.ptr, cn.len, pp, planEnc.length,
             srcPtr, kindPtr, sources.length
           );
-          if (rc < 0) throw codeError(rc, 'compact');
+          if (rc < 0) throw codeError(rc, what);
           bytesBuilt = rc;
         } finally { cn.free(); M._free(pp); }
       } finally {
@@ -4002,7 +4069,9 @@ class Db {
     // Format gate before anything else touches the files (see
     // db_names.h's DC_FORMAT_VERSION and docs/format-compatibility.md). A
     // database without a stamp predates the stamp and is by definition
-    // version 1; it gets stamped now, as does a fresh one.
+    // version 1 -- unless it has no content at all, which makes it a
+    // fresh database of the current version. It gets stamped now either
+    // way.
     const stamp = this._catalog.search(dbFormatKey());
     if (stamp && stamp.v > dbFormatVersion()) {
       await this._catalog.close();
@@ -4012,12 +4081,36 @@ class Db {
         `version ${dbFormatVersion()} -- upgrade nisaba to open it (docs/format-compatibility.md)`
       );
     }
-    if (!stamp || stamp.v < dbFormatVersion()) {
-      this._catalog.add(dbFormatKey(), { v: dbFormatVersion() });
+    const fresh = this._catalog.toArray().every(({ key }) => key === dbFormatKey());
+    const prior = stamp ? stamp.v : (fresh ? dbFormatVersion() : 1);
+    // Either an older database, or a current one whose last migration did
+    // not reach the end -- which the stamp has to record, because once
+    // the version reads current it can no longer say so on its own
+    // (check_format in engine/src/db_session.c carries the same flag for
+    // the same reason).
+    const converting = prior < dbFormatVersion() || !!(stamp && stamp.migrating);
+    if (!stamp || stamp.v < dbFormatVersion() || converting) {
+      // Durable BEFORE any collection is rewritten, the same order
+      // dbs_open uses: from this instant an older build refuses the
+      // database rather than reading half-migrated files as its own.
+      this._catalog.add(dbFormatKey(),
+        converting ? { v: dbFormatVersion(), migrating: true } : { v: dbFormatVersion() });
       this._catalog.flush();
     }
     await this._sweepOrphans();
     this.isOpen = true;
+    if (converting) {
+      try {
+        await this._migrateFormat();
+      } catch (err) {
+        // Each collection's flip is atomic and the ones already done
+        // carry their marker, so the next open resumes where this
+        // stopped -- but this open must not hand back a Db whose files
+        // it could not finish converting.
+        await this.close().catch(() => {});
+        throw err;
+      }
+    }
     if (this._autoCompact) {
       const { minBytes = 0, factor = 0 } = this._autoCompact;
       // Fire-and-forget: open() resolves immediately; operations the host
@@ -4031,6 +4124,47 @@ class Db {
         return null;
       });
     }
+  }
+
+  /**
+   * Bring every collection's keys up to the current on-disk format --
+   * db_session.c's migrate_v1, on this side of the bridge. Run by open()
+   * when the stamp it found was older than this build's, after that stamp
+   * has been raised durably.
+   *
+   * A browser is the host that most needs this: OPFS holds user databases
+   * with no dump/restore escape hatch and no server to convert them, so
+   * "open it and it is converted" is the only migration path there is.
+   *
+   * Per collection, one flip commits the re-keyed generation AND marks
+   * the entry `keys: 2`; an entry already marked is skipped, which is
+   * what makes an interrupted migration resumable rather than repeated.
+   * Collections opened only to be migrated are closed again: a database
+   * may hold far more of them than a host wants handles for, and the
+   * next collection() reopens whichever one it needs.
+   */
+  async _migrateFormat() {
+    for (const name of await this.listCollections()) {
+      const entry = this._catalog.search(name);
+      // 2 is the key shape's own version, not the stamp's: it says these
+      // keys are the tagged, variable-length form (db_catalog.c's flip).
+      if (!entry || entry.keys === 2) continue;
+      const alreadyOpen = this._collections.has(name);
+      const collection = await this.collection(name);
+      try {
+        await collection._migrate();
+      } finally {
+        if (!alreadyOpen) {
+          this._collections.delete(name);
+          await collection._close();
+        }
+      }
+    }
+    // Finished: drop the resume flag. Only now -- it is what makes an
+    // interrupted migration resumable, so it outlives every partial
+    // success (migrate_v1 ends the same way).
+    this._catalog.add(dbFormatKey(), { v: dbFormatVersion() });
+    this._catalog.flush();
   }
 
   /**
@@ -4444,6 +4578,7 @@ export {
   // The WAL command grammar (db_wal.h). src/db-wal.js plans through
   // walPlan and dispatches on WAL_OP, so the opcode spellings live in C
   // and nowhere else.
+  toId,
   walPlan,
   walParse,
   walIsDocument,

@@ -45,8 +45,28 @@ extern "C" {
 #endif
 
 /* On-disk format version. Bump only with a written migration story --
- * see docs/format-compatibility.md's three conditions. */
-#define DC_FORMAT_VERSION 1
+ * see docs/format-compatibility.md's three conditions.
+ *
+ * v2: scalar _id. The primary tree's key is the id's keyenc KEY FORM
+ * (tagged; a v1 primary keyed raw ObjectId bytes), text-index refs are
+ * key-form hex, and the WAL/catalog rows that carry an id carry any
+ * admissible scalar. Secondary-index files are byte-identical to v1 for
+ * the ObjectId ids a v1 database holds, which is what makes the
+ * migration one re-keyed primary copy per collection (dc_migrate_execute
+ * -- the compaction machinery, re-keying the primary through each
+ * document's own _id). A migrated def carries `keys: 2`. The stamp goes
+ * to 2 durably BEFORE the first collection migrates, so a v1 build is
+ * refused from the first instant and a crash mid-migration cannot be
+ * misread; the copy itself is idempotent (keys derive from documents),
+ * so resuming can never double-migrate.
+ *
+ * Because that fence also hides the work left to do -- from the sync on,
+ * the version reads current whether one collection was converted or none
+ * -- the stamp carries `migrating: true` until the last collection has
+ * flipped. Without it a crash in that window would leave v1-keyed
+ * collections nothing would ever offer to convert again. See
+ * check_format in engine/src/db_session.c. */
+#define DC_FORMAT_VERSION 2
 
 /* The B+ tree order every collection, index and catalog in this format is
  * written with. A tree is opened with the order it was written with, so

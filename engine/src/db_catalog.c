@@ -550,7 +550,8 @@ static int copy_def_except_build_state(bj_builder *b, const uint8_t *def, size_t
 
 int dc_catalog_index_building_set(const uint8_t *entry, size_t entry_len,
                                   const char *name, size_t name_len,
-                                  int building, const uint8_t *cursor,
+                                  int building,
+                                  const uint8_t *cursor, uint32_t cursor_len,
                                   dbuf *out) {
     if (entry_len < 1 || entry[0] != BJ_TYPE_OBJECT) return DC_ERR_CATALOG_ENTRY;
 
@@ -589,8 +590,10 @@ int dc_catalog_index_building_set(const uint8_t *entry, size_t entry_len,
                     bj_put_key(b, (const uint8_t *)"building", 8);
                     bj_put_bool(b, 1);
                     if (cursor) {
+                        /* The id's VALUE form, whatever its type --
+                         * format v2's grammar for this field. */
                         bj_put_key(b, (const uint8_t *)"cursor", 6);
-                        bj_put_oid(b, cursor);
+                        bj_put_raw(b, cursor, cursor_len);
                     }
                 }
                 /* building == 0 appends nothing: the commit IS the two
@@ -620,7 +623,7 @@ fail:
 int dc_catalog_index_building_get(const uint8_t *entry, size_t entry_len,
                                   const char *name, size_t name_len,
                                   int *found, int *building,
-                                  uint8_t cursor_out[12], int *has_cursor) {
+                                  dbuf *cursor_out, int *has_cursor) {
     *found = 0;
     *building = 0;
     *has_cursor = 0;
@@ -648,8 +651,9 @@ int dc_catalog_index_building_get(const uint8_t *entry, size_t entry_len,
         const uint8_t *cv; size_t cvlen; int has_cv = 0;
         if ((e = obj_get_field(def, def_len, (const uint8_t *)"cursor", 6,
                                &cv, &cvlen, &has_cv))) return e;
-        if (has_cv && cvlen == 13 && cv[0] == BJ_TYPE_OID) {
-            memcpy(cursor_out, cv + 1, 12);
+        if (has_cv && dc_id_ok(cv, (uint32_t)cvlen)) {
+            cursor_out->len = 0;
+            if ((e = dbuf_put(cursor_out, cv, cvlen))) return e;
             *has_cursor = 1;
         }
         return BJ_OK;
@@ -1333,6 +1337,63 @@ int dc_sweep_execute(bj_ns *ns, const uint8_t *catalog, size_t catalog_len,
 /* ---- executing a compaction --------------------------------------------- */
 
 /* Stream one live structure into a freshly opened destination. */
+/*
+ * The FORMAT-V2 MIGRATION's primary copy (docs/format-compatibility.md):
+ * stream every row of a v1 primary tree into a fresh file, re-keyed
+ * through the document's own _id -- dc_id_key, the one builder -- with
+ * the value bytes untouched. Deriving from the DOCUMENT rather than
+ * transforming the old key makes the copy idempotent: run it over a tree
+ * whose keys are already v2 and it writes the same tree, so a crash
+ * between a flip and its marker can never double-migrate. v1 keys are
+ * raw ObjectId bytes and v1 key order is v2 key order (one constant tag
+ * byte in front), so the adds arrive in order, which is a fresh bpt's
+ * best case. The applied index -- replay's floor -- is carried exactly
+ * as bpt_compact carries it.
+ */
+static int migrate_primary_into(bj_ns *ns, const uint8_t *name, uint32_t name_len,
+                                bpt *src, uint64_t *bytes) {
+    bj_io dst;
+    int e = ns->open(ns->ctx, (const char *)name, name_len,
+                     BJ_NS_CREATE | BJ_NS_TRUNC, &dst);
+    if (e) return e;
+    if (dst.truncate && (e = dst.truncate(dst.ctx, 0))) {
+        if (ns->close) ns->close(ns->ctx, &dst);
+        return e;
+    }
+    bpt *out = bpt_create(&dst, bpt_order(src));
+    if (!out) {
+        if (ns->close) ns->close(ns->ctx, &dst);
+        return BJ_ERR_OOM;
+    }
+    e = bpt_set_applied_index(out, bpt_applied_index(src));
+
+    bpt_cursor *cur_h = e ? NULL : bpt_cursor_open(src, NULL, NULL);
+    if (!e && !cur_h) e = BJ_ERR_OOM;
+    dbuf kf; memset(&kf, 0, sizeof kf);
+    while (!e) {
+        bpt_key k; const uint8_t *val; size_t vlen;
+        int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
+        if (r < 0) { e = r; break; }
+        if (r == 0) break;
+        dc_id id;
+        e = dc_document_id(val, (uint32_t)vlen, &id);
+        if (e) break;
+        kf.len = 0;
+        e = dc_id_key(&kf, id.p, id.len);
+        if (e) break;
+        bpt_key nk; nk.is_string = 1; nk.num = 0;
+        nk.str = kf.data; nk.str_len = (uint32_t)kf.len;
+        e = bpt_add(out, &nk, val, (uint32_t)vlen);
+    }
+    if (cur_h) bpt_cursor_close(cur_h);
+    dbuf_free(&kf);
+    if (!e) e = bpt_sync(out);
+    if (!e && dst.size) *bytes += dst.size(dst.ctx);
+    bpt_free(out);
+    if (ns->close) ns->close(ns->ctx, &dst);
+    return e;
+}
+
 static int compact_into(bj_ns *ns, const uint8_t *name, uint32_t name_len,
                         void *src, int kind, uint64_t *bytes) {
     bj_io dst;
@@ -1363,11 +1424,11 @@ static int compact_into(bj_ns *ns, const uint8_t *name, uint32_t name_len,
     return e;
 }
 
-int dc_compact_execute(bj_ns *ns, bpt *catalog,
-                       const char *coll, size_t coll_len,
-                       const uint8_t *plan, size_t plan_len,
-                       void *const *sources, const int *source_kinds,
-                       uint32_t nsources, uint64_t *bytes_built) {
+static int compact_core(bj_ns *ns, bpt *catalog,
+                        const char *coll, size_t coll_len,
+                        const uint8_t *plan, size_t plan_len,
+                        void *const *sources, const int *source_kinds,
+                        uint32_t nsources, int rekey, uint64_t *bytes_built) {
     *bytes_built = 0;
     if (!ns || !ns->open || !catalog) return BJ_ERR_STATE;
 
@@ -1406,8 +1467,10 @@ int dc_compact_execute(bj_ns *ns, bpt *catalog,
         if ((e = str_field(entry, entry_len, "file", &sp, &slen, &found))) return e;
         if (!found) return DC_ERR_CATALOG_ENTRY;
         if (used >= nsources) return BJ_ERR_RANGE;
-        if ((e = compact_into(ns, sp, slen, sources[used], source_kinds[used], bytes_built)))
-            return e;
+        e = rekey
+            ? migrate_primary_into(ns, sp, slen, (bpt *)sources[used], bytes_built)
+            : compact_into(ns, sp, slen, sources[used], source_kinds[used], bytes_built);
+        if (e) return e;
         used++;
     }
 
@@ -1477,11 +1540,20 @@ int dc_compact_execute(bj_ns *ns, bpt *catalog,
             size_t vstart = c.pos;
             if ((e = skip_value(&c))) { bj_builder_free(b); return e; }
             if (klen == 14 && memcmp(kp, "compactedBytes", 14) == 0) continue;
+            if (rekey && klen == 4 && memcmp(kp, "keys", 4) == 0) continue;
             bj_put_key(b, kp, klen);
             bj_put_raw(b, entry + vstart, (uint32_t)(c.pos - vstart));
         }
         bj_put_key(b, (const uint8_t *)"compactedBytes", 14);
         bj_put_int(b, (int64_t)*bytes_built);
+        if (rekey) {
+            /* The migration marker, riding the same flip that commits
+             * the re-keyed generation: a def carrying it is never
+             * migrated again (the copy is idempotent anyway -- this is
+             * the skip, not the safety). */
+            bj_put_key(b, (const uint8_t *)"keys", 4);
+            bj_put_int(b, 2);
+        }
         bj_end_object(b);
         if ((e = bj_builder_error(b))) { bj_builder_free(b); return e; }
 
@@ -1499,4 +1571,28 @@ int dc_compact_execute(bj_ns *ns, bpt *catalog,
         if (e) return e;
         return bpt_sync(catalog);
     }
+}
+
+int dc_compact_execute(bj_ns *ns, bpt *catalog,
+                       const char *coll, size_t coll_len,
+                       const uint8_t *plan, size_t plan_len,
+                       void *const *sources, const int *source_kinds,
+                       uint32_t nsources, uint64_t *bytes_built) {
+    return compact_core(ns, catalog, coll, coll_len, plan, plan_len,
+                        sources, source_kinds, nsources, 0, bytes_built);
+}
+
+/* The migration: dc_compact_execute with the primary re-keyed through
+ * each document's _id and the flip carrying `keys: 2`. Everything else
+ * -- index copies (byte-stable between v1 and v2 for the ObjectId ids a
+ * v1 database holds), the fresh journal, the durable flip -- is the
+ * compaction machinery, unchanged, which is the whole point of the
+ * format-compatibility rule naming it as the template. */
+int dc_migrate_execute(bj_ns *ns, bpt *catalog,
+                       const char *coll, size_t coll_len,
+                       const uint8_t *plan, size_t plan_len,
+                       void *const *sources, const int *source_kinds,
+                       uint32_t nsources, uint64_t *bytes_built) {
+    return compact_core(ns, catalog, coll, coll_len, plan, plan_len,
+                        sources, source_kinds, nsources, 1, bytes_built);
 }

@@ -205,7 +205,38 @@ const refusalLine = () => [...refusals.entries()]
  * that a read is still in flight when an install adopts. Everything else in
  * the document is an oracle. */
 const PAD = 'x'.repeat(opts.pad);
-const docFor = (coll, n) => ({ n, echo: n, tag: `v${n}`, coll, pad: PAD });
+/**
+ * The self-describing document, and the check that reads it back.
+ *
+ * The `_id` cycles through every type format 2 can key, so the
+ * destructive operations below run over scalar-keyed data rather than
+ * ObjectIds alone — compaction above all, since that is the format
+ * migration's own machinery. Identity for every check here is still `n`,
+ * so nothing about violation detection depends on this.
+ *
+ * `n` increments per collection and a dropped collection restarts it, so
+ * each spelling is unique among the documents alive beside it.
+ */
+let idSeq = 0;
+const docFor = (coll, n) => {
+  const doc = { n, echo: n, tag: `v${n}`, coll, pad: PAD };
+  /*
+   * FRESH PER ATTEMPT, not per `n`. A write lost to leader churn is
+   * retried from the same `n` (the writer's `counts` only advances on
+   * success), and the same `n` arriving twice under DISTINCT ids is
+   * at-least-once delivery -- which this harness separates from data
+   * loss by id, and tolerates. Deriving the id from `n` instead turns
+   * every such retry into a duplicate-key refusal, which is the engine
+   * being right about a document the harness should not have re-sent.
+   */
+  const seq = ++idSeq;
+  switch (seq % 4) {
+    case 0:  return { ...doc, _id: `${coll}-${seq}` };
+    case 1:  return doc;                                   // an ObjectId, minted client-side
+    case 2:  return { ...doc, _id: seq + 0.5 };
+    default: return { ...doc, _id: new Date(1700000000000 + seq) };
+  }
+};
 
 /* A pattern that differs every call and matches the same documents, so
  * every read is a full scan AND a fresh compile -- the compile is the one
@@ -230,6 +261,22 @@ const runsOf = (ns) => {
   return out.join(', ');
 };
 
+/*
+ * A LOSSLESS spelling of an id, for comparing two of them.
+ *
+ * `String(id)` is not one: a Date prints to the second, so two ids a
+ * millisecond apart -- which is what consecutive writes here produce --
+ * read as equal, and two DISTINCT documents describing one `n` (ordinary
+ * at-least-once, see below) get reported as one document returned twice.
+ * The type prefix keeps the domains apart as well, so the string "7" and
+ * the number 7 can never look like the same id either.
+ */
+const idKey = (id) =>
+  id instanceof Date ? `date:${id.getTime()}`
+  : typeof id === 'string' ? `str:${id}`
+  : typeof id === 'number' ? `num:${id}`
+  : `oid:${String(id)}`;
+
 function checkStale(coll, docs, where) {
   const ids = new Map();          /* n -> the _id that carried it */
   for (const d of docs) {
@@ -237,7 +284,7 @@ function checkStale(coll, docs, where) {
     if (d.echo !== d.n) return `${where} ${coll}: torn document, n=${d.n} echo=${d.echo}`;
     if (d.tag !== `v${d.n}`) return `${where} ${coll}: torn document, n=${d.n} tag=${d.tag}`;
     const seen = ids.get(d.n);
-    if (seen === undefined) { ids.set(d.n, String(d._id)); continue; }
+    if (seen === undefined) { ids.set(d.n, idKey(d._id)); continue; }
     /*
      * TWO DOCUMENTS WITH THE SAME n IS THE WRITER'S DOING; THE SAME DOCUMENT
      * TWICE IS NOT.
@@ -256,7 +303,7 @@ function checkStale(coll, docs, where) {
      * killed leaders: "beta: stale read skipped id 217 but returned 216",
      * which was a duplicate 216 and not a gap at all.
      */
-    if (seen === String(d._id)) {
+    if (seen === idKey(d._id)) {
       return `${where} ${coll}: the same document (_id ${seen}, n=${d.n}) twice in one read`;
     }
   }

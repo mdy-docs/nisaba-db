@@ -572,7 +572,10 @@ int dc_set_applied_index(dc_collection *c, uint64_t index) {
  * backfill_index (used by the dc_collection_add_*_index family, defined
  * earlier in the file for readability alongside their attach_* siblings)
  * can call it. */
-static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, const uint8_t id[12]);
+static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, dc_id id);
+static int primary_search_id(dc_collection *c, dc_id id, int *found,
+                             const uint8_t **p, size_t *n);
+int dc_document_id(const uint8_t *doc, uint32_t doc_len, dc_id *id);
 
 /* Scan every document in `c->primary` and add it to `ix` (already
  * appended to `c`, expected empty). On failure, unregisters `ix` from `c`
@@ -587,7 +590,11 @@ static int backfill_index(dc_collection *c, const char *name, int name_len) {
         int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
         if (r < 0) { rc = r; break; }
         if (r == 0) break;
-        rc = add_to_one_index(ix, val, vlen, k.str);
+        /* The id comes from the DOCUMENT: the key is derived state, and
+         * v2 is where the two stopped being the same bytes. */
+        dc_id id;
+        rc = dc_document_id(val, (uint32_t)vlen, &id);
+        if (!rc) rc = add_to_one_index(ix, val, vlen, id);
         if (rc) break;
     }
     bpt_cursor_close(cur_h);
@@ -756,39 +763,89 @@ int dc_collection_index_is_building(dc_collection *c, const char *name, int name
 
 /* ---- shared helpers ----------------------------------------------------- */
 
-static void oid_key(const uint8_t id[12], bpt_key *k) {
-    k->is_string = 1;
-    k->num = 0;
-    k->str = id;
-    k->str_len = 12;
+/*
+ * The id admissibility rule and the ONE key-form builder (db.h's
+ * two-form contract). Everything that keys a document goes through
+ * dc_id_key, which is what makes "int 5 and float 5.0 are the same id"
+ * a property of the format rather than of any one call site.
+ */
+int dc_id_ok(const uint8_t *v, uint32_t len) {
+    if (!v || len < 1 || len > DC_ID_MAX_BYTES) return 0;
+    switch (v[0]) {
+    case BJ_TYPE_OID:
+        return len == 13;
+    case BJ_TYPE_INT:
+    case BJ_TYPE_FLOAT: {
+        cur c = { v, len, 0 };
+        double d;
+        if (read_number(&c, &d) != BJ_OK || c.pos != len) return 0;
+        return d == d;                       /* NaN has no order */
+    }
+    case BJ_TYPE_DATE:
+        return len == 9;
+    case BJ_TYPE_STRING: {
+        cur c = { v, len, 0 };
+        const uint8_t *sp; uint32_t slen;
+        if (take_string(&c, &sp, &slen) != BJ_OK || c.pos != len) return 0;
+        /* The empty string is a legal id (keyenc encodes it fine); a
+         * string CONTAINING U+0000 is not, because that byte is the
+         * key encoding's terminator. */
+        return memchr(sp, 0, slen) == NULL;
+    }
+    default:
+        return 0;
+    }
 }
 
-/* `doc`'s top-level _id, which must be an OID (13 encoded bytes: type + 12
- * raw) if present. *has reports presence; a present value of any other
- * type is BJ_ERR_STATE either way. */
-int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12], int *has) {
+int dc_id_key(dbuf *out, const uint8_t *v, uint32_t len) {
+    if (!dc_id_ok(v, len)) return DC_ERR_UNSUPPORTED_ID;
+    if (v[0] == BJ_TYPE_OID) return qk_put_id(out, v + 1);
+    int e = qk_put_value(out, v, len);
+    /* qk refuses NaN and NUL-bearing strings with its generic code;
+     * dc_id_ok already screened both, so anything left is real trouble
+     * (OOM), passed through as itself. */
+    return e;
+}
+
+/* The primary tree's key for `id`, built into the caller's scratch
+ * (reset here) and pointed at by `k` -- valid until the scratch moves. */
+static int id_key(dbuf *kf, dc_id id, bpt_key *k) {
+    kf->len = 0;
+    int e = dc_id_key(kf, id.p, id.len);
+    if (e) return e;
+    k->is_string = 1;
+    k->num = 0;
+    k->str = kf->data;
+    k->str_len = (uint32_t)kf->len;
+    return BJ_OK;
+}
+
+int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, dc_id *id, int *has) {
     const uint8_t *vp; size_t vlen; int found;
     int e = obj_get_field(doc, doc_len, (const uint8_t *)"_id", 3, &vp, &vlen, &found);
     if (e) return e;
     *has = found;
     if (!found) return BJ_OK;
-    if (vlen != 13 || vp[0] != BJ_TYPE_OID) return BJ_ERR_STATE;
-    memcpy(id_out, vp + 1, 12);
+    if (!dc_id_ok(vp, (uint32_t)vlen)) return DC_ERR_UNSUPPORTED_ID;
+    id->p = vp;
+    id->len = (uint32_t)vlen;
     return BJ_OK;
 }
 
-int dc_document_id(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12]) {
+int dc_document_id(const uint8_t *doc, uint32_t doc_len, dc_id *id) {
     int has = 0;
-    int e = dc_document_id_opt(doc, doc_len, id_out, &has);
+    int e = dc_document_id_opt(doc, doc_len, id, &has);
     if (e) return e;
-    return has ? BJ_OK : BJ_ERR_STATE;
+    return has ? BJ_OK : DC_ERR_UNSUPPORTED_ID;
 }
 
-/* True (via *is_id_filter) iff `filter` is exactly {_id: <OID>}; when true,
- * writes the 12 id bytes. Any other shape is *is_id_filter = 0, not an
- * error — callers fall back to a scan. */
+/* True (via *is_id_filter) iff `filter` is exactly {_id: <admissible
+ * scalar>}; when true, *id spans the value form inside `filter`. Any
+ * other shape -- including an inadmissible id value, which a scan
+ * correctly matches nothing with -- is *is_id_filter = 0, not an
+ * error: callers fall back to a scan. */
 static int filter_is_id_only(const uint8_t *filter, size_t filter_len,
-                             uint8_t id_out[12], int *is_id_filter) {
+                             dc_id *id, int *is_id_filter) {
     cur c = { filter, filter_len, 0 };
     uint32_t count;
     int e = object_begin(&c, &count);
@@ -802,23 +859,24 @@ static int filter_is_id_only(const uint8_t *filter, size_t filter_len,
     size_t vstart = c.pos;
     e = skip_value(&c);
     if (e) return e;
-    size_t vlen = c.pos - vstart;
-    if (vlen != 13 || c.d[vstart] != BJ_TYPE_OID) return BJ_OK;
-    memcpy(id_out, c.d + vstart + 1, 12);
+    if (!dc_id_ok(c.d + vstart, (uint32_t)(c.pos - vstart))) return BJ_OK;
+    id->p = c.d + vstart;
+    id->len = (uint32_t)(c.pos - vstart);
     *is_id_filter = 1;
     return BJ_OK;
 }
 
-/* Build a binjson {_id: <oid>} filter from a raw 12-byte id -- the inverse
- * of filter_is_id_only. Used by the find_one_and_* family to re-target the
- * exact document an initial dc_find_one already captured, so a second
- * internal find/update/delete can never land on a different document. */
-static int build_id_filter(const uint8_t id[12], uint8_t **out, size_t *out_len) {
+/* Build a binjson {_id: <scalar>} filter from an id's value form -- the
+ * inverse of filter_is_id_only. Used by the find_one_and_* family to
+ * re-target the exact document an initial dc_find_one already captured,
+ * so a second internal find/update/delete can never land on a different
+ * document. */
+static int build_id_filter(dc_id id, uint8_t **out, size_t *out_len) {
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     int e = bj_begin_object(b);
     if (!e) e = bj_put_key(b, (const uint8_t *)"_id", 3);
-    if (!e) e = bj_put_oid(b, id);
+    if (!e) e = bj_put_raw(b, id.p, id.len);
     if (!e) e = bj_end_object(b);
     if (!e) {
         size_t n; const uint8_t *p = bj_builder_data(b, &n);
@@ -831,12 +889,30 @@ static int build_id_filter(const uint8_t id[12], uint8_t **out, size_t *out_len)
 
 /* ---- geo/text helpers ------------------------------------------------------ */
 
-static void oid_to_hex(const uint8_t id[12], char hex[24]) {
+/*
+ * A TEXT index's document reference is the hex of the id's KEY FORM --
+ * variable length, filename-safe, and decodable straight back into a
+ * primary-tree key without ever reconstructing the value form. (An OID
+ * id's ref is 26 hex chars now, tag byte included, where v1 wrote 24 of
+ * the raw id; the migration compact rebuilds every text index, so the
+ * two never share a file.) A GEO index is different: the rtree's file
+ * format carries a fixed 12-byte reference, so a geo index refs the raw
+ * ObjectId as it always did -- and a geo-indexed write of a document
+ * whose _id is NOT an ObjectId refuses (DC_ERR_UNSUPPORTED_ID) rather
+ * than indexing something it cannot reference. Stated in db.h; widening
+ * the rtree's reference is future work in binjson-structures.
+ */
+static int id_ref_hex(dbuf *hex, dc_id id) {
     static const char digits[] = "0123456789abcdef";
-    for (int i = 0; i < 12; i++) {
-        hex[i * 2] = digits[id[i] >> 4];
-        hex[i * 2 + 1] = digits[id[i] & 0xf];
+    dbuf kf; memset(&kf, 0, sizeof kf);
+    int e = dc_id_key(&kf, id.p, id.len);
+    for (size_t i = 0; !e && i < kf.len; i++) {
+        uint8_t pair[2] = { (uint8_t)digits[kf.data[i] >> 4],
+                            (uint8_t)digits[kf.data[i] & 0xf] };
+        e = dbuf_put(hex, pair, 2);
     }
+    dbuf_free(&kf);
+    return e;
 }
 
 static int hex_nibble(char c) {
@@ -846,12 +922,16 @@ static int hex_nibble(char c) {
     return -1;
 }
 
-static int hex_to_oid(const char *hex, int hex_len, uint8_t id[12]) {
-    if (hex_len != 24) return BJ_ERR_STATE;
-    for (int i = 0; i < 12; i++) {
+/* The inverse: a ref's hex back into the KEY-FORM bytes a primary
+ * lookup takes directly. */
+static int hex_to_key(const char *hex, int hex_len, dbuf *key) {
+    if (hex_len < 2 || (hex_len & 1)) return BJ_ERR_STATE;
+    for (int i = 0; i < hex_len / 2; i++) {
         int hi = hex_nibble(hex[i * 2]), lo = hex_nibble(hex[i * 2 + 1]);
         if (hi < 0 || lo < 0) return BJ_ERR_STATE;
-        id[i] = (uint8_t)((hi << 4) | lo);
+        uint8_t b = (uint8_t)((hi << 4) | lo);
+        int e = dbuf_put(key, &b, 1);
+        if (e) return e;
     }
     return BJ_OK;
 }
@@ -926,13 +1006,14 @@ static int build_index_key_prefix(const dc_index *ix, const uint8_t *doc, size_t
 }
 
 /* Build one composite-key equality index's key for `doc`/`id` (its ordered
- * field values followed by the id-suffix tag + `id`) into `out`, an
- * ordinary dbuf the caller zero-inits and frees. */
+ * field values followed by the id's KEY FORM -- self-delimiting, so the
+ * suffix concatenates unambiguously whatever the id's type) into `out`,
+ * an ordinary dbuf the caller zero-inits and frees. */
 static int build_index_key(const dc_index *ix, const uint8_t *doc, size_t doc_len,
-                           const uint8_t id[12], dbuf *out) {
+                           dc_id id, dbuf *out) {
     int e = build_index_key_prefix(ix, doc, doc_len, out);
     if (e) return e;
-    return qk_put_id(out, id);
+    return dc_id_key(out, id.p, id.len);
 }
 
 /* Whether `doc` should have an entry in equality index `ix`, per its
@@ -1023,7 +1104,7 @@ static int check_unique_indexes(dc_collection *c, const uint8_t *doc, size_t doc
     return BJ_OK;
 }
 
-static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
+static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, dc_id id) {
     if (ix->kind == DC_IDX_EQUALITY) {
         int applies = 1;
         int e = equality_index_applies(ix, doc, doc_len, &applies);
@@ -1042,11 +1123,12 @@ static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, co
         if (e) { dbuf_free(&key_bytes); return e; }
         bpt_key key; key.is_string = 1; key.num = 0;
         key.str = key_bytes.data; key.str_len = (uint32_t)key_bytes.len;
-        /* The index's value is a proper binjson-encoded OID (the row
-         * reference, per bplustree.h's composite-key convention) so index
-         * files stay independently inspectable with bin/bplustree.js. */
-        uint8_t idval[13]; idval[0] = BJ_TYPE_OID; memcpy(idval + 1, id, 12);
-        e = bpt_add(ix->tree, &key, idval, 13);
+        /* The index's value is the id's VALUE FORM verbatim -- the row
+         * reference, per bplustree.h's composite-key convention -- so
+         * index files stay independently inspectable with
+         * bin/bplustree.js, and the reference is exactly the document's
+         * own _id bytes. */
+        e = bpt_add(ix->tree, &key, id.p, id.len);
         dbuf_free(&key_bytes);
         return e;
     }
@@ -1062,10 +1144,14 @@ static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, co
         const uint8_t *text; uint32_t text_len;
         e = take_string(&c, &text, &text_len);
         if (e) return e;
-        char hex[24];
-        oid_to_hex(id, hex);
-        return tix_add(ix->tix_index, ix->tix_doc_terms, ix->tix_doc_lengths, NULL,
-                       hex, 24, (const char *)text, (int)text_len);
+        dbuf hex; memset(&hex, 0, sizeof hex);
+        e = id_ref_hex(&hex, id);
+        if (e) { dbuf_free(&hex); return e; }
+        e = tix_add(ix->tix_index, ix->tix_doc_terms, ix->tix_doc_lengths, NULL,
+                    (const char *)hex.data, (int)hex.len,
+                    (const char *)text, (int)text_len);
+        dbuf_free(&hex);
+        return e;
     }
 
     /* DC_IDX_GEO */
@@ -1077,11 +1163,15 @@ static int add_to_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, co
         double lat, lng;
         e = parse_geojson_point(vp, vlen, &lat, &lng);
         if (e) return e; /* present but malformed: an error, like a real 2dsphere index */
-        return rtree_insert(ix->rt, lat, lng, id);
+        /* The rtree's reference is a fixed 12 bytes (see id_ref_hex's
+         * comment): a geo-indexed document must have an ObjectId _id,
+         * and one that does not is refused deterministically here. */
+        if (id.len != 13 || id.p[0] != BJ_TYPE_OID) return DC_ERR_UNSUPPORTED_ID;
+        return rtree_insert(ix->rt, lat, lng, id.p + 1);
     }
 }
 
-static int remove_from_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
+static int remove_from_one_index(dc_index *ix, const uint8_t *doc, size_t doc_len, dc_id id) {
     if (ix->kind == DC_IDX_EQUALITY) {
         int applies = 1;
         int e = equality_index_applies(ix, doc, doc_len, &applies);
@@ -1103,10 +1193,14 @@ static int remove_from_one_index(dc_index *ix, const uint8_t *doc, size_t doc_le
         int e = obj_get_field(doc, doc_len, (const uint8_t *)ix->text_field, ix->text_field_len, &vp, &vlen, &found);
         if (e) return e;
         if (!found || vlen < 1 || vp[0] != BJ_TYPE_STRING) return BJ_OK; /* was never indexed */
-        char hex[24];
-        oid_to_hex(id, hex);
+        dbuf hex; memset(&hex, 0, sizeof hex);
+        e = id_ref_hex(&hex, id);
+        if (e) { dbuf_free(&hex); return e; }
         int removed = 0;
-        return tix_remove(ix->tix_index, ix->tix_doc_terms, ix->tix_doc_lengths, NULL, hex, 24, &removed);
+        e = tix_remove(ix->tix_index, ix->tix_doc_terms, ix->tix_doc_lengths, NULL,
+                       (const char *)hex.data, (int)hex.len, &removed);
+        dbuf_free(&hex);
+        return e;
     }
 
     /* DC_IDX_GEO */
@@ -1118,12 +1212,15 @@ static int remove_from_one_index(dc_index *ix, const uint8_t *doc, size_t doc_le
         double lat, lng;
         e = parse_geojson_point(vp, vlen, &lat, &lng);
         if (e) return e;
+        /* A non-OID id was never geo-indexed (the add refuses), so there
+         * is nothing to remove. */
+        if (id.len != 13 || id.p[0] != BJ_TYPE_OID) return BJ_OK;
         int removed = 0;
-        return rtree_remove_at(ix->rt, lat, lng, id, &removed);
+        return rtree_remove_at(ix->rt, lat, lng, id.p + 1, &removed);
     }
 }
 
-static int add_to_indexes(dc_collection *c, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
+static int add_to_indexes(dc_collection *c, const uint8_t *doc, size_t doc_len, dc_id id) {
     for (uint32_t i = 0; i < c->index_count; i++) {
         int e = add_to_one_index(&c->indexes[i], doc, doc_len, id);
         if (e) return e;
@@ -1131,7 +1228,7 @@ static int add_to_indexes(dc_collection *c, const uint8_t *doc, size_t doc_len, 
     return BJ_OK;
 }
 
-static int remove_from_indexes(dc_collection *c, const uint8_t *doc, size_t doc_len, const uint8_t id[12]) {
+static int remove_from_indexes(dc_collection *c, const uint8_t *doc, size_t doc_len, dc_id id) {
     for (uint32_t i = 0; i < c->index_count; i++) {
         int e = remove_from_one_index(&c->indexes[i], doc, doc_len, id);
         if (e) return e;
@@ -1147,7 +1244,7 @@ static int remove_from_indexes(dc_collection *c, const uint8_t *doc, size_t doc_
  * genuine duplicate.
  */
 static int check_unique_excluding(const dc_index *ix, const uint8_t *doc, size_t doc_len,
-                                  const uint8_t id[12], int *conflict) {
+                                  dc_id id, int *conflict) {
     *conflict = 0;
     dbuf prefix; memset(&prefix, 0, sizeof(prefix));
     int e = build_index_key_prefix(ix, doc, doc_len, &prefix);
@@ -1170,8 +1267,10 @@ static int check_unique_excluding(const dc_index *ix, const uint8_t *doc, size_t
         int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
         if (r < 0) { e = r; break; }
         if (r == 0) break;
-        /* The stored value is a binjson OID (add_to_one_index's idval). */
-        if (vlen == 13 && val[0] == BJ_TYPE_OID && memcmp(val + 1, id, 12) == 0) continue;
+        /* The stored value is the referenced document's _id in VALUE
+         * form (add_to_one_index), and a document's _id bytes never
+         * change -- so "is this row me" is a byte compare. */
+        if (vlen == id.len && memcmp(val, id.p, id.len) == 0) continue;
         *conflict = 1;
         break;
     }
@@ -1190,7 +1289,7 @@ static int check_unique_excluding(const dc_index *ix, const uint8_t *doc, size_t
  * key ends in the document's own id, so presence is one exact search.
  */
 static int backfill_add(dc_index *ix, const uint8_t *doc, size_t doc_len,
-                        const uint8_t id[12]) {
+                        dc_id id) {
     int applies = 1;
     int e = equality_index_applies(ix, doc, doc_len, &applies);
     if (e) return e;
@@ -1212,18 +1311,16 @@ static int backfill_add(dc_index *ix, const uint8_t *doc, size_t doc_len,
         e = check_unique_excluding(ix, doc, doc_len, id, &conflict);
         if (!e && conflict) e = DC_ERR_DUPLICATE_KEY;
     }
-    if (!e) {
-        uint8_t idval[13]; idval[0] = BJ_TYPE_OID; memcpy(idval + 1, id, 12);
-        e = bpt_add(ix->tree, &key, idval, 13);
-    }
+    if (!e) e = bpt_add(ix->tree, &key, id.p, id.len);
     dbuf_free(&key_bytes);
     return e;
 }
 
 int dc_collection_backfill_step(dc_collection *c, const char *name, int name_len,
-                                const uint8_t *after_id, uint32_t k,
-                                uint8_t last_id_out[12], uint32_t *advanced, int *done) {
-    if (!c || !advanced || !done || !last_id_out) return BJ_ERR_STATE;
+                                const uint8_t *after_id, uint32_t after_id_len,
+                                uint32_t k,
+                                dbuf *last_id, uint32_t *advanced, int *done) {
+    if (!c || !advanced || !done || !last_id) return BJ_ERR_STATE;
     *advanced = 0;
     *done = 0;
     if (c->is_view) return DC_ERR_READ_ONLY;
@@ -1234,15 +1331,21 @@ int dc_collection_backfill_step(dc_collection *c, const char *name, int name_len
     if (ix->kind != DC_IDX_EQUALITY) return DC_ERR_INDEX_KIND;
     if (!ix->building) { *done = 1; return BJ_OK; }   /* already committed: replay */
 
-    /* From just past the cursor. bpt ranges are inclusive, so the
-     * cursor's own document -- already backfilled by the chunk that
-     * recorded it -- is skipped by comparison rather than by arithmetic
-     * on key bytes. */
+    /* From just past the cursor -- `after_id` is the VALUE form the
+     * catalog recorded, turned into the key it sorts at. bpt ranges are
+     * inclusive, so the cursor's own document -- already backfilled by
+     * the chunk that recorded it -- is skipped by comparing key forms
+     * rather than by arithmetic on key bytes. */
+    dbuf after_kf; memset(&after_kf, 0, sizeof after_kf);
     bpt_key min; bpt_key *minp = NULL;
-    if (after_id) { oid_key(after_id, &min); minp = &min; }
+    if (after_id) {
+        int ke = id_key(&after_kf, (dc_id){ after_id, after_id_len }, &min);
+        if (ke) { dbuf_free(&after_kf); return ke; }
+        minp = &min;
+    }
 
     bpt_cursor *cur_h = bpt_cursor_open(c->primary, minp, NULL);
-    if (!cur_h) return BJ_ERR_OOM;
+    if (!cur_h) { dbuf_free(&after_kf); return BJ_ERR_OOM; }
     int e = BJ_OK;
     uint32_t n = 0;
     for (;;) {
@@ -1250,13 +1353,22 @@ int dc_collection_backfill_step(dc_collection *c, const char *name, int name_len
         int r = bpt_cursor_next(cur_h, &key, &val, &vlen);
         if (r < 0) { e = r; break; }
         if (r == 0) { *done = 1; break; }
-        if (after_id && key.str_len == 12 && memcmp(key.str, after_id, 12) == 0) continue;
-        e = backfill_add(ix, val, vlen, key.str);
+        if (minp && key.str_len == after_kf.len &&
+            memcmp(key.str, after_kf.data, after_kf.len) == 0) continue;
+        /* The id the entry belongs to comes from the DOCUMENT -- the key
+         * is derived state, the _id field is the truth. */
+        dc_id id;
+        e = dc_document_id(val, (uint32_t)vlen, &id);
         if (e) break;
-        memcpy(last_id_out, key.str, 12);
+        e = backfill_add(ix, val, vlen, id);
+        if (e) break;
+        last_id->len = 0;
+        e = dbuf_put(last_id, id.p, id.len);
+        if (e) break;
         if (++n == k) break;
     }
     bpt_cursor_close(cur_h);
+    dbuf_free(&after_kf);
     *advanced = n;
     return e;
 }
@@ -1354,10 +1466,13 @@ int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len
         int r = bpt_cursor_next(cur_h, &k, &val, &vlen);
         if (r < 0) { e = r; break; }
         if (r == 0) break;
-        if (vlen != 13 || val[0] != BJ_TYPE_OID) { e = BJ_ERR_STATE; break; }
-        bpt_key pkey; oid_key(val + 1, &pkey);
+        dbuf pkf; memset(&pkf, 0, sizeof pkf);
+        bpt_key pkey;
+        e = id_key(&pkf, (dc_id){ val, (uint32_t)vlen }, &pkey);
+        if (e) { dbuf_free(&pkf); break; }
         int found = 0; const uint8_t *dp; size_t dn;
         e = bpt_search(c->primary, &pkey, &found, &dp, &dn);
+        dbuf_free(&pkf);
         if (e) break;
         if (found) e = bj_put_raw(b, dp, (uint32_t)dn);
     }
@@ -1522,22 +1637,31 @@ static int ids_to_docs(dc_collection *c, const uint8_t *entries, size_t entries_
         if (e) break;
         if (!idfound) continue;
 
-        uint8_t oid[12];
+        dbuf pkf; memset(&pkf, 0, sizeof pkf);
         if (shape == DC_ID_OID_FIELD) {
+            /* A geo hit: the rtree's reference is a raw ObjectId (see
+             * id_ref_hex), so its key form is the tagged suffix. */
             if (idlen != 13 || idp[0] != BJ_TYPE_OID) { e = BJ_ERR_STATE; break; }
-            memcpy(oid, idp + 1, 12);
+            e = dc_id_key(&pkf, idp, (uint32_t)idlen);
+            if (e) { dbuf_free(&pkf); break; }
         } else {
+            /* A text hit: the reference IS the key form, in hex. */
             if (idlen < 1 || idp[0] != BJ_TYPE_STRING) { e = BJ_ERR_STATE; break; }
             cur idc = { idp, idlen, 0 };
             const uint8_t *hexs; uint32_t hexlen;
             e = take_string(&idc, &hexs, &hexlen);
             if (e) break;
-            if (hex_to_oid((const char *)hexs, (int)hexlen, oid)) continue; /* malformed id: skip defensively */
+            if (hex_to_key((const char *)hexs, (int)hexlen, &pkf)) {
+                dbuf_free(&pkf);
+                continue; /* malformed id: skip defensively */
+            }
         }
 
-        bpt_key pkey; oid_key(oid, &pkey);
+        bpt_key pkey; pkey.is_string = 1; pkey.num = 0;
+        pkey.str = pkf.data; pkey.str_len = (uint32_t)pkf.len;
         int found = 0; const uint8_t *dp; size_t dn;
         e = bpt_search(c->primary, &pkey, &found, &dp, &dn);
+        dbuf_free(&pkf);
         if (e) break;
         if (found) e = bj_put_raw(b, dp, (uint32_t)dn);
     }
@@ -1949,8 +2073,8 @@ int dc_explain(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                int *kind_out, uint8_t **name_out, size_t *name_len_out) {
     *kind_out = DC_EXPLAIN_SCAN; *name_out = NULL; *name_len_out = 0;
 
-    uint8_t id[12]; int is_id = 0;
-    int e = filter_is_id_only(filter, filter_len, id, &is_id);
+    dc_id id; int is_id = 0;
+    int e = filter_is_id_only(filter, filter_len, &id, &is_id);
     if (e) return e;
     if (is_id) { *kind_out = DC_EXPLAIN_IDS; return BJ_OK; }
 
@@ -1985,13 +2109,12 @@ static int gather_matches(dc_collection *c, const uint8_t *filter, uint32_t filt
      * pay a full scan (and dc_explain's kind 1 is the truth for every
      * caller of this dispatch). The lookup IS the whole filter (a single
      * {_id: oid} key -- filter_is_id_only's contract), so no re-check. */
-    uint8_t fid[12]; int fis_id = 0;
-    int e = filter_is_id_only(filter, filter_len, fid, &fis_id);
+    dc_id fid; int fis_id = 0;
+    int e = filter_is_id_only(filter, filter_len, &fid, &fis_id);
     if (e) return e;
     if (fis_id) {
-        bpt_key key; oid_key(fid, &key);
         int f = 0; const uint8_t *p; size_t n;
-        e = bpt_search(c->primary, &key, &f, &p, &n);
+        e = primary_search_id(c, fid, &f, &p, &n);
         if (e) return e;
         qry_doc *matches = NULL; size_t match_count = 0, match_cap = 0;
         if (f) {
@@ -2080,24 +2203,40 @@ static int gather_matches(dc_collection *c, const uint8_t *filter, uint32_t filt
 
 /* ---- CRUD ---------------------------------------------------------------- */
 
+/* One O(log n) primary lookup by id: the scratch-key dance, once. The
+ * row's bytes alias the tree exactly as bpt_search's do. */
+static int primary_search_id(dc_collection *c, dc_id id, int *found,
+                             const uint8_t **p, size_t *n) {
+    dbuf kf; memset(&kf, 0, sizeof kf);
+    bpt_key key;
+    int e = id_key(&kf, id, &key);
+    if (!e) e = bpt_search(c->primary, &key, found, p, n);
+    dbuf_free(&kf);
+    return e;
+}
+
 int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len) {
-    uint8_t id[12];
-    int e = dc_document_id(doc, doc_len, id);
+    dc_id id;
+    int e = dc_document_id(doc, doc_len, &id);
     if (e) return e;
-    bpt_key key; oid_key(id, &key);
+    dbuf kf; memset(&kf, 0, sizeof kf);
+    bpt_key key;
+    e = id_key(&kf, id, &key);
+    if (e) { dbuf_free(&kf); return e; }
     int found = 0;
     const uint8_t *p; size_t n;
     e = bpt_search(c->primary, &key, &found, &p, &n);
-    if (e) return e;
-    if (found) return DC_ERR_DUPLICATE;
+    if (e) { dbuf_free(&kf); return e; }
+    if (found) { dbuf_free(&kf); return DC_ERR_DUPLICATE; }
     e = check_unique_indexes(c, doc, doc_len);
-    if (e) return e;
+    if (e) { dbuf_free(&kf); return e; }
     uint64_t *undo;
     e = mut_begin(c, &undo);
-    if (e) return e;
+    if (e) { dbuf_free(&kf); return e; }
     e = bpt_add(c->primary, &key, doc, doc_len);
     if (!e) e = add_to_indexes(c, doc, doc_len, id);
     if (!e) e = commit_journal(c);
+    dbuf_free(&kf);
     return mut_end(c, undo, e);
 }
 
@@ -2146,14 +2285,13 @@ int dc_find_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                 int *found, uint8_t **out, size_t *out_len) {
     *found = 0; *out = NULL; *out_len = 0;
 
-    uint8_t id[12]; int is_id;
-    int e = filter_is_id_only(filter, filter_len, id, &is_id);
+    dc_id id; int is_id;
+    int e = filter_is_id_only(filter, filter_len, &id, &is_id);
     if (e) return e;
 
     if (is_id) {
-        bpt_key key; oid_key(id, &key);
         int f = 0; const uint8_t *p; size_t n;
-        e = bpt_search(c->primary, &key, &f, &p, &n);
+        e = primary_search_id(c, id, &f, &p, &n);
         if (e || !f) return e;
         *found = 1;
         return emit_found(p, n, projection, projection_len, out, out_len);
@@ -2322,13 +2460,12 @@ int dc_cursor_open(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
      * the original filter -- re-checking {_id: oid} against the looked-up
      * document is a trivially true no-op, and it keeps this mode's
      * invariants identical to the planned-index mode below. */
-    uint8_t fid[12]; int fis_id = 0;
-    int e = filter_is_id_only(filter, filter_len, fid, &fis_id);
+    dc_id fid; int fis_id = 0;
+    int e = filter_is_id_only(filter, filter_len, &fid, &fis_id);
     if (e) { dc_cursor_close(dcur); return e; }
     if (fis_id) {
-        bpt_key key; oid_key(fid, &key);
         int f = 0; const uint8_t *p; size_t n;
-        e = bpt_search(c->primary, &key, &f, &p, &n);
+        e = primary_search_id(c, fid, &f, &p, &n);
         if (e) { dc_cursor_close(dcur); return e; }
         bj_builder *b = bj_builder_new();
         if (!b) { dc_cursor_close(dcur); return BJ_ERR_OOM; }
@@ -2481,19 +2618,21 @@ int dc_delete_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len, 
     if (e) { free(doc); return e; }
     if (!found) { free(doc); return BJ_OK; }
 
-    uint8_t id[12];
-    e = dc_document_id(doc, (uint32_t)doc_len, id);
+    dc_id id;
+    e = dc_document_id(doc, (uint32_t)doc_len, &id);
     if (e) { free(doc); return e; }
+    dbuf kf; memset(&kf, 0, sizeof kf);
+    bpt_key key;
+    e = id_key(&kf, id, &key);
+    if (e) { dbuf_free(&kf); free(doc); return e; }
     uint64_t *undo;
     e = mut_begin(c, &undo);
-    if (e) { free(doc); return e; }
+    if (e) { dbuf_free(&kf); free(doc); return e; }
     e = remove_from_indexes(c, doc, doc_len, id);
     free(doc);
-    if (!e) {
-        bpt_key key; oid_key(id, &key);
-        e = bpt_delete(c->primary, &key);
-    }
+    if (!e) e = bpt_delete(c->primary, &key);
     if (!e) e = commit_journal(c);
+    dbuf_free(&kf);
     e = mut_end(c, undo, e);
     if (e) return e;
     *deleted = 1;
@@ -2516,26 +2655,31 @@ int dc_delete_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     int e = gather_matches(c, filter, filter_len, &matches, &match_count);
     if (e) { bj_builder_free(idb); return e; }
 
+    dbuf kf; memset(&kf, 0, sizeof kf);
     for (size_t i = 0; !e && i < match_count; i++) {
-        uint8_t id[12];
-        e = dc_document_id(matches[i].ptr, (uint32_t)matches[i].len, id);
+        dc_id id;
+        e = dc_document_id(matches[i].ptr, (uint32_t)matches[i].len, &id);
+        if (e) break;
+        bpt_key key;
+        e = id_key(&kf, id, &key);
         if (e) break;
         uint64_t *undo;
         e = mut_begin(c, &undo);
         if (e) break;
         e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
-        if (!e) {
-            bpt_key key; oid_key(id, &key);
-            e = bpt_delete(c->primary, &key);
-        }
+        if (!e) e = bpt_delete(c->primary, &key);
         if (!e) e = commit_journal(c);
         e = mut_end(c, undo, e);
         if (!e) {
             (*deleted_count)++;
-            /* After the commit, so no event names a document still present. */
-            if (idb) bj_put_oid(idb, id);
+            /* After the commit, so no event names a document still
+             * present. The array carries VALUE forms: an id is a scalar
+             * now, and the OID-only writer this replaced could not have
+             * spelled the others. */
+            if (idb) bj_put_raw(idb, id.p, id.len);
         }
     }
+    dbuf_free(&kf);
 
     free_matches(matches, match_count);
 
@@ -2563,8 +2707,8 @@ int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t fil
     if (e) { free(doc); return e; }
     if (!f) { free(doc); return BJ_OK; }
 
-    uint8_t id[12];
-    e = dc_document_id(doc, (uint32_t)doc_len, id);
+    dc_id id;
+    e = dc_document_id(doc, (uint32_t)doc_len, &id);
     if (e) { free(doc); return e; }
     uint8_t *idfilter = NULL; size_t idfilter_len = 0;
     e = build_id_filter(id, &idfilter, &idfilter_len);
@@ -2582,7 +2726,7 @@ int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t fil
  * _id field it carries, or adding one if it has none); every other field's
  * bytes are spliced verbatim (bj_put_raw) rather than decoded/re-encoded. */
 static int splice_id(const uint8_t *replacement, size_t replacement_len,
-                     const uint8_t id[12], uint8_t **out, size_t *out_len) {
+                     dc_id id, uint8_t **out, size_t *out_len) {
     cur c = { replacement, replacement_len, 0 };
     uint32_t count;
     int e = object_begin(&c, &count);
@@ -2592,7 +2736,7 @@ static int splice_id(const uint8_t *replacement, size_t replacement_len,
     if (!b) return BJ_ERR_OOM;
     e = bj_begin_object(b);
     if (!e) e = bj_put_key(b, (const uint8_t *)"_id", 3);
-    if (!e) e = bj_put_oid(b, id);
+    if (!e) e = bj_put_raw(b, id.p, id.len);
     for (uint32_t i = 0; !e && i < count; i++) {
         const uint8_t *kp; uint32_t klen;
         e = take_key(&c, &kp, &klen);
@@ -2620,12 +2764,12 @@ static int splice_id(const uint8_t *replacement, size_t replacement_len,
  * {_id: {$in: [...]}} pins nothing and an upsert generates an id, exactly
  * as it does for {team: {$in: [...]}}.
  *
- * DC_ERR_UNSUPPORTED_ID for a pinned _id of any other type: this format
- * stores ObjectId keys only, and a filter never passes through JS's
- * toObjectId gate, so nothing upstream has already rejected it.
+ * DC_ERR_UNSUPPORTED_ID for a pinned _id that is not an admissible id
+ * scalar (dc_id_ok): quietly substituting a generated id would store the
+ * document somewhere the caller never asked for.
  */
 static int filter_pinned_id(const uint8_t *filter, size_t filter_len,
-                            uint8_t id_out[12], int *has) {
+                            dc_id *id, int *has) {
     *has = 0;
     const uint8_t *vp; size_t vlen; int found;
     int e = obj_get_field(filter, filter_len, (const uint8_t *)"_id", 3, &vp, &vlen, &found);
@@ -2633,10 +2777,23 @@ static int filter_pinned_id(const uint8_t *filter, size_t filter_len,
     int is_expr = 0;
     e = qry_is_operator_expr(vp, vlen, &is_expr);
     if (e || is_expr) return e;
-    if (vlen != 13 || vp[0] != BJ_TYPE_OID) return DC_ERR_UNSUPPORTED_ID;
-    memcpy(id_out, vp + 1, 12);
+    if (!dc_id_ok(vp, (uint32_t)vlen)) return DC_ERR_UNSUPPORTED_ID;
+    id->p = vp;
+    id->len = (uint32_t)vlen;
     *has = 1;
     return BJ_OK;
+}
+
+/* Two ids name the same document iff their KEY forms agree -- which is
+ * what makes int 5 and float 5.0 one id, exactly as one bpt key. */
+static int id_eq(dc_id a, dc_id b, int *eq) {
+    dbuf ka, kb;
+    memset(&ka, 0, sizeof ka); memset(&kb, 0, sizeof kb);
+    int e = dc_id_key(&ka, a.p, a.len);
+    if (!e) e = dc_id_key(&kb, b.p, b.len);
+    *eq = !e && ka.len == kb.len && memcmp(ka.data, kb.data, ka.len) == 0;
+    dbuf_free(&ka); dbuf_free(&kb);
+    return e;
 }
 
 /*
@@ -2650,24 +2807,24 @@ static int filter_pinned_id(const uint8_t *filter, size_t filter_len,
  */
 int dc_replace_document(const uint8_t *replacement, uint32_t replacement_len,
                         const uint8_t *filter, uint32_t filter_len,
-                        const uint8_t default_id[12],
+                        dc_id default_id,
                         uint8_t **out, size_t *out_len) {
-    uint8_t id[12]; int has = 0;
-    int e = dc_document_id_opt(replacement, replacement_len, id, &has);
+    dc_id id; int has = 0;
+    int e = dc_document_id_opt(replacement, replacement_len, &id, &has);
     if (e) return e;
-    if (!has && filter) e = filter_pinned_id(filter, filter_len, id, &has);
+    if (!has && filter) e = filter_pinned_id(filter, filter_len, &id, &has);
     if (e) return e;
     return splice_id(replacement, replacement_len, has ? id : default_id, out, out_len);
 }
 
 int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *replacement, uint32_t replacement_len,
-                   const uint8_t default_id[12], int upsert, int *result,
-                   uint8_t upserted_id[12]) {
+                   dc_id default_id, int upsert, int *result,
+                   dbuf *upserted_id) {
     *result = 0;
 
-    uint8_t repl_id[12]; int repl_has_id;
-    int e = dc_document_id_opt(replacement, replacement_len, repl_id, &repl_has_id);
+    dc_id repl_id; int repl_has_id;
+    int e = dc_document_id_opt(replacement, replacement_len, &repl_id, &repl_has_id);
     if (e) return e;
 
     int found = 0; uint8_t *doc = NULL; size_t doc_len = 0;
@@ -2682,29 +2839,49 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                                 default_id, &spliced, &spliced_len);
         if (e) return e;
         e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
-        if (!e && upserted_id) e = dc_document_id(spliced, (uint32_t)spliced_len, upserted_id);
+        if (!e && upserted_id) {
+            dc_id got;
+            e = dc_document_id(spliced, (uint32_t)spliced_len, &got);
+            if (!e) {
+                upserted_id->len = 0;
+                e = dbuf_put(upserted_id, got.p, got.len);
+            }
+        }
         free(spliced);
         if (e) return e;
         *result = 2;
         return BJ_OK;
     }
 
-    uint8_t existing_id[12];
-    e = dc_document_id(doc, (uint32_t)doc_len, existing_id);
+    dc_id existing_id;
+    e = dc_document_id(doc, (uint32_t)doc_len, &existing_id);
     if (e) { free(doc); return e; }
 
-    if (repl_has_id && memcmp(repl_id, existing_id, 12) != 0) {
-        free(doc);
-        return DC_ERR_ID_MISMATCH;
+    if (repl_has_id) {
+        int same = 0;
+        e = id_eq(repl_id, existing_id, &same);
+        if (e) { free(doc); return e; }
+        if (!same) { free(doc); return DC_ERR_ID_MISMATCH; }
     }
 
     uint8_t *spliced; size_t spliced_len;
     e = splice_id(replacement, replacement_len, existing_id, &spliced, &spliced_len);
     if (e) { free(doc); return e; }
 
+    /* The key -- and existing_id itself -- alias `doc`; the id inside
+     * `spliced` is byte-identical (splice_id spliced it), so from here
+     * on the spliced copy's own _id is the span that outlives doc. */
+    dbuf kf; memset(&kf, 0, sizeof kf);
+    bpt_key key;
+    e = id_key(&kf, existing_id, &key);
+    if (e) { dbuf_free(&kf); free(doc); free(spliced); return e; }
+    dc_id kept_id;
+    e = dc_document_id(spliced, (uint32_t)spliced_len, &kept_id);
+    if (e) { dbuf_free(&kf); free(doc); free(spliced); return e; }
+
     uint64_t *undo;
     e = mut_begin(c, &undo);
-    if (e) { free(doc); free(spliced); return e; }
+    if (e) { dbuf_free(&kf); free(doc); free(spliced); return e; }
 
     e = remove_from_indexes(c, doc, doc_len, existing_id);
     free(doc);
@@ -2715,12 +2892,10 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
      * mut_end's rewind restores the just-removed entries on rejection. */
     if (!e) e = check_unique_indexes(c, spliced, spliced_len);
 
-    if (!e) {
-        bpt_key key; oid_key(existing_id, &key);
-        e = bpt_add(c->primary, &key, spliced, (uint32_t)spliced_len);
-    }
-    if (!e) e = add_to_indexes(c, spliced, (uint32_t)spliced_len, existing_id);
+    if (!e) e = bpt_add(c->primary, &key, spliced, (uint32_t)spliced_len);
+    if (!e) e = add_to_indexes(c, spliced, (uint32_t)spliced_len, kept_id);
     if (!e) e = commit_journal(c);
+    dbuf_free(&kf);
     free(spliced);
     e = mut_end(c, undo, e);
     if (e) return e;
@@ -2730,7 +2905,7 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
 
 int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                             const uint8_t *replacement, uint32_t replacement_len,
-                            const uint8_t default_id[12], int upsert, int return_new,
+                            dc_id default_id, int upsert, int return_new,
                             int *found, uint8_t **out, size_t *out_len) {
     *found = 0; *out = NULL; *out_len = 0;
 
@@ -2739,21 +2914,28 @@ int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t fi
     if (e) { free(before); return e; }
     if (!before_found && !upsert) { free(before); return BJ_OK; }
 
+    /* The upsert path may insert under an id the REPLACEMENT or FILTER
+     * pinned rather than default_id, so the re-read target is whatever
+     * dc_replace_one reports back -- held as owned bytes, because every
+     * span in sight dies with `before` or with the call. */
     int result = 0;
-    uint8_t target_id[12];
+    dbuf target = {0};
     if (before_found) {
-        e = dc_document_id(before, (uint32_t)before_len, target_id);
+        dc_id tid;
+        e = dc_document_id(before, (uint32_t)before_len, &tid);
+        if (!e) e = dbuf_put(&target, tid.p, tid.len);
         uint8_t *idfilter = NULL; size_t idfilter_len = 0;
-        if (!e) e = build_id_filter(target_id, &idfilter, &idfilter_len);
+        if (!e) e = build_id_filter(tid, &idfilter, &idfilter_len);
         if (!e) e = dc_replace_one(c, idfilter, (uint32_t)idfilter_len, replacement, replacement_len, default_id, 0, &result, NULL);
         free(idfilter);
     } else {
-        e = dc_replace_one(c, filter, filter_len, replacement, replacement_len, default_id, 1, &result, NULL);
-        memcpy(target_id, default_id, 12);
+        e = dc_replace_one(c, filter, filter_len, replacement, replacement_len, default_id, 1, &result, &target);
+        if (!e && !target.len) e = dbuf_put(&target, default_id.p, default_id.len);
     }
-    if (e) { free(before); return e; }
+    if (e) { dbuf_free(&target); free(before); return e; }
 
     if (!return_new) {
+        dbuf_free(&target);
         if (before_found) { *found = 1; *out = before; *out_len = before_len; return BJ_OK; }
         free(before);
         return BJ_OK;
@@ -2761,7 +2943,9 @@ int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t fi
     free(before);
 
     uint8_t *idfilter2 = NULL; size_t idfilter2_len = 0;
-    e = build_id_filter(target_id, &idfilter2, &idfilter2_len);
+    e = build_id_filter((dc_id){ target.data, (uint32_t)target.len },
+                        &idfilter2, &idfilter2_len);
+    dbuf_free(&target);
     if (e) return e;
     e = dc_find_one(c, idfilter2, (uint32_t)idfilter2_len, NULL, 0, found, out, out_len);
     free(idfilter2);
@@ -2821,10 +3005,10 @@ static int build_upsert_seed(const uint8_t *filter, size_t filter_len, uint8_t *
  */
 int dc_upsert_document(const uint8_t *filter, uint32_t filter_len,
                        const uint8_t *update, uint32_t update_len,
-                       const uint8_t default_id[12],
+                       dc_id default_id,
                        uint8_t **out, size_t *out_len) {
-    uint8_t pinned[12]; int has = 0;
-    int e = filter_pinned_id(filter, filter_len, pinned, &has);
+    dc_id pinned; int has = 0;
+    int e = filter_pinned_id(filter, filter_len, &pinned, &has);
     if (e) return e;
 
     uint8_t *seed = NULL; size_t seed_len = 0;
@@ -2841,8 +3025,8 @@ int dc_upsert_document(const uint8_t *filter, uint32_t filter_len,
 
 int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                   const uint8_t *update, uint32_t update_len,
-                  const uint8_t default_id[12], int upsert, int *result,
-                  uint8_t upserted_id[12]) {
+                  dc_id default_id, int upsert, int *result,
+                  dbuf *upserted_id) {
     *result = 0;
 
     int e = upd_validate(update, update_len);
@@ -2860,24 +3044,42 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                                default_id, &spliced, &spliced_len);
         if (e) return e;
         e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
-        if (!e && upserted_id) e = dc_document_id(spliced, (uint32_t)spliced_len, upserted_id);
+        if (!e && upserted_id) {
+            dc_id got;
+            e = dc_document_id(spliced, (uint32_t)spliced_len, &got);
+            if (!e) {
+                upserted_id->len = 0;
+                e = dbuf_put(upserted_id, got.p, got.len);
+            }
+        }
         free(spliced);
         if (e) return e;
         *result = 2;
         return BJ_OK;
     }
 
-    uint8_t id[12];
-    e = dc_document_id(doc, (uint32_t)doc_len, id);
+    dc_id id;
+    e = dc_document_id(doc, (uint32_t)doc_len, &id);
     if (e) { free(doc); return e; }
 
     uint8_t *updated = NULL; size_t updated_len = 0;
     e = upd_apply(doc, doc_len, update, update_len, 0, &updated, &updated_len);
     if (e) { free(doc); free(updated); return e; }
 
+    /* `id` aliases `doc`; the updated image carries the same _id bytes
+     * ($set of _id is refused upstream), so the span that outlives doc
+     * is the updated copy's own. */
+    dbuf kf; memset(&kf, 0, sizeof kf);
+    bpt_key key;
+    e = id_key(&kf, id, &key);
+    if (e) { dbuf_free(&kf); free(doc); free(updated); return e; }
+    dc_id kept_id;
+    e = dc_document_id(updated, (uint32_t)updated_len, &kept_id);
+    if (e) { dbuf_free(&kf); free(doc); free(updated); return e; }
+
     uint64_t *undo;
     e = mut_begin(c, &undo);
-    if (e) { free(doc); free(updated); return e; }
+    if (e) { dbuf_free(&kf); free(doc); free(updated); return e; }
 
     e = remove_from_indexes(c, doc, doc_len, id);
     free(doc);
@@ -2885,12 +3087,10 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
     /* Same placement rationale (and mut_end restore) as dc_replace_one's. */
     if (!e) e = check_unique_indexes(c, updated, updated_len);
 
-    if (!e) {
-        bpt_key key; oid_key(id, &key);
-        e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
-    }
-    if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
+    if (!e) e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
+    if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, kept_id);
     if (!e) e = commit_journal(c);
+    dbuf_free(&kf);
     free(updated);
     e = mut_end(c, undo, e);
     if (e) return e;
@@ -2900,7 +3100,7 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
 
 int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                            const uint8_t *update, uint32_t update_len,
-                           const uint8_t default_id[12], int upsert, int return_new,
+                           dc_id default_id, int upsert, int return_new,
                            int *found, uint8_t **out, size_t *out_len) {
     *found = 0; *out = NULL; *out_len = 0;
 
@@ -2912,23 +3112,30 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
     if (e) { free(before); return e; }
     if (!before_found && !upsert) { free(before); return BJ_OK; }
 
+    /* Owned bytes for the re-read target: the matched id's span dies
+     * with `before`, and an upsert's actual id is whatever
+     * dc_update_one reports back (a filter-pinned _id beats
+     * default_id). */
     int result = 0;
-    uint8_t target_id[12];
+    dbuf target = {0};
     if (before_found) {
         /* Re-target the exact matched document by _id so dc_update_one's
          * own internal re-scan can never land on a different document. */
-        e = dc_document_id(before, (uint32_t)before_len, target_id);
+        dc_id tid;
+        e = dc_document_id(before, (uint32_t)before_len, &tid);
+        if (!e) e = dbuf_put(&target, tid.p, tid.len);
         uint8_t *idfilter = NULL; size_t idfilter_len = 0;
-        if (!e) e = build_id_filter(target_id, &idfilter, &idfilter_len);
+        if (!e) e = build_id_filter(tid, &idfilter, &idfilter_len);
         if (!e) e = dc_update_one(c, idfilter, (uint32_t)idfilter_len, update, update_len, default_id, 0, &result, NULL);
         free(idfilter);
     } else {
-        e = dc_update_one(c, filter, filter_len, update, update_len, default_id, 1, &result, NULL);
-        memcpy(target_id, default_id, 12); /* only consulted below when return_new */
+        e = dc_update_one(c, filter, filter_len, update, update_len, default_id, 1, &result, &target);
+        if (!e && !target.len) e = dbuf_put(&target, default_id.p, default_id.len);
     }
-    if (e) { free(before); return e; }
+    if (e) { dbuf_free(&target); free(before); return e; }
 
     if (!return_new) {
+        dbuf_free(&target);
         if (before_found) { *found = 1; *out = before; *out_len = before_len; return BJ_OK; }
         free(before);
         return BJ_OK; /* upsert + "before": no prior state, matches real MongoDB's null */
@@ -2936,7 +3143,9 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
     free(before);
 
     uint8_t *idfilter2 = NULL; size_t idfilter2_len = 0;
-    e = build_id_filter(target_id, &idfilter2, &idfilter2_len);
+    e = build_id_filter((dc_id){ target.data, (uint32_t)target.len },
+                        &idfilter2, &idfilter2_len);
+    dbuf_free(&target);
     if (e) return e;
     e = dc_find_one(c, idfilter2, (uint32_t)idfilter2_len, NULL, 0, found, out, out_len);
     free(idfilter2);
@@ -2945,9 +3154,9 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
 
 int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *update, uint32_t update_len,
-                   const uint8_t default_id[12], int upsert,
+                   dc_id default_id, int upsert,
                    int64_t *matched_count, int *upserted,
-                   uint8_t upserted_id[12],
+                   dbuf *upserted_id,
                    uint8_t **images, size_t *images_len) {
     *matched_count = 0; *upserted = 0;
     if (images) { *images = NULL; *images_len = 0; }
@@ -2974,7 +3183,14 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             e = dc_upsert_document(filter, filter_len, update, update_len,
                                    default_id, &spliced, &spliced_len);
             if (!e) e = dc_insert_one(c, spliced, (uint32_t)spliced_len);
-            if (!e && upserted_id) e = dc_document_id(spliced, (uint32_t)spliced_len, upserted_id);
+            if (!e && upserted_id) {
+                dc_id got;
+                e = dc_document_id(spliced, (uint32_t)spliced_len, &got);
+                if (!e) {
+                    upserted_id->len = 0;
+                    e = dbuf_put(upserted_id, got.p, got.len);
+                }
+            }
             /* The inserted document is the upsert's post-image. */
             if (!e && img) bj_put_raw(img, spliced, (uint32_t)spliced_len);
             free(spliced);
@@ -2982,22 +3198,23 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
         }
     } else {
         *matched_count = (int64_t)match_count;
+        dbuf kf = {0};
         for (size_t i = 0; !e && i < match_count; i++) {
-            uint8_t id[12];
-            e = dc_document_id(matches[i].ptr, (uint32_t)matches[i].len, id);
+            dc_id id;
+            e = dc_document_id(matches[i].ptr, (uint32_t)matches[i].len, &id);
             if (e) break;
             uint8_t *updated = NULL; size_t updated_len = 0;
             e = upd_apply(matches[i].ptr, matches[i].len, update, update_len, 0, &updated, &updated_len);
+            if (e) { free(updated); break; }
+            bpt_key key;
+            e = id_key(&kf, id, &key);
             if (e) { free(updated); break; }
             uint64_t *undo;
             e = mut_begin(c, &undo);
             if (e) { free(updated); break; }
             e = remove_from_indexes(c, matches[i].ptr, matches[i].len, id);
             if (!e) e = check_unique_indexes(c, updated, updated_len);
-            if (!e) {
-                bpt_key key; oid_key(id, &key);
-                e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
-            }
+            if (!e) e = bpt_add(c->primary, &key, updated, (uint32_t)updated_len);
             if (!e) e = add_to_indexes(c, updated, (uint32_t)updated_len, id);
             if (!e) e = commit_journal(c);
             /* Recorded only after the write committed, so a caller never
@@ -3006,6 +3223,7 @@ int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
             free(updated);
             e = mut_end(c, undo, e);
         }
+        dbuf_free(&kf);
     }
 
     free_matches(matches, match_count);

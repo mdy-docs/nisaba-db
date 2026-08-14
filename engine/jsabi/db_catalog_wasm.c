@@ -71,11 +71,12 @@ EMSCRIPTEN_KEEPALIVE int catw_create_plan(catw *w, const uint8_t *keys, int keys
  * both pure buffer transforms, like everything else in this file. */
 EMSCRIPTEN_KEEPALIVE int catw_index_building_set(catw *w, const uint8_t *entry, int entry_len,
                                                  const char *name, int name_len,
-                                                 int building, const uint8_t *cursor) {
-    if (entry_len < 0 || name_len < 0) return BJ_ERR_RANGE;
+                                                 int building,
+                                                 const uint8_t *cursor, int cursor_len) {
+    if (entry_len < 0 || name_len < 0 || cursor_len < 0) return BJ_ERR_RANGE;
     w->buf.len = 0;
     return dc_catalog_index_building_set(entry, (size_t)entry_len, name, (size_t)name_len,
-                                         building, cursor, &w->buf);
+                                         building, cursor, (uint32_t)cursor_len, &w->buf);
 }
 
 EMSCRIPTEN_KEEPALIVE int catw_index_building_get(catw *w, const uint8_t *entry, int entry_len,
@@ -83,10 +84,10 @@ EMSCRIPTEN_KEEPALIVE int catw_index_building_get(catw *w, const uint8_t *entry, 
     if (entry_len < 0 || name_len < 0) return BJ_ERR_RANGE;
     w->buf.len = 0;
     int found = 0, building = 0, has_cursor = 0;
-    uint8_t cursor[12];
+    dbuf cursor = {0};
     int e = dc_catalog_index_building_get(entry, (size_t)entry_len, name, (size_t)name_len,
-                                          &found, &building, cursor, &has_cursor);
-    if (e) return e;
+                                          &found, &building, &cursor, &has_cursor);
+    if (e) { dbuf_free(&cursor); return e; }
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     e = bj_begin_object(b);
@@ -96,7 +97,7 @@ EMSCRIPTEN_KEEPALIVE int catw_index_building_get(catw *w, const uint8_t *entry, 
     if (!e) e = bj_put_bool(b, building);
     if (!e && has_cursor) {
         e = bj_put_key(b, (const uint8_t *)"cursor", 6);
-        if (!e) e = bj_put_oid(b, cursor);
+        if (!e) e = bj_put_raw(b, cursor.data, (uint32_t)cursor.len);
     }
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
@@ -106,6 +107,7 @@ EMSCRIPTEN_KEEPALIVE int catw_index_building_get(catw *w, const uint8_t *entry, 
         e = d ? dbuf_put(&w->buf, d, n) : BJ_ERR_STATE;
     }
     bj_builder_free(b);
+    dbuf_free(&cursor);
     return e;
 }
 
@@ -182,6 +184,31 @@ EMSCRIPTEN_KEEPALIVE double catw_compact_execute(int scope, bpt *catalog,
     if (e) return e;
     uint64_t built = 0;
     e = dc_compact_execute(&ns, catalog, coll, (size_t)coll_len,
+                           plan, (size_t)plan_len, sources, kinds,
+                           (uint32_t)nsources, &built);
+    bjns_bridge_free(&ns);
+    return e ? (double)e : (double)built;
+}
+
+/*
+ * The format-v2 migration, through the same adapter and the same plan:
+ * dc_migrate_execute IS dc_compact_execute with the primary copy re-keyed
+ * from each document's _id (docs/format-compatibility.md). A browser
+ * holding v1 databases in OPFS has no dump/restore escape hatch and no
+ * server to migrate them for it, so the in-place path has to exist on
+ * this side of the bridge too.
+ */
+EMSCRIPTEN_KEEPALIVE double catw_migrate_execute(int scope, bpt *catalog,
+                                                 const char *coll, int coll_len,
+                                                 const uint8_t *plan, int plan_len,
+                                                 void *const *sources,
+                                                 const int *kinds, int nsources) {
+    if (coll_len < 0 || plan_len < 0 || nsources < 0) return BJ_ERR_RANGE;
+    bj_ns ns;
+    int e = bjns_bridge_open(scope, &ns);
+    if (e) return e;
+    uint64_t built = 0;
+    e = dc_migrate_execute(&ns, catalog, coll, (size_t)coll_len,
                            plan, (size_t)plan_len, sources, kinds,
                            (uint32_t)nsources, &built);
     bjns_bridge_free(&ns);

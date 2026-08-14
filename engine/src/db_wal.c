@@ -27,7 +27,7 @@ struct dc_wal_plan {
     struct { size_t off, len; } *at;      /* one span into cmds each     */
     uint32_t n, cap;
     int outcome;
-    uint8_t target[12];
+    dbuf target;                          /* the target id's VALUE form  */
     int has_target;
     uint8_t *preimage;
     size_t preimage_len;
@@ -51,15 +51,17 @@ static int plan_push(dc_wal_plan *p, const uint8_t *cmd, size_t len) {
 }
 
 /*
- * Build one command and append it to the plan. `id` (12 bytes or NULL),
- * `a` and `b` carry whatever the opcode's shape needs -- see the table in
- * db_wal.h. Field order is c, op, then the payload, matching what
- * src/db-wal.js used to encode so an existing log still decodes the same
- * way for the opcodes that survived.
+ * Build one command and append it to the plan. `id` (a VALUE-form scalar
+ * span, {NULL,0} where the opcode carries none), `a` and `b` carry
+ * whatever the opcode's shape needs -- see the table in db_wal.h. Field
+ * order is c, op, then the payload, matching what src/db-wal.js used to
+ * encode so an existing log still decodes the same way for the opcodes
+ * that survived. The `id` field widened from an OID to any admissible id
+ * scalar in format v2; v2 entries live in v2-stamped databases.
  */
 static int emit(dc_wal_plan *p, dc_wal_op op,
                 const char *coll, uint32_t coll_len,
-                const uint8_t *id,
+                dc_id id,
                 const uint8_t *a, size_t a_len,
                 const uint8_t *b, size_t b_len) {
     bj_builder *bd = bj_builder_new();
@@ -79,19 +81,19 @@ static int emit(dc_wal_plan *p, dc_wal_op op,
             break;
         case DC_WAL_UPDATE:
             if (!e) e = bj_put_key(bd, (const uint8_t *)"id", 2);
-            if (!e) e = bj_put_oid(bd, id);
+            if (!e) e = bj_put_raw(bd, id.p, id.len);
             if (!e) e = bj_put_key(bd, (const uint8_t *)"update", 6);
             if (!e) e = bj_put_raw(bd, b, (uint32_t)b_len);
             break;
         case DC_WAL_REPLACE:
             if (!e) e = bj_put_key(bd, (const uint8_t *)"id", 2);
-            if (!e) e = bj_put_oid(bd, id);
+            if (!e) e = bj_put_raw(bd, id.p, id.len);
             if (!e) e = bj_put_key(bd, (const uint8_t *)"doc", 3);
             if (!e) e = bj_put_raw(bd, b, (uint32_t)b_len);
             break;
         case DC_WAL_DELETE:
             if (!e) e = bj_put_key(bd, (const uint8_t *)"id", 2);
-            if (!e) e = bj_put_oid(bd, id);
+            if (!e) e = bj_put_raw(bd, id.p, id.len);
             break;
         case DC_WAL_CREATE_INDEX:
             if (!e) e = bj_put_key(bd, (const uint8_t *)"keys", 4);
@@ -197,7 +199,7 @@ static int plan_update_like(dc_wal_plan *p, dc_collection *c,
                             int req,
                             const uint8_t *filter, uint32_t filter_len,
                             const uint8_t *arg, uint32_t arg_len,
-                            int upsert, const uint8_t default_id[12]) {
+                            int upsert, dc_id default_id) {
     int is_update = (req == DC_WREQ_UPDATE_ONE || req == DC_WREQ_UPDATE_MANY);
     int is_many   = (req == DC_WREQ_UPDATE_MANY || req == DC_WREQ_DELETE_MANY);
 
@@ -221,8 +223,8 @@ static int plan_update_like(dc_wal_plan *p, dc_collection *c,
             size_t start = cr.pos;
             e = skip_value(&cr);
             if (e) break;
-            uint8_t id[12];
-            e = dc_document_id(cr.d + start, (uint32_t)(cr.pos - start), id);
+            dc_id id;
+            e = dc_document_id(cr.d + start, (uint32_t)(cr.pos - start), &id);
             if (e) break;
             e = emit(p, is_update ? DC_WAL_UPDATE : DC_WAL_DELETE,
                      coll, coll_len, id, NULL, 0, arg, arg_len);
@@ -241,11 +243,14 @@ static int plan_update_like(dc_wal_plan *p, dc_collection *c,
         if (e) { free(doc); return e; }
 
         if (found) {
-            uint8_t id[12];
-            e = dc_document_id(doc, (uint32_t)doc_len, id);
+            dc_id id;
+            e = dc_document_id(doc, (uint32_t)doc_len, &id);
             if (!e) e = keep_preimage(p, doc, doc_len);
             if (!e) {
-                memcpy(p->target, id, 12);
+                p->target.len = 0;
+                e = dbuf_put(&p->target, id.p, id.len);
+            }
+            if (!e) {
                 p->has_target = 1;
                 switch (req) {
                     case DC_WREQ_UPDATE_ONE:
@@ -258,9 +263,19 @@ static int plan_update_like(dc_wal_plan *p, dc_collection *c,
                          * proposer, unlike the applier, still has a caller
                          * to hand the error to. */
                         {
-                            uint8_t rid[12]; int has = 0;
-                            e = dc_document_id_opt(arg, arg_len, rid, &has);
-                            if (!e && has && memcmp(rid, id, 12) != 0) e = DC_ERR_ID_MISMATCH;
+                            dc_id rid; int has = 0;
+                            e = dc_document_id_opt(arg, arg_len, &rid, &has);
+                            if (!e && has) {
+                                /* KEY forms decide identity (int 5 ==
+                                 * float 5.0), same rule as apply's. */
+                                dbuf ka = {0}, kb = {0};
+                                e = dc_id_key(&ka, rid.p, rid.len);
+                                if (!e) e = dc_id_key(&kb, id.p, id.len);
+                                if (!e && (ka.len != kb.len ||
+                                           memcmp(ka.data, kb.data, ka.len) != 0))
+                                    e = DC_ERR_ID_MISMATCH;
+                                dbuf_free(&ka); dbuf_free(&kb);
+                            }
                         }
                         if (!e) e = emit(p, DC_WAL_REPLACE, coll, coll_len, id, NULL, 0, arg, arg_len);
                         break;
@@ -289,10 +304,14 @@ static int plan_update_like(dc_wal_plan *p, dc_collection *c,
         ? dc_upsert_document(filter, filter_len, arg, arg_len, default_id, &ins, &ins_len)
         : dc_replace_document(arg, arg_len, filter, filter_len, default_id, &ins, &ins_len);
     if (e) return e;
-    e = dc_document_id(ins, (uint32_t)ins_len, p->target);
+    {
+        dc_id iid;
+        e = dc_document_id(ins, (uint32_t)ins_len, &iid);
+        if (!e) { p->target.len = 0; e = dbuf_put(&p->target, iid.p, iid.len); }
+    }
     if (!e) {
         p->has_target = 1;
-        e = emit(p, DC_WAL_INSERT, coll, coll_len, NULL, ins, ins_len, NULL, 0);
+        e = emit(p, DC_WAL_INSERT, coll, coll_len, (dc_id){0,0}, ins, ins_len, NULL, 0);
     }
     free(ins);
     if (e) return e;
@@ -304,7 +323,7 @@ int dc_wal_plan_build(dc_collection *c, const char *coll, uint32_t coll_len,
                 int req,
                 const uint8_t *a, uint32_t a_len,
                 const uint8_t *b, uint32_t b_len,
-                int upsert, const uint8_t default_id[12],
+                int upsert, dc_id default_id,
                 dc_wal_plan **out) {
     *out = NULL;
     dc_wal_plan *p = (dc_wal_plan *)calloc(1, sizeof(*p));
@@ -333,11 +352,15 @@ int dc_wal_plan_build(dc_collection *c, const char *coll, uint32_t coll_len,
              * hitting this actually saw.
              */
             int has = 0;
-            e = dc_document_id_opt(a, a_len, p->target, &has);
+            dc_id iid;
+            e = dc_document_id_opt(a, a_len, &iid, &has);
             if (e) break;
             if (!has) { e = DC_ERR_WAL_NO_ID; break; }
+            p->target.len = 0;
+            e = dbuf_put(&p->target, iid.p, iid.len);
+            if (e) break;
             p->has_target = 1;
-            e = emit(p, DC_WAL_INSERT, coll, coll_len, NULL, a, a_len, NULL, 0);
+            e = emit(p, DC_WAL_INSERT, coll, coll_len, (dc_id){0,0}, a, a_len, NULL, 0);
             break;
         }
 
@@ -349,7 +372,7 @@ int dc_wal_plan_build(dc_collection *c, const char *coll, uint32_t coll_len,
             for (uint32_t i = 0; !e && i < count; i++) {
                 size_t start = cr.pos;
                 e = skip_value(&cr);
-                if (!e) e = emit(p, DC_WAL_INSERT, coll, coll_len, NULL,
+                if (!e) e = emit(p, DC_WAL_INSERT, coll, coll_len, (dc_id){0,0},
                                  cr.d + start, cr.pos - start, NULL, 0);
             }
             break;
@@ -366,22 +389,22 @@ int dc_wal_plan_build(dc_collection *c, const char *coll, uint32_t coll_len,
             break;
 
         case DC_WREQ_CREATE_INDEX:
-            e = emit(p, DC_WAL_CREATE_INDEX, coll, coll_len, NULL, a, a_len, b, b_len);
+            e = emit(p, DC_WAL_CREATE_INDEX, coll, coll_len, (dc_id){0,0}, a, a_len, b, b_len);
             break;
         case DC_WREQ_INDEX_BEGIN:
-            e = emit(p, DC_WAL_INDEX_BEGIN, coll, coll_len, NULL, a, a_len, b, b_len);
+            e = emit(p, DC_WAL_INDEX_BEGIN, coll, coll_len, (dc_id){0,0}, a, a_len, b, b_len);
             break;
         case DC_WREQ_INDEX_CHUNK:
             /* a = the index name (raw UTF-8), b = `k` as an encoded
              * binjson number -- the caller sizes the chunk, because the
              * caller is the one with a latency budget. */
-            e = emit(p, DC_WAL_INDEX_CHUNK, coll, coll_len, NULL, a, a_len, b, b_len);
+            e = emit(p, DC_WAL_INDEX_CHUNK, coll, coll_len, (dc_id){0,0}, a, a_len, b, b_len);
             break;
         case DC_WREQ_DROP_INDEX:
-            e = emit(p, DC_WAL_DROP_INDEX, coll, coll_len, NULL, a, a_len, NULL, 0);
+            e = emit(p, DC_WAL_DROP_INDEX, coll, coll_len, (dc_id){0,0}, a, a_len, NULL, 0);
             break;
         case DC_WREQ_DROP_COLLECTION:
-            e = emit(p, DC_WAL_DROP_COLLECTION, coll, coll_len, NULL, NULL, 0, NULL, 0);
+            e = emit(p, DC_WAL_DROP_COLLECTION, coll, coll_len, (dc_id){0,0}, NULL, 0, NULL, 0);
             break;
 
         default:
@@ -409,13 +432,16 @@ const uint8_t *dc_wal_plan_preimage(const dc_wal_plan *p, uint32_t *len) {
     return p->preimage;
 }
 
-const uint8_t *dc_wal_plan_target_id(const dc_wal_plan *p) {
-    return (p && p->has_target) ? p->target : NULL;
+const uint8_t *dc_wal_plan_target_id(const dc_wal_plan *p, uint32_t *len) {
+    if (!p || !p->has_target) { *len = 0; return NULL; }
+    *len = (uint32_t)p->target.len;
+    return p->target.data;
 }
 
 void dc_wal_plan_free(dc_wal_plan *p) {
     if (!p) return;
     dbuf_free(&p->cmds);
+    dbuf_free(&p->target);
     free(p->at);
     free(p->preimage);
     free(p);
@@ -471,7 +497,11 @@ int dc_wal_parse(const uint8_t *buf, uint32_t len,
     if (REQUIRED[op].needs_id) {
         e = obj_get_field(buf, len, (const uint8_t *)"id", 2, &vp, &vlen, &found);
         if (e) return e;
-        if (!found || vlen != 13 || vp[0] != BJ_TYPE_OID) return DC_ERR_WAL_MISSING_FIELD;
+        /* Any id the format can key -- the same domain dc_id_ok admits
+         * everywhere else, not the fixed OID this row carried in v1. A
+         * command naming an id no reader could resolve is refused here,
+         * before it can be applied. */
+        if (!found || !dc_id_ok(vp, (uint32_t)vlen)) return DC_ERR_WAL_MISSING_FIELD;
     }
     for (int i = 0; i < 3 && REQUIRED[op].f[i]; i++) {
         const char *f = REQUIRED[op].f[i];
@@ -598,12 +628,12 @@ int dc_wal_index_name(const uint8_t *cmd, uint32_t len,
 
 /* `{ _id: <oid> }` -- the only filter apply ever runs against, and it is
  * a point lookup rather than a query. */
-static int id_filter(const uint8_t id[12], dbuf *out) {
+static int id_filter(dc_id id, dbuf *out) {
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     int e = bj_begin_object(b);
     if (!e) e = bj_put_key(b, (const uint8_t *)"_id", 3);
-    if (!e) e = bj_put_oid(b, id);
+    if (!e) e = bj_put_raw(b, id.p, id.len);
     if (!e) e = bj_end_object(b);
     if (!e) {
         size_t n; const uint8_t *d = bj_builder_data(b, &n);
@@ -614,9 +644,10 @@ static int id_filter(const uint8_t id[12], dbuf *out) {
     return e;
 }
 
-/* One driver-shaped result. `id` is the insertedId (NULL for the count
- * forms); `counts` and `count_keys` are the numeric fields, in order. */
-static int result_object(dbuf *out, const uint8_t *id, int upserted_null,
+/* One driver-shaped result. `id` is the insertedId in VALUE form (NULL
+ * for the count forms); `counts` and `count_keys` are the numeric
+ * fields, in order. */
+static int result_object(dbuf *out, const dc_id *id, int upserted_null,
                          const char *const *count_keys, const int64_t *counts, int n) {
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
@@ -625,7 +656,7 @@ static int result_object(dbuf *out, const uint8_t *id, int upserted_null,
     if (!e) e = bj_put_bool(b, 1);
     if (id) {
         if (!e) e = bj_put_key(b, (const uint8_t *)"insertedId", 10);
-        if (!e) e = bj_put_oid(b, id);
+        if (!e) e = bj_put_raw(b, id->p, id->len);
     }
     for (int i = 0; i < n && !e; i++) {
         e = bj_put_key(b, (const uint8_t *)count_keys[i], (uint32_t)strlen(count_keys[i]));
@@ -677,18 +708,20 @@ int dc_wal_apply(dc_collection *c, uint64_t index,
     if (op == DC_WAL_INSERT) {
         const uint8_t *doc = field(cmd, len, "doc", &vlen);
         if (!doc) return DC_ERR_WAL_MISSING_FIELD;
-        uint8_t id[12];
-        e = dc_document_id(doc, (uint32_t)vlen, id);
+        dc_id id;
+        e = dc_document_id(doc, (uint32_t)vlen, &id);
         if (e) return e;
         e = dc_insert_one(c, doc, (uint32_t)vlen);
         if (e) return e;
-        return result_object(result, id, 0, NULL, NULL, 0);
+        return result_object(result, &id, 0, NULL, NULL, 0);
     }
 
-    /* The remaining three name one document, by id. */
+    /* The remaining three name one document, by id -- any admissible id
+     * scalar since format v2, and v2 entries live in v2-stamped
+     * databases. */
     const uint8_t *idv = field(cmd, len, "id", &vlen);
-    if (!idv || vlen != 13) return DC_ERR_WAL_MISSING_FIELD;
-    const uint8_t *id = idv + 1;   /* past the OID tag */
+    if (!idv || !dc_id_ok(idv, (uint32_t)vlen)) return DC_ERR_WAL_MISSING_FIELD;
+    dc_id id = { idv, (uint32_t)vlen };
 
     dbuf filter = {0};
     e = id_filter(id, &filter);
@@ -703,14 +736,14 @@ int dc_wal_apply(dc_collection *c, uint64_t index,
         const uint8_t *payload = field(cmd, len, op == DC_WAL_UPDATE ? "update" : "doc", &vlen);
         if (!payload) e = DC_ERR_WAL_MISSING_FIELD;
         int outcome = 0;
-        uint8_t upserted[12];
-        static const uint8_t NO_DEFAULT_ID[12] = {0};
         if (!e) {
+            /* upsert is off, so default_id is never consulted and
+             * upserted_id can never be written: both stay empty. */
             e = op == DC_WAL_UPDATE
                 ? dc_update_one(c, filter.data, (uint32_t)filter.len, payload, (uint32_t)vlen,
-                                NO_DEFAULT_ID, 0, &outcome, upserted)
+                                (dc_id){0,0}, 0, &outcome, NULL)
                 : dc_replace_one(c, filter.data, (uint32_t)filter.len, payload, (uint32_t)vlen,
-                                 NO_DEFAULT_ID, 0, &outcome, upserted);
+                                 (dc_id){0,0}, 0, &outcome, NULL);
         }
         /* 0 = no such document, 1 = matched and written. 2 (upserted) is
          * unreachable with upsert off, and would be a lie to report. */

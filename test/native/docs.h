@@ -52,6 +52,10 @@ static inline void doc_oid(doc *d, const char *k, const uint8_t id[12]) {
     doc_key(d, k);
     bj_put_oid(d->b, id);
 }
+static inline void doc_null(doc *d, const char *k) {
+    doc_key(d, k);
+    bj_put_null(d->b);
+}
 /* Nested object/array: caller balances with doc_end_obj/doc_end_arr. */
 static inline void doc_begin_obj(doc *d, const char *k) { doc_key(d, k); bj_begin_object(d->b); }
 static inline void doc_end_obj(doc *d) { bj_end_object(d->b); }

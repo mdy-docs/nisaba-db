@@ -932,7 +932,7 @@ int dbi_chunk_entry(const char *db, size_t db_len,
     }
     dc_wal_plan *p = NULL;
     int e = dc_wal_plan_build(NULL, coll, (uint32_t)coll_len, DC_WREQ_INDEX_CHUNK,
-                              name, name_len, kspan, kspan_len, 0, NULL, &p);
+                              name, name_len, kspan, kspan_len, 0, (dc_id){0,0}, &p);
     if (e) return e;
     uint32_t clen = 0;
     const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);

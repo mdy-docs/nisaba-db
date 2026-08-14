@@ -16,8 +16,8 @@
  * What deliberately STAYS in JavaScript: the map from code to JS error
  * CLASS (DuplicateKeyError, MissingIndexedFieldError, ...). That is a
  * JavaScript type taxonomy, not a database rule, and C has no opinion
- * about it. So is the JS-type dispatch in toObjectId -- C never sees a JS
- * value.
+ * about it. So is the JS-type dispatch in `toId` -- C never sees a JS
+ * value, only the bytes one encoded to.
  */
 #ifndef DB_VALIDATE_H
 #define DB_VALIDATE_H

@@ -26,11 +26,12 @@ the entry-point split (`nisaba` full / `@mdy-docs/nisaba-db/remote` ~11 KB main-
 ## P0 — adoption blockers
 
 **Status: all six items landed 2026-07-16.** Notes against the original
-acceptance criteria: #3 resolved as the documented-restriction branch —
-the spike confirmed the C core is OID-typed end to end (fixed 12-byte
-primary keys, OID back-pointers in every index row, `{_id}` fast paths),
-so scalar `_id`s are a format-v2 migration, now recorded below; scalar
-`_id`s throw `InvalidIdError` pointing at the unique-index alternative.
+acceptance criteria: #3 landed in two steps — the documented-restriction
+branch first, because the spike found the C core OID-typed end to end
+(fixed 12-byte primary keys, OID back-pointers in every index row,
+`{_id}` fast paths), and then the PREFERRED branch as format v2 on
+2026-08-15 (see P2). `InvalidIdError` still exists and still names the
+domain; it just refuses a much smaller set.
 #4 shipped with its own dedicated suite (`test/db.nodefs.test.js`)
 rather than parametrizing the OPFS tests — parametrization is still
 worth doing. #5: build/lib turned out to be gitignored (artifacts build at pack
@@ -76,12 +77,13 @@ everything needed.
   carry `code`/`name` through the payload so followers rebuild the same
   shape (`db-coordinator.js` already rebuilds `result`/`writeErrors`).
 
-### 3. Scalar `_id` support (or a loud, documented restriction) ✅ (restriction branch)
+### 3. Scalar `_id` support (or a loud, documented restriction) ✅ (both branches)
 
-Verified empirically: `{ _id: 'user-42' }` and `{ _id: 1 }` both throw
-(`toObjectId` requires ObjectId/24-hex). MongoDB accepts any scalar
-`_id`, and natural keys are extremely common — this will be the #1
-"it doesn't work" report.
+Verified empirically at the time: `{ _id: 'user-42' }` and `{ _id: 1 }`
+both threw (`toObjectId` required ObjectId/24-hex). MongoDB accepts any
+scalar `_id`, and natural keys are extremely common — this was going to
+be the #1 "it doesn't work" report. **Format v2 accepts them** (P2);
+what follows is the reasoning that got there.
 
 - Preferred: allow string/number/Date `_id`s. The key encoder already
   handles exactly those types for secondary indexes (see the -14 error
@@ -221,8 +223,8 @@ deliberate error, and a test opening a doctored future-version file.
 
 ## P2 — ecosystem polish (after P0/P1)
 
-**Status: landed 2026-07-16** except scalar `_id`/format v2, which stays
-the one open project. Notes: `explain()` is backed by a real C export
+**Status: landed 2026-07-16**, and the one item left open then — scalar
+`_id`/format v2 — landed 2026-08-15. Notes: `explain()` is backed by a real C export
 (`dc_explain`) consulting the same planners the queries run — and the
 spike surfaced that `find({_id})` full-scanned while `findOne({_id})`
 point-looked-up, so the `{_id}` fast path now covers the whole shared
@@ -243,11 +245,16 @@ leading `$match` into the engine and documents its JS-side subset.
 - ✅ **Benchmarks** — a small tracked suite (insert/query/index/compact at
   1k/100k docs, node + browser) guarding the WASM-boundary cost from
   regressions.
-- **Scalar `_id` support (format v2)** — the P0 #3 spike's finding:
-  variable-length primary keys via `keyenc`'s ordered encoding, new
-  index-row back-pointer format, migration per
-  `docs/format-compatibility.md`'s rules. A real project; the format
-  stamp machinery it needs now exists.
+- ✅ **Scalar `_id` support (format v2)** — an `_id` may be an ObjectId,
+  a string, a finite number or a Date. Variable-length primary keys via
+  `keyenc`'s ordered encoding; index rows needed no new back-pointer
+  format after all (their composite keys already ended in the tagged id
+  and their rows already held its value form, which is what made the
+  migration one re-keyed primary copy per collection). A version 1
+  database migrates on open, resumably; `docs/format-compatibility.md`
+  has the whole story. The 24-hex-string coercion `toObjectId` used to
+  do is GONE with it — a string `_id` is now a string, so coercing one
+  would be guessing.
 - ✅ **Non-goals to state in the README**: cross-collection transactions,
   watch() pipelines/`updateDescription` beyond current scope,
   multi-writer across origins/processes (single-leader by design).

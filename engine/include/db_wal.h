@@ -215,7 +215,7 @@ int dc_wal_plan_build(dc_collection *c, const char *coll, uint32_t coll_len,
                 int req,
                 const uint8_t *a, uint32_t a_len,
                 const uint8_t *b, uint32_t b_len,
-                int upsert, const uint8_t default_id[12],
+                int upsert, dc_id default_id,
                 dc_wal_plan **out);
 
 /* DC_PLAN_NOTHING / _MATCHED / _UPSERT. */
@@ -245,7 +245,7 @@ const uint8_t *dc_wal_plan_preimage(const dc_wal_plan *p, uint32_t *len);
  * NULL when there is no single such id (DC_PLAN_NOTHING, the many-forms,
  * DDL). The host reports it as `upsertedId`.
  */
-const uint8_t *dc_wal_plan_target_id(const dc_wal_plan *p);
+const uint8_t *dc_wal_plan_target_id(const dc_wal_plan *p, uint32_t *len);
 
 void dc_wal_plan_free(dc_wal_plan *p);
 

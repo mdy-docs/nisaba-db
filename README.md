@@ -130,11 +130,13 @@ instantiation itself; only the WASM-backed low-level surface
 (`@mdy-docs/nisaba-db/wasm`'s `encode`/`decode`, tree classes) needs an explicit
 `await ready()` first.
 
-One deliberate MongoDB deviation to know up front: **`_id` must be an
-ObjectId** (scalar `_id`s — numbers, arbitrary strings, Dates — throw
-`InvalidIdError`; the on-disk format keys everything by fixed 12-byte
-OIDs). Keep natural keys in their own field with a unique index:
-`createIndex({ email: 1 }, { unique: true })`.
+One deviation from MongoDB to know up front: an **`_id` must be an
+ObjectId, a string (without U+0000), a finite number, or a `Date`** —
+the values the on-disk key encoding can order. Anything else (`null`, a
+boolean, an array, an object, `NaN`) throws `InvalidIdError`. Integer
+and float ids are one domain, so `5` and `5.0` are the same id, and a
+24-hex string is a string id rather than an ObjectId spelled
+differently — nothing is coerced.
 
 ### Entry points
 
@@ -154,8 +156,6 @@ Deliberate scope limits, stated up front rather than discovered late:
 - **Cross-collection transactions.** Every single write (including
   `updateMany`/`bulkWrite` sub-operations) is atomic and journaled;
   there is no multi-collection transaction and none planned.
-- **Scalar `_id`s** — until a future format v2 (`docs/roadmap.md`): the
-  on-disk format keys everything by fixed 12-byte ObjectIds.
 - **Change-stream pipelines, `updateDescription`, resume tokens.**
   `watch()` delivers whole events, bounded-buffered; an overflowed
   consumer re-watches and re-reads current state.

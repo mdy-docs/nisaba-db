@@ -80,6 +80,7 @@ import {
   EntryLog,
   SnapshotStore,
   ObjectId,
+  toId,
   decode,
   resolveCurrentDate,
   runBulkWrite,
@@ -555,7 +556,11 @@ class WalCollection {
     if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
       throw new Error('insertOne requires a document object');
     }
-    const _id = doc._id !== undefined ? doc._id : new ObjectId();
+    // The same id gate the in-process collection applies, for the same
+    // reason and with the same message: the planner would refuse an
+    // inadmissible id too, but only after this host had decided what to
+    // log, and a cross-realm ObjectId needs re-wrapping either way.
+    const _id = doc._id !== undefined ? toId(doc._id) : new ObjectId();
     return this._wal._serialize(async () =>
       (await this._write(WAL_REQ.INSERT_ONE, { ...doc, _id })).results[0]);
   }
@@ -564,7 +569,9 @@ class WalCollection {
     if (!Array.isArray(docs) || docs.length === 0) {
       throw new Error('insertMany requires a non-empty array of documents');
     }
-    const withIds = docs.map((doc) => ({ ...doc, _id: doc._id !== undefined ? doc._id : new ObjectId() }));
+    const withIds = docs.map((doc) => ({
+      ...doc, _id: doc._id !== undefined ? toId(doc._id) : new ObjectId()
+    }));
     return this._wal._serialize(async () => {
       // The one caller that collects rather than throws: insertMany's
       // contract is to report a partial result on the failing document,

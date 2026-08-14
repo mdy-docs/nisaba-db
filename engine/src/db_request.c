@@ -254,21 +254,36 @@ static int field_flag(const uint8_t *o, size_t olen, const char *key, int dflt, 
     return read_bool(&c, out);
 }
 
-/* The 12 id bytes a write falls back on, as an OID or a 12-byte binary --
- * whichever the client's codec produced. */
-static int field_id(const uint8_t *o, size_t olen, uint8_t out[12], int *found) {
+/*
+ * The id a write falls back on when it turns out to need one, as the
+ * VALUE form the rest of the engine speaks: any scalar the format can
+ * key (dc_id_ok), not the fixed ObjectId of format 1 -- a client whose
+ * document is keyed by a string sends that string here.
+ *
+ * `scratch` receives the one shape that has to be rewritten rather than
+ * pointed at: a 12-byte BINARY, which is how a codec without an ObjectId
+ * type spells one. Everything else is a span into the request buffer, so
+ * `scratch` must outlive the returned dc_id.
+ */
+static int field_id(const uint8_t *o, size_t olen, uint8_t scratch[13],
+                    dc_id *out, int *found) {
+    out->p = NULL; out->len = 0;
     const uint8_t *v; size_t vlen;
     int e = field_raw(o, olen, "id", &v, &vlen, found);
     if (e || !*found) return e;
-    if (vlen == 13 && (v[0] == BJ_TYPE_OID)) { memcpy(out, v + 1, 12); return BJ_OK; }
+    if (dc_id_ok(v, (uint32_t)vlen)) {
+        out->p = v; out->len = (uint32_t)vlen;
+        return BJ_OK;
+    }
     cur c = { v, vlen, 0 };
-    const uint8_t *b; uint32_t blen;
+    uint32_t blen;
     uint8_t t;
     if (take_type(&c, &t) || t != BJ_TYPE_BINARY) return DC_ERR_REQ_MALFORMED;
     if (take_u32(&c, &blen)) return BJ_ERR_EOF;
     if (blen != 12 || cur_need(&c, blen)) return DC_ERR_REQ_MALFORMED;
-    b = c.d + c.pos;
-    memcpy(out, b, 12);
+    scratch[0] = BJ_TYPE_OID;
+    memcpy(scratch + 1, c.d + c.pos, 12);
+    out->p = scratch; out->len = 13;
     return BJ_OK;
 }
 
@@ -425,13 +440,14 @@ int dbs_refusal_format_newer(dbuf *out, int64_t found, int64_t understands) {
     return e;
 }
 
-/* {_id: <oid>} -- the filter that reads one document back by id, which
- * the query layer answers with a single bpt_search rather than a scan. */
-static int id_filter(const uint8_t id[12], dbuf *out) {
+/* {_id: <scalar>} -- the filter that reads one document back by id,
+ * which the query layer answers with a single bpt_search rather than a
+ * scan. `id` is the VALUE form. */
+static int id_filter(dc_id id, dbuf *out) {
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     bj_begin_object(b);
-    PUT_KEY(b, "_id"); bj_put_oid(b, id);
+    PUT_KEY(b, "_id"); bj_put_raw(b, id.p, id.len);
     bj_end_object(b);
     size_t len = 0;
     const uint8_t *data = bj_builder_data(b, &len);
@@ -508,16 +524,17 @@ static int build_event(dc_collection *c, const char *coll, uint32_t coll_len,
     const uint8_t *doc = NULL; size_t doc_len = 0; int has_doc = 0;
     if ((e = field_raw(cmd, cmd_len, "doc", &doc, &doc_len, &has_doc))) return e;
 
-    uint8_t id[12];
+    dc_id id;
     if (op == DC_WAL_INSERT) {
         if (!has_doc) return BJ_ERR_STATE;
-        e = dc_document_id(doc, doc_len, id);
+        e = dc_document_id(doc, doc_len, &id);
         if (e) return e;
     } else {
         const uint8_t *v; size_t vlen; int f = 0;
         if ((e = field_raw(cmd, cmd_len, "id", &v, &vlen, &f))) return e;
-        if (!f || vlen != 13 || v[0] != BJ_TYPE_OID) return BJ_ERR_STATE;
-        memcpy(id, v + 1, 12);
+        if (!f || !dc_id_ok(v, (uint32_t)vlen)) return BJ_ERR_STATE;
+        id.p = v;
+        id.len = (uint32_t)vlen;
     }
 
     /* An update's post-image, read back by the id the command names. */
@@ -547,7 +564,7 @@ static int build_event(dc_collection *c, const char *coll, uint32_t coll_len,
     bj_put_string(b, (const uint8_t *)type, (uint32_t)strlen(type));
     PUT_KEY(b, "documentKey");
     bj_begin_object(b);
-    PUT_KEY(b, "_id"); bj_put_oid(b, id);
+    PUT_KEY(b, "_id"); bj_put_raw(b, id.p, id.len);
     bj_end_object(b);
     if (index) {
         /* The resume token: name this in a later watch's `from` and the
@@ -635,7 +652,8 @@ typedef struct {
      * says so. One field, because they are one fact. */
     int     outcome;
     int     has_target_id;
-    uint8_t target_id[12];
+    uint8_t target_id[DC_ID_MAX_BYTES];   /* VALUE form */
+    uint32_t target_id_len;
 } write_result;
 
 /* ---- the replicated fork (db_session.h) ---------------------------------
@@ -658,7 +676,7 @@ typedef struct {
 static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
                      int wreq, const uint8_t *a, uint32_t a_len,
                      const uint8_t *b, uint32_t b_len,
-                     int upsert, const uint8_t id[12], dc_wal_plan **out) {
+                     int upsert, dc_id did, dc_wal_plan **out) {
     if (dbs_repl_active(s)) {
         /* A plan this request already made, on an earlier pass. */
         *out = dbs_repl_resuming(s);
@@ -690,8 +708,11 @@ static int plan_open(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
         if (ce) return ce;
     }
 
+    /* The default id is the CALLER's (db_wal.h says why the host mints
+     * it), already in the value form the planner speaks. DDL plans arrive
+     * with no id at all -- they never need one. */
     int e = dc_wal_plan_build(c, coll, coll_len, wreq, a, a_len, b, b_len,
-                              upsert, id, out);
+                              upsert, did, out);
     if (e) return e;
     if (!dbs_repl_active(s)) return BJ_OK;
     /*
@@ -763,7 +784,7 @@ static void plan_close(dbs *s, dc_wal_plan *p) {
 static int run_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
                      int wreq, const uint8_t *a, uint32_t a_len,
                      const uint8_t *b, uint32_t b_len,
-                     int upsert, const uint8_t id[12], write_result *wr,
+                     int upsert, dc_id id, write_result *wr,
                      dbuf *preimage) {
     memset(wr, 0, sizeof *wr);
 
@@ -819,8 +840,13 @@ static int run_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_l
     }
     wr->outcome = dc_wal_plan_outcome(p);
     {
-        const uint8_t *tid = dc_wal_plan_target_id(p);
-        if (tid) { memcpy(wr->target_id, tid, 12); wr->has_target_id = 1; }
+        uint32_t tlen = 0;
+        const uint8_t *tid = dc_wal_plan_target_id(p, &tlen);
+        if (tid && tlen <= sizeof wr->target_id) {
+            memcpy(wr->target_id, tid, tlen);
+            wr->target_id_len = tlen;
+            wr->has_target_id = 1;
+        }
     }
     /* An upsert is APPLIED as an insert, so the apply result says
      * "insertedId" -- but a driver counts it as an upsert and not as
@@ -847,7 +873,8 @@ static int render_write(const write_result *wr, dbuf *out) {
     PUT_KEY(rb, "deletedCount");  bj_put_int(rb, wr->deleted);
     PUT_KEY(rb, "insertedCount"); bj_put_int(rb, wr->inserted);
     PUT_KEY(rb, "upsertedId");
-    if (wr->outcome == DC_PLAN_UPSERT && wr->has_target_id) bj_put_oid(rb, wr->target_id);
+    if (wr->outcome == DC_PLAN_UPSERT && wr->has_target_id)
+        bj_put_raw(rb, wr->target_id, wr->target_id_len);
     else bj_put_null(rb);
     bj_end_object(rb);
     size_t rlen = 0;
@@ -860,7 +887,7 @@ static int render_write(const write_result *wr, dbuf *out) {
 static int do_write(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
                     int wreq, const uint8_t *a, uint32_t a_len,
                     const uint8_t *b, uint32_t b_len,
-                    int upsert, const uint8_t id[12], dbuf *out) {
+                    int upsert, dc_id id, dbuf *out) {
     write_result wr;
     int e = run_write(s, c, coll, coll_len, wreq, a, a_len, b, b_len, upsert, id, &wr, NULL);
     if (e) return e;
@@ -951,7 +978,7 @@ static int respond_many(dbuf *out, const write_result *t, uint32_t attempted,
 static int do_insert_many(dbs *s, dc_collection *c, const char *coll, uint32_t coll_len,
                           const uint8_t *docs, size_t docs_len, int ordered,
                           dbuf *out) {
-    static const uint8_t NO_ID[12] = {0};   /* INSERT_MANY needs no default */
+    static const dc_id NO_ID = { 0, 0 };   /* INSERT_MANY needs no default */
 
     cur scan = { docs, docs_len, 0 };
     uint32_t count = 0;
@@ -1028,17 +1055,18 @@ typedef struct {
     const uint8_t *a; uint32_t a_len;
     const uint8_t *b; uint32_t b_len;
     int upsert;
-    uint8_t id[12];
+    dc_id id;
 } bulk_write;
 
+/* `idscratch` is the caller's, and must outlive `bw`: see field_id. */
 static int read_bulk_write(int type, const uint8_t *sp, size_t sp_len,
-                           int have_now, bulk_write *bw) {
+                           int have_now, bulk_write *bw, uint8_t idscratch[13]) {
     memset(bw, 0, sizeof *bw);
     const uint8_t *v; size_t vlen; int f = 0;
     int have_id = 0;
 
     if (field_flag(sp, sp_len, "upsert", 0, &bw->upsert)) return DC_ERR_REQ_MALFORMED;
-    if (field_id(sp, sp_len, bw->id, &have_id)) return DC_ERR_REQ_MALFORMED;
+    if (field_id(sp, sp_len, idscratch, &bw->id, &have_id)) return DC_ERR_REQ_MALFORMED;
 
     switch (type) {
         case DC_BULK_INSERT_ONE: {
@@ -1139,9 +1167,10 @@ static int do_bulk_write(dbs *s, dc_collection *c, const char *coll, uint32_t co
      * grammar, and for the same reason. */
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *sp; size_t sp_len; double d; bulk_write bw;
+        uint8_t idscratch[13];
         if ((e = next_spec(&oc, &sp, &sp_len))) return DC_ERR_REQ_MALFORMED;
         if ((e = read_number(&tc, &d))) return e;
-        if ((e = read_bulk_write((int)d, sp, sp_len, have_now, &bw))) return e;
+        if ((e = read_bulk_write((int)d, sp, sp_len, have_now, &bw, idscratch))) return e;
     }
 
     oc.pos = 0; tc.pos = 0;
@@ -1165,9 +1194,10 @@ static int do_bulk_write(dbs *s, dc_collection *c, const char *coll, uint32_t co
 
     for (uint32_t i = 0; i < count; i++) {
         const uint8_t *sp; size_t sp_len; double d; bulk_write bw;
+        uint8_t idscratch[13];
         if ((e = next_spec(&oc, &sp, &sp_len))) break;
         if ((e = read_number(&tc, &d))) break;
-        if ((e = read_bulk_write((int)d, sp, sp_len, have_now, &bw))) break;
+        if ((e = read_bulk_write((int)d, sp, sp_len, have_now, &bw, idscratch))) break;
 
         /* $currentDate becomes a concrete date HERE, once per operation
          * but from one clock reading for the whole request: two members
@@ -1194,7 +1224,7 @@ static int do_bulk_write(dbs *s, dc_collection *c, const char *coll, uint32_t co
         if (wr.outcome == DC_PLAN_UPSERT && wr.has_target_id) {
             bj_begin_object(upb);
             PUT_KEY(upb, "index"); bj_put_int(upb, (int64_t)i);
-            PUT_KEY(upb, "id");    bj_put_oid(upb, wr.target_id);
+            PUT_KEY(upb, "id");    bj_put_raw(upb, wr.target_id, wr.target_id_len);
             bj_end_object(upb);
             if ((e = bj_builder_error(upb))) break;
             nups++;
@@ -1268,7 +1298,7 @@ static int do_ddl(dbs *s, const char *coll, uint32_t coll_len, int wreq,
                   dbuf *result) {
     dc_wal_plan *p = NULL;
     int e = plan_open(s, NULL, coll, coll_len, wreq,
-                      a, (uint32_t)a_len, b, (uint32_t)b_len, 0, NULL, &p);
+                      a, (uint32_t)a_len, b, (uint32_t)b_len, 0, (dc_id){0, 0}, &p);
     if (e == DC_PENDING) return BJ_OK;
     if (e) return e;
     uint32_t clen = 0;
@@ -1343,7 +1373,7 @@ static int staged_op(dbs *s, const char *coll, uint32_t coll_len, int wreq,
     dc_wal_plan *p = NULL;
     *rc = 0;
     int e = plan_open(s, NULL, coll, coll_len, wreq,
-                      a, (uint32_t)a_len, b, (uint32_t)b_len, 0, NULL, &p);
+                      a, (uint32_t)a_len, b, (uint32_t)b_len, 0, (dc_id){0, 0}, &p);
     if (e) return e;                    /* DC_PENDING included */
     (void)dbs_repl_next_index(s);       /* the lists stay in step */
     e = dbs_repl_applied(s, result, rc);
@@ -2161,10 +2191,10 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
         return respond_error(out, DC_ERR_REQ_MALFORMED);
     if (!has) upd = NULL;
 
-    uint8_t id[12];
+    uint8_t idscratch[13];
+    dc_id id = { 0, 0 };
     int have_id = 0;
-    memset(id, 0, sizeof id);
-    if ((e = field_id(req, req_len, id, &have_id)))
+    if ((e = field_id(req, req_len, idscratch, &id, &have_id)))
         return respond_error(out, DC_ERR_REQ_MALFORMED);
     int upsert = 0;
     if ((e = field_flag(req, req_len, "upsert", 0, &upsert)))
@@ -2357,7 +2387,8 @@ int dbs_handle(dbs *s, uint64_t client, const uint8_t *req, size_t req_len,
             } else if (return_new) {
                 if (wr.has_target_id) {
                     dbuf idf = {0};
-                    if ((e = id_filter(wr.target_id, &idf))) { dbuf_free(&idf); break; }
+                    if ((e = id_filter((dc_id){ wr.target_id, wr.target_id_len },
+                                       &idf))) { dbuf_free(&idf); break; }
                     uint8_t *d = NULL; size_t dlen = 0; int got = 0;
                     e = dc_find_one(c, idf.data, (uint32_t)idf.len, NULL, 0, &got, &d, &dlen);
                     dbuf_free(&idf);

@@ -164,12 +164,13 @@ int dc_catalog_drop_index(const uint8_t *entry, size_t entry_len,
  */
 int dc_catalog_index_building_set(const uint8_t *entry, size_t entry_len,
                                   const char *name, size_t name_len,
-                                  int building, const uint8_t *cursor,
+                                  int building,
+                                  const uint8_t *cursor, uint32_t cursor_len,
                                   dbuf *out);
 int dc_catalog_index_building_get(const uint8_t *entry, size_t entry_len,
                                   const char *name, size_t name_len,
                                   int *found, int *building,
-                                  uint8_t cursor_out[12], int *has_cursor);
+                                  dbuf *cursor_out, int *has_cursor);
 
 /*
  * Plan a NEW index from a createIndex call: what kind it is, what it will
@@ -362,6 +363,11 @@ typedef enum { DC_SRC_BPT = 0, DC_SRC_RTREE = 1 } dc_source_kind;
  * the new files merely orphaned. The caller deletes them; a crash instead
  * leaves them for the next sweep.
  */
+int dc_migrate_execute(bj_ns *ns, bpt *catalog,
+                       const char *coll, size_t coll_len,
+                       const uint8_t *plan, size_t plan_len,
+                       void *const *sources, const int *source_kinds,
+                       uint32_t nsources, uint64_t *bytes_built);
 int dc_compact_execute(bj_ns *ns, bpt *catalog,
                        const char *coll, size_t coll_len,
                        const uint8_t *plan, size_t plan_len,

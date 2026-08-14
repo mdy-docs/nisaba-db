@@ -27,7 +27,9 @@ describe('db-names: constants', () => {
   });
 
   it('reports the on-disk format version from C, not a JS constant', () => {
-    expect(dbFormatVersion()).toBe(1);
+    // 2 = scalar _ids: variable-length primary keys and index
+    // back-pointers (docs/format-compatibility.md).
+    expect(dbFormatVersion()).toBe(2);
   });
 });
 

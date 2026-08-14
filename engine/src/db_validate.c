@@ -41,10 +41,9 @@ const char *dc_strerror(int code) {
             return "Document is missing a field required by a non-sparse index "
                    "(create the index with sparse: true to skip such documents)";
         case DC_ERR_UNSUPPORTED_ID:
-            return "Upsert: the filter pins an _id that is not an ObjectId. Unlike "
-                   "MongoDB, scalar _ids (numbers, arbitrary strings, Dates) are not "
-                   "supported by the on-disk format; keep natural keys in their own "
-                   "field with a unique index. See docs/db-api.md.";
+            return "Unsupported _id: an _id must be an ObjectId, a string without "
+                   "U+0000, a finite number, or a Date -- the values the on-disk key "
+                   "encoding can order. See docs/db-api.md.";
         case DC_ERR_UNINDEXABLE_VALUE:
             return "Indexed field value cannot be key-encoded: only numbers, strings, "
                    "and Dates are indexable (no NaN, no strings containing U+0000)";

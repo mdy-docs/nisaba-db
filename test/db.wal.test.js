@@ -300,6 +300,79 @@ describe('WAL: what gets logged', () => {
   });
 });
 
+describe('WAL: scalar _ids', () => {
+  /**
+   * Format v2's id domain, through the LOGGED path -- which is a
+   * different question from the in-process one. Every write here becomes
+   * a command whose `id` row the grammar must accept at replay
+   * (dc_wal_parse), so a write path that can log what the replay path
+   * refuses is a node that halts on its own history. That is exactly
+   * what a leftover version-1 shape check did: matched updates and
+   * deletes of a string-keyed document logged fine and then failed to
+   * parse.
+   */
+  const IDS = ['user-42', 42, -0.5, new Date(1700000000000)];
+
+  it('every admissible id type survives insert, update, delete and replay', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider);
+    const users = await db.collection('users');
+
+    for (const _id of IDS) await users.insertOne({ _id, n: 1 });
+    for (const _id of IDS) {
+      expect((await users.findOne({ _id })).n, `insert ${String(_id)}`).toBe(1);
+      // The matched update and the delete are the two commands that
+      // carry an id row of their own.
+      const r = await users.updateOne({ _id }, { $set: { n: 2 } });
+      expect(r.matchedCount, `update ${String(_id)}`).toBe(1);
+    }
+    // An upsert takes the id the filter pinned, whatever type it is.
+    const up = await users.updateOne({ _id: 'pinned' }, { $set: { n: 3 } }, { upsert: true });
+    expect(up.upsertedId).toBe('pinned');
+    expect(await users.deleteOne({ _id: 42 })).toEqual({ acknowledged: true, deletedCount: 1 });
+    await db.close();
+
+    // Replay the whole log into a database that has applied none of it:
+    // the entries are re-read by the same grammar that wrote them.
+    const replayed = await connectWal(provider);
+    const back = await replayed.collection('users');
+    expect(await back.countDocuments({})).toBe(IDS.length); // 4 - 1 deleted + 1 upserted
+    for (const _id of IDS.filter((v) => v !== 42)) {
+      expect((await back.findOne({ _id })).n, `replayed ${String(_id)}`).toBe(2);
+    }
+    expect((await back.findOne({ _id: 'pinned' })).n).toBe(3);
+    await replayed.close();
+  });
+
+  it('change events name the document by its own id, whatever type it is', async () => {
+    const db = await connectWal(new MemoryStorageProvider());
+    const users = await db.collection('users');
+    const seen = [];
+    const stream = users.watch();
+    (async () => { for await (const event of stream) seen.push(event); })();
+
+    await users.insertOne({ _id: 'str', n: 1 });
+    await users.updateOne({ _id: 'str' }, { $set: { n: 2 } });
+    await users.deleteOne({ _id: 'str' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(seen.map((e) => [e.operationType, e.documentKey._id]))
+      .toEqual([['insert', 'str'], ['update', 'str'], ['delete', 'str']]);
+    stream.close();
+    await db.close();
+  });
+
+  it('refuses an id no format can key, before anything is logged', async () => {
+    const provider = new MemoryStorageProvider();
+    const db = await connectWal(provider);
+    const users = await db.collection('users');
+    await expect(users.insertOne({ _id: null, n: 1 })).rejects.toThrow(/_id/);
+    expect(db.log.lastIndex).toBe(0);
+    expect(await users.countDocuments({})).toBe(0);
+    await db.close();
+  });
+});
+
 describe('WAL: crash recovery', () => {
   it('replays commands that were durable in the log but never applied', async () => {
     const provider = new MemoryStorageProvider();

@@ -35,13 +35,18 @@ EMSCRIPTEN_KEEPALIVE dc_wal_plan *walw_plan(dc_collection *c,
                                             int req,
                                             const uint8_t *a, int a_len,
                                             const uint8_t *b, int b_len,
-                                            int upsert, const uint8_t *default_id,
+                                            int upsert,
+                                            const uint8_t *default_id, int default_id_len,
                                             int *rc_out) {
-    if (coll_len < 0 || a_len < 0 || b_len < 0) { *rc_out = BJ_ERR_RANGE; return NULL; }
+    if (coll_len < 0 || a_len < 0 || b_len < 0 || default_id_len < 0) {
+        *rc_out = BJ_ERR_RANGE;
+        return NULL;
+    }
     dc_wal_plan *p = NULL;
     *rc_out = dc_wal_plan_build(c, coll, (uint32_t)coll_len, req,
                           a, (uint32_t)a_len, b, (uint32_t)b_len,
-                          upsert, default_id, &p);
+                          upsert,
+                          (dc_id){ default_id, (uint32_t)default_id_len }, &p);
     return p;
 }
 
@@ -70,9 +75,16 @@ EMSCRIPTEN_KEEPALIVE int walw_preimage_len(dc_wal_plan *p) {
     return (int)len;
 }
 
-/* 12 raw id bytes, or 0 when the plan resolved no single document. */
+/* The target id's VALUE form, or 0 when the plan resolved no single
+ * document; _len reads its length the way every other pair here does. */
 EMSCRIPTEN_KEEPALIVE const uint8_t *walw_target_id(dc_wal_plan *p) {
-    return dc_wal_plan_target_id(p);
+    uint32_t len;
+    return dc_wal_plan_target_id(p, &len);
+}
+EMSCRIPTEN_KEEPALIVE int walw_target_id_len(dc_wal_plan *p) {
+    uint32_t len;
+    dc_wal_plan_target_id(p, &len);
+    return (int)len;
 }
 
 /*

@@ -105,6 +105,43 @@
 extern "C" {
 #endif
 
+/*
+ * ---- document ids (format v2) -------------------------------------------
+ *
+ * An `_id` is a SCALAR: an ObjectId, a string (UTF-8, no U+0000 --
+ * keyenc's terminator), a finite number (INT and FLOAT are one domain:
+ * 5 and 5.0 name the same document), or a date. It lives in two forms,
+ * and every function below says which it takes:
+ *
+ *   VALUE FORM  the binjson scalar (type byte + payload) exactly as the
+ *               document carries it. What the wire moves, what index
+ *               rows store, what change events carry. `dc_id` spans one,
+ *               aliasing whatever buffer it was found in.
+ *   KEY FORM    the keyenc part (keyenc.h) -- order-preserving and
+ *               canonical, so the two number encodings of one number
+ *               are one key. The primary tree's key, and the
+ *               back-pointer suffix of every secondary-index composite
+ *               key. Cross-type order is keyenc's tag order:
+ *               number < string < ObjectId < date.
+ *
+ * dc_id_ok says whether a scalar is an admissible id; dc_id_key is the
+ * ONE builder of the key form. Anything inadmissible refuses with
+ * DC_ERR_UNSUPPORTED_ID at the boundary that met it.
+ */
+typedef struct {
+    const uint8_t *p;      /* the binjson scalar, type byte first */
+    uint32_t       len;
+} dc_id;
+
+/* The most VALUE-form bytes an id may occupy -- a bound on primary keys,
+ * index back-pointers and text refs alike (MongoDB's index-key cap is
+ * the same order of magnitude). A string id of ~250 UTF-8 bytes fits;
+ * a document does not, and was never an id. */
+#define DC_ID_MAX_BYTES 256
+
+int dc_id_ok(const uint8_t *v, uint32_t len);
+int dc_id_key(dbuf *out, const uint8_t *v, uint32_t len);
+
 /* insertOne (or a replaceOne upsert) targets an _id that already exists. */
 #define DC_ERR_DUPLICATE   (-10)
 /* replaceOne's replacement document names an _id different from the
@@ -123,12 +160,12 @@ extern "C" {
  * (keyenc.h: number/string/Date only; no NaN, no strings containing
  * U+0000). Same rationale as DC_ERR_MISSING_INDEXED_FIELD. */
 #define DC_ERR_UNINDEXABLE_VALUE (-14)
-/* An upsert's filter pins an `_id` that this format cannot store as one
- * (only ObjectIds are storable keys -- see the InvalidIdError text in
- * src/nisaba-wasm.js for the full rationale). Distinct from the generic
- * BJ_ERR_STATE the other _id checks return, because this one is reached
- * through a *filter* rather than a document, where JS's toObjectId gate
- * never runs and the caller therefore gets no earlier warning. */
+/* An `_id` outside the domain this format can key: an ObjectId, a string
+ * without U+0000, a finite number, or a Date (dc_id_ok). Distinct from
+ * the generic BJ_ERR_STATE the other _id checks return, because it is
+ * also reached through an upsert's *filter* rather than a document,
+ * where a host's own id gate never runs and the caller would otherwise
+ * get no earlier warning. */
 #define DC_ERR_UNSUPPORTED_ID (-35)
 /* dc_collection_snapshot was asked for a read view of a collection holding
  * a structure that cannot produce one — today that means a geo index,
@@ -402,8 +439,9 @@ int dc_collection_add_index_staged(dc_collection *c, const char *name, int name_
                                    const uint8_t *partial_filter, uint32_t partial_filter_len);
 int dc_collection_index_is_building(dc_collection *c, const char *name, int name_len);
 int dc_collection_backfill_step(dc_collection *c, const char *name, int name_len,
-                                const uint8_t *after_id, uint32_t k,
-                                uint8_t last_id_out[12], uint32_t *advanced, int *done);
+                                const uint8_t *after_id, uint32_t after_id_len,
+                                uint32_t k,
+                                dbuf *last_id, uint32_t *advanced, int *done);
 
 /*
  * Every document whose indexed fields equal `values` (a binjson ARRAY of
@@ -421,14 +459,15 @@ int dc_collection_find_by_index(dc_collection *c, const char *name, int name_len
                                 uint8_t **out, size_t *out_len);
 
 /*
- * The 12-byte `_id` of a document. BJ_ERR_STATE if the top-level `_id` is
- * missing or is not an OID. `dc_document_id_opt` instead reports absence
- * through *has (0/1) and only errors on a present-but-wrong-typed one --
- * the distinction replaceOne needs, where an absent _id is legal and a
- * string one is not.
+ * The `_id` of a document, in VALUE form -- a span into `doc`, valid as
+ * long as `doc` is. DC_ERR_UNSUPPORTED_ID if the top-level `_id` is
+ * missing or inadmissible (dc_id_ok). `dc_document_id_opt` instead
+ * reports absence through *has (0/1) and only errors on a
+ * present-but-inadmissible one -- the distinction replaceOne needs,
+ * where an absent _id is legal and a null one is not.
  */
-int dc_document_id(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12]);
-int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12], int *has);
+int dc_document_id(const uint8_t *doc, uint32_t doc_len, dc_id *id);
+int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, dc_id *id, int *has);
 
 /*
  * The document an upsert WOULD insert, without inserting it: for an
@@ -438,11 +477,12 @@ int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12],
  * for an `_id`).
  *
  * Both then carry an `_id`: the one the replacement pinned, else the one
- * the filter pinned as a bare equality, else `default_id` -- matching
- * real MongoDB, which seeds an upsert's id from the query. A pinned `_id`
- * that is not an ObjectId is DC_ERR_UNSUPPORTED_ID: this format stores no
- * other kind of key, and quietly substituting a generated id would store
- * the document somewhere the caller never asked for.
+ * the filter pinned as a bare equality, else `default_id` (VALUE form,
+ * normally a generated ObjectId) -- matching real MongoDB, which seeds
+ * an upsert's id from the query. A pinned `_id` that is not an
+ * admissible id scalar (dc_id_ok) is DC_ERR_UNSUPPORTED_ID: quietly
+ * substituting a generated id would store the document somewhere the
+ * caller never asked for.
  * Writes a freshly malloc'd OBJECT through *out / *out_len (caller frees).
  *
  * dc_update_one/dc_update_many/dc_replace_one build their upserted
@@ -454,17 +494,18 @@ int dc_document_id_opt(const uint8_t *doc, uint32_t doc_len, uint8_t id_out[12],
  */
 int dc_upsert_document(const uint8_t *filter, uint32_t filter_len,
                        const uint8_t *update, uint32_t update_len,
-                       const uint8_t default_id[12],
+                       dc_id default_id,
                        uint8_t **out, size_t *out_len);
 int dc_replace_document(const uint8_t *replacement, uint32_t replacement_len,
                         const uint8_t *filter, uint32_t filter_len,
-                        const uint8_t default_id[12],
+                        dc_id default_id,
                         uint8_t **out, size_t *out_len);
 
 /*
- * Insert `doc` (a binjson OBJECT whose top-level `_id` is an OID — BJ_ERR_
- * STATE if missing or not an OID) into `c`'s primary tree and every
- * attached index. DC_ERR_DUPLICATE if that id already exists.
+ * Insert `doc` (a binjson OBJECT whose top-level `_id` is an admissible
+ * id scalar -- DC_ERR_UNSUPPORTED_ID if missing or not) into `c`'s
+ * primary tree and every attached index. DC_ERR_DUPLICATE if that id
+ * already exists.
  */
 int dc_insert_one(dc_collection *c, const uint8_t *doc, uint32_t doc_len);
 
@@ -639,8 +680,9 @@ int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t fil
  * *result is written to 0 (no match, no upsert), 1 (matched and replaced),
  * or 2 (upserted).
  *
- * `upserted_id` (may be NULL) receives the 12 id bytes of the document an
- * upsert actually inserted -- which is NOT always `default_id`: a filter
+ * `upserted_id` (may be NULL) receives the VALUE form of the id the
+ * upsert actually inserted under, appended to the caller's dbuf (reset
+ * first) -- which is NOT always `default_id`: a filter
  * or a replacement that pins an `_id` gets that one (dc_upsert_document /
  * dc_replace_document). The host reports it as `upsertedId`, and has to
  * be told rather than deduce it, or the rule ends up written twice.
@@ -648,8 +690,8 @@ int dc_find_one_and_delete(dc_collection *c, const uint8_t *filter, uint32_t fil
  */
 int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *replacement, uint32_t replacement_len,
-                   const uint8_t default_id[12], int upsert, int *result,
-                   uint8_t upserted_id[12]);
+                   dc_id default_id, int upsert, int *result,
+                   dbuf *upserted_id);
 
 /*
  * Atomically find the first document matching `filter` and replace it with
@@ -664,7 +706,7 @@ int dc_replace_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
  */
 int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                             const uint8_t *replacement, uint32_t replacement_len,
-                            const uint8_t default_id[12], int upsert, int return_new,
+                            dc_id default_id, int upsert, int return_new,
                             int *found, uint8_t **out, size_t *out_len);
 
 /*
@@ -679,8 +721,8 @@ int dc_find_one_and_replace(dc_collection *c, const uint8_t *filter, uint32_t fi
  */
 int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                   const uint8_t *update, uint32_t update_len,
-                  const uint8_t default_id[12], int upsert, int *result,
-                  uint8_t upserted_id[12]);
+                  dc_id default_id, int upsert, int *result,
+                  dbuf *upserted_id);
 
 /*
  * Atomically find the first document matching `filter` and apply `update`
@@ -691,7 +733,7 @@ int dc_update_one(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
  */
 int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                            const uint8_t *update, uint32_t update_len,
-                           const uint8_t default_id[12], int upsert, int return_new,
+                           dc_id default_id, int upsert, int return_new,
                            int *found, uint8_t **out, size_t *out_len);
 
 /*
@@ -715,9 +757,9 @@ int dc_find_one_and_update(dc_collection *c, const uint8_t *filter, uint32_t fil
  */
 int dc_update_many(dc_collection *c, const uint8_t *filter, uint32_t filter_len,
                    const uint8_t *update, uint32_t update_len,
-                   const uint8_t default_id[12], int upsert,
+                   dc_id default_id, int upsert,
                    int64_t *matched_count, int *upserted,
-                   uint8_t upserted_id[12],
+                   dbuf *upserted_id,
                    uint8_t **images, size_t *images_len);
 
 /* Count of documents matching `filter` ({} is bpt_size of the primary tree,

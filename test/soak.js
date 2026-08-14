@@ -205,8 +205,30 @@ async function startServer(dir, port) {
   return { proc, stderr: () => err };
 }
 
-/** The self-describing document, and the check that reads it back. */
-const docFor = (coll, n) => ({ n, echo: n, tag: `v${n}`, coll });
+/**
+ * The self-describing document, and the check that reads it back.
+ *
+ * The `_id` cycles through every type format 2 can key, so the
+ * destructive operations below run over scalar-keyed data rather than
+ * ObjectIds alone — compaction above all, since that is the format
+ * migration's own machinery. Identity for every check here is still `n`,
+ * so nothing about violation detection depends on this.
+ *
+ * `n` increments per collection and a dropped collection restarts it, so
+ * each spelling is unique among the documents alive beside it. (One
+ * member, so a write is never retried from the same `n` after a lost
+ * leader -- soak-install.js has that hazard and mints per attempt
+ * instead; its docFor says why.)
+ */
+const docFor = (coll, n) => {
+  const doc = { n, echo: n, tag: `v${n}`, coll };
+  switch (n % 4) {
+    case 0:  return { ...doc, _id: `${coll}-${n}` };
+    case 1:  return doc;                                   // an ObjectId, minted client-side
+    case 2:  return { ...doc, _id: n + 0.5 };
+    default: return { ...doc, _id: new Date(1700000000000 + n) };
+  }
+};
 
 /*
  * A $regex filter whose pattern is DIFFERENT EVERY TIME, matching exactly

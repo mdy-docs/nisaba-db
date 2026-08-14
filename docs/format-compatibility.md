@@ -17,9 +17,23 @@ server:
 
 - `Db.open()` stamps a fresh database with the current version.
 - A database with **no stamp** predates the stamp mechanism and is by
-  definition version 1; it is stamped on open and otherwise unchanged.
-- A database stamped **at or below** the build's version opens normally
-  (see the bump rules below).
+  definition version 1 — unless it has no content at all, which makes it
+  a fresh database of the current version. Either way it is stamped on
+  open.
+- A database stamped **at or below** the build's version opens normally,
+  migrating first if it is below (see the bump rules below).
+- The stamp's value is `{ v }`, plus **`migrating: true`** for as long as
+  a migration is unfinished. That flag exists because the version alone
+  cannot say: the stamp is raised *before* the first collection is
+  converted (so no older build can misread what the migration writes),
+  which means from that instant the version reads current whether one
+  collection was converted or none. A crash in that window would
+  otherwise leave v1-keyed collections in a database nothing would ever
+  offer to convert again — their documents sitting under keys no reader
+  derives any more, with no error to go with it. The flag is written
+  durably with the raised version and cleared, durably, only when the
+  last collection has flipped; every open in between resumes the
+  migration, skipping the definitions already marked (see below).
 - A database stamped **above** the build's version is refused before
   anything touches the files — in particular before the orphan sweep,
   which must never judge a future format's files by an old version's
@@ -101,6 +115,61 @@ existing bytes — key encodings, journal record layout, tree node
 formats, the semantics of an existing catalog field, file-naming rules
 the orphan sweep relies on.
 
+## Version 2: scalar `_id`, and how a version 1 database becomes one
+
+The first real bump, and the migration story rule 1 asks for.
+
+**What changed.** An `_id` may now be an ObjectId, a string (no U+0000),
+a finite number, or a Date — the domain the ordered key encoding can
+order — where version 1 had only ObjectIds. Two forms carry an id: the
+*value form* (the binjson scalar, as documents, the wire, index rows and
+change events carry it) and the *key form* (the `keyenc` part —
+order-preserving, and canonical in that `5` and `5.0` are one id). The
+primary tree's key is the key form, where v1 used the raw twelve
+ObjectId bytes; text-index refs are key-form hex; and the WAL and
+catalog rows that carry an id carry any admissible scalar.
+
+**What did not change, and why the migration is small.** Secondary index
+files are *byte-identical* between the versions for the ObjectId ids a v1
+database holds: their composite keys already ended in the tagged key
+form, and their rows already held the id's value form. Only the primary
+tree is re-keyed. So the migration is one compaction-shaped copy per
+collection — `dc_migrate_execute`, which is `dc_compact_execute` with the
+primary's rows re-keyed on the way out (`Collection._migrate()` on the JS
+side, the same call through the browser's namespace adapter).
+
+**How it runs.** Opening is the whole interface; there is no migrate
+command, and it is eager rather than lazy, because a v1 key is bytes a v2
+read would simply not find:
+
+1. The stamp is raised to 2 **durably, first** — the fence — carrying
+   `migrating: true` (see *The stamp* above for what that flag is for).
+2. Each collection whose catalog definition lacks `keys: 2` gets one
+   re-keyed generation, committed by the same catalog flip that commits
+   any compaction, with `keys: 2` added in that flip.
+3. The flag is cleared, durably, once every collection has flipped.
+
+Each key is derived from its document's own `_id`, never transformed from
+the old key, which makes the copy **idempotent**: running it over a tree
+that is already v2 writes the same tree. A crash therefore cannot
+double-migrate, and resuming needs no record of where it stopped beyond
+which definitions are already marked. A collection created *by* a v2
+build carries no marker and needs none — it is only ever consulted for
+databases the flag or the version says are being converted.
+
+Not covered, deliberately: geo indexes store fixed twelve-byte refs, so a
+geo-indexed write of a document whose `_id` is not an ObjectId is refused
+(`DC_ERR_UNSUPPORTED_ID`) rather than silently truncated. Removal still
+works, so such a document can always be deleted.
+
+The escape hatch is unchanged: dump and restore through the CLI.
+
+Tested from both hosts against real v1 fixtures — a primary tree keyed
+the way v1 keyed it — in `test/db.format.test.js` (in process, including
+the interrupted-migration resume) and the C harness's *a version 1
+database is re-keyed when it is opened* and *a migration interrupted
+after the fence resumes at the next open*.
+
 ## What the stamp does not cover
 
 The stamp is a **database's**. An instance root holds files that belong to
@@ -133,16 +202,20 @@ only while a build is IN FLIGHT — the final chunk strips the fields,
 leaving a definition byte-identical to one that was never staged, and
 the opcodes compact out of the log with everything else.
 
-This did not bump the format version, and the trade is stated rather
-than hidden: a version bump would refuse EVERY database the new engine
-ever touched, forever, to protect against opening one during a window
-that lasts seconds. Inside that window an older engine would attach a
-half-built index as live (wrong reads) and refuse the chunk entries at
-replay (`DC_ERR_WAL_UNKNOWN_OP`). The deployment rule that covers it is
-the one nisaba-web already follows — one engine version per fleet, and
-never downgrade a directory that crashed mid-DDL without replaying it
-on the version that wrote it. Format v2 (the scalar-`_id` bump) will
-stamp this along with everything else it stamps.
+This did not bump the format version on its own, and the trade was
+stated rather than hidden: a version bump would refuse EVERY database the
+new engine ever touched, forever, to protect against opening one during a
+window that lasts seconds. Inside that window an older engine would
+attach a half-built index as live (wrong reads) and refuse the chunk
+entries at replay (`DC_ERR_WAL_UNKNOWN_OP`). The deployment rule that
+covered it is the one nisaba-web already follows — one engine version per
+fleet, and never downgrade a directory that crashed mid-DDL without
+replaying it on the version that wrote it.
+
+**Format 2 closed the window anyway.** Every database a v2 engine has
+touched is stamped 2, so a v1 build refuses the whole database rather
+than reaching an in-flight build's fields at all — in-flight build state
+included, since the fence goes down before anything else is written.
 
 ## Escape hatch
 

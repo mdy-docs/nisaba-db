@@ -258,3 +258,5 @@ _dcw_collection_index_is_building
 _dcw_backfill_step
 _catw_index_building_set
 _catw_index_building_get
+_walw_target_id_len
+_catw_migrate_execute

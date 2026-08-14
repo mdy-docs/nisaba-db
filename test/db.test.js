@@ -2396,17 +2396,28 @@ describe('db: CRUD completeness (milestone 8)', () => {
       await db.close();
     });
 
-    it('refuses an _id this format cannot store rather than substituting one', async () => {
-      // Filters skip the toObjectId gate that insertOne's documents pass
-      // through, so this is the first place such an _id can be caught --
-      // and quietly storing the document under a generated id instead is
-      // the behavior being fixed, not an acceptable fallback.
+    it('a pinned scalar _id seeds the upsert, and an unstorable one refuses', async () => {
       const db = await openDb();
       const users = await db.collection('users');
+
+      // Format v2: the filter's string id is the upserted document's id,
+      // not a generated ObjectId standing in for it.
+      const str = await users.updateOne({ _id: 'user-42' }, { $set: { n: 1 } }, { upsert: true });
+      expect(str.upsertedId).toBe('user-42');
+      expect(await users.findOne({ _id: 'user-42' })).toEqual({ _id: 'user-42', n: 1 });
+      // Running it again matches rather than creating a second document.
+      const again = await users.updateOne({ _id: 'user-42' }, { $set: { n: 2 } }, { upsert: true });
+      expect(again.matchedCount).toBe(1);
+      expect(again.upsertedId).toBeNull();
+
+      // Filters skip the toId gate that insertOne's documents pass
+      // through, so this is the first place an inadmissible _id can be
+      // caught -- and quietly storing the document under a generated id
+      // instead is the behavior being guarded against, not a fallback.
       await expect(
-        users.updateOne({ _id: 'not-an-objectid' }, { $set: { n: 1 } }, { upsert: true })
-      ).rejects.toThrow(/ObjectId/);
-      expect(await users.countDocuments({})).toBe(0);
+        users.updateOne({ _id: null }, { $set: { n: 1 } }, { upsert: true })
+      ).rejects.toThrow(/_id/);
+      expect(await users.countDocuments({})).toBe(1);
       await db.close();
     });
   });

@@ -487,12 +487,41 @@ done:
 
 /* ---- public ------------------------------------------------------------ */
 
+/* Write the format stamp. `migrating` records that this database's
+ * collections are not all converted yet -- see check_format. */
+static int write_stamp(dbs *s, int migrating) {
+    bpt_key key = { .is_string = 1, .num = 0,
+                    .str = (const uint8_t *)DC_FORMAT_KEY,
+                    .str_len = (uint32_t)strlen(DC_FORMAT_KEY) };
+    bj_builder *b = bj_builder_new();
+    if (!b) return BJ_ERR_OOM;
+    bj_begin_object(b);
+    bj_put_key(b, (const uint8_t *)"v", 1);
+    bj_put_int(b, DC_FORMAT_VERSION);
+    if (migrating) {
+        bj_put_key(b, (const uint8_t *)"migrating", 9);
+        bj_put_bool(b, 1);
+    }
+    bj_end_object(b);
+    size_t len = 0;
+    const uint8_t *data = bj_builder_data(b, &len);
+    int e = data ? bpt_add(s->catalog, &key, data, (uint32_t)len) : BJ_ERR_OOM;
+    bj_builder_free(b);
+    return e;
+}
+
 /* The format stamp, checked and (when creating) written -- the same
  * gate Db.open() applies in JavaScript, against the same key and the
  * same {v} shape, because a database is only one format however many
  * hosts read it. A database with no stamp predates the stamp and is
- * version 1 by definition. */
-static int check_format(dbs *s, int create) {
+ * version 1 by definition.
+ *
+ * `unfinished` reports the stamp's `migrating` flag: a database whose
+ * version is current but whose collections are not all converted. See
+ * the fence comment below for why that state has to be recorded rather
+ * than inferred from the version. */
+static int check_format(dbs *s, int create, int fresh, int64_t *prior,
+                        int *unfinished) {
     bpt_key key = { .is_string = 1, .num = 0,
                     .str = (const uint8_t *)DC_FORMAT_KEY,
                     .str_len = (uint32_t)strlen(DC_FORMAT_KEY) };
@@ -502,6 +531,7 @@ static int check_format(dbs *s, int create) {
     if (e) return e;
 
     int64_t v = DC_FORMAT_VERSION;
+    *unfinished = 0;
     if (found) {
         const uint8_t *nv; size_t nvlen; int f = 0;
         if ((e = obj_get_field(vp, vlen, (const uint8_t *)"v", 1, &nv, &nvlen, &f))) return e;
@@ -511,23 +541,104 @@ static int check_format(dbs *s, int create) {
             if ((e = read_number(&c, &d))) return e;
             v = (int64_t)d;
         }
+        const uint8_t *mv; size_t mvlen; int mf = 0;
+        if ((e = obj_get_field(vp, vlen, (const uint8_t *)"migrating", 9, &mv, &mvlen, &mf)))
+            return e;
+        if (mf && mvlen >= 1 && mv[0] == BJ_TYPE_TRUE) *unfinished = 1;
         /* Newer than this build understands: refused, not opened and
          * misread. There is no way to know what a field this build has
          * never seen means. */
         if (v > DC_FORMAT_VERSION) return DC_ERR_FORMAT_NEWER;
+    } else if (!fresh) {
+        /* A database with content and no stamp predates the mechanism
+         * and is by definition version 1 (docs/format-compatibility.md). */
+        v = 1;
     }
-    if (!create || (found && v == DC_FORMAT_VERSION)) return BJ_OK;
+    *prior = v;
+    (void)create;
+    int converting = (v < DC_FORMAT_VERSION) || *unfinished;
+    if (found && v == DC_FORMAT_VERSION && !converting) return BJ_OK;
 
-    bj_builder *b = bj_builder_new();
-    if (!b) return BJ_ERR_OOM;
-    bj_begin_object(b);
-    bj_put_key(b, (const uint8_t *)"v", 1);
-    bj_put_int(b, DC_FORMAT_VERSION);
-    bj_end_object(b);
-    size_t len = 0;
-    const uint8_t *data = bj_builder_data(b, &len);
-    e = data ? bpt_add(s->catalog, &key, data, (uint32_t)len) : BJ_ERR_OOM;
-    bj_builder_free(b);
+    if ((e = write_stamp(s, converting))) return e;
+    /*
+     * FOR AN OLDER DATABASE, THE STAMP IS THE FENCE and it goes down
+     * durably BEFORE the first collection migrates: from this sync on, a
+     * v1 build refuses the whole database, so no state the migration is
+     * about to write can ever be misread by one.
+     *
+     * THE FENCE ALSO HIDES THE WORK LEFT TO DO, which is why it carries
+     * `migrating`. Once the version reads current, the version alone can
+     * no longer say whether every collection was converted -- and a
+     * crash between this sync and the last collection's flip would
+     * otherwise leave v1-keyed collections in a database nothing would
+     * ever offer to convert again, their documents unreachable under
+     * keys nobody derives any more. The flag is cleared by the migration
+     * that finishes the job; until then every open resumes it, skipping
+     * the defs already marked `keys: 2`, and the copy is idempotent
+     * anyway.
+     */
+    if (converting) e = bpt_sync(s->catalog);
+    return e;
+}
+
+/*
+ * FORMAT-V2 MIGRATION, at open (docs/format-compatibility.md): every
+ * collection whose def does not carry `keys: 2` gets one re-keyed
+ * generation (compact_or_migrate with the migrate flag), eagerly, before
+ * anything is served -- a v1 primary key is bytes a v2 read would
+ * misinterpret, so lazy was never an option. Cost: one compaction-shaped
+ * copy per collection, once per database, ever.
+ */
+static int compact_or_migrate(dbs *s, const char *name, size_t name_len,
+                              dbs_compact_stats *out, int migrate);
+static int catalog_get(dbs *s, const char *coll, size_t coll_len,
+                       uint8_t **out, size_t *out_len, int *found);
+static dbs_entry *find_entry(dbs *s, const char *name, size_t name_len);
+
+static int migrate_v1(dbs *s) {
+    dbuf names = {0};
+    int e = dbs_list_collections(s, &names);
+    if (e) { dbuf_free(&names); return e; }
+    cur c = { names.data, names.len, 0 };
+    uint32_t n = 0;
+    if ((e = array_begin(&c, &n))) { dbuf_free(&names); return e; }
+    for (uint32_t i = 0; !e && i < n; i++) {
+        const uint8_t *np; uint32_t nlen;
+        if ((e = take_string(&c, &np, &nlen))) break;
+
+        uint8_t *entry = NULL; size_t entry_len = 0; int found = 0;
+        if ((e = catalog_get(s, (const char *)np, nlen, &entry, &entry_len, &found)))
+            break;
+        int done = 0;
+        if (found) {
+            const uint8_t *kv; size_t kvlen; int has = 0;
+            if (!obj_get_field(entry, entry_len, (const uint8_t *)"keys", 4,
+                               &kv, &kvlen, &has) && has) {
+                cur kc = { kv, kvlen, 0 };
+                double d = 0;
+                if (!read_number(&kc, &d) && (int64_t)d == 2) done = 1;
+            }
+        }
+        free(entry);
+        if (!found || done) continue;
+
+        dbs_compact_stats st;
+        e = compact_or_migrate(s, (const char *)np, nlen, &st, 1);
+        /* Released, not kept: a database can hold more collections than
+         * the session's open table, and a migration that pinned every
+         * one open would fail on the table before it failed on anything
+         * real. The next request reopens whatever it needs. */
+        if (!e) {
+            dbs_entry *en = find_entry(s, (const char *)np, nlen);
+            if (en) entry_release(s->ns, en);
+        }
+    }
+    dbuf_free(&names);
+    /* Every collection is converted: drop the resume flag, durably, so
+     * later opens stop offering to do this again. Only now -- the flag
+     * is what makes an interrupted migration resumable, so it outlives
+     * every partial success. */
+    if (!e && !(e = write_stamp(s, 0))) e = bpt_sync(s->catalog);
     return e;
 }
 
@@ -597,11 +708,25 @@ int dbs_open(bj_ns *ns, int order, int create, dbs **out) {
         free(s);
         return BJ_ERR_STATE;
     }
-    if ((e = check_format(s, create))) {
-        bpt_free(s->catalog);
-        ns->close(ns->ctx, &s->catalog_io);
-        free(s);
-        return e;   /* *out stays NULL: nothing was opened */
+    {
+        int fresh = s->catalog_io.size(s->catalog_io.ctx) == 0 ||
+                    bpt_size(s->catalog) == 0;
+        int64_t prior = DC_FORMAT_VERSION;
+        int unfinished = 0;
+        e = check_format(s, create, fresh, &prior, &unfinished);
+        /* Either an older database, or a current one whose last
+         * migration did not reach the end. */
+        if (!e && (prior < DC_FORMAT_VERSION || unfinished)) e = migrate_v1(s);
+        if (e) {
+            /* Entries the migration may have opened close with the
+             * session teardown a failed open owes anyway. */
+            for (int i = 0; i < DBS_MAX_COLLECTIONS; i++)
+                if (s->open[i].used) entry_release(ns, &s->open[i]);
+            bpt_free(s->catalog);
+            ns->close(ns->ctx, &s->catalog_io);
+            free(s);
+            return e;   /* *out stays NULL: nothing was opened */
+        }
     }
 
     *out = s;
@@ -1101,7 +1226,7 @@ int dbs_index_begin(dbs *s, const char *coll, size_t coll_len,
     free(entry);
     if (!e) e = dc_catalog_index_building_set(with_def.data, with_def.len,
                                               (const char *)name, name_len,
-                                              1, NULL, &staged);
+                                              1, NULL, 0, &staged);
     /* Staged here, not by the dispatcher: the put below is the commit
      * that makes "this entry applied" true, so the record rides it. */
     if (!e) e = catalog_note_applied(s, index);
@@ -1208,12 +1333,12 @@ int dbs_index_chunk(dbs *s, const char *coll, size_t coll_len,
     if (!found) { free(entry); *done = 1; return BJ_OK; }
 
     int def_found = 0, building = 0, has_cursor = 0;
-    uint8_t cursor[12];
+    dbuf cursor = {0};
     e = dc_catalog_index_building_get(entry, entry_len, (const char *)name, name_len,
-                                      &def_found, &building, cursor, &has_cursor);
+                                      &def_found, &building, &cursor, &has_cursor);
     free(entry);
-    if (e) return e;
-    if (!def_found || !building) { *done = 1; return BJ_OK; }
+    if (e) { dbuf_free(&cursor); return e; }
+    if (!def_found || !building) { dbuf_free(&cursor); *done = 1; return BJ_OK; }
 
     /*
      * ALREADY APPLIED: the catalog's applied index covers this entry, so
@@ -1221,17 +1346,18 @@ int dbs_index_chunk(dbs *s, const char *coll, size_t coll_len,
      * where the original run stopped -- the one way a replay could
      * diverge from a member that never crashed.
      */
-    if (index && index <= bpt_applied_index(s->catalog)) return BJ_OK;
+    if (index && index <= bpt_applied_index(s->catalog)) { dbuf_free(&cursor); return BJ_OK; }
     /* Staged now -- AFTER the guard it would otherwise satisfy -- and
      * committed by whichever catalog write ends this chunk: the cursor
      * advance, the final commit, or the unwind. */
-    if ((e = catalog_note_applied(s, index))) return e;
+    if ((e = catalog_note_applied(s, index))) { dbuf_free(&cursor); return e; }
 
-    uint8_t last[12];
+    dbuf last = {0};
     int scan_done = 0;
     e = dc_collection_backfill_step(en->coll, (const char *)name, (int)name_len,
-                                    has_cursor ? cursor : NULL, k,
-                                    last, advanced, &scan_done);
+                                    has_cursor ? cursor.data : NULL,
+                                    (uint32_t)cursor.len, k,
+                                    &last, advanced, &scan_done);
     if (e) {
         /*
          * The build cannot complete -- a genuine duplicate under
@@ -1242,6 +1368,8 @@ int dbs_index_chunk(dbs *s, const char *coll, size_t coll_len,
          * the UNWIND itself still wins: it is the harder error.
          */
         int ue = unwind_building_index(s, en, coll, coll_len, name, name_len);
+        dbuf_free(&cursor);
+        dbuf_free(&last);
         return ue ? ue : e;
     }
 
@@ -1249,17 +1377,28 @@ int dbs_index_chunk(dbs *s, const char *coll, size_t coll_len,
      * COMMIT: clear the staged state, and the index is live from this
      * entry on. One catalog write either way, carrying the staged
      * applied index with it. */
-    if ((e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found))) return e;
-    if (!found) { free(entry); return DC_ERR_NO_COLLECTION; }
+    if ((e = catalog_get(s, coll, coll_len, &entry, &entry_len, &found))) {
+        dbuf_free(&cursor); dbuf_free(&last);
+        return e;
+    }
+    if (!found) {
+        free(entry); dbuf_free(&cursor); dbuf_free(&last);
+        return DC_ERR_NO_COLLECTION;
+    }
+    const uint8_t *next_cursor = (!scan_done && *advanced) ? last.data
+                               : (!scan_done && has_cursor) ? cursor.data : NULL;
+    uint32_t next_cursor_len = (!scan_done && *advanced) ? (uint32_t)last.len
+                             : (!scan_done && has_cursor) ? (uint32_t)cursor.len : 0;
     dbuf updated = {0};
     e = dc_catalog_index_building_set(entry, entry_len, (const char *)name, name_len,
                                       scan_done ? 0 : 1,
-                                      (!scan_done && *advanced) ? last
-                                      : (!scan_done && has_cursor) ? cursor : NULL,
+                                      next_cursor, next_cursor_len,
                                       &updated);
     free(entry);
     if (!e) e = catalog_put(s, coll, coll_len, updated.data, updated.len);
     dbuf_free(&updated);
+    dbuf_free(&cursor);
+    dbuf_free(&last);
     if (e) return e;
 
     if (scan_done) {
@@ -1413,10 +1552,11 @@ int dbs_index_building_state(dbs *s, const char *coll, size_t coll_len,
         return 0;
     }
     int def_found = 0, building = 0, has_cursor = 0;
-    uint8_t cursor[12];
+    dbuf cursor = {0};
     int e = dc_catalog_index_building_get(entry, entry_len, (const char *)name, name_len,
-                                          &def_found, &building, cursor, &has_cursor);
+                                          &def_found, &building, &cursor, &has_cursor);
     free(entry);
+    dbuf_free(&cursor);
     return (!e && def_found && building) ? 1 : 0;
 }
 
@@ -1718,7 +1858,8 @@ static int gather_sources(dbs_entry *en, const uint8_t *plan, size_t plan_len,
     return BJ_OK;
 }
 
-int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *out) {
+static int compact_or_migrate(dbs *s, const char *name, size_t name_len,
+                              dbs_compact_stats *out, int migrate) {
     if (!s || !name || !out) return BJ_ERR_STATE;
     memset(out, 0, sizeof(*out));
 
@@ -1761,8 +1902,11 @@ int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *ou
     out->bytes_before = entry_bytes(en);
 
     uint64_t built = 0;
-    e = dc_compact_execute(s->ns, s->catalog, name, name_len, plan.data, plan.len,
-                           sources, kinds, nsources, &built);
+    e = migrate
+        ? dc_migrate_execute(s->ns, s->catalog, name, name_len, plan.data, plan.len,
+                             sources, kinds, nsources, &built)
+        : dc_compact_execute(s->ns, s->catalog, name, name_len, plan.data, plan.len,
+                             sources, kinds, nsources, &built);
     if (e) { dbuf_free(&plan); return e; }   /* nothing flipped; still on the old generation */
 
     /*
@@ -1804,6 +1948,10 @@ int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *ou
     out->bytes_after = en ? entry_bytes(en) : built;
     out->generation = gen;
     return BJ_OK;
+}
+
+int dbs_compact(dbs *s, const char *name, size_t name_len, dbs_compact_stats *out) {
+    return compact_or_migrate(s, name, name_len, out, 0);
 }
 
 /* The size this collection's files were right after its last

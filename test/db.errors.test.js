@@ -61,17 +61,18 @@ describe('db: named, coded errors', () => {
     await db.close();
   });
 
-  it('scalar _ids raise InvalidIdError pointing at the unique-index alternative', async () => {
+  it('an _id outside the orderable domain raises InvalidIdError', async () => {
     const { db, users } = await freshUsers();
-    for (const bad of ['user-42', 1, new Date(), null]) {
+    // Format v2 stores the four types the key encoding can order...
+    for (const good of ['user-42', 1, -0.5, new Date(7)]) {
+      await users.insertOne({ _id: good, a: 1 });
+      expect((await users.findOne({ _id: good })).a, `_id ${String(good)}`).toBe(1);
+    }
+    // ...and nothing else, because there is no key part for it.
+    for (const bad of [null, true, NaN, ['a'], { k: 1 }, 'has\u0000nul']) {
       const err = await users.insertOne({ _id: bad, a: 1 }).catch((e) => e);
       expect(err, `_id ${String(bad)}`).toBeInstanceOf(InvalidIdError);
-      expect(err.message).toMatch(/unique index/);
     }
-    // The documented alternative works.
-    await users.createIndex({ email: 1 }, { unique: true });
-    await users.insertOne({ email: 'natural@key.example' });
-    expect((await users.findOne({ email: 'natural@key.example' }))._id).toBeInstanceOf(ObjectId);
     await db.close();
   });
 

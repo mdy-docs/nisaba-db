@@ -8,9 +8,14 @@ JS-facing API; see `docs/db-plan.md` for the milestone-by-milestone
 design history and exact scope decisions behind each feature.
 
 Every document is a plain JS object; `_id` is an `ObjectId` (auto-assigned
-on insert if omitted) unless you supply your own. `Date`/`ObjectId`/binary
-(`Uint8Array`) values round-trip through the same binjson codec used
-everywhere else in this package — no BSON, no JSON, no lossy conversion.
+on insert if omitted) unless you supply your own. A supplied `_id` may be
+an `ObjectId`, a string (without U+0000), a finite number, or a `Date` —
+the values the on-disk key encoding can order; anything else (`null`, a
+boolean, an array, an object, `NaN`) is refused with `InvalidIdError`.
+Integer and float ids are one domain: `5` and `5.0` are the same id.
+`Date`/`ObjectId`/binary (`Uint8Array`) values round-trip through the same
+binjson codec used everywhere else in this package — no BSON, no JSON, no
+lossy conversion.
 
 ## Contents
 
@@ -155,7 +160,8 @@ await users.insertMany([{ name: 'Grace' }, { name: 'Linus' }], { ordered: true }
 ```
 
 - `insertOne(doc)` — `_id` is generated client-side (`new ObjectId()`) if
-  `doc._id` is absent.
+  `doc._id` is absent. A supplied one is kept exactly as given: a 24-hex
+  string is a string id, not an `ObjectId` spelled differently.
 - `insertMany(docs, { ordered = true })` — `ordered: true` (default) stops
   at the first failing document; `false` attempts every document
   regardless of earlier failures (the thrown error's `.result` still
@@ -220,8 +226,9 @@ await users.updateOne({ _id: x, team: 'core' }, { $set: { seen: true } }, { upse
 ```
 
 creates `x`, and running it again matches rather than creating a second
-document. A pinned `_id` that is not an ObjectId is rejected — the
-on-disk format has no other kind of key.
+document. A pinned `_id` outside the admissible domain above is rejected
+rather than replaced by a generated one — the on-disk format has no key
+for it.
 
 ### Find-and-modify
 

@@ -37,6 +37,15 @@
 #include "db_wal.h"
 #include "db_session.h"
 #include "db_instance.h"
+
+/* v2 write signatures take a VALUE-form id; the harness mints raw OID
+ * bytes. The compound literal's storage lasts the enclosing block, which
+ * is exactly the call it wraps. */
+#define OID_ID(o) ((dc_id){ (const uint8_t *)(const uint8_t[13]){ BJ_TYPE_OID, \
+    (o)[0], (o)[1], (o)[2], (o)[3], (o)[4], (o)[5], \
+    (o)[6], (o)[7], (o)[8], (o)[9], (o)[10], (o)[11] }, 13 })
+#define NO_ID ((dc_id){ 0, 0 })
+
 #include "root.h"
 #include "snapstore.h"
 #include "bjfile.h"    /* bjfile_crc32: what a snapshot manifest records per file */
@@ -322,8 +331,7 @@ TEST(update_and_delete) {
     uint8_t default_id[12];
     mk_oid(default_id, 99);
     int64_t matched = 0; int upserted = 0;
-    CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen,
-                            default_id, 0, &matched, &upserted, NULL, NULL, NULL));
+    CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, OID_ID(default_id), 0, &matched, &upserted, NULL, NULL, NULL));
     CHECK_I64(matched, 2);
     CHECK_I64(upserted, 0);
 
@@ -371,7 +379,7 @@ TEST(upsert_seeds_from_filter) {
     uint8_t default_id[12];
     mk_oid(default_id, 7);
     int result = -1;
-    CHECK_OK(dc_update_one(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 1, &result, NULL));
+    CHECK_OK(dc_update_one(fx.coll, qbuf, qlen, ubuf, ulen, OID_ID(default_id), 1, &result, NULL));
     CHECK_I64(result, 2);   /* 2 == upserted */
 
     /* The upserted document must carry BOTH the filter's equality seed and
@@ -744,12 +752,12 @@ TEST(a_read_view_refuses_every_write_and_cannot_be_stacked) {
     uint8_t default_id[12];
     mk_oid(default_id, 42);
     int result = 0;
-    CHECK_RC(dc_update_one(view, qbuf, qlen, ubuf, ulen, default_id, 0, &result, NULL),
+    CHECK_RC(dc_update_one(view, qbuf, qlen, ubuf, ulen, OID_ID(default_id), 0, &result, NULL),
              DC_ERR_READ_ONLY);
     /* An UPSERT too: it is the one write that can create a document out of
      * a filter, so it is the one that could plausibly slip past a guard
      * placed on the update path alone. */
-    CHECK_RC(dc_update_one(view, qbuf, qlen, ubuf, ulen, default_id, 1, &result, NULL),
+    CHECK_RC(dc_update_one(view, qbuf, qlen, ubuf, ulen, OID_ID(default_id), 1, &result, NULL),
              DC_ERR_READ_ONLY);
     doc_free(u); doc_free(q);
 
@@ -1987,6 +1995,21 @@ static int build_users_db(bj_ns *ns) {
     dbuf_free(&full); dbuf_free(&entry); dbuf_free(&iplan);
     if (e) return -1;
 
+    /* The stamp: this builder writes v2 files with v2 calls, and an
+     * unstamped catalog with content reads as version 1 -- which would
+     * make every open of this fixture a migration. */
+    {
+        doc *fmt = doc_new();
+        doc_int(fmt, "v", DC_FORMAT_VERSION);
+        uint32_t flen2; const uint8_t *fdoc = doc_done(fmt, &flen2);
+        bpt_key fkey = { .is_string = 1, .num = 0,
+                         .str = (const uint8_t *)DC_FORMAT_KEY,
+                         .str_len = (uint32_t)strlen(DC_FORMAT_KEY) };
+        e = bpt_add(catalog, &fkey, fdoc, flen2);
+        doc_free(fmt);
+        if (e) return -1;
+    }
+
     /* Trees first, then the ios: freeing a tree writes through the io it
      * borrows, and the namespace opened these so the namespace closes
      * them. */
@@ -1996,6 +2019,217 @@ static int build_users_db(bj_ns *ns) {
     ns->close(ns->ctx, &coll_io);
     ns->close(ns->ctx, &cat_io);
     return 0;
+}
+
+/*
+ * Write a database the way a VERSION-1 host wrote one: the primary tree
+ * keyed by the RAW twelve ObjectId bytes, which is what v1 keys were,
+ * with no index (a v1 index file and a v2 one are the same bytes, so an
+ * index would prove nothing here).
+ *
+ * `migrating_stamp` writes {v: 2, migrating: true} in place of {v: 1} --
+ * the state a crash between the fence and the last collection's flip
+ * leaves behind, where the version alone can no longer say there is
+ * anything left to convert.
+ *
+ * Returns 0, or -1 having reported the failure itself.
+ */
+static int build_v1_db(bj_ns *ns, int migrating_stamp) {
+    bj_io cat_io, coll_io;
+    if (ns->open(ns->ctx, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE),
+                 BJ_NS_CREATE, &cat_io) != BJ_OK) return -1;
+    bpt *catalog = bpt_create(&cat_io, ORDER);
+    if (!catalog) return -1;
+
+    if (ns->open(ns->ctx, "coll-users.bj", 13, BJ_NS_CREATE, &coll_io) != BJ_OK) return -1;
+    bpt *primary = bpt_create(&coll_io, ORDER);
+    if (!primary) return -1;
+
+    /* Rows added through the tree directly, under v1 keys: the dc_ write
+     * path builds v2 keys and could not produce this file at all. */
+    static const char *names[3] = { "Ada", "Grace", "Alan" };
+    int e = BJ_OK;
+    for (uint32_t i = 0; !e && i < 3; i++) {
+        uint8_t oid[12];
+        mk_oid(oid, i + 1);
+        doc *d = doc_new();
+        doc_oid(d, "_id", oid);
+        doc_str(d, "name", names[i]);
+        uint32_t dlen; const uint8_t *dbytes = doc_done(d, &dlen);
+        bpt_key k = { .is_string = 1, .num = 0, .str = oid, .str_len = 12 };
+        e = bpt_add(primary, &k, dbytes, dlen);
+        doc_free(d);
+    }
+    if (e) return -1;
+
+    dbuf entry = {0};
+    if (dc_catalog_new_entry("users", 5, &entry) != BJ_OK) return -1;
+    bpt_key ckey = { .is_string = 1, .num = 0, .str = (const uint8_t *)"users", .str_len = 5 };
+    e = bpt_add(catalog, &ckey, entry.data, (uint32_t)entry.len);
+    dbuf_free(&entry);
+    if (e) return -1;
+
+    {
+        doc *fmt = doc_new();
+        doc_int(fmt, "v", migrating_stamp ? DC_FORMAT_VERSION : 1);
+        if (migrating_stamp) {
+            doc_key(fmt, "migrating");
+            bj_put_bool(fmt->b, 1);
+        }
+        uint32_t flen; const uint8_t *fdoc = doc_done(fmt, &flen);
+        bpt_key fkey = { .is_string = 1, .num = 0,
+                         .str = (const uint8_t *)DC_FORMAT_KEY,
+                         .str_len = (uint32_t)strlen(DC_FORMAT_KEY) };
+        e = bpt_add(catalog, &fkey, fdoc, flen);
+        doc_free(fmt);
+        if (e) return -1;
+    }
+
+    bpt_free(primary); bpt_free(catalog);
+    ns->close(ns->ctx, &coll_io);
+    ns->close(ns->ctx, &cat_io);
+    return 0;
+}
+
+/* Is document `n` of the v1 fixture reachable BY ITS _id? Only a re-keyed
+ * primary can answer yes: a point lookup builds the v2 key form, and a
+ * tree still keyed by raw ObjectId bytes has nothing at that key. */
+static int found_by_id(dbs *s, uint32_t n, const char *want_name) {
+    dc_collection *users = NULL;
+    if (dbs_collection(s, "users", 5, &users) != BJ_OK) return 0;
+    uint8_t oid[12];
+    mk_oid(oid, n);
+    doc *q = doc_new();
+    doc_oid(q, "_id", oid);
+    uint32_t qlen; const uint8_t *qbuf = doc_done(q, &qlen);
+    int found = 0; uint8_t *out = NULL; size_t out_len = 0;
+    int e = dc_find_one(users, qbuf, qlen, NULL, 0, &found, &out, &out_len);
+    int ok = 0;
+    if (e == BJ_OK && found) {
+        char name[64];
+        ok = doc_get_str(out, out_len, "name", name, sizeof(name)) &&
+             strcmp(name, want_name) == 0;
+    }
+    free(out);
+    doc_free(q);
+    return ok;
+}
+
+/* Does the stamp still say a migration is under way? Read from the
+ * catalog on disk, because that is the only place the answer survives a
+ * close -- and a flag left set outlives the work it describes, telling
+ * every later open (and every operator) there is something owed. */
+static int stamp_says_migrating(bj_ns *ns) {
+    bj_io io;
+    if (ns->open(ns->ctx, DC_CATALOG_FILE, (uint32_t)strlen(DC_CATALOG_FILE), 0, &io) != BJ_OK)
+        return -1;
+    bpt *catalog = bpt_open(&io);
+    if (!catalog) { ns->close(ns->ctx, &io); return -1; }
+    bpt_key key = { .is_string = 1, .num = 0,
+                    .str = (const uint8_t *)DC_FORMAT_KEY,
+                    .str_len = (uint32_t)strlen(DC_FORMAT_KEY) };
+    int found = 0;
+    const uint8_t *vp = NULL; size_t vlen = 0;
+    int said = -1;
+    if (bpt_search(catalog, &key, &found, &vp, &vlen) == BJ_OK && found) {
+        said = 0;
+        /* The value is a two-field object at most; the key's bytes appear
+         * in it or they do not. */
+        for (size_t i = 0; vlen >= 9 && i + 9 <= vlen; i++) {
+            if (memcmp(vp + i, "migrating", 9) == 0) { said = 1; break; }
+        }
+    }
+    bpt_free(catalog);
+    ns->close(ns->ctx, &io);
+    return said;
+}
+
+/* Did a SECOND migration run? Each one flips the collection to the next
+ * generation, so the existence of a generation-2 primary is the record
+ * of a pass that should never have happened. */
+static int second_generation_exists(bj_ns *ns) {
+    bj_io io;
+    if (ns->open(ns->ctx, "g2-coll-users.bj", 16, 0, &io) != BJ_OK) return 0;
+    ns->close(ns->ctx, &io);
+    return 1;
+}
+
+TEST(a_version_1_database_is_re_keyed_when_it_is_opened) {
+    /*
+     * The migration end to end, over real files: a v1-keyed primary goes
+     * in, and every document comes back out by its own _id -- which it
+     * cannot do unless the tree was rebuilt under the new key form.
+     * Opening is the whole interface; there is no migrate command.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-migrate", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    CHECK_FATAL(build_v1_db(&ns, 0) == 0);
+
+    dbs *s = NULL;
+    CHECK_OK(dbs_open(&ns, ORDER, 0, &s));
+    CHECK(found_by_id(s, 1, "Ada"));
+    CHECK(found_by_id(s, 2, "Grace"));
+    CHECK(found_by_id(s, 3, "Alan"));
+    dbs_close(s);
+
+    /* The stamp records the version it was converted to, and no longer
+     * claims to owe anything. */
+    CHECK_I64(dbs_peek_format(&ns), DC_FORMAT_VERSION);
+    CHECK_I64(stamp_says_migrating(&ns), 0);
+
+    /* ...and the conversion happened once: the second open finds every
+     * def marked and rebuilds nothing. */
+    s = NULL;
+    CHECK_OK(dbs_open(&ns, ORDER, 0, &s));
+    CHECK(found_by_id(s, 2, "Grace"));
+    dbs_close(s);
+    CHECK(!second_generation_exists(&ns));
+
+    bjns_posix_free(&ns);
+    close(dirfd);
+}
+
+TEST(a_migration_interrupted_after_the_fence_resumes_at_the_next_open) {
+    /*
+     * THE STAMP GOES DOWN FIRST, so that no older build can misread what
+     * the migration is about to write -- and that same fence hides the
+     * work still to do, because from then on the version reads current
+     * whether or not a single collection was converted.
+     *
+     * So the stamp carries `migrating` until the last flip lands. Without
+     * it, a crash in that window leaves v1-keyed collections in a
+     * database nothing would ever offer to convert again: their documents
+     * sit under keys no reader derives any more, which is data loss with
+     * no error to go with it.
+     */
+    char tmpl[64];
+    CHECK_FATAL(scratch_dir("nisaba-resume", tmpl, sizeof tmpl) == 0);
+    int dirfd = open(tmpl, O_RDONLY);
+    CHECK_FATAL(dirfd >= 0);
+    bj_ns ns;
+    CHECK_FATAL(bjns_posix_open(dirfd, &ns) == BJ_OK);
+    /* Stamped CURRENT already -- the version says nothing is owed. */
+    CHECK_FATAL(build_v1_db(&ns, 1) == 0);
+
+    dbs *s = NULL;
+    CHECK_OK(dbs_open(&ns, ORDER, 0, &s));
+    CHECK(found_by_id(s, 1, "Ada"));
+    CHECK(found_by_id(s, 3, "Alan"));
+    dbs_close(s);
+
+    /* Finished now, and said so: the next open converts nothing. */
+    CHECK_I64(stamp_says_migrating(&ns), 0);
+    s = NULL;
+    CHECK_OK(dbs_open(&ns, ORDER, 0, &s));
+    dbs_close(s);
+    CHECK(!second_generation_exists(&ns));
+
+    bjns_posix_free(&ns);
+    close(dirfd);
 }
 
 TEST(a_session_resolves_a_collection_by_name_with_no_host_language) {
@@ -3993,7 +4227,7 @@ TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
         static const uint8_t EMPTY[9] = { BJ_TYPE_OBJECT, 4,0,0,0, 0,0,0,0 };
         dc_wal_plan *p = NULL;
         CHECK_OK(dc_wal_plan_build(NULL, "users", 5, DC_WREQ_CREATE_INDEX,
-                                   kb, klen, EMPTY, sizeof EMPTY, 0, NULL, &p));
+                                   kb, klen, EMPTY, sizeof EMPTY, 0, NO_ID, &p));
         uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
         dbuf res = {0};
         CHECK_OK(dbs_apply(replica, 0, cmd, clen, &res));
@@ -4041,7 +4275,7 @@ TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
 
         dc_wal_plan *p = NULL;
         CHECK_OK(dc_wal_plan_build(NULL, "users", 5, DC_WREQ_DROP_INDEX,
-                                   (const uint8_t *)"name_1", 6, NULL, 0, 0, NULL, &p));
+                                   (const uint8_t *)"name_1", 6, NULL, 0, 0, NO_ID, &p));
         uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
         dbuf ares = {0};
         CHECK_OK(dbs_apply(replica, 0, cmd, clen, &ares));
@@ -4064,7 +4298,7 @@ TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
         uint32_t dlen; const uint8_t *db_ = doc_done(d, &dlen);
         dc_wal_plan *p = NULL;
         CHECK_OK(dc_wal_plan_build(NULL, "fresh", 5, DC_WREQ_INSERT_ONE,
-                                   db_, dlen, NULL, 0, 0, NULL, &p));
+                                   db_, dlen, NULL, 0, 0, NO_ID, &p));
         uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
         dbuf res = {0};
         CHECK_OK(dbs_apply(replica, 7, cmd, clen, &res));
@@ -4086,7 +4320,7 @@ TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
     {
         dc_wal_plan *p = NULL;
         CHECK_OK(dc_wal_plan_build(NULL, "fresh", 5, DC_WREQ_DROP_COLLECTION,
-                                   NULL, 0, NULL, 0, 0, NULL, &p));
+                                   NULL, 0, NULL, 0, 0, NO_ID, &p));
         uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
         dbuf res = {0};
         CHECK_OK(dbs_apply(replica, 0, cmd, clen, &res));
@@ -7710,7 +7944,7 @@ TEST(update_many_hands_back_post_images_when_asked) {
     mk_oid(default_id, 99);
     int64_t matched = 0; int upserted = 0;
     uint8_t *images = NULL; size_t images_len = 0;
-    CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 0,
+    CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, OID_ID(default_id), 0,
                             &matched, &upserted, NULL, &images, &images_len));
     CHECK_I64(matched, 2);
     CHECK_I64(arr_count(images, images_len), 2);
@@ -7720,7 +7954,7 @@ TEST(update_many_hands_back_post_images_when_asked) {
 
     /* Not asking costs nothing and returns nothing. */
     images = NULL; images_len = 0;
-    CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, default_id, 0,
+    CHECK_OK(dc_update_many(fx.coll, qbuf, qlen, ubuf, ulen, OID_ID(default_id), 0,
                             &matched, &upserted, NULL, NULL, NULL));
     CHECK(images == NULL);
 
@@ -7729,7 +7963,7 @@ TEST(update_many_hands_back_post_images_when_asked) {
     doc_str(q2, "team", "brand-new");
     uint32_t q2len; const uint8_t *q2buf = doc_done(q2, &q2len);
     images = NULL; images_len = 0;
-    CHECK_OK(dc_update_many(fx.coll, q2buf, q2len, ubuf, ulen, default_id, 1,
+    CHECK_OK(dc_update_many(fx.coll, q2buf, q2len, ubuf, ulen, OID_ID(default_id), 1,
                             &matched, &upserted, NULL, &images, &images_len));
     CHECK_I64(upserted, 1);
     CHECK_I64(arr_count(images, images_len), 1);
@@ -9466,7 +9700,7 @@ TEST(wal_grammar_round_trips_every_op_it_can_emit) {
         int rc = dc_wal_plan_build(fx.coll, "people", 6, cases[i].req,
                                    cases[i].a, cases[i].a_len,
                                    cases[i].b, cases[i].b_len,
-                                   cases[i].upsert, did, &p);
+                                   cases[i].upsert, OID_ID(did), &p);
         if (rc != BJ_OK) { TAP_FAIL("case %zu: plan failed rc=%d", i, rc); continue; }
         CHECK_I64((long long)dc_wal_plan_count(p), 1);
         uint32_t len; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &len);
@@ -9512,11 +9746,12 @@ TEST(wal_grammar_refuses_what_it_cannot_replay) {
     uint32_t tlen; const uint8_t *tbuf = doc_done(torn, &tlen);
     CHECK_RC(dc_wal_parse(tbuf, tlen, &op, &coll, &coll_len), DC_ERR_WAL_MISSING_FIELD);
 
-    /* An id of the wrong type is missing as far as the grammar cares. */
+    /* An id of a type no format can key is missing as far as the grammar
+     * cares -- null has no ordering, so no reader could resolve it. */
     doc *wrong = doc_new();
     doc_str(wrong, "c", "people");
     doc_str(wrong, "op", "d");
-    doc_str(wrong, "id", "not-an-oid");
+    doc_null(wrong, "id");
     uint32_t wlen; const uint8_t *wbuf = doc_done(wrong, &wlen);
     CHECK_RC(dc_wal_parse(wbuf, wlen, &op, &coll, &coll_len), DC_ERR_WAL_MISSING_FIELD);
 
@@ -9530,6 +9765,28 @@ TEST(wal_grammar_refuses_what_it_cannot_replay) {
      * return value must not find a plausible one sitting in `op`. */
     CHECK_I64(op, -1);
 
+    /* And what the grammar now ACCEPTS in that row: every id this format
+     * can key, not the fixed ObjectId of version 1. A logged delete of a
+     * string-keyed document is an ordinary entry -- refusing it here
+     * would make the write path able to log entries the replay path
+     * cannot read, which is a node that halts on its own history. */
+    doc *str_id = doc_new();
+    doc_str(str_id, "c", "people");
+    doc_str(str_id, "op", "d");
+    doc_str(str_id, "id", "user-42");
+    uint32_t slen; const uint8_t *sbuf = doc_done(str_id, &slen);
+    CHECK_OK(dc_wal_parse(sbuf, slen, &op, &coll, &coll_len));
+    CHECK_I64(op, DC_WAL_DELETE);
+
+    doc *num_id = doc_new();
+    doc_str(num_id, "c", "people");
+    doc_str(num_id, "op", "d");
+    doc_int(num_id, "id", 7);
+    uint32_t nulen; const uint8_t *nubuf = doc_done(num_id, &nulen);
+    CHECK_OK(dc_wal_parse(nubuf, nulen, &op, &coll, &coll_len));
+    CHECK_I64(op, DC_WAL_DELETE);
+
+    doc_free(num_id); doc_free(str_id);
     doc_free(nc); doc_free(wrong); doc_free(torn); doc_free(old); doc_free(unknown);
 }
 
@@ -9575,7 +9832,7 @@ TEST(a_logged_command_is_planned_and_applied_with_no_host_language) {
 
     dc_wal_plan *p = NULL;
     CHECK_OK(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
-                               dbuf_, dlen, NULL, 0, 0, spare, &p));
+                               dbuf_, dlen, NULL, 0, 0, OID_ID(spare), &p));
     CHECK_FATAL(p != NULL);
     CHECK_I64((long long)dc_wal_plan_count(p), 1);
 
@@ -9611,7 +9868,7 @@ TEST(a_logged_command_is_planned_and_applied_with_no_host_language) {
     {
         dc_wal_plan *p2 = NULL;
         CHECK_OK(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
-                                   dbuf_, dlen, NULL, 0, 0, spare, &p2));
+                                   dbuf_, dlen, NULL, 0, 0, OID_ID(spare), &p2));
         uint32_t l2; const uint8_t *c2 = dc_wal_plan_cmd(p2, 0, &l2);
         dbuf r2 = {0};
         int e = dc_wal_apply(fx.coll, 6, c2, l2, &r2);
@@ -9638,7 +9895,7 @@ TEST(a_logged_command_is_planned_and_applied_with_no_host_language) {
 
         dc_wal_plan *pu = NULL;
         CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_ONE,
-                                   fbuf, flen, ubuf, ulen, 0, spare, &pu));
+                                   fbuf, flen, ubuf, ulen, 0, OID_ID(spare), &pu));
         CHECK_I64(dc_wal_plan_outcome(pu), DC_PLAN_MATCHED);
         uint32_t ul; const uint8_t *ucmd = dc_wal_plan_cmd(pu, 0, &ul);
         dbuf ur = {0};
@@ -9659,7 +9916,7 @@ TEST(a_logged_command_is_planned_and_applied_with_no_host_language) {
         uint32_t flen; const uint8_t *fbuf = doc_done(filter, &flen);
         dc_wal_plan *pd = NULL;
         CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_DELETE_ONE,
-                                   fbuf, flen, NULL, 0, 0, spare, &pd));
+                                   fbuf, flen, NULL, 0, 0, OID_ID(spare), &pd));
         uint32_t dl; const uint8_t *dcmd = dc_wal_plan_cmd(pd, 0, &dl);
         dbuf dr = {0};
         CHECK_OK(dc_wal_apply(fx.coll, 8, dcmd, dl, &dr));
@@ -9717,7 +9974,7 @@ TEST(a_logged_command_is_planned_and_applied_with_no_host_language) {
         uint32_t olen; const uint8_t *obuf = doc_done(opts, &olen);
         dc_wal_plan *pi = NULL;
         CHECK_OK(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_CREATE_INDEX,
-                                   kbuf, klen, obuf, olen, 0, spare, &pi));
+                                   kbuf, klen, obuf, olen, 0, OID_ID(spare), &pi));
         uint32_t il; const uint8_t *icmd = dc_wal_plan_cmd(pi, 0, &il);
         dbuf ir = {0};
         CHECK_I64(dc_wal_apply(fx.coll, 10, icmd, il, &ir), DC_ERR_WAL_NOT_APPLIABLE);
@@ -9767,7 +10024,7 @@ TEST(wal_plan_resolves_every_command_to_one_id_and_no_filter) {
         int rc = dc_wal_plan_build(fx.coll, "people", 6, cases[i].req,
                                    cases[i].a, cases[i].a_len,
                                    cases[i].b, cases[i].b_len,
-                                   cases[i].upsert, did, &p);
+                                   cases[i].upsert, OID_ID(did), &p);
         if (rc != BJ_OK) { TAP_FAIL("%s: plan failed rc=%d", cases[i].what, rc); continue; }
         if (dc_wal_plan_count(p) != cases[i].want_count) {
             TAP_FAIL("%s: planned %u commands, want %u",
@@ -9792,16 +10049,16 @@ TEST(wal_plan_resolves_every_command_to_one_id_and_no_filter) {
      * stores, ships and replays. */
     dc_wal_plan *p = NULL;
     CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_ONE,
-                               nbuf, nlen, ubuf, ulen, 0, did, &p));
+                               nbuf, nlen, ubuf, ulen, 0, OID_ID(did), &p));
     CHECK_I64(dc_wal_plan_outcome(p), DC_PLAN_NOTHING);
     CHECK_I64((long long)dc_wal_plan_count(p), 0);
-    CHECK(dc_wal_plan_target_id(p) == NULL);
+    { uint32_t tl = 0; CHECK(dc_wal_plan_target_id(p, &tl) == NULL); }
     dc_wal_plan_free(p);
 
     /* deleteMany matching nothing, likewise. */
     p = NULL;
     CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_DELETE_MANY,
-                               nbuf, nlen, NULL, 0, 0, did, &p));
+                               nbuf, nlen, NULL, 0, 0, OID_ID(did), &p));
     CHECK_I64(dc_wal_plan_outcome(p), DC_PLAN_NOTHING);
     CHECK_I64((long long)dc_wal_plan_count(p), 0);
     dc_wal_plan_free(p);
@@ -9832,11 +10089,11 @@ TEST(upsert_uses_the_id_the_filter_pinned) {
     uint32_t ulen; const uint8_t *ubuf = doc_done(u, &ulen);
 
     int result = -1;
-    uint8_t reported[12];
-    memset(reported, 0, sizeof(reported));
-    CHECK_OK(dc_update_one(fx.coll, qbuf, qlen, ubuf, ulen, generated, 1, &result, reported));
+    dbuf reported = {0};
+    CHECK_OK(dc_update_one(fx.coll, qbuf, qlen, ubuf, ulen, OID_ID(generated), 1, &result, &reported));
     CHECK_I64(result, 2);
-    CHECK(memcmp(reported, pinned, 12) == 0);
+    CHECK(reported.len == 13 && reported.data[0] == BJ_TYPE_OID &&
+          memcmp(reported.data + 1, pinned, 12) == 0);
 
     /* Findable by the id that was asked for, not by the generated one. */
     doc *byPinned = doc_new(); doc_oid(byPinned, "_id", pinned);
@@ -9856,11 +10113,11 @@ TEST(upsert_uses_the_id_the_filter_pinned) {
     doc *q2 = doc_new(); doc_oid(q2, "_id", pinned2);
     uint32_t q2len; const uint8_t *q2buf = doc_done(q2, &q2len);
     int64_t matched = 0; int upserted = 0;
-    memset(reported, 0, sizeof(reported));
-    CHECK_OK(dc_update_many(fx.coll, q2buf, q2len, ubuf, ulen, generated, 1,
-                            &matched, &upserted, reported, NULL, NULL));
+    reported.len = 0;
+    CHECK_OK(dc_update_many(fx.coll, q2buf, q2len, ubuf, ulen, OID_ID(generated), 1,
+                            &matched, &upserted, &reported, NULL, NULL));
     CHECK_I64(upserted, 1);
-    CHECK(memcmp(reported, pinned2, 12) == 0);
+    CHECK(reported.len == 13 && memcmp(reported.data + 1, pinned2, 12) == 0);
 
     /* replaceOne, whose replacement names no _id, likewise takes the
      * filter's -- the same bug wearing a different hat. */
@@ -9870,19 +10127,19 @@ TEST(upsert_uses_the_id_the_filter_pinned) {
     doc *repl = doc_new(); doc_str(repl, "name", "Replaced");
     uint32_t rlen; const uint8_t *rbuf = doc_done(repl, &rlen);
     result = -1;
-    memset(reported, 0, sizeof(reported));
-    CHECK_OK(dc_replace_one(fx.coll, q3buf, q3len, rbuf, rlen, generated, 1, &result, reported));
+    reported.len = 0;
+    CHECK_OK(dc_replace_one(fx.coll, q3buf, q3len, rbuf, rlen, OID_ID(generated), 1, &result, &reported));
     CHECK_I64(result, 2);
-    CHECK(memcmp(reported, pinned3, 12) == 0);
+    CHECK(reported.len == 13 && memcmp(reported.data + 1, pinned3, 12) == 0);
 
     /* No pinned id: the generated one, as before. */
     doc *q4 = doc_new(); doc_str(q4, "team", "ghosts");
     uint32_t q4len; const uint8_t *q4buf = doc_done(q4, &q4len);
     result = -1;
-    memset(reported, 0, sizeof(reported));
-    CHECK_OK(dc_update_one(fx.coll, q4buf, q4len, ubuf, ulen, generated, 1, &result, reported));
+    reported.len = 0;
+    CHECK_OK(dc_update_one(fx.coll, q4buf, q4len, ubuf, ulen, OID_ID(generated), 1, &result, &reported));
     CHECK_I64(result, 2);
-    CHECK(memcmp(reported, generated, 12) == 0);
+    CHECK(reported.len == 13 && memcmp(reported.data + 1, generated, 12) == 0);
 
     /* An _id inside an operator expression pins nothing -- the same rule
      * build_upsert_seed applies to every other field. */
@@ -9895,19 +10152,38 @@ TEST(upsert_uses_the_id_the_filter_pinned) {
     uint32_t q5len; const uint8_t *q5buf = doc_done(q5, &q5len);
     uint8_t generated2[12]; mk_oid(generated2, 100);
     result = -1;
-    memset(reported, 0, sizeof(reported));
-    CHECK_OK(dc_update_one(fx.coll, q5buf, q5len, ubuf, ulen, generated2, 1, &result, reported));
+    reported.len = 0;
+    CHECK_OK(dc_update_one(fx.coll, q5buf, q5len, ubuf, ulen, OID_ID(generated2), 1, &result, &reported));
     CHECK_I64(result, 2);
-    CHECK(memcmp(reported, generated2, 12) == 0);
+    CHECK(reported.len == 13 && memcmp(reported.data + 1, generated2, 12) == 0);
+    dbuf_free(&reported);
 
-    /* A pinned _id this format cannot store is refused, not quietly
-     * swapped for a generated one. */
-    doc *q6 = doc_new(); doc_str(q6, "_id", "not-an-objectid");
+    /* A pinned STRING _id is an ordinary id since format v2: the upsert
+     * inserts under it, and the document is findable by it. */
+    doc *q6 = doc_new(); doc_str(q6, "_id", "a-string-id");
     uint32_t q6len; const uint8_t *q6buf = doc_done(q6, &q6len);
     result = -1;
-    CHECK_RC(dc_update_one(fx.coll, q6buf, q6len, ubuf, ulen, generated, 1, &result, NULL),
+    dbuf sid = {0};
+    CHECK_OK(dc_update_one(fx.coll, q6buf, q6len, ubuf, ulen, OID_ID(generated), 1, &result, &sid));
+    CHECK_I64(result, 2);
+    CHECK(sid.len > 1 && sid.data[0] == BJ_TYPE_STRING);
+    {
+        int f6 = 0; uint8_t *d6 = NULL; size_t l6 = 0;
+        CHECK_OK(dc_find_one(fx.coll, q6buf, q6len, NULL, 0, &f6, &d6, &l6));
+        CHECK_I64(f6, 1);
+        free(d6);
+    }
+    dbuf_free(&sid);
+
+    /* A pinned _id no format can key -- null has no order -- is refused,
+     * not quietly swapped for a generated one. */
+    doc *q7 = doc_new(); doc_null(q7, "_id");
+    uint32_t q7len; const uint8_t *q7buf = doc_done(q7, &q7len);
+    result = -1;
+    CHECK_RC(dc_update_one(fx.coll, q7buf, q7len, ubuf, ulen, OID_ID(generated), 1, &result, NULL),
              DC_ERR_UNSUPPORTED_ID);
     CHECK_I64(result, 0);
+    doc_free(q7);
 
     doc_free(q6); doc_free(q5); doc_free(q4); doc_free(repl); doc_free(q3);
     doc_free(q2); doc_free(byPinned); doc_free(u); doc_free(q);
@@ -9935,7 +10211,7 @@ TEST(wal_plan_and_direct_upsert_insert_the_same_document) {
 
     dc_wal_plan *p = NULL;
     CHECK_OK(dc_wal_plan_build(planned.coll, "people", 6, DC_WREQ_UPDATE_ONE,
-                               qbuf, qlen, ubuf, ulen, 1, did, &p));
+                               qbuf, qlen, ubuf, ulen, 1, OID_ID(did), &p));
     CHECK_I64(dc_wal_plan_outcome(p), DC_PLAN_UPSERT);
     CHECK_I64((long long)dc_wal_plan_count(p), 1);
 
@@ -9948,7 +10224,7 @@ TEST(wal_plan_and_direct_upsert_insert_the_same_document) {
     if (found) CHECK_OK(dc_insert_one(planned.coll, dp, (uint32_t)dlen));
 
     int result = -1;
-    CHECK_OK(dc_update_one(direct.coll, qbuf, qlen, ubuf, ulen, did, 1, &result, NULL));
+    CHECK_OK(dc_update_one(direct.coll, qbuf, qlen, ubuf, ulen, OID_ID(did), 1, &result, NULL));
     CHECK_I64(result, 2);
 
     doc *all = doc_new();
@@ -9961,12 +10237,13 @@ TEST(wal_plan_and_direct_upsert_insert_the_same_document) {
     if (l1 == l2) CHECK(memcmp(d1, d2, l1) == 0);
 
     /* And the id the plan reports is the id it actually inserted. */
-    const uint8_t *target = dc_wal_plan_target_id(p);
+    uint32_t target_len = 0;
+    const uint8_t *target = dc_wal_plan_target_id(p, &target_len);
     CHECK(target != NULL);
     if (target && f1) {
-        uint8_t actual[12];
-        CHECK_OK(dc_document_id(d1, (uint32_t)l1, actual));
-        CHECK(memcmp(target, actual, 12) == 0);
+        dc_id actual;
+        CHECK_OK(dc_document_id(d1, (uint32_t)l1, &actual));
+        CHECK(target_len == actual.len && memcmp(target, actual.p, actual.len) == 0);
     }
 
     free(d1); free(d2);
@@ -9999,13 +10276,13 @@ TEST(an_insert_without_an_id_says_which_field_is_missing) {
     {
         dc_wal_plan *p = NULL;
         CHECK_RC(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
-                                   dbuf_, dlen, NULL, 0, 0, given, &p),
+                                   dbuf_, dlen, NULL, 0, 0, OID_ID(given), &p),
                  DC_ERR_WAL_NO_ID);
         CHECK(p == NULL);
 
         p = NULL;
         CHECK_RC(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
-                                   dbuf_, dlen, NULL, 0, 0, NULL, &p),
+                                   dbuf_, dlen, NULL, 0, 0, NO_ID, &p),
                  DC_ERR_WAL_NO_ID);
         CHECK(p == NULL);
     }
@@ -10083,7 +10360,7 @@ TEST(wal_plan_returns_the_preimage_the_host_would_have_queried_for) {
 
     dc_wal_plan *p = NULL;
     CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_ONE,
-                               qbuf, qlen, ubuf, ulen, 0, did, &p));
+                               qbuf, qlen, ubuf, ulen, 0, OID_ID(did), &p));
     uint32_t plen; const uint8_t *pre = dc_wal_plan_preimage(p, &plen);
     CHECK(pre != NULL);
     if (pre) {
@@ -10101,7 +10378,7 @@ TEST(wal_plan_returns_the_preimage_the_host_would_have_queried_for) {
     uint32_t nlen; const uint8_t *nbuf = doc_done(nomatch, &nlen);
     p = NULL;
     CHECK_OK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_ONE,
-                               nbuf, nlen, ubuf, ulen, 1, did, &p));
+                               nbuf, nlen, ubuf, ulen, 1, OID_ID(did), &p));
     CHECK_I64(dc_wal_plan_outcome(p), DC_PLAN_UPSERT);
     CHECK(dc_wal_plan_preimage(p, &plen) == NULL);
     dc_wal_plan_free(p);
@@ -10129,7 +10406,7 @@ TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
     uint32_t mlen; const uint8_t *mbuf = doc_done(moved, &mlen);
     dc_wal_plan *p = NULL;
     CHECK_RC(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_REPLACE_ONE,
-                               qbuf, qlen, mbuf, mlen, 0, did, &p),
+                               qbuf, qlen, mbuf, mlen, 0, OID_ID(did), &p),
              DC_ERR_ID_MISMATCH);
     CHECK(p == NULL);
 
@@ -10141,7 +10418,7 @@ TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
     uint32_t blen; const uint8_t *bbuf = doc_done(bad, &blen);
     p = NULL;
     CHECK(dc_wal_plan_build(fx.coll, "people", 6, DC_WREQ_UPDATE_MANY,
-                            qbuf, qlen, bbuf, blen, 0, did, &p) != BJ_OK);
+                            qbuf, qlen, bbuf, blen, 0, OID_ID(did), &p) != BJ_OK);
     CHECK(p == NULL);
 
     /* An insert with no _id: the host assigns ids, and one that forgot
@@ -10154,7 +10431,7 @@ TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
     uint32_t anlen; const uint8_t *anbuf = doc_done(anon, &anlen);
     p = NULL;
     CHECK_RC(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_ONE,
-                               anbuf, anlen, NULL, 0, 0, did, &p),
+                               anbuf, anlen, NULL, 0, 0, OID_ID(did), &p),
              DC_ERR_WAL_NO_ID);
     CHECK(p == NULL);
 
@@ -10167,7 +10444,7 @@ TEST(wal_plan_rejects_before_it_logs_rather_than_after) {
         size_t n; const uint8_t *d = bj_builder_data(b, &n);
         p = NULL;
         CHECK_RC(dc_wal_plan_build(NULL, "people", 6, DC_WREQ_INSERT_MANY,
-                                   d, (uint32_t)n, NULL, 0, 0, did, &p),
+                                   d, (uint32_t)n, NULL, 0, 0, OID_ID(did), &p),
                  DC_ERR_WAL_BAD_REQUEST);
         CHECK(p == NULL);
         bj_builder_free(b);
@@ -12494,6 +12771,8 @@ int main(void) {
     RUN(catalog_plan_refuses_an_entry_it_cannot_honor);
     RUN(catalog_list_indexes_inverts_what_create_index_stored);
     RUN(posix_namespace_backs_a_real_database);
+    RUN(a_version_1_database_is_re_keyed_when_it_is_opened);
+    RUN(a_migration_interrupted_after_the_fence_resumes_at_the_next_open);
     RUN(a_session_resolves_a_collection_by_name_with_no_host_language);
     RUN(a_collection_that_cannot_be_opened_leaves_the_session_untouched);
     RUN(a_read_view_opens_no_file_and_gives_back_every_handle);

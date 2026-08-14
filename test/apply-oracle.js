@@ -80,14 +80,30 @@ const rand = () => {
   return seed / 0x100000000;
 };
 const pick = (arr) => arr[(rand() * arr.length) | 0];
-/** Deterministic ObjectIds: the workload's own ids never vary between
- * runs, so a divergence is the SERVER's, never the driver's. Real
- * ObjectId instances -- a hex STRING is a scalar _id and is refused
- * loudly, which once made this whole workload a 250-write no-op that
- * "passed" its own floor check at applied=1 (the boot noop). The
- * vacuous guard below is that lesson made permanent. */
-let oidAt = 0;
-const oid = () => new ObjectId((++oidAt).toString(16).padStart(24, '0'));
+/**
+ * Deterministic ids, one of every type format 2 can key: the workload's
+ * own ids never vary between runs, so a divergence is the SERVER's,
+ * never the driver's.
+ *
+ * All four types, because this is the sharpest available statement about
+ * the key forms they are stored under: a primary key or an index
+ * back-pointer derived even slightly differently on the replay path
+ * would show up here as bytes that differ, in a way no behavioural test
+ * can catch. (It also retires the reason this used to mint ObjectIds
+ * alone -- a hex STRING was refused as a scalar _id, which once made the
+ * whole workload a 250-write no-op that "passed" its own floor check at
+ * applied=1. The vacuous guard below is that lesson made permanent.)
+ */
+let idAt = 0;
+const oid = () => {
+  const n = ++idAt;
+  switch (n % 4) {
+    case 0:  return `id-${n}`;                          // string
+    case 1:  return new ObjectId(n.toString(16).padStart(24, '0'));
+    case 2:  return n * 1.5;                            // number, non-integer
+    default: return new Date(1700000000000 + n);        // date
+  }
+};
 
 function start(dir, extra) {
   /* Snapshots off: the log must hold the whole history so B replays from

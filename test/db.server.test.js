@@ -21,7 +21,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ready, encode, decode } from '../src/nisaba-wasm.js';
+import { ready, encode, decode, dbFormatVersion } from '../src/nisaba-wasm.js';
 import { connect, connectClient, ObjectId } from '../src/db.js';
 import { NodeFSStorageProvider } from '../src/db-node.js';
 import { connectServer, ServerError, WIRE_OPS, ChangeStreamOverflowError } from '../src/db-server-client.js';
@@ -29,6 +29,7 @@ import { BPlusTree, EntryLog, MemoryHandle } from '../src/nisaba-wasm.js';
 import { RaftNode } from '../src/raft.js';
 import { TcpRaftTransport } from '../src/raft-transport-tcp.js';
 import { joinGroup, leaveGroup } from '../src/raft-host.js';
+import { downgradeToV1 } from './helpers/v1-fixture.js';
 
 await ready();
 
@@ -4831,11 +4832,12 @@ for (const engine of ENGINES) {
       // is one format however many implementations write it, and this is
       // the only field whose absence a future version could not
       // interpret. Nothing else in this suite would notice if C stopped
-      // writing it -- JS reads an unstamped database as version 1 -- so
-      // it is asserted here rather than assumed.
+      // writing it -- JS reads an unstamped database as the version
+      // before the current one -- so it is asserted here rather than
+      // assumed.
       const catalog = new BPlusTree(await provider.openFile('__catalog__.bj', { create: false }), 32);
       await catalog.open();
-      expect(catalog.search('__format__')).toEqual({ v: 1 });
+      expect(catalog.search('__format__')).toEqual({ v: dbFormatVersion() });
       await catalog.close();
 
       const jsDb = await connect(provider);
@@ -5214,7 +5216,7 @@ for (const engine of ENGINES) {
     }, 60000);
   });
 
-  describe.skipIf(!enabled)(`nisaba-server: a format from the future (${engine.name})`, () => {
+  describe.skipIf(!enabled)(`nisaba-server: the format gate (${engine.name})`, () => {
     const SLOT = nextPort();
 
     it('is refused, and NOT swept: an old version must not judge new files',
@@ -5292,12 +5294,78 @@ for (const engine of ENGINES) {
           ' version it found').toBe(99);
         expect(err.body?.understands ?? err.understands,
           'the refusal does not name the version this build understands')
-          .toBe(1);
+          .toBe(dbFormatVersion());
         await back.close();
       } finally {
         first.proc.kill();
         second?.proc.kill();
       }
+    }, 60000);
+
+    it('a version 1 database is migrated on open, and every document is reachable by its _id', async () => {
+      /*
+       * The other direction of the format gate, and the one with real
+       * stakes now that there IS an older version: a database written by
+       * a version-1 build must open here, converted, rather than being
+       * re-stamped and quietly misread. A v1 primary tree keys its rows
+       * by raw ObjectId bytes, so a point lookup that builds a v2 key
+       * finds NOTHING in one — every document present in a scan and
+       * absent by its own id, with no error anywhere. That is what makes
+       * "find each document by the id the scan just reported" the whole
+       * assertion.
+       *
+       * The fixture is a downgraded real database rather than hand-built
+       * bytes; test/helpers/v1-fixture.js says why.
+       */
+      const port = SLOT + 1;
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nisaba-v1-'));
+      const root = new NodeFSStorageProvider(dir);
+      const provider = await root.subProvider(DB);
+      const seeded = await connect(provider);
+      const seededUsers = await seeded.collection('users');
+      await seededUsers.createIndex({ team: 1 });
+      for (let i = 0; i < 20; i++) {
+        await seededUsers.insertOne({ name: `User ${i}`, team: i % 2 ? 'core' : 'ops' });
+      }
+      await seeded.close();
+      await downgradeToV1(provider, ['users']);
+      await root.close();
+
+      const { proc } = await startServer(engine, port, [], 0, dir);
+      try {
+        const client = await connectServer(port, { keepAliveMs: 0 });
+        const users = client.db(DB).collection('users');
+        expect(await users.countDocuments({})).toBe(20);
+
+        const scanned = await users.find({}).toArray();
+        for (const doc of scanned) {
+          const byId = await users.findOne({ _id: doc._id });
+          expect(byId, `document ${doc.name} is unreachable by its own _id`).not.toBeNull();
+          expect(byId.name).toBe(doc.name);
+        }
+        // The index came across with the rest of the collection.
+        expect(await users.findByIndex('team_1', ['core'])).toHaveLength(10);
+        // And the migrated collection takes ids version 1 had no key for.
+        await users.insertOne({ _id: 'natural-key', name: 'New', team: 'core' });
+        expect((await users.findOne({ _id: 'natural-key' })).name).toBe('New');
+        await client.close();
+      } finally {
+        proc.kill();
+        await new Promise((r) => proc.once('exit', r));
+      }
+
+      // The stamp records the conversion and no longer claims to owe
+      // anything -- the flag that makes an interrupted migration resumable
+      // outlives every partial success, and this one finished.
+      const after = new NodeFSStorageProvider(dir);
+      const catalog = new BPlusTree(
+        await (await after.subProvider(DB)).openFile('__catalog__.bj', { create: false }), 32);
+      await catalog.open();
+      expect(catalog.search('__format__')).toEqual({ v: dbFormatVersion() });
+      expect(catalog.search('users').keys).toBe(2);
+      await catalog.close();
+      await after.close();
+      fs.rmSync(dir, { recursive: true, force: true });
     }, 60000);
   });
 
@@ -5637,6 +5705,49 @@ for (const engine of ENGINES) {
       const found = await c.findOne({ _id: insertedIds[2] });
       expect(found.n).toBe(3);
       expect(await c.countDocuments({})).toBe(3);
+    });
+
+    it('carries every id type the format keys, singly and in a list', async () => {
+      /*
+       * Format v2's id domain, over the WIRE. The request grammar has a
+       * default-id field of its own (`id`, what an upsert falls back on),
+       * and a client whose document is keyed by a string sends that
+       * string in it -- so a server still checking that field for twelve
+       * ObjectId bytes refuses ordinary writes as malformed. Both the
+       * single-write path and the bulk list read that field, and only one
+       * of them is exercised by everything else here.
+       */
+      const c = db.collection('scalars');
+      const IDS = ['user-42', 42, -0.5, new Date(1700000000000)];
+
+      for (const _id of IDS) {
+        const r = await c.insertOne({ _id, n: 1 });
+        expect(r.insertedId, `insertOne ${String(_id)}`).toEqual(_id);
+        expect((await c.findOne({ _id })).n).toBe(1);
+      }
+      await c.insertMany([{ _id: 'many-a', n: 2 }, { _id: 99, n: 2 }]);
+      expect((await c.findOne({ _id: 'many-a' })).n).toBe(2);
+      expect((await c.findOne({ _id: 99 })).n).toBe(2);
+
+      // The bulk list's own read of that field, one operation per shape.
+      const result = await c.bulkWrite([
+        { insertOne: { document: { _id: 'bulk-str', n: 3 } } },
+        { updateOne: { filter: { _id: 'user-42' }, update: { $set: { n: 4 } } } },
+        { replaceOne: { filter: { _id: 42 }, replacement: { n: 5 } } },
+        { deleteOne: { filter: { _id: -0.5 } } },
+        { updateOne: { filter: { _id: 'upserted-str' }, update: { $set: { n: 6 } }, upsert: true } }
+      ]);
+      expect(result.insertedCount).toBe(1);
+      expect(result.deletedCount).toBe(1);
+      expect(result.upsertedCount).toBe(1);
+      expect((await c.findOne({ _id: 'bulk-str' })).n).toBe(3);
+      expect((await c.findOne({ _id: 'user-42' })).n).toBe(4);
+      expect((await c.findOne({ _id: 42 })).n).toBe(5);
+      expect(await c.findOne({ _id: -0.5 })).toBeNull();
+      expect((await c.findOne({ _id: 'upserted-str' })).n).toBe(6);
+
+      // An id no format can key is refused, not stored under a substitute.
+      await expect(c.insertOne({ _id: null, n: 7 })).rejects.toThrow();
     });
 
     it('stops where ordered says to, and reports what landed', async () => {
@@ -6798,6 +6909,64 @@ describe.each(ENGINES.filter((e) => e.ready()))(
         expect(after.find((ix) => ix.name === 'team_1').building).toBeUndefined();
         expect(await wcoll.countDocuments({ team: 3 })).toBe(462);
         await watcher.close();
+        await client.close();
+      } finally { proc.kill(); }
+    }, 120000);
+
+    it('backfills scalar-keyed documents, across every type boundary', async () => {
+      /*
+       * The backfill's RESUME KEY is an id: each chunk records the last
+       * document it reached, in the catalog, so the next chunk starts
+       * after it. Version 1 stored twelve raw bytes there; a chunk that
+       * cannot record where it got to either loops or skips the rest of
+       * the collection, and the finished index quietly answers short.
+       *
+       * The C session owns that cursor here (the JS twin is covered by
+       * db.scalar-id.test.js), and every other test in this suite drives
+       * it with generated ObjectIds alone. So: ids of every admissible
+       * type, in an order that makes the scan cross each type boundary,
+       * with the chunk size small enough that the cursor is written and
+       * re-read many times over.
+       */
+      const port = SLOT + 4;
+      const { proc } = await startServer(engine, port,
+        ['--raft', '1', '--index-chunk', '16'], -1);
+      try {
+        const client = await connectServer(port);
+        const coll = client.db(DB).collection('mixed');
+
+        const ids = [];
+        for (let i = 0; i < 400; i++) {
+          const _id = i % 4 === 0 ? `s-${i}`
+            : i % 4 === 1 ? i
+            : i % 4 === 2 ? new Date(1700000000000 + i)
+            : new ObjectId();
+          ids.push(_id);
+        }
+        for (let at = 0; at < ids.length; at += 100) {
+          await coll.insertMany(ids.slice(at, at + 100).map((_id, i) => ({
+            _id, team: (at + i) % 5
+          })));
+        }
+
+        expect(await coll.createIndex({ team: 1 })).toBe('team_1');
+        const after = await coll.listIndexes();
+        expect(after.find((ix) => ix.name === 'team_1').building).toBeUndefined();
+
+        // Every document, exactly once: a cursor that stalled would have
+        // indexed a prefix, and one that skipped would come up short.
+        let counted = 0;
+        for (let team = 0; team < 5; team++) {
+          const hits = await coll.findByIndex('team_1', [team]);
+          expect(hits.length, `team ${team}`).toBe(80);
+          counted += hits.length;
+        }
+        expect(counted).toBe(ids.length);
+
+        // And each backfilled entry still names a document that resolves.
+        for (const _id of [ids[0], ids[1], ids[2], ids[3], ids[399]]) {
+          expect(await coll.findOne({ _id }), `id ${String(_id)}`).not.toBeNull();
+        }
         await client.close();
       } finally { proc.kill(); }
     }, 120000);

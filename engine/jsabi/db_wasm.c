@@ -140,15 +140,17 @@ EMSCRIPTEN_KEEPALIVE int dcw_collection_index_is_building(dc_collection *c,
 }
 EMSCRIPTEN_KEEPALIVE int dcw_backfill_step(dcw_out *o, dc_collection *c,
         const char *name, int name_len,
-        const uint8_t *after_id, int k) {
+        const uint8_t *after_id, int after_id_len, int k) {
     reset_out(o);
-    uint8_t last[12];
+    if (after_id_len < 0) return BJ_ERR_RANGE;
+    dbuf last = {0};
     uint32_t advanced = 0;
     int done = 0;
     int e = dc_collection_backfill_step(c, name, name_len,
-                                        after_id, (uint32_t)k,
-                                        last, &advanced, &done);
-    if (e) return e;
+                                        after_id, (uint32_t)after_id_len,
+                                        (uint32_t)k,
+                                        &last, &advanced, &done);
+    if (e) { dbuf_free(&last); return e; }
     bj_builder *b = bj_builder_new();
     if (!b) return BJ_ERR_OOM;
     e = bj_begin_object(b);
@@ -158,7 +160,7 @@ EMSCRIPTEN_KEEPALIVE int dcw_backfill_step(dcw_out *o, dc_collection *c,
     if (!e) e = bj_put_bool(b, done);
     if (!e && advanced) {
         e = bj_put_key(b, (const uint8_t *)"last", 4);
-        if (!e) e = bj_put_oid(b, last);
+        if (!e) e = bj_put_raw(b, last.data, (uint32_t)last.len);
     }
     if (!e) e = bj_end_object(b);
     if (!e) e = bj_builder_error(b);
@@ -309,17 +311,28 @@ EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_delete(dcw_out *o, dc_collection *c,
 
 /* Returns 0 (no match, no upsert), 1 (matched and replaced), 2 (upserted),
  * or a negative error. */
-/* `upserted_id_out` (12 writable bytes) receives the id an upsert
- * actually used, which is not always `default_id` -- see dc_replace_one.
- * The host reads it only when the return value is 2. */
-EMSCRIPTEN_KEEPALIVE int dcw_replace_one(dc_collection *c,
+/* The out slot receives the VALUE form of the id an upsert actually
+ * used, which is not always `default_id` -- see dc_replace_one. The
+ * host reads it only when the return value is 2. `default_id` is a
+ * value-form span too (normally the host's generated ObjectId). */
+EMSCRIPTEN_KEEPALIVE int dcw_replace_one(dcw_out *o, dc_collection *c,
         const uint8_t *filter, int filter_len,
         const uint8_t *replacement, int replacement_len,
-        const uint8_t *default_id, int upsert, uint8_t *upserted_id_out) {
+        const uint8_t *default_id, int default_id_len, int upsert) {
+    reset_out(o);
+    if (default_id_len < 0) return BJ_ERR_RANGE;
     int result = 0;
+    dbuf up = {0};
     int e = dc_replace_one(c, filter, (uint32_t)filter_len,
                            replacement, (uint32_t)replacement_len,
-                           default_id, upsert, &result, upserted_id_out);
+                           (dc_id){ default_id, (uint32_t)default_id_len },
+                           upsert, &result, &up);
+    if (!e && up.len) {
+        o->buf = (uint8_t *)malloc(up.len);
+        if (!o->buf) e = BJ_ERR_OOM;
+        else { memcpy(o->buf, up.data, up.len); o->len = up.len; }
+    }
+    dbuf_free(&up);
     if (e) return e;
     return result;
 }
@@ -330,27 +343,39 @@ EMSCRIPTEN_KEEPALIVE int dcw_replace_one(dc_collection *c,
 EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_replace(dcw_out *o, dc_collection *c,
         const uint8_t *filter, int filter_len,
         const uint8_t *replacement, int replacement_len,
-        const uint8_t *default_id, int upsert, int return_new) {
+        const uint8_t *default_id, int default_id_len, int upsert, int return_new) {
     reset_out(o);
+    if (default_id_len < 0) return BJ_ERR_RANGE;
     int found = 0;
     int e = dc_find_one_and_replace(c, filter, (uint32_t)filter_len,
                                     replacement, (uint32_t)replacement_len,
-                                    default_id, upsert, return_new, &found, &o->buf, &o->len);
+                                    (dc_id){ default_id, (uint32_t)default_id_len },
+                                    upsert, return_new, &found, &o->buf, &o->len);
     if (e) return e;
     return found ? 1 : 0;
 }
 
 /* Returns 0 (no match, no upsert), 1 (matched and updated), 2 (upserted),
  * or a negative error. */
-/* `upserted_id_out`: see dcw_replace_one. */
-EMSCRIPTEN_KEEPALIVE int dcw_update_one(dc_collection *c,
+/* The upserted id comes back through the out slot: see dcw_replace_one. */
+EMSCRIPTEN_KEEPALIVE int dcw_update_one(dcw_out *o, dc_collection *c,
         const uint8_t *filter, int filter_len,
         const uint8_t *update, int update_len,
-        const uint8_t *default_id, int upsert, uint8_t *upserted_id_out) {
+        const uint8_t *default_id, int default_id_len, int upsert) {
+    reset_out(o);
+    if (default_id_len < 0) return BJ_ERR_RANGE;
     int result = 0;
+    dbuf up = {0};
     int e = dc_update_one(c, filter, (uint32_t)filter_len,
                           update, (uint32_t)update_len,
-                          default_id, upsert, &result, upserted_id_out);
+                          (dc_id){ default_id, (uint32_t)default_id_len },
+                          upsert, &result, &up);
+    if (!e && up.len) {
+        o->buf = (uint8_t *)malloc(up.len);
+        if (!o->buf) e = BJ_ERR_OOM;
+        else { memcpy(o->buf, up.data, up.len); o->len = up.len; }
+    }
+    dbuf_free(&up);
     if (e) return e;
     return result;
 }
@@ -361,12 +386,14 @@ EMSCRIPTEN_KEEPALIVE int dcw_update_one(dc_collection *c,
 EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_update(dcw_out *o, dc_collection *c,
         const uint8_t *filter, int filter_len,
         const uint8_t *update, int update_len,
-        const uint8_t *default_id, int upsert, int return_new) {
+        const uint8_t *default_id, int default_id_len, int upsert, int return_new) {
     reset_out(o);
+    if (default_id_len < 0) return BJ_ERR_RANGE;
     int found = 0;
     int e = dc_find_one_and_update(c, filter, (uint32_t)filter_len,
                                    update, (uint32_t)update_len,
-                                   default_id, upsert, return_new, &found, &o->buf, &o->len);
+                                   (dc_id){ default_id, (uint32_t)default_id_len },
+                                   upsert, return_new, &found, &o->buf, &o->len);
     if (e) return e;
     return found ? 1 : 0;
 }
@@ -380,20 +407,22 @@ EMSCRIPTEN_KEEPALIVE int dcw_find_one_and_update(dcw_out *o, dc_collection *c,
 EMSCRIPTEN_KEEPALIVE int dcw_update_many(dcw_out *o, dc_collection *c,
         const uint8_t *filter, int filter_len,
         const uint8_t *update, int update_len,
-        const uint8_t *default_id, int upsert, int want_images) {
+        const uint8_t *default_id, int default_id_len, int upsert, int want_images) {
     reset_out(o);
+    if (default_id_len < 0) return BJ_ERR_RANGE;
     int64_t matched = 0; int upserted = 0;
-    uint8_t upserted_id[12];
+    dbuf upserted_id = {0};
     uint8_t *images = NULL; size_t images_len = 0;
     int e = dc_update_many(c, filter, (uint32_t)filter_len,
                            update, (uint32_t)update_len,
-                           default_id, upsert, &matched, &upserted, upserted_id,
+                           (dc_id){ default_id, (uint32_t)default_id_len },
+                           upsert, &matched, &upserted, &upserted_id,
                            want_images ? &images : NULL,
                            want_images ? &images_len : NULL);
-    if (e) { free(images); return e; }
+    if (e) { dbuf_free(&upserted_id); free(images); return e; }
 
     bj_builder *b = bj_builder_new();
-    if (!b) { free(images); return BJ_ERR_OOM; }
+    if (!b) { dbuf_free(&upserted_id); free(images); return BJ_ERR_OOM; }
     e = bj_begin_object(b);
     if (!e) e = bj_put_key(b, (const uint8_t *)"matchedCount", 12);
     if (!e) e = bj_put_int(b, matched);
@@ -404,7 +433,7 @@ EMSCRIPTEN_KEEPALIVE int dcw_update_many(dcw_out *o, dc_collection *c,
      * single-document forms need. */
     if (!e && upserted) {
         e = bj_put_key(b, (const uint8_t *)"upsertedId", 10);
-        if (!e) e = bj_put_oid(b, upserted_id);
+        if (!e) e = bj_put_raw(b, upserted_id.data, (uint32_t)upserted_id.len);
     }
     if (!e && images) {
         e = bj_put_key(b, (const uint8_t *)"documents", 9);
@@ -417,6 +446,7 @@ EMSCRIPTEN_KEEPALIVE int dcw_update_many(dcw_out *o, dc_collection *c,
         else e = dbuf_dup(p, n, &o->buf, &o->len);
     }
     bj_builder_free(b);
+    dbuf_free(&upserted_id);
     free(images);
     return e;
 }

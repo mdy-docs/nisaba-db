@@ -360,6 +360,11 @@ describe.skipIf(!have)('WAL instance ↔ nisaba-server: one artifact', () => {
     const inst = await connectWalInstance(provider);
     const users = await (await inst.db('appa')).collection('users');
     for (let i = 1; i <= 3; i++) await users.insertOne({ _id: oid(i), i });
+    // Scalar _ids cross too (format v2): these go through the snapshot
+    // as FILES, so both the primary tree's new key form and the log's
+    // widened `id` row have to mean the same thing to both engines.
+    await users.insertOne({ _id: 'js-str', i: 'str' });
+    await users.insertOne({ _id: 7.5, i: 'num' });
     await (await (await inst.db('appb')).collection('things')).insertOne({ _id: oid(10), n: 10 });
     await inst.snapshot();
     for (let i = 4; i <= 5; i++) await users.insertOne({ _id: oid(i), i });
@@ -367,6 +372,7 @@ describe.skipIf(!have)('WAL instance ↔ nisaba-server: one artifact', () => {
     // files. If the C server sees this document, it parsed a JS-built
     // envelope and applied the db_wal.h command inside it.
     forgeUnapplied(inst, 'appa', 'users', { _id: oid(99), forged: true });
+    forgeUnapplied(inst, 'appa', 'users', { _id: 'forged-str', forged: true });
     await inst.close();
     await provider.close();   // locks off: the root changes owners now
 
@@ -374,13 +380,20 @@ describe.skipIf(!have)('WAL instance ↔ nisaba-server: one artifact', () => {
     try {
       const a = server.client.db('appa').collection('users');
       await eventually(async () => {
-        expect(await a.countDocuments({})).toBe(6);   // 3 + 2 + the forged one
+        expect(await a.countDocuments({})).toBe(9);   // 5 + 2 scalar + 2 forged
       });
       expect((await a.findOne({ _id: oid(99) })).forged).toBe(true);
+      // Written as files by JS, read by C...
+      expect((await a.findOne({ _id: 'js-str' })).i).toBe('str');
+      expect((await a.findOne({ _id: 7.5 })).i).toBe('num');
+      // ...and replayed out of a JS-built log entry by C.
+      expect((await a.findOne({ _id: 'forged-str' })).forged).toBe(true);
       expect(await server.client.db('appb').collection('things').countDocuments({})).toBe(1);
-      // And the server can carry on writing to it.
+      // And the server can carry on writing to it, in the same domain.
       await a.insertOne({ _id: oid(100), fromC: true });
-      expect(await a.countDocuments({})).toBe(7);
+      await a.insertOne({ _id: 'c-str', fromC: true });
+      expect((await a.findOne({ _id: 'c-str' })).fromC).toBe(true);
+      expect(await a.countDocuments({})).toBe(11);
     } finally {
       await server.stop();
     }

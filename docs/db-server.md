@@ -1282,15 +1282,50 @@ follower stop waiting for the backlog too, for the plainer reason that
 `stale: true` never promised otherwise (`after:` is still honored against
 the reaped floor).
 
-**Measured** (same WRITE INTERFERENCE axis, 50,000 documents, solo
-member): during a full-collection `updateMany`, eight sockets of point
-reads went from 226/s (1% of idle) to **2,700/s (15%)**, read p50 from
-12.3 ms to **0.94 ms** (idle 0.35 ms), p99 from **1,373 ms to 3.5 ms**;
-`getMore` beside them the same. The write round itself: 14.3 s vs 14.0 s
-(+2%). During a staged `createIndex`, read p50 fell from ~12 ms to
-~7 ms — the residue there is the loop's per-chunk fsync, not the apply.
-Idle throughput is unchanged, and `ping` reports `writeThread` so the
-config being measured is never a guess.
+**Measured** (the WRITE INTERFERENCE axis; 20,000 documents is the
+gate's size, 50,000 agrees): during a full-collection `updateMany`,
+eight sockets of point reads went from ~230–390/s (1–2% of idle) to
+**4,900/s (26%)**, read p99 from **~600–1,400 ms to ~3 ms**, and read
+p50 from 8.7–12.3 ms to **0.79 ms** — which is **1.23× the
+like-for-like idle** (the axis pages a cursor lane beside the point
+reads while the write runs, and that lane alone costs the point readers
+0.33→0.64 ms of p50 with *no* write running, so the bench now measures
+idle both ways and judges the write against the matching mix). The
+write round itself: +1–3% with no readers — an A/B against
+`--write-thread 0` on the same machine — and at parity under load
+*while* serving those 4,900 reads/s the inline server starved. During a
+staged `createIndex`, read p50 fell from ~12 ms to ~5.7 ms — the residue
+there is the loop's per-chunk fsync, not the apply. Idle throughput is
+unchanged, and `ping` reports `writeThread` so the config being measured
+is never a guess.
+
+Two costs found on the way there, both structural and both removed: the
+read path used to pump the writer's completions inline (a slice of
+reap-and-submit per point read, for freshness the arrival floor never
+needed), and the transport paid a boundary pause **every pass** to ask
+the stream queues whether they held events — ~9% of the loop's wall time
+during a burst, answered now by the event hint (`wr_events`: the worker
+notes when an apply fed a stream, the loop notes its own barrier applies
+and watch resumes, and the drain pauses only when either is up). The
+worker also wakes the loop once per empty→non-empty of its done queue
+rather than once per entry, which under a burst was ~7,700 forced
+wakeups a second announcing nothing the reap would not discover.
+
+**The soak gate this shipped behind**: four consecutive sanitized hours
+of the three-member kill-storm (`test/soak-install.js` — a member killed
+every few seconds, a third of the kills taking the leader, installs
+forced by `--snapshot-entries 4`), two under TSan and two under ASan on
+different seeds, with the full write mix running throughout: 643k
+acknowledged writes, 5,183 updateMany rounds, 4.5M stale reads against
+all three members, 4,075 staged-index ops, 10k compacts, 2,153 drops,
+1,111 installs adopted, 1,990 kill cycles — zero violations, zero
+sanitizer reports, and at the end of each run the **survivors agree**:
+once applied converges to the shared commit, every collection answers
+identically on every member the storm left standing (the epilogue that
+asks is part of the soak now, so a diverged member fails loudly instead
+of passing by never being asked). Byte-level equivalence of the two
+apply paths stays the oracle's half, and both directions of it ran green
+on eight seeds.
 
 **`--write-thread 0` keeps the inline pump, byte for byte** — proven, not
 asserted: `test/apply-oracle.js --a "--write-thread 0" --b

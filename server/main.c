@@ -808,10 +808,8 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
          * overflow notice sits undelivered until an unrelated request
          * happens to wake the loop.
          */
-        replica_pause_applies(rep);
-        int events_due = dbi_stream_pending(inst);
-        replica_resume_applies(rep);
-        if (events_due) wait_ms = 0;
+        if (rep ? replica_streams_pending(rep) : dbi_stream_pending(inst))
+            wait_ms = 0;
         else if (idle_ms && n > 0) {
             uint64_t now = now_ms(), earliest = 0;
             for (int i = 0; i < n; i++)
@@ -1151,6 +1149,11 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
          * becoming this process's problem, and it says so (-60, on the
          * stream, when it overflows).
          */
+        /* Only when the hint says there could be events: the drain has
+         * to pause the writer, and a pause taken every pass to find
+         * nothing was the single biggest read-latency tax a write burst
+         * paid (replica.h's gate says the numbers). */
+        if (rep ? replica_streams_pending(rep) : dbi_stream_pending(inst)) {
         replica_pause_applies(rep);
         for (int i = n - 1; i >= 0; i--) {
             int any = 0;
@@ -1187,7 +1190,9 @@ static int serve_forever(dbi **inst_p, replica *rep, peers *px, int srv,
                 n--;
             }
         }
+        if (rep) replica_streams_note(rep);
         replica_resume_applies(rep);
+        }
 
         /*
          * Answers to writes that have now committed and applied. They

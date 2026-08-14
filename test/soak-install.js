@@ -373,7 +373,7 @@ const main = async () => {
   const deadline = Date.now() + opts.seconds * 1000;
   const rand = rng(opts.seed);
   const counts = new Map(COLLS.map((c) => [c, 0]));
-  const stats = { writes: 0, reads: 0, regexReads: 0, compacts: 0, drops: 0,
+  const stats = { writes: 0, reads: 0, regexReads: 0, compacts: 0, drops: 0, rounds: 0,
                   indexes: 0, cycles: 0, wipes: 0, reconnects: 0,
                   leaderKills: 0, leaderKillsKept: 0,
                   installsAfterLeaderKill: 0, skipped: 0, wipeWaits: 0 };
@@ -519,7 +519,7 @@ const main = async () => {
          * that size and drained a reader for 2 installs out of 168. Drops
          * still happen, rarely; they are soak.js's subject, not this one's.
          */
-        if (roll < 0.80 && counts.get(coll) < opts.cap) {
+        if (roll < 0.75 && counts.get(coll) < opts.cap) {
           const at = counts.get(coll);
           wslot.what = `insertMany ${coll} at ${at} -> member ${lead.m.id}`;
           /* A batch, so the log advances fast enough for
@@ -550,6 +550,18 @@ const main = async () => {
                    ` member ${lead.m.id}`);
             }
           }
+        } else if (roll < 0.80 && counts.get(coll) > 0) {
+          /*
+           * A ROUND, not a write: updateMany plans one command per matched
+           * document and goes to the log in waves, so over a collection
+           * near the cap this is ~60 waves of committed entries pouring
+           * through the writer thread while members die around it -- the
+           * exact mix the write-isolation soak gate names. `touched` is a
+           * field nothing else reads, so neither oracle changes.
+           */
+          wslot.what = `updateMany ${coll} (${counts.get(coll)} docs) -> member ${lead.m.id}`;
+          await db.collection(coll).updateMany({}, { $inc: { touched: 1 } });
+          stats.rounds++;
         } else if (roll < 0.90) {
           wslot.what = `compact ${coll} -> member ${lead.m.id}`;
           await db.collection(coll).compact();
@@ -942,12 +954,81 @@ const main = async () => {
   const total = (k) => MEMBERS.reduce((n, m) => n + m.banked[k], 0);
   const installs = MEMBERS.reduce((n, m) => n + m.installs, 0);
 
+  /*
+   * THE SURVIVORS MUST AGREE -- the write-isolation soak gate's
+   * apply-equivalence, asked of whoever the kill-storm left standing.
+   * Byte-sameness of the files under one log is test/apply-oracle.js's
+   * half; what a CLUSTER owes is answer-sameness, so once the churn has
+   * stopped and every survivor has applied everything committed, a stale
+   * full scan of every collection must return the same documents on
+   * every member. A member the writer thread diverged fails here with
+   * the collection named, instead of passing by never being asked.
+   */
+  {
+    const survivors = MEMBERS.filter((m) => m.proc);
+    let converged = false;
+    const until = Date.now() + 30000;
+    while (Date.now() < until && survivors.length >= 2) {
+      const pings = [];
+      for (const m of survivors) {
+        try {
+          const c = await connectServer(m.port, { keepAliveMs: 0 });
+          pings.push(await c.ping());
+          await c.close();
+        } catch { pings.push(null); }
+      }
+      if (pings.every(Boolean)) {
+        const top = Math.max(...pings.map((p) => Number(p.commit)));
+        if (pings.every((p) => Number(p.applied) >= top &&
+                               Number(p.commit) === top)) { converged = true; break; }
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!converged && survivors.length >= 2) {
+      note('the survivors never converged: applied would not reach the shared' +
+           ' commit within 30s of the churn stopping');
+    }
+    let agreed = 0;
+    if (converged) {
+      for (const coll of COLLS) {
+        const seen = [];
+        for (const m of survivors) {
+          try {
+            const c = await connectServer(m.port, { keepAliveMs: 0 });
+            const docs = await c.db(DB).collection(coll)
+              .find({}, { stale: true }).toArray();
+            await c.close();
+            docs.sort((a, b) => a.n - b.n);
+            seen.push({ id: m.id,
+                        body: JSON.stringify(docs.map((d) => [d.n, d.touched ?? 0])) });
+          } catch (e) {
+            /* A dropped collection answers -37 everywhere or nowhere,
+             * which is itself the agreement under test. */
+            seen.push({ id: m.id, body: `refused ${e.code ?? e.message}` });
+          }
+        }
+        const want = seen[0].body;
+        const odd = seen.find((s) => s.body !== want);
+        if (odd) {
+          note(`the survivors DISAGREE about ${coll}: member ${seen[0].id} and` +
+               ` member ${odd.id} answer differently` +
+               ` (${want.slice(0, 80)}... vs ${odd.body.slice(0, 80)}...)`);
+        } else {
+          agreed++;
+        }
+      }
+      say(`      survivors agree: ${agreed}/${COLLS.length} collections identical` +
+          ` across ${survivors.length} member(s) after convergence`);
+    }
+  }
+
   for (const m of MEMBERS) {
     m.proc?.kill();
     if (m.dir) fs.rmSync(m.dir, { recursive: true, force: true });
   }
 
-  say(`done: ${stats.writes} writes, ${stats.reads} reads` +
+  say(`done: ${stats.writes} writes, ${stats.rounds} updateMany rounds,` +
+      ` ${stats.reads} reads` +
       ` (${stats.regexReads} compiling a fresh $regex), ${stats.compacts} compacts,` +
       ` ${stats.indexes} index ops, ${stats.drops} drops`);
   say(`      ${stats.cycles} churn cycles (${stats.wipes} onto an empty directory),` +

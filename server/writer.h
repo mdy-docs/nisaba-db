@@ -123,6 +123,18 @@ int wr_inflight(const wrpool *p);
 int wr_unapplied(const wrpool *p);
 
 /*
+ * Whether some apply since the last wr_events_set(0) queued change
+ * events -- the worker checks its own work and raises this, so the loop
+ * only pays a boundary pause for the stream drain when there is
+ * something to drain. Re-arm it UNDER that pause, from what
+ * dbi_stream_pending says after draining: a stream held back by the
+ * high-water mark must keep the flag up, or its events sleep until the
+ * next unrelated apply.
+ */
+int  wr_events(const wrpool *p);
+void wr_events_set(wrpool *p, int on);
+
+/*
  * THE BOUNDARY PAUSE. Return with the worker parked between entries: not
  * inside dbi_apply, and unable to start another until wr_resume. Queued
  * entries stay queued. Bounded by the largest single apply, which the

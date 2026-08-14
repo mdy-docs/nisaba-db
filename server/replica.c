@@ -315,6 +315,14 @@ struct replica {
      */
     wrpool    *writer;
     /*
+     * The LOOP's half of the event hint (writer.h's wr_events): raised
+     * when something applied or replayed ON THIS THREAD may have queued
+     * change events -- a barrier entry, a watch resume inside a propose.
+     * Either half up means the transport's stream drain has work;
+     * both are re-armed together under the drain's pause.
+     */
+    int        events_hint;
+    /*
      * THE DRAIN, COUNTED -- because the drain is the correctness argument
      * for offloading reads at all, and a soak proves it only by failing to
      * crash. Racing finds a MISSING barrier approximately never, so these
@@ -2409,6 +2417,9 @@ static int apply_one_here(replica *r, uint64_t index, int type, dbuf *payload) {
         if (!rc || dc_is_deterministic(rc))
             r->mark_carries = dbi_entry_is_db_drop(payload->data,
                                                    (uint32_t)payload->len);
+        /* Applied on THIS thread, so the writer's event hint cannot know
+         * about whatever this fed a stream. */
+        if (!r->events_hint && dbi_stream_pending(r->inst)) r->events_hint = 1;
         dbuf_free(&scratch);
         if (rc && !dc_is_deterministic(rc)) {
             /*
@@ -2663,7 +2674,16 @@ static int apply_caught_up(replica *r) {
  * unreplicated server.
  */
 static void engine_pause(replica *r)  { if (r->writer) wr_pause(r->writer); }
-static void engine_resume(replica *r) { if (r->writer) wr_resume(r->writer); }
+static void engine_resume(replica *r) {
+    if (!r->writer) return;
+    /* Whatever ran inside this pause may have fed a stream -- a watch
+     * resume replaying the log, a session step -- and only this thread
+     * knows. Checked once per window, while the writer is still parked,
+     * so the transport's drain gate can never sleep on events that
+     * exist (writer.h's wr_events has the other half). */
+    if (!r->events_hint && dbi_stream_pending(r->inst)) r->events_hint = 1;
+    wr_resume(r->writer);
+}
 
 /* An abandoned plan releases session state, which is an engine touch
  * like any other -- and it happens on enough error paths that the pair
@@ -3249,8 +3269,17 @@ static int submit_read(replica *r, pending *p, uint64_t client,
         return e ? e : 0;
     }
 
-    e = apply_committed(r);
-    if (e) { rn_read_release(r->node, barrier); return e; }
+    /*
+     * NO PUMP ON THE READ PATH -- and that is a measured decision, not an
+     * omission. The floor below is the read's own arrival, so the read
+     * needs nothing applied that is not applied already: every
+     * acknowledgement this loop ever delivered was reaped before it went
+     * out, and the tick pumped before this pass served anybody. The pump
+     * call that used to sit here made every point read absorb a slice of
+     * reap-and-submit work during a write burst -- most of the gap
+     * between read p50 idle and read p50 during a round, for freshness
+     * nothing required.
+     */
 
     /* Leadership may have arrived THIS pass, after the tick's own
      * noticing: the floor below must be this term's. */
@@ -4388,6 +4417,25 @@ int replica_read_wake_fd(const replica *r) {
 
 int replica_write_wake_fd(const replica *r) {
     return r ? wr_wake_fd(r->writer) : -1;
+}
+
+int replica_streams_pending(replica *r) {
+    if (!r) return 0;
+    /* Without a writer nothing races the queues and the question is
+     * answered directly, exactly as it always was. */
+    if (!r->writer) return dbi_stream_pending(r->inst);
+    return r->events_hint || wr_events(r->writer);
+}
+
+void replica_streams_note(replica *r) {
+    if (!r) return;
+    /* Under the caller's pause: the queues are quiet, so what they say
+     * now is what both halves of the hint should say -- a stream held
+     * back by the transport's high-water mark keeps the hint up, or its
+     * events would sleep until the next unrelated apply. */
+    int still = dbi_stream_pending(r->inst);
+    r->events_hint = still;
+    if (r->writer) wr_events_set(r->writer, still);
 }
 
 void replica_pause_applies(replica *r)  { if (r) engine_pause(r); }

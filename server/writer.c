@@ -51,6 +51,17 @@ struct wrpool {
     int              unapplied; /* submitted, not yet applied */
     int              applying;  /* the worker is inside dbi_apply */
     /*
+     * AN APPLY MAY HAVE QUEUED CHANGE EVENTS. The loop's stream drain
+     * has to run under the boundary pause -- and a pause waits out the
+     * current entry, so taking one every pass to discover there is
+     * nothing to drain was ~9% of the loop's wall time during a write
+     * burst, measured. The worker checks its own work instead (it just
+     * applied; the queues are its writes) and raises this; the loop
+     * pauses only when it is up, and re-arms it under the pause after
+     * draining.
+     */
+    int              events;
+    /*
      * A COUNT, not a flag: pauses nest. A client teardown inside the
      * event-drain block is two holders of the same park, and the worker
      * runs again when the LAST one lets go -- a flag there would resume
@@ -124,11 +135,30 @@ static void *worker(void *ctx) {
          * reaped and should not hold the entry's bytes with it. */
         dbuf_free(&j->payload);
 
+        /* Asked OUTSIDE the lock, of state this thread just wrote: the
+         * queues an apply feeds are dbi's, and nothing else touches them
+         * while the pause discipline holds. */
+        int fed = dbi_stream_pending(inst);
+
         pthread_mutex_lock(&p->m);
         p->applying = 0;
         p->unapplied--;
+        if (fed) p->events = 1;
         if (j->rc && !dc_is_deterministic(j->rc)) p->halted = 1;
         j->next = NULL;
+        /*
+         * ONE WAKE PER BATCH, not one per entry. The loop reaps the
+         * whole done queue in one pass, so a byte written while the
+         * queue is already non-empty announces nothing it will not
+         * discover anyway -- and during a write burst those bytes were
+         * ~7,700 forced wakeups a second, each a full pass of the poll
+         * loop competing with the reads the writer exists to protect.
+         * Level-triggered instead: a byte only when the queue goes
+         * empty -> non-empty, so a completion after a reap still wakes,
+         * and nothing is ever lost -- readers.c keeps per-job wakes
+         * because its jobs finish at scan pace, not at apply pace.
+         */
+        int first = p->done_head == NULL;
         if (p->done_tail) p->done_tail->next = j; else p->done_head = j;
         p->done_tail = j;
         /* Both ways, like readers.c's completion: through the pipe when
@@ -136,7 +166,7 @@ static void *worker(void *ctx) {
          * BLOCKED in wr_pause or wr_wait_applied. */
         pthread_cond_broadcast(&p->done);
         pthread_mutex_unlock(&p->m);
-        wake_up(p);
+        if (first) wake_up(p);
     }
 }
 
@@ -278,6 +308,22 @@ int wr_unapplied(const wrpool *p) {
     return n;
 }
 
+int wr_events(const wrpool *p) {
+    if (!p) return 0;
+    wrpool *q = (wrpool *)p;
+    pthread_mutex_lock(&q->m);
+    int n = q->events;
+    pthread_mutex_unlock(&q->m);
+    return n;
+}
+
+void wr_events_set(wrpool *p, int on) {
+    if (!p) return;
+    pthread_mutex_lock(&p->m);
+    p->events = on;
+    pthread_mutex_unlock(&p->m);
+}
+
 void wr_pause(wrpool *p) {
     if (!p) return;
     pthread_mutex_lock(&p->m);
@@ -324,6 +370,8 @@ int wr_reap(wrpool *p, uint64_t *index, int *rc, dbuf *result, int *have) {
 }
 int  wr_inflight(const wrpool *p) { (void)p; return 0; }
 int  wr_unapplied(const wrpool *p) { (void)p; return 0; }
+int  wr_events(const wrpool *p) { (void)p; return 0; }
+void wr_events_set(wrpool *p, int on) { (void)p; (void)on; }
 void wr_pause(wrpool *p) { (void)p; }
 void wr_resume(wrpool *p) { (void)p; }
 void wr_wait_applied(wrpool *p) { (void)p; }

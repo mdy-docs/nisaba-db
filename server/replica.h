@@ -209,6 +209,22 @@ void replica_resume_applies(replica *r);
 int replica_drain_applies(replica *r);
 
 /*
+ * THE EVENT-DRAIN GATE. dbi_stream_take must run under the boundary
+ * pause, and a pause waits out the current apply -- so taking one every
+ * pass to find nothing was ~9% of the loop's time during a write burst,
+ * measured. This answers "could there be events?" with no pause at all:
+ * the writer notes when an apply fed a stream (writer.h's wr_events) and
+ * the loop notes its own (a barrier apply, a watch resume). Only when it
+ * is up does the transport pause and drain -- and it then calls
+ * replica_streams_note under that same pause to re-arm both halves from
+ * what the queues actually still hold. Zero and a no-op respectively on
+ * a server with no writer, where dbi_stream_pending is the gate as it
+ * always was.
+ */
+int  replica_streams_pending(replica *r);
+void replica_streams_note(replica *r);
+
+/*
  * ---- offloaded reads (server/readers.h) ----------------------------------
  *
  * The read end of the reader pool's wake pipe, or -1 when there is no pool.

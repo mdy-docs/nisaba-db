@@ -362,6 +362,37 @@ const main = async () => {
       const idleP50 = pctl(idleLat, 0.5), idleP99 = pctl(idleLat, 0.99);
 
       /*
+       * A SECOND IDLE, WITH THE SAME READ MIX THE DURING-WINDOW RUNS. The
+       * cursor lane below pages beside the point reads while a write is
+       * measured -- and it is not free: with no write running at all, it
+       * costs the point readers ~0.3ms of p50 (0.36 -> 0.65, measured).
+       * A during/idle comparison whose idle omits it charges that
+       * contention to the write, so the write's own effect is judged
+       * against THIS baseline, and both are printed.
+       */
+      let mixGo = true;
+      const mixConn = await connectServer(port);
+      const mixPaging = (async () => {
+        const cc = mixConn.db(DB).collection('scan');
+        while (mixGo) {
+          try {
+            const cur = cc.find({}, { batchSize: 50 });
+            for (let b = 0; b < 20 && mixGo; b++) {
+              const batch = await cur.nextBatch();
+              if (!batch.length) break;
+            }
+            await cur.close().catch(() => {});
+          } catch { /* the lane is load here, not the lane under test */ }
+        }
+      })();
+      const mixLat = [];
+      await points(opts.seconds * 1000, mixLat);
+      mixGo = false;
+      await mixPaging;
+      await mixConn.close().catch(() => {});
+      const mixP50 = pctl(mixLat, 0.5), mixP99 = pctl(mixLat, 0.99);
+
+      /*
        * Two long writes, each measured over the same window: `updateMany`
        * touches every document, `createIndex` reads every document and
        * writes an index file (and is dropped again so the next round has
@@ -452,6 +483,7 @@ const main = async () => {
                           ? `REFUSED (${refused})${rounds ? ` after ${rounds}` : ''}`
                           : `${(wrote / Math.max(rounds, 1)).toFixed(0)}ms x${rounds}`}`);
         console.log(`           p50/p99 ms      idle ${idleP50.toFixed(2)}/${idleP99.toFixed(2)}` +
+                    `   idle+cursor ${mixP50.toFixed(2)}/${mixP99.toFixed(2)}` +
                     `   during ${pctl(busyLat, 0.5).toFixed(2)}/${pctl(busyLat, 0.99).toFixed(2)}` +
                     `   getMore ${pctl(gmLat, 0.5).toFixed(2)}/${pctl(gmLat, 0.99).toFixed(2)}` +
                     (gmErrors ? `   (${gmErrors} cursor error(s), last ${gmLastErr})` : ''));

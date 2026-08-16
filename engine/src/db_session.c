@@ -2493,6 +2493,75 @@ int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
         if ((e = catalog_note_applied(s, index))) return e;
     }
 
+    /*
+     * A COLLECTION THIS APPLIER HAS NEVER HEARD OF, made here — and why
+     * that is convergence rather than papering over divergence.
+     *
+     * `createCollection` has no command of its own (db_request.c says
+     * why: an insert creates one implicitly and THAT is logged, so a
+     * collection named and never written to "carries nothing"). True of
+     * its documents. False of its catalog entry — because `createIndex`
+     * on that empty collection IS logged, and an entry naming a
+     * collection the applier does not have is an entry that cannot
+     * apply. A follower that cannot apply an entry halts, so the leader
+     * went on serving while the rest of the cluster froze at an old
+     * applied index, saying nothing. That is the failure this exists to
+     * prevent, and it was reachable from an ordinary
+     * createCollection-then-createIndex.
+     *
+     * THE RULE THAT MAKES IT SAFE, and it is narrower than it first
+     * looks: every write that creates a collection is logged, so an
+     * applier can only be missing a collection the proposer has if that
+     * collection is EMPTY — **provided this applier has missed
+     * nothing**. Hence the contiguity test. An applier replaying at
+     * `floor + 1` has the whole prefix, so an unknown name means an
+     * unwritten one, and making it reproduces exactly the implicit
+     * create the proposer performed. An applier replaying across a GAP
+     * — a member that restored a generation older than the log's base —
+     * cannot tell "never written to" from "written to in the entries I
+     * do not have", and there making the collection would build an
+     * index over an empty tree the proposer built over a full one, then
+     * serve it. That member must halt, and still does; the server's own
+     * reconciliation is what is supposed to notice, and this must not
+     * quietly rescue it (test/db.server.test.js's "leaves a generation
+     * older than the log alone").
+     *
+     * Only-on-insert was the previous rule. It was right about the
+     * document ops and silent about the DDL ones dispatched below, every
+     * one of which resolves this same name — and it happened to be
+     * gap-safe only because an insert into a gap is a document written
+     * twice rather than an index built over the wrong tree.
+     *
+     * TWO OPS SIT OUTSIDE THE CONTIGUITY TEST, in opposite directions.
+     *
+     * INSERT keeps its own, older, unconditional rule: "a first insert
+     * makes the collection" is what every host of this library does and
+     * what lets createCollection have no command at all. Narrowing THAT
+     * to contiguous replays would be a different change with a different
+     * argument; this one is only about the ops that used to stop.
+     *
+     * DROP_COLLECTION is excluded entirely, and the exclusion is
+     * load-bearing rather than tidy: `dbs_drop_collection` already
+     * tolerates a name that is not there and answers `dropped: false`,
+     * so a drop never halts and needs no help — while making the
+     * collection first would turn a REPLAYED drop into a
+     * create-then-drop that answers `dropped: true`, and "gone is gone,
+     * idempotently" is a contract a replica's replay depends on.
+     */
+    int contiguous = (index == 0) || (index == dbs_applied_floor(s) + 1);
+    int may_make = (op == DC_WAL_INSERT) ||
+                   (contiguous && op != DC_WAL_DROP_COLLECTION);
+    if (coll && coll_len && may_make) {
+        dc_collection *have = NULL;
+        int ce = dbs_collection(s, (const char *)coll, coll_len, &have);
+        if (ce == DC_ERR_NO_COLLECTION) {
+            int made = 0;
+            if ((ce = dbs_create_collection(s, (const char *)coll, coll_len, &made))) return ce;
+        } else if (ce) {
+            return ce;
+        }
+    }
+
     if (op == DC_WAL_DROP_COLLECTION) {
         int dropped = 0;
         e = dbs_drop_collection(s, (const char *)coll, coll_len, &dropped);
@@ -2569,20 +2638,10 @@ int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
         return e;
     }
 
+    /* Present by now whatever the op: a name this applier did not have
+     * was made above, for the reason argued there. */
     dc_collection *c = NULL;
-    e = dbs_collection(s, (const char *)coll, coll_len, &c);
-    /* A first insert makes the collection, the way it does on the wire
-     * and in every host of this library -- which is what lets
-     * createCollection have no command of its own. Only an insert: any
-     * other command naming a collection that is not here is a replica
-     * whose state does not match the log it is applying, and that is a
-     * thing to stop on rather than to paper over. */
-    if (e == DC_ERR_NO_COLLECTION && op == DC_WAL_INSERT) {
-        int made = 0;
-        e = dbs_create_collection(s, (const char *)coll, coll_len, &made);
-        if (!e) e = dbs_collection(s, (const char *)coll, coll_len, &c);
-    }
-    if (e) return e;
+    if ((e = dbs_collection(s, (const char *)coll, coll_len, &c))) return e;
 
     return dc_wal_apply(c, index, cmd, len, result);
 }

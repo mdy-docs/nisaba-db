@@ -4348,6 +4348,86 @@ TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
         dc_wal_plan_free(p);
     }
 
+    /*
+     * ---- AND SO DOES AN INDEX COMMAND, which is the case that used to
+     * halt every follower in a cluster.
+     *
+     * `createCollection` has no command (an insert makes one implicitly
+     * and that is logged), so "a collection named and never written to
+     * carries nothing to replicate" -- true of its documents and false
+     * of its catalog entry, because `createIndex` on that empty
+     * collection IS logged. The applier had never heard of the name, the
+     * entry would not apply, and a replica that cannot apply an entry
+     * stops. The leader went on serving while the rest of the cluster
+     * froze at an old applied index, saying nothing.
+     *
+     * It is safe to make the collection here because every write that
+     * creates one is logged: an applier can only be missing a name the
+     * proposer has if that name is EMPTY.
+     */
+    {
+        doc *k2 = doc_new();
+        doc_int(k2, "who", 1);
+        uint32_t k2len; const uint8_t *k2b = doc_done(k2, &k2len);
+        static const uint8_t EMPTY2[9] = { BJ_TYPE_OBJECT, 4,0,0,0, 0,0,0,0 };
+        dc_wal_plan *p = NULL;
+        CHECK_OK(dc_wal_plan_build(NULL, "unheard", 7, DC_WREQ_CREATE_INDEX,
+                                   k2b, k2len, EMPTY2, sizeof EMPTY2, 0, NO_ID, &p));
+        uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+        dbuf res = {0};
+        /* Index 0 is the unreplicated path, which has no prefix to be
+         * missing any of -- the same index every other apply in this
+         * test uses. */
+        CHECK_OK(dbs_apply(replica, 0, cmd, clen, &res));
+        CHECK(find_bytes(res.data, res.len, "who_1", 5) != NULL);
+        dbuf_free(&res);
+        dc_wal_plan_free(p);
+
+        /* The collection is really there, with the index on it -- not a
+         * name the applier swallowed to avoid stopping. */
+        const uint8_t *req; uint32_t req_len;
+        bj_builder *rb = request("listIndexes", "unheard", NULL, NULL, 0, &req, &req_len);
+        dbuf lres = {0};
+        CHECK_OK(dbs_handle(replica, CLIENT, req, req_len, &lres));
+        CHECK_I64(response_ok(&lres), 1);
+        CHECK(find_bytes(lres.data, lres.len, "who_1", 5) != NULL);
+        dbuf_free(&lres); bj_builder_free(rb);
+        doc_free(k2);
+    }
+
+    /*
+     * ---- BUT ONLY WHEN NOTHING WAS MISSED, which is what keeps the
+     * rescue above from becoming a way to serve a state nobody can
+     * account for.
+     *
+     * "An unknown name must be an empty one" holds because every write
+     * that makes a collection is logged -- and that is an argument about
+     * a CONTIGUOUS prefix. A member replaying across a gap (one that
+     * restored a generation older than the log's base) cannot tell "never
+     * written to" from "written to in the entries I do not have", and
+     * making the collection there would build an index over an empty
+     * tree the leader built over a full one. So an entry that is not the
+     * next one refuses, exactly as it did before, and the member halts:
+     * test/db.server.test.js's "leaves a generation older than the log
+     * alone" is the other end of this.
+     */
+    {
+        doc *k3 = doc_new();
+        doc_int(k3, "gap", 1);
+        uint32_t k3len; const uint8_t *k3b = doc_done(k3, &k3len);
+        static const uint8_t EMPTY3[9] = { BJ_TYPE_OBJECT, 4,0,0,0, 0,0,0,0 };
+        dc_wal_plan *p = NULL;
+        CHECK_OK(dc_wal_plan_build(NULL, "gapped", 6, DC_WREQ_CREATE_INDEX,
+                                   k3b, k3len, EMPTY3, sizeof EMPTY3, 0, NO_ID, &p));
+        uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
+        dbuf res = {0};
+        CHECK(dbs_applied_floor(replica) + 1 < 500);   /* a gap, not an off-by-one */
+        CHECK_RC(dbs_apply(replica, 500, cmd, clen, &res), DC_ERR_NO_COLLECTION);
+        dbuf_free(&res);
+        dc_wal_plan_free(p);
+        doc_free(k3);
+    }
+
     /* ---- and a command this build cannot execute is REFUSED, not
      * skipped: the difference between a node that stops and one that has
      * quietly diverged from its peers. */

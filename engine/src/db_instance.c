@@ -64,6 +64,9 @@ struct dbi {
     /* Staged-build chunk size, applied to every session this instance
      * opens (dbi_set_index_chunk). 0 = the session default. */
     uint32_t  index_chunk;
+    /* Every session this instance opens is told (dbi_set_replay_gap):
+     * the hole is the MEMBER's, not one database's. */
+    int       replay_gap;
 };
 
 /* ---- opening ------------------------------------------------------------ */
@@ -156,6 +159,7 @@ int dbi_database(dbi *i, const char *name, size_t len, int create, dbs **out) {
     d->s = s;
     dbs_set_id_source(s, &i->next_id);
     if (i->index_chunk) dbs_set_index_chunk(s, i->index_chunk);
+    if (i->replay_gap) dbs_set_replay_gap(s, 1);
 
     /*
      * THE ORPHAN SWEEP, HERE AND NOWHERE ELSE. Every DDL op leaves files
@@ -956,6 +960,14 @@ int dbi_chunk_entry(const char *db, size_t db_len,
     bj_builder_free(b);
     dc_wal_plan_free(p);
     return e;
+}
+
+void dbi_set_replay_gap(dbi *i, int gapped) {
+    if (!i) return;
+    i->replay_gap = gapped ? 1 : 0;
+    for (int s = 0; s < DBI_MAX_DATABASES; s++) {
+        if (i->db[s].used) dbs_set_replay_gap(i->db[s].s, gapped);
+    }
 }
 
 void dbi_set_index_chunk(dbi *i, uint32_t k) {

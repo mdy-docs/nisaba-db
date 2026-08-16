@@ -2025,6 +2025,39 @@ int replica_open(bj_ns *ns, dbi *inst, uint64_t self_id, peers *px,
      * the one case that cannot be restored -- no generation at the base at
      * all -- where resuming is still better than refusing to start.
      */
+    /*
+     * AND IF IT IS ABOUT TO PAPER OVER ONE, SAY SO DOWNWARD.
+     *
+     * The clamp above is the backstop for the case nothing can restore:
+     * the files account for less than the log's base, so the entries in
+     * between are simply gone and resuming beats refusing to start. A
+     * member in that state must not be RESCUED by the engine's other
+     * accommodation -- making a collection an entry names and this
+     * database does not have (dbs_set_replay_gap says why that is
+     * normally safe and why it is not here). Without this it would
+     * build an index over an empty tree the leader built over a full
+     * one, and serve it; with it, the first such entry refuses and the
+     * member halts, which is what "a state it cannot account for" is
+     * supposed to cost.
+     *
+     * The condition is the one restore_if_unusable already names
+     * `unaccountable`, re-read here because a restore may have just
+     * fixed it.
+     *
+     * IT IS SET ONCE AND NEVER CLEARED, and that is not an oversight in
+     * either direction. It must not clear on catching up: the missing
+     * entries are gone for good, so a member that reaches the log's head
+     * this way is still one whose files cannot account for what came
+     * before -- it is caught up, not whole. It must clear on an INSTALL,
+     * which is the actual cure, and it does: the install path closes the
+     * instance and opens a new one (server/main.c's site, around
+     * `replica_adopt`), and a fresh dbi starts ungapped. If that ever
+     * becomes an in-place swap, this flag has to be cleared there by
+     * hand, or a member the leader just repaired will go on halting on
+     * the first entry naming a collection it has not got.
+     */
+    dbi_set_replay_gap(r->inst, dbi_applied_floor(r->inst) < elog_base_index(r->log));
+
     if (r->applied < elog_base_index(r->log))
         r->applied = elog_base_index(r->log);
     r->submitted = r->applied;

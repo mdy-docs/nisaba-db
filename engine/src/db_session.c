@@ -195,6 +195,9 @@ struct dbs {
      * carried in each entry, so this is a knob about entries this member
      * emits, never about how it applies anyone else's. */
     uint32_t          index_chunk;
+    /* Set by the server when this member's replay has a hole in it
+     * (dbs_set_replay_gap). Refuses the rescue in dbs_apply. */
+    int               replay_gap;
 };
 
 /* ---- plan reading ------------------------------------------------------ */
@@ -2513,18 +2516,26 @@ int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
      * looks: every write that creates a collection is logged, so an
      * applier can only be missing a collection the proposer has if that
      * collection is EMPTY — **provided this applier has missed
-     * nothing**. Hence the contiguity test. An applier replaying at
-     * `floor + 1` has the whole prefix, so an unknown name means an
-     * unwritten one, and making it reproduces exactly the implicit
-     * create the proposer performed. An applier replaying across a GAP
-     * — a member that restored a generation older than the log's base —
-     * cannot tell "never written to" from "written to in the entries I
-     * do not have", and there making the collection would build an
-     * index over an empty tree the proposer built over a full one, then
-     * serve it. That member must halt, and still does; the server's own
-     * reconciliation is what is supposed to notice, and this must not
-     * quietly rescue it (test/db.server.test.js's "leaves a generation
-     * older than the log alone").
+     * nothing**. An applier with the whole prefix can read an unknown
+     * name as an unwritten one, and making it reproduces exactly the
+     * implicit create the proposer performed. An applier replaying
+     * across a GAP — a member whose files account for less than the
+     * log's base — cannot tell "never written to" from "written to in
+     * the entries I do not have", and there making the collection would
+     * build an index over an empty tree the proposer built over a full
+     * one, then serve it. That member must halt, and still does
+     * (test/db.server.test.js's "leaves a generation older than the log
+     * alone").
+     *
+     * WHICH OF THE TWO IT IS, IT IS TOLD (`dbs_set_replay_gap`) rather
+     * than working out. The first version of this inferred it from
+     * `index == applied_floor + 1`, which is wrong twice over: the floor
+     * counts DATABASE applies, so a raft CONFIG entry leaves a hole in
+     * it, and every fresh cluster's first real entry then looked like a
+     * gap and was refused. The server already computes the true
+     * condition at boot — the applied floor below the log's base, its
+     * own `unaccountable` — and an applier guessing at a fact the layer
+     * above holds is how a guard ends up defending nothing.
      *
      * Only-on-insert was the previous rule. It was right about the
      * document ops and silent about the DDL ones dispatched below, every
@@ -2532,7 +2543,7 @@ int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
      * gap-safe only because an insert into a gap is a document written
      * twice rather than an index built over the wrong tree.
      *
-     * TWO OPS SIT OUTSIDE THE CONTIGUITY TEST, in opposite directions.
+     * TWO OPS SIT OUTSIDE THE GAP TEST, in opposite directions.
      *
      * INSERT keeps its own, older, unconditional rule: "a first insert
      * makes the collection" is what every host of this library does and
@@ -2548,9 +2559,8 @@ int dbs_apply(dbs *s, uint64_t index, const uint8_t *cmd, uint32_t len,
      * create-then-drop that answers `dropped: true`, and "gone is gone,
      * idempotently" is a contract a replica's replay depends on.
      */
-    int contiguous = (index == 0) || (index == dbs_applied_floor(s) + 1);
     int may_make = (op == DC_WAL_INSERT) ||
-                   (contiguous && op != DC_WAL_DROP_COLLECTION);
+                   (!s->replay_gap && op != DC_WAL_DROP_COLLECTION);
     if (coll && coll_len && may_make) {
         dc_collection *have = NULL;
         int ce = dbs_collection(s, (const char *)coll, coll_len, &have);
@@ -2683,6 +2693,11 @@ int dbs_repl_active(const dbs *s) { return s && s->resuming != NULL; }
 
 uint32_t dbs_index_chunk_docs(const dbs *s) {
     return s ? s->index_chunk : DBS_INDEX_CHUNK_DEFAULT;
+}
+
+void dbs_set_replay_gap(dbs *s, int gapped) {
+    if (!s) return;
+    s->replay_gap = gapped ? 1 : 0;
 }
 
 void dbs_set_index_chunk(dbs *s, uint32_t k) {

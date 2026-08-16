@@ -180,6 +180,10 @@ int dbi_chunk_entry(const char *db, size_t db_len,
                     uint32_t k, dbuf *out);
 void dbi_set_index_chunk(dbi *i, uint32_t k);
 
+/* Tell every database this instance holds that its replay has a hole in
+ * it -- see dbs_set_replay_gap, which is where the whole argument is. */
+void dbi_set_replay_gap(dbi *i, int gapped);
+
 /* ---- the request path ---------------------------------------------------
  *
  * The same three entry points db_session.h has, with the routing in

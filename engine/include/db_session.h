@@ -460,6 +460,26 @@ int dbs_create_index(dbs *s, const char *coll, size_t coll_len,
 uint32_t dbs_index_chunk_docs(const dbs *s);
 void dbs_set_index_chunk(dbs *s, uint32_t k);
 
+/*
+ * THIS APPLIER IS REPLAYING ACROSS A GAP -- entries it does not have sit
+ * between the state on its disk and the log it is about to run.
+ *
+ * It changes exactly one thing: whether `dbs_apply` may MAKE a
+ * collection an entry names and this database does not have. Normally
+ * it may, because every write that creates a collection is logged, so
+ * an unknown name can only be one that was named and never written to
+ * (createCollection carries no command of its own). Across a gap that
+ * argument fails -- the name may be one whose inserts are in the
+ * missing entries -- and making it would build an index over an empty
+ * tree the proposer built over a full one, and then serve it. Set,
+ * such an entry is refused as it always was, and the member halts.
+ *
+ * The server sets it from the condition it already computes at boot:
+ * the applied floor below the log's base (server/replica.c's
+ * `unaccountable`).
+ */
+void dbs_set_replay_gap(dbs *s, int gapped);
+
 int dbs_index_begin(dbs *s, const char *coll, size_t coll_len,
                     const uint8_t *keys, size_t keys_len,
                     const uint8_t *options, size_t options_len,

@@ -4406,10 +4406,11 @@ TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
      * restored a generation older than the log's base) cannot tell "never
      * written to" from "written to in the entries I do not have", and
      * making the collection there would build an index over an empty
-     * tree the leader built over a full one. So an entry that is not the
-     * next one refuses, exactly as it did before, and the member halts:
-     * test/db.server.test.js's "leaves a generation older than the log
-     * alone" is the other end of this.
+     * tree the leader built over a full one. The server knows which of
+     * the two it is and says so (dbs_set_replay_gap); told there is a
+     * gap, such an entry refuses exactly as it did before this change,
+     * and the member halts: test/db.server.test.js's "leaves a
+     * generation older than the log alone" is the other end of this.
      */
     {
         doc *k3 = doc_new();
@@ -4421,9 +4422,29 @@ TEST(ddl_is_a_command_a_second_database_can_be_caught_up_by) {
                                    k3b, k3len, EMPTY3, sizeof EMPTY3, 0, NO_ID, &p));
         uint32_t clen; const uint8_t *cmd = dc_wal_plan_cmd(p, 0, &clen);
         dbuf res = {0};
-        CHECK(dbs_applied_floor(replica) + 1 < 500);   /* a gap, not an off-by-one */
-        CHECK_RC(dbs_apply(replica, 500, cmd, clen, &res), DC_ERR_NO_COLLECTION);
+        /* The server sets this when the files account for less than the
+         * log's base (server/replica.c). Set, the rescue is off. */
+        dbs_set_replay_gap(replica, 1);
+        CHECK_RC(dbs_apply(replica, 0, cmd, clen, &res), DC_ERR_NO_COLLECTION);
         dbuf_free(&res);
+        /* ...and an INSERT still makes one, because that rule predates
+         * this and answers to a different argument. */
+        {
+            uint8_t gid[12]; mk_oid(gid, 62);
+            doc *gd = doc_new();
+            doc_oid(gd, "_id", gid);
+            uint32_t gdlen; const uint8_t *gdb = doc_done(gd, &gdlen);
+            dc_wal_plan *ip = NULL;
+            CHECK_OK(dc_wal_plan_build(NULL, "gapped", 6, DC_WREQ_INSERT_ONE,
+                                       gdb, gdlen, NULL, 0, 0, NO_ID, &ip));
+            uint32_t ilen; const uint8_t *icmd = dc_wal_plan_cmd(ip, 0, &ilen);
+            dbuf ires = {0};
+            CHECK_OK(dbs_apply(replica, 0, icmd, ilen, &ires));
+            dbuf_free(&ires);
+            dc_wal_plan_free(ip);
+            doc_free(gd);
+        }
+        dbs_set_replay_gap(replica, 0);
         dc_wal_plan_free(p);
         doc_free(k3);
     }
